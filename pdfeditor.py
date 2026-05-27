@@ -31,6 +31,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self.pen_color = (0.05, 0.05, 0.8, 0.9)
         self.pen_width = 1.0
+        self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
 
         self.on_page_changed = None  # callback(current_idx, n_pages)
 
@@ -107,10 +108,19 @@ class PDFCanvas(Gtk.DrawingArea):
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def _draw(self, area, ctx, width, height):
-        ctx.set_source_rgb(0.45, 0.45, 0.45)
+        ctx.set_source_rgb(*self.surround_color)
         ctx.paint()
 
         if self.page is None:
+            r, g, b = self.surround_color
+            # Placeholder text: foreground-ish tint derived from surround
+            ctx.set_source_rgba(r * 0.6, g * 0.6, b * 0.6, 0.8)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(16)
+            text = "Open a PDF to begin"
+            e = ctx.text_extents(text)
+            ctx.move_to((width - e.width) / 2, (height + e.height) / 2)
+            ctx.show_text(text)
             return
 
         if self.offset_x == 0 and self.offset_y == 0 and self.scale == 1.0:
@@ -238,11 +248,69 @@ class PDFCanvas(Gtk.DrawingArea):
         os.replace(tmp, path)
 
 
+def _load_theme():
+    """Read background/foreground/accent from the current omarchy theme."""
+    defaults = {"background": "#fdf6ee", "foreground": "#22211d", "accent": "#85b34c"}
+    path = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if " = " in line and not line.startswith("#"):
+                    k, v = line.split(" = ", 1)
+                    k = k.strip()
+                    if k in defaults:
+                        defaults[k] = v.strip().strip('"')
+    except OSError:
+        pass
+    return defaults
+
+
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+
+
 class PDFEditorWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="PDF Editor")
         self.set_default_size(960, 780)
         self._path = None
+
+        theme = _load_theme()
+        bg = _hex_to_rgb(theme["background"])
+        fg = _hex_to_rgb(theme["foreground"])
+        acc = _hex_to_rgb(theme["accent"])
+
+        # Canvas surround: background blended 12% toward foreground
+        surround = tuple(b + 0.12 * (f - b) for b, f in zip(bg, fg))
+
+        # Pass surround color to canvas
+        self.canvas = PDFCanvas()
+        self.canvas.surround_color = surround
+        self.canvas.set_vexpand(True)
+        self.canvas.set_hexpand(True)
+        self.canvas.on_page_changed = self._update_page_label
+
+        # ── CSS: accent-colored Save button ───────────────────────────────────
+        acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
+        fg_hex = theme["foreground"]
+        css = f"""
+            .save-button {{
+                background: {acc_hex};
+                color: {fg_hex};
+                font-weight: bold;
+            }}
+            .save-button:hover {{
+                background: shade({acc_hex}, 1.1);
+            }}
+        """.encode()
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
         # ── header bar ────────────────────────────────────────────────────────
         header = Gtk.HeaderBar()
@@ -252,67 +320,88 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         open_btn.connect("clicked", self._on_open)
         header.pack_start(open_btn)
 
-        # page navigation
-        prev_btn = Gtk.Button(label="◀")
+        # page navigation (icon buttons + counter)
+        prev_btn = Gtk.Button()
+        prev_btn.set_icon_name("go-previous-symbolic")
+        prev_btn.set_tooltip_text("Previous page (PageUp)")
         prev_btn.connect("clicked", lambda _: self.canvas.go_to_page(self.canvas.current_page_idx - 1))
+
         self._page_label = Gtk.Label(label="—")
         self._page_label.set_width_chars(7)
-        next_btn = Gtk.Button(label="▶")
+
+        next_btn = Gtk.Button()
+        next_btn.set_icon_name("go-next-symbolic")
+        next_btn.set_tooltip_text("Next page (PageDown)")
         next_btn.connect("clicked", lambda _: self.canvas.go_to_page(self.canvas.current_page_idx + 1))
 
-        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        nav_box.add_css_class("linked")
         nav_box.append(prev_btn)
         nav_box.append(self._page_label)
         nav_box.append(next_btn)
         header.set_title_widget(nav_box)
 
-        undo_btn = Gtk.Button(label="Undo")
+        # undo (icon only)
+        undo_btn = Gtk.Button()
+        undo_btn.set_icon_name("edit-undo-symbolic")
+        undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
         undo_btn.connect("clicked", lambda _: self.canvas.undo_last())
         header.pack_end(undo_btn)
 
+        # save
         save_btn = Gtk.Button(label="Save")
+        save_btn.add_css_class("save-button")
+        save_btn.set_tooltip_text("Save (Ctrl+S)")
         save_btn.connect("clicked", self._on_save)
         header.pack_end(save_btn)
 
-        # ── pen toolbar ───────────────────────────────────────────────────────
-        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        toolbar.set_margin_start(12)
-        toolbar.set_margin_end(12)
-        toolbar.set_margin_top(6)
-        toolbar.set_margin_bottom(6)
+        # pen settings popover (hidden by default, icon button reveals it)
+        popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        popover_box.set_margin_start(16)
+        popover_box.set_margin_end(16)
+        popover_box.set_margin_top(12)
+        popover_box.set_margin_bottom(12)
 
-        toolbar.append(Gtk.Label(label="Width:"))
-        self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5, 0.1)
+        width_label = Gtk.Label(label="Width", xalign=0)
+        width_label.add_css_class("dim-label")
+        popover_box.append(width_label)
+
+        self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5.0, 0.1)
         self._width_scale.set_value(1.0)
-        self._width_scale.set_size_request(140, -1)
         self._width_scale.set_draw_value(True)
+        self._width_scale.set_size_request(200, -1)
         self._width_scale.connect("value-changed", self._on_width_changed)
-        toolbar.append(self._width_scale)
+        popover_box.append(self._width_scale)
 
-        toolbar.append(Gtk.Label(label="Color:"))
+        color_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        color_row.set_margin_top(4)
+        color_label = Gtk.Label(label="Color", xalign=0, hexpand=True)
+        color_label.add_css_class("dim-label")
         color_dialog = Gtk.ColorDialog.new()
         color_dialog.set_with_alpha(True)
         self._color_btn = Gtk.ColorDialogButton.new(color_dialog)
-        rgba = Gdk.RGBA()
-        rgba.red, rgba.green, rgba.blue, rgba.alpha = 0.05, 0.05, 0.8, 0.9
-        self._color_btn.set_rgba(rgba)
+        init_rgba = Gdk.RGBA()
+        init_rgba.red, init_rgba.green, init_rgba.blue, init_rgba.alpha = *acc, 1.0
+        self._color_btn.set_rgba(init_rgba)
         self._color_btn.connect("notify::rgba", self._on_color_changed)
-        toolbar.append(self._color_btn)
+        self.canvas.pen_color = (*acc, 1.0)
+        color_row.append(color_label)
+        color_row.append(self._color_btn)
+        popover_box.append(color_row)
+
+        popover = Gtk.Popover()
+        popover.set_child(popover_box)
+
+        pen_btn = Gtk.MenuButton()
+        pen_btn.set_icon_name("document-edit-symbolic")
+        pen_btn.set_tooltip_text("Pen settings")
+        pen_btn.set_popover(popover)
+        header.pack_end(pen_btn)
 
         # ── canvas + toast overlay ────────────────────────────────────────────
-        self.canvas = PDFCanvas()
-        self.canvas.set_vexpand(True)
-        self.canvas.set_hexpand(True)
-        self.canvas.on_page_changed = self._update_page_label
-
         self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(self.canvas)
-        self.toast_overlay.set_vexpand(True)
-
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        root.append(toolbar)
-        root.append(self.toast_overlay)
-        self.set_child(root)
+        self.set_child(self.toast_overlay)
 
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self._on_key)

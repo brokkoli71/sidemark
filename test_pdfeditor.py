@@ -175,5 +175,53 @@ class TestSave(unittest.TestCase):
         self.assertFalse(os.path.exists(self._tmp_out + ".tmp"))
 
 
+# ── theme loading ─────────────────────────────────────────────────────────────
+
+class TestTheme(unittest.TestCase):
+    def test_hex_to_rgb_black(self):
+        from pdfeditor import _hex_to_rgb
+        self.assertEqual(_hex_to_rgb("#000000"), (0.0, 0.0, 0.0))
+
+    def test_hex_to_rgb_white(self):
+        from pdfeditor import _hex_to_rgb
+        r, g, b = _hex_to_rgb("#ffffff")
+        self.assertAlmostEqual(r, 1.0)
+        self.assertAlmostEqual(g, 1.0)
+        self.assertAlmostEqual(b, 1.0)
+
+    def test_hex_to_rgb_accent(self):
+        from pdfeditor import _hex_to_rgb
+        r, g, b = _hex_to_rgb("#85b34c")
+        self.assertAlmostEqual(r, 0x85 / 255)
+        self.assertAlmostEqual(g, 0xb3 / 255)
+        self.assertAlmostEqual(b, 0x4c / 255)
+
+    def test_load_theme_returns_defaults_when_file_missing(self):
+        from pdfeditor import _load_theme
+        import unittest.mock as mock
+        with mock.patch("builtins.open", side_effect=OSError):
+            theme = _load_theme()
+        self.assertIn("background", theme)
+        self.assertIn("foreground", theme)
+        self.assertIn("accent", theme)
+        self.assertTrue(theme["background"].startswith("#"))
+
+    def test_load_theme_parses_toml_values(self):
+        from pdfeditor import _load_theme
+        import tempfile, unittest.mock as mock
+        fake_toml = 'background = "#aabbcc"\nforeground = "#112233"\naccent = "#445566"\n'
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+            f.write(fake_toml)
+            tmp = f.name
+        try:
+            with mock.patch("pdfeditor.os.path.expanduser", return_value=tmp):
+                theme = _load_theme()
+            self.assertEqual(theme["background"], "#aabbcc")
+            self.assertEqual(theme["foreground"], "#112233")
+            self.assertEqual(theme["accent"], "#445566")
+        finally:
+            os.unlink(tmp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
