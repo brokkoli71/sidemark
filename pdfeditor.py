@@ -33,8 +33,15 @@ class PDFCanvas(Gtk.DrawingArea):
         self.pen_color = (0.05, 0.05, 0.8, 0.9)
         self.pen_width = 1.0
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
+        self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
         self.on_page_changed = None  # callback(current_idx, n_pages)
+
+        # zoom-to-region state
+        self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
+        self._zoom_selecting = False
+        self._zoom_start = None        # screen (x, y)
+        self._zoom_end = None          # screen (x, y), constrained
 
         self.set_draw_func(self._draw)
         self.set_focusable(True)
@@ -167,6 +174,23 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.restore()
             ctx.stroke()
 
+        # zoom-selection rubber-band
+        if self._zoom_selecting and self._zoom_start and self._zoom_end:
+            x1 = min(self._zoom_start[0], self._zoom_end[0])
+            y1 = min(self._zoom_start[1], self._zoom_end[1])
+            rw = abs(self._zoom_end[0] - self._zoom_start[0])
+            rh = abs(self._zoom_end[1] - self._zoom_start[1])
+            ar, ag, ab = self.zoom_accent
+            ctx.set_source_rgba(ar, ag, ab, 0.15)
+            ctx.rectangle(x1, y1, rw, rh)
+            ctx.fill()
+            ctx.set_source_rgba(ar, ag, ab, 0.85)
+            ctx.set_line_width(1.5)
+            ctx.set_dash([5.0, 3.0])
+            ctx.rectangle(x1, y1, rw, rh)
+            ctx.stroke()
+            ctx.set_dash([])
+
     # ── input handlers ────────────────────────────────────────────────────────
 
     def _on_motion(self, ctrl, x, y):
@@ -191,22 +215,71 @@ class PDFCanvas(Gtk.DrawingArea):
         return True
 
     def _on_drag_begin(self, gesture, start_x, start_y):
-        self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
+        state = gesture.get_current_event_state()
+        if state & Gdk.ModifierType.SHIFT_MASK:
+            self._zoom_selecting = True
+            self._zoom_start = (start_x, start_y)
+            self._zoom_end = (start_x, start_y)
+        else:
+            self._zoom_selecting = False
+            self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
-        self.current_stroke.append(self._screen_to_pdf(sx + offset_x, sy + offset_y))
+        if self._zoom_selecting:
+            self._zoom_end = self._constrain_zoom_end(sx, sy, sx + offset_x, sy + offset_y)
+        else:
+            self.current_stroke.append(self._screen_to_pdf(sx + offset_x, sy + offset_y))
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
-        if self.current_stroke:
-            self.strokes.append({
-                "pts": self.current_stroke,
-                "color": self.pen_color,
-                "width": self.pen_width,
-            })
-        self.current_stroke = []
+        if self._zoom_selecting:
+            if self._zoom_start and self._zoom_end:
+                self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
+            self._zoom_selecting = False
+            self._zoom_start = None
+            self._zoom_end = None
+        else:
+            if self.current_stroke:
+                self.strokes.append({
+                    "pts": self.current_stroke,
+                    "color": self.pen_color,
+                    "width": self.pen_width,
+                })
+            self.current_stroke = []
         self.queue_draw()
+
+    def _constrain_zoom_end(self, sx, sy, ex, ey):
+        """Constrain (ex, ey) so the rect has the same aspect ratio as the canvas."""
+        cw = self.get_width() or 800
+        ch = self.get_height() or 600
+        dx = ex - sx
+        dy_constrained = abs(dx) * ch / cw
+        return sx + dx, sy + (dy_constrained if ey >= sy else -dy_constrained)
+
+    def _execute_zoom_to_rect(self, start, end):
+        x1, y1 = min(start[0], end[0]), min(start[1], end[1])
+        x2, y2 = max(start[0], end[0]), max(start[1], end[1])
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return
+        # Convert to PDF coords
+        px1, py1 = self._screen_to_pdf(x1, y1)
+        px2, py2 = self._screen_to_pdf(x2, y2)
+        pdf_w, pdf_h = px2 - px1, py2 - py1
+        if pdf_w <= 0 or pdf_h <= 0:
+            return
+        cw = self.get_width() or 800
+        ch = self.get_height() or 600
+        self._zoom_stack.append((self.scale, self.offset_x, self.offset_y))
+        new_scale = min(cw / pdf_w, ch / pdf_h) * 0.97
+        self.scale = new_scale
+        self.offset_x = (cw - pdf_w * new_scale) / 2 - px1 * new_scale
+        self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
+
+    def zoom_back(self):
+        if self._zoom_stack:
+            self.scale, self.offset_x, self.offset_y = self._zoom_stack.pop()
+            self.queue_draw()
 
     def undo_last(self):
         if self.strokes:
@@ -330,6 +403,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
         self.canvas = PDFCanvas()
         self.canvas.surround_color = surround
+        self.canvas.zoom_accent = acc
         self.canvas.set_vexpand(True)
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._on_page_changed
@@ -593,6 +667,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             return True
         if keyval == Gdk.KEY_Page_Up:
             self._go_to_page(self.canvas.current_page_idx - 1)
+            return True
+        if keyval in (Gdk.KEY_b, Gdk.KEY_B):
+            self.canvas.zoom_back()
             return True
         return False
 

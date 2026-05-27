@@ -77,6 +77,64 @@ class TestCoordinates(unittest.TestCase):
         self.assertAlmostEqual(pdf_y_before, pdf_y_after, places=10)
 
 
+# ── zoom to region ────────────────────────────────────────────────────────────
+
+class TestZoomToRegion(unittest.TestCase):
+    def _canvas(self):
+        c = PDFCanvas()
+        c.scale = 1.0
+        c.offset_x = 0.0
+        c.offset_y = 0.0
+        return c
+
+    def test_execute_zoom_centers_selection(self):
+        c = self._canvas()
+        # Simulate 800×600 canvas
+        # Select screen rect (100,100)–(300,250)
+        c._execute_zoom_to_rect((100, 100), (300, 250))
+        self.assertEqual(len(c._zoom_stack), 1)
+        # After zoom, the selection should be scaled up
+        self.assertGreater(c.scale, 1.0)
+
+    def test_zoom_back_restores_state(self):
+        c = self._canvas()
+        original = (c.scale, c.offset_x, c.offset_y)
+        c._execute_zoom_to_rect((100, 100), (300, 250))
+        c.zoom_back()
+        self.assertAlmostEqual(c.scale, original[0])
+        self.assertAlmostEqual(c.offset_x, original[1])
+        self.assertAlmostEqual(c.offset_y, original[2])
+        self.assertEqual(len(c._zoom_stack), 0)
+
+    def test_zoom_back_on_empty_stack_does_not_raise(self):
+        c = self._canvas()
+        c.zoom_back()  # should not raise
+
+    def test_tiny_rect_ignored(self):
+        c = self._canvas()
+        c._execute_zoom_to_rect((100, 100), (103, 102))  # < 8px, should be ignored
+        self.assertEqual(len(c._zoom_stack), 0)
+        self.assertAlmostEqual(c.scale, 1.0)
+
+    def test_constrain_zoom_end_aspect_ratio(self):
+        c = self._canvas()
+        # Canvas 800×600 → aspect 4/3
+        # Drag 120px horizontally → expect 90px vertically (120 * 600/800)
+        ex, ey = c._constrain_zoom_end(0, 0, 120, 999)
+        self.assertAlmostEqual(ex, 120)
+        self.assertAlmostEqual(ey, 90.0, places=5)
+
+    def test_zoom_stack_is_lifo(self):
+        c = self._canvas()
+        c._execute_zoom_to_rect((50, 50), (200, 200))
+        scale1 = c.scale
+        c._execute_zoom_to_rect((60, 60), (180, 180))
+        c.zoom_back()
+        self.assertAlmostEqual(c.scale, scale1)
+        c.zoom_back()
+        self.assertAlmostEqual(c.scale, 1.0)
+
+
 # ── stroke storage ────────────────────────────────────────────────────────────
 
 class TestStrokes(unittest.TestCase):
