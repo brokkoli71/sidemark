@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- Page shadow -->
+  <path d="M8,6 H34 L42,14 V46 H8 Z" fill="#e7c085" opacity="0.45"/>
+
+  <!-- Page body -->
+  <path d="M6,4 H32 L40,12 V44 H6 Z" fill="#fdf6ee"/>
+
+  <!-- Folded corner fill -->
+  <path d="M32,4 L40,12 H32 Z" fill="#e8ddd0"/>
+
+  <!-- Page and fold outline -->
+  <path d="M6,4 H32 L40,12 V44 H6 Z" fill="none" stroke="#22211d" stroke-width="2" stroke-linejoin="miter"/>
+  <line x1="32" y1="4" x2="40" y2="12" stroke="#22211d" stroke-width="1.5"/>
+
+  <!-- Faint text lines -->
+  <line x1="11" y1="20" x2="35" y2="20" stroke="#22211d" stroke-width="1.5" opacity="0.2"/>
+  <line x1="11" y1="26" x2="30" y2="26" stroke="#22211d" stroke-width="1.5" opacity="0.2"/>
+  <line x1="11" y1="32" x2="33" y2="32" stroke="#22211d" stroke-width="1.5" opacity="0.2"/>
+
+  <!-- Pen annotation stroke (accent olive green) -->
+  <path d="M11,41 Q20,30 33,17" stroke="#85b34c" stroke-width="3.5" fill="none"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Pen nib at tip -->
+  <polygon points="33,13 37,17 33,18 30,16" fill="#85b34c" stroke="#22211d" stroke-width="1" stroke-linejoin="miter"/>
+  <polygon points="33,13 37,17 36,14" fill="#496c1e" stroke="none"/>
+</svg>
