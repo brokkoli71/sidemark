@@ -235,7 +235,12 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_drag_end(self, gesture, offset_x, offset_y):
         if self._zoom_selecting:
             if self._zoom_start and self._zoom_end:
-                self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
+                dx = abs(self._zoom_end[0] - self._zoom_start[0])
+                dy = abs(self._zoom_end[1] - self._zoom_start[1])
+                if dx >= 8 and dy >= 8:
+                    self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
+                else:
+                    self.zoom_back()   # Shift+click with no rect → step back
             self._zoom_selecting = False
             self._zoom_start = None
             self._zoom_end = None
@@ -667,9 +672,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             return True
         if keyval == Gdk.KEY_Page_Up:
             self._go_to_page(self.canvas.current_page_idx - 1)
-            return True
-        if keyval in (Gdk.KEY_b, Gdk.KEY_B):
-            self.canvas.zoom_back()
             return True
         return False
 

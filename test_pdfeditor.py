@@ -110,9 +110,9 @@ class TestZoomToRegion(unittest.TestCase):
         c = self._canvas()
         c.zoom_back()  # should not raise
 
-    def test_tiny_rect_ignored(self):
+    def test_tiny_rect_does_not_zoom_in(self):
         c = self._canvas()
-        c._execute_zoom_to_rect((100, 100), (103, 102))  # < 8px, should be ignored
+        c._execute_zoom_to_rect((100, 100), (103, 102))  # < 8px → no zoom push
         self.assertEqual(len(c._zoom_stack), 0)
         self.assertAlmostEqual(c.scale, 1.0)
 
