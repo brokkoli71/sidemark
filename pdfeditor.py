@@ -2,6 +2,7 @@
 import sys
 import os
 import math
+import re
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -271,38 +272,84 @@ def _hex_to_rgb(h):
     return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
 
 
+def notes_path_for(pdf_path):
+    return os.path.splitext(pdf_path)[0] + "-notes.md"
+
+
+class NotesModel:
+    """Per-page markdown notes, backed by a sidecar .md file."""
+
+    def __init__(self):
+        self._notes = {}
+
+    def get(self, idx):
+        return self._notes.get(idx, "")
+
+    def set(self, idx, text):
+        self._notes[idx] = text
+
+    def load(self, path):
+        self._notes = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            return
+        # Format: <!-- page:N --> delimiters (invisible in markdown viewers)
+        parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
+        for i in range(1, len(parts), 2):
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            if content:
+                self._notes[int(parts[i])] = content
+
+    def save(self, path):
+        sections = [
+            f"<!-- page:{idx} -->\n\n{self._notes[idx].strip()}"
+            for idx in sorted(self._notes)
+            if self._notes[idx].strip()
+        ]
+        content = "\n\n".join(sections) + "\n" if sections else ""
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+
+
 class PDFEditorWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="PDF Editor")
-        self.set_default_size(960, 780)
+        self.set_default_size(1280, 800)
         self._path = None
+        self.notes_model = NotesModel()
 
         theme = _load_theme()
         bg = _hex_to_rgb(theme["background"])
         fg = _hex_to_rgb(theme["foreground"])
         acc = _hex_to_rgb(theme["accent"])
-
-        # Canvas surround: background blended 12% toward foreground
         surround = tuple(b + 0.12 * (f - b) for b, f in zip(bg, fg))
 
-        # Pass surround color to canvas
         self.canvas = PDFCanvas()
         self.canvas.surround_color = surround
         self.canvas.set_vexpand(True)
         self.canvas.set_hexpand(True)
-        self.canvas.on_page_changed = self._update_page_label
+        self.canvas.on_page_changed = self._on_page_changed
 
-        # ── CSS: accent-colored Save button ───────────────────────────────────
+        # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
-        fg_hex = theme["foreground"]
+        fg_hex  = theme["foreground"]
+        bg_hex  = theme["background"]
         css = f"""
             .save-button {{
                 background: {acc_hex};
                 color: {fg_hex};
                 font-weight: bold;
             }}
-            .save-button:hover {{
-                background: shade({acc_hex}, 1.1);
+            .save-button:hover {{ background: shade({acc_hex}, 1.1); }}
+            .notes-view {{
+                font-family: monospace;
+                font-size: 13px;
+                background-color: {bg_hex};
+                color: {fg_hex};
             }}
         """.encode()
         provider = Gtk.CssProvider()
@@ -320,11 +367,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         open_btn.connect("clicked", self._on_open)
         header.pack_start(open_btn)
 
-        # page navigation (icon buttons + counter)
         prev_btn = Gtk.Button()
         prev_btn.set_icon_name("go-previous-symbolic")
         prev_btn.set_tooltip_text("Previous page (PageUp)")
-        prev_btn.connect("clicked", lambda _: self.canvas.go_to_page(self.canvas.current_page_idx - 1))
+        prev_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx - 1))
 
         self._page_label = Gtk.Label(label="—")
         self._page_label.set_width_chars(7)
@@ -332,7 +378,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         next_btn = Gtk.Button()
         next_btn.set_icon_name("go-next-symbolic")
         next_btn.set_tooltip_text("Next page (PageDown)")
-        next_btn.connect("clicked", lambda _: self.canvas.go_to_page(self.canvas.current_page_idx + 1))
+        next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
 
         nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
@@ -341,21 +387,19 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         nav_box.append(next_btn)
         header.set_title_widget(nav_box)
 
-        # undo (icon only)
         undo_btn = Gtk.Button()
         undo_btn.set_icon_name("edit-undo-symbolic")
         undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
         undo_btn.connect("clicked", lambda _: self.canvas.undo_last())
         header.pack_end(undo_btn)
 
-        # save
         save_btn = Gtk.Button(label="Save")
         save_btn.add_css_class("save-button")
         save_btn.set_tooltip_text("Save (Ctrl+S)")
         save_btn.connect("clicked", self._on_save)
         header.pack_end(save_btn)
 
-        # pen settings popover (hidden by default, icon button reveals it)
+        # pen settings popover
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         popover_box.set_margin_start(16)
         popover_box.set_margin_end(16)
@@ -398,19 +442,93 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         pen_btn.set_popover(popover)
         header.pack_end(pen_btn)
 
-        # ── canvas + toast overlay ────────────────────────────────────────────
+        # notes toggle
+        self._notes_toggle = Gtk.ToggleButton()
+        self._notes_toggle.set_icon_name("view-sidebar-symbolic")
+        self._notes_toggle.set_tooltip_text("Toggle notes (Ctrl+\\)")
+        self._notes_toggle.set_active(True)
+        self._notes_toggle.connect("toggled", self._on_notes_toggled)
+        header.pack_end(self._notes_toggle)
+
+        # ── notes panel ───────────────────────────────────────────────────────
+        self._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        notes_header = Gtk.Label(label="Notes")
+        notes_header.add_css_class("dim-label")
+        notes_header.set_xalign(0)
+        notes_header.set_margin_start(10)
+        notes_header.set_margin_top(6)
+        notes_header.set_margin_bottom(4)
+        self._notes_box.append(notes_header)
+
+        notes_scroll = Gtk.ScrolledWindow()
+        notes_scroll.set_vexpand(True)
+        notes_scroll.set_hexpand(True)
+        self._notes_view = Gtk.TextView()
+        self._notes_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._notes_view.add_css_class("notes-view")
+        self._notes_view.set_left_margin(10)
+        self._notes_view.set_right_margin(10)
+        self._notes_view.set_top_margin(6)
+        self._notes_view.set_bottom_margin(10)
+        notes_scroll.set_child(self._notes_view)
+        self._notes_box.append(notes_scroll)
+
+        # ── split pane ────────────────────────────────────────────────────────
+        self._saved_pane_pos = 800
+        self._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self._paned.set_start_child(self.canvas)
+        self._paned.set_resize_start_child(True)
+        self._paned.set_shrink_start_child(False)
+        self._paned.set_end_child(self._notes_box)
+        self._paned.set_resize_end_child(True)
+        self._paned.set_shrink_end_child(True)
+        self.connect("realize", self._on_realize)
+
         self.toast_overlay = Adw.ToastOverlay()
-        self.toast_overlay.set_child(self.canvas)
+        self.toast_overlay.set_child(self._paned)
         self.set_child(self.toast_overlay)
 
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self._on_key)
         self.add_controller(key_ctrl)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    # ── page & notes handshake ────────────────────────────────────────────────
 
-    def _update_page_label(self, idx, n):
+    def _on_realize(self, _widget):
+        w, _ = self.get_default_size()
+        pos = int(w * 0.62)
+        self._paned.set_position(pos)
+        self._saved_pane_pos = pos
+
+    def _on_page_changed(self, idx, n):
         self._page_label.set_label(f"{idx + 1} / {n}")
+        self._restore_note()
+
+    def _go_to_page(self, idx):
+        self._commit_note()
+        self.canvas.go_to_page(idx)
+
+    def _commit_note(self):
+        if not self._path:
+            return
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        self.notes_model.set(self.canvas.current_page_idx, text)
+
+    def _restore_note(self):
+        text = self.notes_model.get(self.canvas.current_page_idx)
+        self._notes_view.get_buffer().set_text(text)
+
+    def _on_notes_toggled(self, btn):
+        if btn.get_active():
+            self._notes_box.set_visible(True)
+            self._paned.set_position(self._saved_pane_pos)
+        else:
+            self._saved_pane_pos = self._paned.get_position()
+            self._notes_box.set_visible(False)
+
+    # ── standard helpers ──────────────────────────────────────────────────────
 
     def _on_width_changed(self, scale):
         self.canvas.pen_width = scale.get_value()
@@ -422,7 +540,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def open_file(self, path):
         self._path = path
         self.set_title(f"PDF Editor — {os.path.basename(path)}")
-        self.canvas.load(path)
+        self.notes_model = NotesModel()
+        self.notes_model.load(notes_path_for(path))
+        self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
 
     def _on_open(self, _btn):
         dialog = Gtk.FileDialog.new()
@@ -446,8 +566,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         if not self._path:
             return
         try:
+            self._commit_note()
             self.canvas.save(self._path)
-            toast = Adw.Toast.new("Saved successfully")
+            self.notes_model.save(notes_path_for(self._path))
+            toast = Adw.Toast.new("Saved")
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
         except Exception as e:
@@ -463,11 +585,14 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             if keyval == Gdk.KEY_z:
                 self.canvas.undo_last()
                 return True
+            if keyval == Gdk.KEY_backslash:
+                self._notes_toggle.set_active(not self._notes_toggle.get_active())
+                return True
         if keyval == Gdk.KEY_Page_Down:
-            self.canvas.go_to_page(self.canvas.current_page_idx + 1)
+            self._go_to_page(self.canvas.current_page_idx + 1)
             return True
         if keyval == Gdk.KEY_Page_Up:
-            self.canvas.go_to_page(self.canvas.current_page_idx - 1)
+            self._go_to_page(self.canvas.current_page_idx - 1)
             return True
         return False
 

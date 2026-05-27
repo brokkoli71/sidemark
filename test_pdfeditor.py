@@ -23,7 +23,7 @@ import cairo
 Adw.init()
 
 sys.path.insert(0, os.path.dirname(__file__))
-from pdfeditor import PDFCanvas
+from pdfeditor import PDFCanvas, NotesModel, notes_path_for
 
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
@@ -173,6 +173,98 @@ class TestSave(unittest.TestCase):
         canvas.load(self._tmp_in)
         canvas.save(self._tmp_out)
         self.assertFalse(os.path.exists(self._tmp_out + ".tmp"))
+
+
+# ── notes model ──────────────────────────────────────────────────────────────
+
+class TestNotes(unittest.TestCase):
+    def test_notes_path_for(self):
+        self.assertEqual(notes_path_for("/tmp/lecture.pdf"), "/tmp/lecture-notes.md")
+        self.assertEqual(notes_path_for("slides.pdf"), "slides-notes.md")
+
+    def test_parse_empty(self):
+        m = NotesModel()
+        m.load.__func__  # just access to confirm it exists
+        m._notes = {}
+        self.assertEqual(m.get(0), "")
+
+    def test_parse_single_page(self):
+        m = NotesModel()
+        raw = "<!-- page:2 -->\n\nSome notes here."
+        import re as _re
+        parts = _re.split(r'<!--\s*page:(\d+)\s*-->', raw)
+        for i in range(1, len(parts), 2):
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            if content:
+                m._notes[int(parts[i])] = content
+        self.assertEqual(m.get(2), "Some notes here.")
+        self.assertEqual(m.get(0), "")
+
+    def test_parse_multiple_pages_with_gaps(self):
+        m = NotesModel()
+        raw = "<!-- page:0 -->\n\nFirst.\n\n<!-- page:3 -->\n\nFourth.\n\n<!-- page:5 -->\n\nSixth."
+        import re as _re
+        parts = _re.split(r'<!--\s*page:(\d+)\s*-->', raw)
+        for i in range(1, len(parts), 2):
+            content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+            if content:
+                m._notes[int(parts[i])] = content
+        self.assertEqual(m.get(0), "First.")
+        self.assertEqual(m.get(3), "Fourth.")
+        self.assertEqual(m.get(5), "Sixth.")
+        self.assertEqual(m.get(1), "")  # gap
+
+    def test_serialize_roundtrip(self):
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
+            path = f.name
+        try:
+            m1 = NotesModel()
+            m1.set(0, "Page zero notes")
+            m1.set(2, "Page two notes")
+            m1.set(4, "Page four notes")
+            m1.save(path)
+
+            m2 = NotesModel()
+            m2.load(path)
+            self.assertEqual(m2.get(0), "Page zero notes")
+            self.assertEqual(m2.get(2), "Page two notes")
+            self.assertEqual(m2.get(4), "Page four notes")
+            self.assertEqual(m2.get(1), "")
+        finally:
+            os.unlink(path)
+
+    def test_empty_pages_not_written(self):
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
+            path = f.name
+        try:
+            m = NotesModel()
+            m.set(0, "")
+            m.set(1, "  ")  # whitespace only
+            m.set(2, "Real note")
+            m.save(path)
+            with open(path) as f:
+                content = f.read()
+            self.assertNotIn("page:0", content)
+            self.assertNotIn("page:1", content)
+            self.assertIn("page:2", content)
+        finally:
+            os.unlink(path)
+
+    def test_load_missing_file_is_silent(self):
+        m = NotesModel()
+        m.load("/tmp/this-file-does-not-exist-ever.md")
+        self.assertEqual(m.get(0), "")
+
+    def test_save_atomic(self):
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
+            path = f.name
+        try:
+            m = NotesModel()
+            m.set(0, "hello")
+            m.save(path)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+        finally:
+            os.unlink(path)
 
 
 # ── theme loading ─────────────────────────────────────────────────────────────
