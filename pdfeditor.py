@@ -5,8 +5,9 @@ import math
 
 import gi
 gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
 gi.require_version("Poppler", "0.18")
-from gi.repository import Gtk, Gdk, Poppler, GLib, Gio
+from gi.repository import Gtk, Adw, Gdk, Poppler, GLib, Gio
 import cairo
 
 
@@ -289,11 +290,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         toolbar.append(self._width_scale)
 
         toolbar.append(Gtk.Label(label="Color:"))
-        self._color_btn = Gtk.ColorButton()
+        color_dialog = Gtk.ColorDialog.new()
+        color_dialog.set_with_alpha(True)
+        self._color_btn = Gtk.ColorDialogButton.new(color_dialog)
         rgba = Gdk.RGBA()
         rgba.red, rgba.green, rgba.blue, rgba.alpha = 0.05, 0.05, 0.8, 0.9
         self._color_btn.set_rgba(rgba)
-        self._color_btn.connect("color-set", self._on_color_changed)
+        self._color_btn.connect("notify::rgba", self._on_color_changed)
         toolbar.append(self._color_btn)
 
         # ── canvas + toast overlay ────────────────────────────────────────────
@@ -302,7 +305,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._update_page_label
 
-        self.toast_overlay = Gtk.ToastOverlay()
+        self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(self.canvas)
         self.toast_overlay.set_vexpand(True)
 
@@ -323,7 +326,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _on_width_changed(self, scale):
         self.canvas.pen_width = scale.get_value()
 
-    def _on_color_changed(self, btn):
+    def _on_color_changed(self, btn, _param=None):
         rgba = btn.get_rgba()
         self.canvas.pen_color = (rgba.red, rgba.green, rgba.blue, rgba.alpha)
 
@@ -355,11 +358,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             return
         try:
             self.canvas.save(self._path)
-            toast = Gtk.Toast.new("Saved successfully")
+            toast = Adw.Toast.new("Saved successfully")
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
         except Exception as e:
-            toast = Gtk.Toast.new(f"Save failed: {e}")
+            toast = Adw.Toast.new(f"Save failed: {e}")
             toast.set_timeout(4)
             self.toast_overlay.add_toast(toast)
 
@@ -380,9 +383,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         return False
 
 
-class PDFEditorApp(Gtk.Application):
+class PDFEditorApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id="de.hspitz.pdfeditor")
+        super().__init__(
+            application_id="de.hspitz.pdfeditor",
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
         self._initial_file = None
 
     def do_activate(self):
