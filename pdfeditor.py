@@ -30,7 +30,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.current_stroke = []
 
         self.pen_color = (0.05, 0.05, 0.8, 0.9)
-        self.pen_width = 2.0
+        self.pen_width = 1.0
 
         self.on_page_changed = None  # callback(current_idx, n_pages)
 
@@ -282,8 +282,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         toolbar.set_margin_bottom(6)
 
         toolbar.append(Gtk.Label(label="Width:"))
-        self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 20, 0.5)
-        self._width_scale.set_value(2.0)
+        self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5, 0.1)
+        self._width_scale.set_value(1.0)
         self._width_scale.set_size_request(140, -1)
         self._width_scale.set_draw_value(True)
         self._width_scale.connect("value-changed", self._on_width_changed)
