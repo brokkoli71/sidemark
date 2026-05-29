@@ -93,11 +93,6 @@ class PDFCanvas(Gtk.DrawingArea):
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
-        self._text_selecting = False
-        self._text_select_start = None   # screen (x, y)
-        self._text_select_end = None     # screen (x, y)
-
-        self.on_text_copied = None       # callback(text_or_None)
 
         self.set_draw_func(self._draw)
         self.set_focusable(True)
@@ -279,27 +274,6 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.restore()
             ctx.stroke()
 
-        # text-selection glyph highlights
-        if self._text_selecting and self._text_select_start and self._text_select_end and self.page:
-            x1, y1 = self._screen_to_pdf(*self._text_select_start)
-            x2, y2 = self._screen_to_pdf(*self._text_select_end)
-            rect = self._build_selection_rect(x1, y1, x2, y2)
-            try:
-                region = self.page.get_selected_region(1.0, Poppler.SelectionStyle.GLYPH, rect)
-                n = region.num_rectangles()
-                if n > 0:
-                    ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
-                    ctx.save()
-                    ctx.translate(self.offset_x, self.offset_y)
-                    ctx.scale(self.scale, self.scale)
-                    for i in range(n):
-                        r = region.get_rectangle(i)
-                        ctx.rectangle(r.x, r.y, r.width, r.height)
-                    ctx.fill()
-                    ctx.restore()
-            except Exception:
-                pass  # page has no text layer
-
         # zoom-selection rubber-band
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
             x1 = min(self._zoom_start[0], self._zoom_end[0])
@@ -382,24 +356,15 @@ class PDFCanvas(Gtk.DrawingArea):
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
             self._pan_start_offset = (self.offset_x, self.offset_y)
-            self._text_selecting = False
-            self._zoom_selecting = False
-        elif state & Gdk.ModifierType.ALT_MASK:
-            self._text_selecting = True
-            self._text_select_start = (start_x, start_y)
-            self._text_select_end = (start_x, start_y)
-            self._panning = False
             self._zoom_selecting = False
         elif state & Gdk.ModifierType.SHIFT_MASK:
             self._zoom_selecting = True
             self._zoom_start = (start_x, start_y)
             self._zoom_end = (start_x, start_y)
             self._panning = False
-            self._text_selecting = False
         else:
             self._zoom_selecting = False
             self._panning = False
-            self._text_selecting = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
@@ -413,10 +378,6 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._panning:
             self.offset_x = self._pan_start_offset[0] + offset_x
             self.offset_y = self._pan_start_offset[1] + offset_y
-            self.queue_draw()
-            return
-        if self._text_selecting:
-            self._text_select_end = (sx + offset_x, sy + offset_y)
             self.queue_draw()
             return
         if self._zoom_selecting:
@@ -435,13 +396,6 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._panning:
             self._panning = False
-            return
-        if self._text_selecting:
-            self._finish_text_selection()
-            self._text_selecting = False
-            self._text_select_start = None
-            self._text_select_end = None
-            self.queue_draw()
             return
         if self._zoom_selecting:
             if self._zoom_start and self._zoom_end:
@@ -464,34 +418,6 @@ class PDFCanvas(Gtk.DrawingArea):
             self.current_stroke = []
         self.queue_draw()
 
-    def _build_selection_rect(self, x1, y1, x2, y2):
-        """Build a Poppler rect from PDF screen coords (Y down).
-        Multi-line selections extend to full page width so complete lines
-        are captured in reading order rather than a geometric clip."""
-        py_min, py_max = min(y1, y2), max(y1, y2)
-        rect = Poppler.Rectangle()
-        if py_max - py_min > 5:  # spans more than one line → full width
-            rect.x1 = 0
-            rect.x2 = self.page_width
-        else:
-            rect.x1 = min(x1, x2)
-            rect.x2 = max(x1, x2)
-        rect.y1 = self.page_height - py_max   # Poppler Y=0 at bottom
-        rect.y2 = self.page_height - py_min
-        return rect
-
-    def _finish_text_selection(self):
-        if not self.page or not self._text_select_start or not self._text_select_end:
-            return
-        x1, y1 = self._screen_to_pdf(*self._text_select_start)
-        x2, y2 = self._screen_to_pdf(*self._text_select_end)
-        rect = self._build_selection_rect(x1, y1, x2, y2)
-        text = self.page.get_selected_text(Poppler.SelectionStyle.GLYPH, rect)
-        if text:
-            content = Gdk.ContentProvider.new_for_value(GLib.Variant('s', text))
-            Gdk.Display.get_default().get_clipboard().set_content(content)
-        if self.on_text_copied:
-            self.on_text_copied(text)
 
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
@@ -689,7 +615,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.set_vexpand(True)
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._on_page_changed
-        self.canvas.on_text_copied = self._on_text_copied
+
         self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
 
         # ── CSS ───────────────────────────────────────────────────────────────
@@ -875,7 +801,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Right-drag",    "Erase stroke"),
             ("Ctrl+Z",        "Undo last stroke"),
             ("Text",          None),
-            ("Alt+Drag",      "Select & copy text"),
+
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
@@ -983,18 +909,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 Gdk.Display.get_default().get_clipboard().set_text(detail, -1)
         dlg.connect("response", on_response)
         dlg.present(self)
-
-    def _on_text_copied(self, text):
-        if text:
-            preview = text[:48].replace("\n", " ")
-            if len(text) > 48:
-                preview += "…"
-            msg = f"Copied: \"{preview}\""
-        else:
-            msg = "No text in selection"
-        toast = Adw.Toast.new(msg)
-        toast.set_timeout(2)
-        self.toast_overlay.add_toast(toast)
 
     def _on_width_changed(self, scale):
         self.canvas.pen_width = scale.get_value()
