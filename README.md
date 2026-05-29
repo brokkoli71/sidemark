@@ -9,31 +9,50 @@ A minimal GTK4/libadwaita PDF viewer and annotation tool, designed for [Omarchy]
 - **View PDFs** with pan and zoom (scroll, Ctrl+scroll, or drag-to-zoom)
 - **Draw annotations** directly on pages with a configurable pen (color, width)
 - **Undo** strokes one at a time
-- **Per-page notes** in a resizable sidebar, saved to a sidecar `.md` file
+- **Live markdown notes** in a resizable sidebar with syntax highlighting and Ctrl+B/I/E shortcuts
 - **Save in place** — annotations are written back into the PDF
+- **Open markdown files** directly — notes-only mode with no PDF required
 - Picks up background/accent colors from `~/.config/omarchy/current/theme/colors.toml`
 
-## Requirements
+## Installation
 
-- Python 3
-- GTK 4 + libadwaita
-- `python-gobject` (PyGObject)
-- `poppler-glib` (via gi typelib `Poppler 0.18`)
-- `python-cairo`
+### AUR (Arch Linux / Omarchy)
 
-On Arch / EndeavourOS:
-
+```bash
+yay -S pdf-editor-omarchy-git
 ```
-sudo pacman -S python python-gobject gtk4 libadwaita poppler-glib python-cairo
+
+### install.sh (any Linux)
+
+```bash
+git clone https://github.com/brokkoli71/pdf-editor-omarchy
+cd pdf-editor-omarchy
+./install.sh
+```
+
+This installs the app, creates a launcher entry, and registers it as the default handler for PDF and Markdown files. To uninstall:
+
+```bash
+./install.sh --uninstall
+```
+
+### Run directly (no install)
+
+```bash
+git clone https://github.com/brokkoli71/pdf-editor-omarchy
+cd pdf-editor-omarchy
+python pdfeditor.py [file.pdf]
+```
+
+**Dependencies** (Arch / EndeavourOS):
+
+```bash
+sudo pacman -S python python-gobject gtk4 libadwaita poppler-glib python-cairo gtksourceview5
 ```
 
 ## Usage
 
-```
-python pdfeditor.py [file.pdf]
-```
-
-Open a file from the command line or via the **Open** button.
+Open a file from the command line or via the **Open** button. Use **New** to create a blank A4 PDF.
 
 ## Keyboard shortcuts
 
@@ -44,16 +63,20 @@ Open a file from the command line or via the **Open** button.
 | `Ctrl+\` | Toggle notes panel |
 | `PageDown` | Next page |
 | `PageUp` | Previous page |
+| `Ctrl+B` | Bold selected text in notes |
+| `Ctrl+I` | Italic selected text in notes |
+| `Ctrl+E` | Inline code selected text in notes |
 
-## Zoom
+## Zoom & pan
 
 | Input | Action |
 |-------|--------|
-| Scroll wheel | Pan vertically |
+| Scroll | Pan |
 | Ctrl + scroll | Zoom in/out (cursor-anchored) |
-| Shift + drag | Draw a region to zoom into |
-| Shift + click | Step back through zoom history |
+| Ctrl + drag | Pan |
+| Shift + drag | Zoom to region |
+| Shift + click | Fit page |
 
 ## Notes
 
-Notes are saved alongside the PDF as `<filename>-notes.md`, using invisible `<!-- page:N -->` markers so the file renders cleanly in any Markdown viewer.
+Notes are saved alongside the PDF as `<filename>-notes.md`, using invisible `<!-- page:N -->` markers so the file renders cleanly in any Markdown viewer or Obsidian vault.
