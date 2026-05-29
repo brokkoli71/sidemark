@@ -16,8 +16,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Poppler", "0.18")
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Gtk, Adw, GLib, Gdk, Poppler
 import cairo
+import unittest.mock as mock
 
 # Bootstrap Adw so widget construction works without a real display
 Adw.init()
@@ -472,6 +473,149 @@ class TestTheme(unittest.TestCase):
             self.assertEqual(theme["accent"], "#445566")
         finally:
             os.unlink(tmp)
+
+
+# ── deferred fit (needs_fit flag) ─────────────────────────────────────────────
+
+class TestNeedsFit(unittest.TestCase):
+    """
+    _load_page is called before the canvas has been allocated, so _fit_page
+    would use the 800×600 fallback.  The _needs_fit flag defers the fit to the
+    first real _draw call, at which point get_width/get_height are valid.
+    """
+
+    def setUp(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)
+
+    def tearDown(self):
+        if os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def _canvas(self):
+        c = PDFCanvas()
+        c.load(self._tmp)
+        return c
+
+    def _draw(self, canvas, w, h):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(w, 1), max(h, 1))
+        canvas._draw(canvas, cairo.Context(surf), w, h)
+
+    def test_false_before_load(self):
+        self.assertFalse(PDFCanvas()._needs_fit)
+
+    def test_set_after_load(self):
+        self.assertTrue(self._canvas()._needs_fit)
+
+    def test_cleared_after_draw_with_real_dimensions(self):
+        c = self._canvas()
+        self._draw(c, 800, 600)
+        self.assertFalse(c._needs_fit)
+
+    def test_not_cleared_by_zero_size_draw(self):
+        c = self._canvas()
+        self._draw(c, 0, 0)
+        self.assertTrue(c._needs_fit)
+
+    def test_page_fits_inside_canvas_after_draw(self):
+        c = self._canvas()
+        W, H = 800, 600
+        self._draw(c, W, H)
+        self.assertGreaterEqual(c.offset_x, 0)
+        self.assertGreaterEqual(c.offset_y, 0)
+        self.assertLessEqual(c.offset_x + c.page_width  * c.scale, W + 1e-6)
+        self.assertLessEqual(c.offset_y + c.page_height * c.scale, H + 1e-6)
+
+    def test_screen_to_pdf_maps_page_center_correctly(self):
+        # After a real draw the page centre in screen coords should round-trip
+        # back to (page_width/2, page_height/2).
+        c = self._canvas()
+        self._draw(c, 800, 600)
+        screen_cx = c.offset_x + c.page_width  * c.scale / 2
+        screen_cy = c.offset_y + c.page_height * c.scale / 2
+        pdf_x, pdf_y = c._screen_to_pdf(screen_cx, screen_cy)
+        self.assertAlmostEqual(pdf_x, c.page_width  / 2, places=1)
+        self.assertAlmostEqual(pdf_y, c.page_height / 2, places=1)
+
+
+# ── text selection Poppler rectangle ─────────────────────────────────────────
+
+class TestTextSelectionCoords(unittest.TestCase):
+    """
+    Poppler.Page.get_selected_text uses PDF coordinates: y=0 at the page
+    bottom, y increases upward.  _finish_text_selection must flip the
+    screen-space y values before building the rectangle.
+    """
+
+    class _MockPage:
+        """Minimal Poppler.Page stand-in that records the rectangle it received."""
+        def __init__(self, w=595, h=842):
+            self.width = w
+            self.height = h
+            self.last_rect = None
+
+        def get_size(self):
+            return self.width, self.height
+
+        def get_selected_text(self, style, rect):
+            self.last_rect = (rect.x1, rect.y1, rect.x2, rect.y2)
+            return "hello"
+
+    def _canvas(self, pw=595, ph=842):
+        c = PDFCanvas()
+        page = self._MockPage(pw, ph)
+        c.page = page
+        c.page_width  = pw
+        c.page_height = ph
+        c.scale    = 1.0
+        c.offset_x = 0.0
+        c.offset_y = 0.0
+        return c, page
+
+    def _select(self, canvas, page, start, end):
+        """Run _finish_text_selection with a mocked clipboard; return Poppler rect."""
+        canvas._text_select_start = start
+        canvas._text_select_end   = end
+        with mock.patch.object(Gdk, 'ContentProvider'), \
+             mock.patch.object(Gdk, 'Display') as md:
+            md.get_default.return_value.get_clipboard.return_value.set_content.return_value = None
+            canvas._finish_text_selection()
+        return page.last_rect
+
+    def test_y_flipped_for_poppler(self):
+        # Screen y=100 (near top) → Poppler y = page_height - 100 = 742 (near top in PDF space).
+        # Screen y=200 (lower)    → Poppler y = page_height - 200 = 642.
+        # The rect passed to Poppler should have y1=642 (lower bound) and y2=742.
+        c, pg = self._canvas(ph=842)
+        rect = self._select(c, pg, (100, 100), (300, 200))
+        self.assertAlmostEqual(rect[1], 842 - 200)  # y1 = bottom of selection in Poppler coords
+        self.assertAlmostEqual(rect[3], 842 - 100)  # y2 = top of selection in Poppler coords
+
+    def test_x_coordinates_not_flipped(self):
+        c, pg = self._canvas()
+        rect = self._select(c, pg, (50, 100), (250, 300))
+        self.assertAlmostEqual(rect[0], 50.0)
+        self.assertAlmostEqual(rect[2], 250.0)
+
+    def test_y1_always_less_than_y2(self):
+        # Poppler rect must be lower-left → upper-right (y1 ≤ y2).
+        c, pg = self._canvas()
+        rect = self._select(c, pg, (100, 50), (300, 400))
+        self.assertLessEqual(rect[1], rect[3])
+
+    def test_x1_always_less_than_x2(self):
+        c, pg = self._canvas()
+        rect = self._select(c, pg, (300, 100), (100, 300))  # x dragged right-to-left
+        self.assertLessEqual(rect[0], rect[2])
+
+    def test_same_rect_regardless_of_drag_direction(self):
+        c1, pg1 = self._canvas()
+        c2, pg2 = self._canvas()
+        r1 = self._select(c1, pg1, (100, 100), (300, 300))
+        r2 = self._select(c2, pg2, (300, 300), (100, 100))  # reversed drag
+        for a, b in zip(r1, r2):
+            self.assertAlmostEqual(a, b)
 
 
 if __name__ == "__main__":

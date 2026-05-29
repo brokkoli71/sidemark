@@ -6,6 +6,35 @@ import re
 import subprocess
 import threading
 import tempfile
+import logging
+import atexit
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+_log_path = None
+logger = logging.getLogger(__name__)
+
+
+def _setup_logging():
+    global _log_path
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _log_path = os.path.join(LOG_DIR, f"session_{os.getpid()}.log")
+    handler = logging.FileHandler(_log_path)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.info("session started")
+    atexit.register(_cleanup_log)
+
+
+def _cleanup_log():
+    logger.info("session ended cleanly")
+    logging.shutdown()
+    try:
+        if _log_path:
+            os.remove(_log_path)
+    except OSError:
+        pass
+
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -39,6 +68,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
         self.on_page_changed = None  # callback(current_idx, n_pages)
+        self.on_nav_button = None    # callback(delta: int) for back/forward buttons
 
         # zoom-to-region state
         self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
@@ -50,11 +80,14 @@ class PDFCanvas(Gtk.DrawingArea):
         self._page_surface = None      # cairo.ImageSurface rendered at _surface_scale
         self._surface_scale = 0.0
         self._rerender_id = None       # GLib timeout handle
+        self._needs_fit = False        # refit on first draw after load (canvas may not be allocated yet)
 
         self._erasing = False
 
         self._panning = False
         self._pan_start_offset = (0.0, 0.0)
+
+        self._ignoring = False  # True while a button-8/9/10 drag sequence is active
 
         self._text_selecting = False
         self._text_select_start = None   # screen (x, y)
@@ -86,6 +119,7 @@ class PDFCanvas(Gtk.DrawingArea):
         drag.connect("drag-end", self._on_drag_end)
         self.add_controller(drag)
 
+
     # ── page management ──────────────────────────────────────────────────────
 
     def load(self, path):
@@ -105,7 +139,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._rerender_id is not None:
             GLib.source_remove(self._rerender_id)
             self._rerender_id = None
-        self._fit_page()
+        self._needs_fit = True   # re-fit on first draw with real canvas dimensions
         self.queue_draw()
         if self.on_page_changed:
             self.on_page_changed(idx, self.n_pages)
@@ -182,7 +216,10 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.show_text(text)
             return
 
-        if self.offset_x == 0 and self.offset_y == 0 and self.scale == 1.0:
+        if self._needs_fit and width > 0 and height > 0:
+            self._needs_fit = False
+            self._fit_page()
+        elif self.offset_x == 0 and self.offset_y == 0 and self.scale == 1.0:
             self._fit_page()
 
         ctx.set_source_rgb(1, 1, 1)
@@ -295,13 +332,22 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_selecting = False
             self._erase_at(start_x, start_y)
             return
-        if gesture.get_current_button() == 8:  # MX Master thumb button
+        btn = gesture.get_current_button()
+        logger.debug(f"drag-begin button={btn}")
+        if btn in (8, 9):
+            self._ignoring = True
+            if self.on_nav_button:
+                self.on_nav_button(-1 if btn == 8 else 1)
+            return
+        if btn == 10:
+            self._ignoring = False
             self._panning = True
             self._pan_start_offset = (self.offset_x, self.offset_y)
             self._erasing = False
             self._text_selecting = False
             self._zoom_selecting = False
             return
+        self._ignoring = False
         self._erasing = False
         state = gesture.get_current_event_state()
         if state & Gdk.ModifierType.CONTROL_MASK:
@@ -328,6 +374,9 @@ class PDFCanvas(Gtk.DrawingArea):
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
+        if self._ignoring:
+            return
+        logger.debug(f"drag-update btn={gesture.get_current_button()} panning={self._panning} offset=({offset_x:.0f},{offset_y:.0f})")
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
         if self._erasing:
             self._erase_at(sx + offset_x, sy + offset_y)
@@ -348,6 +397,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
+        logger.debug(f"drag-end btn={gesture.get_current_button() if gesture else '?'} offset=({offset_x:.0f},{offset_y:.0f})")
+        if self._ignoring:
+            self._ignoring = False
+            return
         if self._erasing:
             self._erasing = False
             return
@@ -394,7 +447,9 @@ class PDFCanvas(Gtk.DrawingArea):
         rect.y2 = self.page_height - min(y1, y2)
         text = self.page.get_selected_text(Poppler.SelectionStyle.GLYPH, rect)
         if text:
-            Gdk.Display.get_default().get_clipboard().set_text(text, -1)
+            # GTK4 clipboard API (set_text doesn't exist on Gdk.Clipboard)
+            content = Gdk.ContentProvider.new_for_value(GLib.Variant('s', text))
+            Gdk.Display.get_default().get_clipboard().set_content(content)
         if self.on_text_copied:
             self.on_text_copied(text)
 
@@ -595,6 +650,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._on_page_changed
         self.canvas.on_text_copied = self._on_text_copied
+        self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -827,10 +883,18 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     # ── page & notes handshake ────────────────────────────────────────────────
 
     def _on_realize(self, _widget):
-        w, _ = self.get_default_size()
-        pos = int(w * 0.62)
-        self._paned.set_position(pos)
+        self._pane_init_tries = 0
+        GLib.timeout_add(50, self._try_init_pane)
+
+    def _try_init_pane(self):
+        w = self.get_width()
+        self._pane_init_tries += 1
+        if w < 200 and self._pane_init_tries < 20:
+            return True  # retry until window has real width
+        pos = int(max(w, 1280) * 0.62)
         self._saved_pane_pos = pos
+        self._paned.set_position(pos)
+        return False
 
     def _on_page_changed(self, idx, n):
         self._page_label.set_label(f"{idx + 1} / {n}")
@@ -854,9 +918,17 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _on_notes_toggled(self, btn):
         if btn.get_active():
             self._notes_box.set_visible(True)
-            self._paned.set_position(self._saved_pane_pos)
+            w = self.get_width() or 1280
+            pos = self._saved_pane_pos
+            if pos > w - 150 or pos < 100:
+                pos = int(w * 0.62)
+                self._saved_pane_pos = pos
+            self._paned.set_position(pos)
         else:
-            self._saved_pane_pos = self._paned.get_position()
+            pos = self._paned.get_position()
+            w = self.get_width() or 1280
+            if 100 < pos < w - 50:
+                self._saved_pane_pos = pos
             self._notes_box.set_visible(False)
 
     # ── standard helpers ──────────────────────────────────────────────────────
@@ -1000,6 +1072,7 @@ class PDFEditorApp(Adw.Application):
 
 
 def main():
+    _setup_logging()
     app = PDFEditorApp()
     if len(sys.argv) > 1:
         path = sys.argv[1]
