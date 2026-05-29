@@ -601,11 +601,135 @@ class NotesModel:
         os.replace(tmp, path)
 
 
+class MarkdownNotesView(GtkSource.View):
+    """
+    GtkSource.View with Typora-style in-place markdown rendering.
+    Non-cursor lines: syntax markers hidden, bold/italic/code/heading applied.
+    Cursor line: raw markdown visible for editing.
+    """
+
+    # Combined regex — bold must come before italic so ** is consumed first.
+    # Italic uses [^*\n] to prevent matching across ** markers or newlines.
+    _INLINE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
+
+    def __init__(self, scheme_id="Adwaita"):
+        buf = GtkSource.Buffer()
+        super().__init__(buffer=buf)
+        self.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.set_left_margin(10)
+        self.set_right_margin(10)
+        self.set_top_margin(6)
+        self.set_bottom_margin(10)
+        self.add_css_class("notes-view")
+
+        buf.set_language(GtkSource.LanguageManager.get_default().get_language("markdown"))
+        buf.set_style_scheme(GtkSource.StyleSchemeManager.get_default().get_scheme(scheme_id))
+
+        # Build TextTags
+        tt = buf.get_tag_table()
+        is_dark = scheme_id.endswith("dark")
+
+        def tag(name, **props):
+            tg = Gtk.TextTag.new(name)
+            for k, v in props.items():
+                tg.set_property(k.replace("_", "-"), v)
+            tt.add(tg)
+            return tg
+
+        self._t = {
+            "h1":     tag("h1",     weight=700, scale=1.5),
+            "h2":     tag("h2",     weight=700, scale=1.25),
+            "h3":     tag("h3",     weight=600, scale=1.1),
+            "bold":   tag("bold",   weight=700),
+            "italic": tag("italic", style=2),   # Pango.Style.ITALIC
+            "code":   tag("code",   family="monospace",
+                          background="#2d2d2d" if is_dark else "#f0f0f0",
+                          foreground="#e06c75" if is_dark else "#c0392b"),
+            "hide":   tag("hide",   invisible=True),
+        }
+
+        self._cursor_line = 0
+        self._rehighlight_id = None
+        buf.connect("notify::cursor-position", self._on_cursor_moved)
+        buf.connect("changed", self._on_changed)
+
+    # ── signal handlers ───────────────────────────────────────────────────────
+
+    def _on_cursor_moved(self, buf, _):
+        line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+        if line != self._cursor_line:
+            self._cursor_line = line
+            self._schedule()
+
+    def _on_changed(self, _buf):
+        self._schedule()
+
+    def _schedule(self):
+        if self._rehighlight_id is not None:
+            GLib.source_remove(self._rehighlight_id)
+        self._rehighlight_id = GLib.timeout_add(30, self._rehighlight)
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+
+    def _rehighlight(self):
+        self._rehighlight_id = None
+        buf = self.get_buffer()
+        s, e = buf.get_start_iter(), buf.get_end_iter()
+        for tg in self._t.values():
+            buf.remove_tag(tg, s, e)
+        self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+        for ln in range(buf.get_line_count()):
+            ls = buf.get_iter_at_line(ln)[1]
+            le = ls.copy()
+            if not le.ends_line():
+                le.forward_to_line_end()
+            self._highlight_line(buf, ls, ln, buf.get_text(ls, le, False))
+        return False
+
+    def _highlight_line(self, buf, ls, ln, text):
+        on_cursor = (ln == self._cursor_line)
+
+        def at(n):
+            it = ls.copy(); it.forward_chars(n); return it
+
+        def apply(name, a, b):
+            buf.apply_tag(self._t[name], at(a), at(b))
+
+        def hide(a, b):
+            if not on_cursor:
+                apply("hide", a, b)
+
+        # Heading
+        m = re.match(r'^(#{1,3}) ', text)
+        if m:
+            lvl = len(m.group(1))
+            apply(["h1", "h2", "h3"][lvl - 1], 0, len(text))
+            hide(0, m.end())
+            return
+
+        # Inline: bold / italic / code (combined regex handles priority)
+        for m in self._INLINE.finditer(text):
+            a, b = m.start(), m.end()
+            if m.group(1) is not None:       # **bold**
+                apply("bold", a + 2, b - 2)
+                hide(a, a + 2)
+                hide(b - 2, b)
+            elif m.group(2) is not None:     # *italic*
+                apply("italic", a + 1, b - 1)
+                hide(a, a + 1)
+                hide(b - 1, b)
+            else:                            # `code`
+                apply("code", a, b)
+                hide(a, a + 1)
+                hide(b - 1, b)
+
+
 class PDFEditorWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="PDF Editor")
         self.set_default_size(1280, 800)
         self._path = None
+        self._notes_path = None   # set when a .md file is opened without an associated PDF
         self.notes_model = NotesModel()
 
         theme = _load_theme()
@@ -685,6 +809,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         open_btn = Gtk.Button(label="Open")
         open_btn.connect("clicked", self._on_open)
         header.pack_start(open_btn)
+
+        new_btn = Gtk.Button(label="New")
+        new_btn.set_tooltip_text("Create a new blank A4 PDF")
+        new_btn.connect("clicked", self._on_new_pdf)
+        header.pack_start(new_btn)
 
         prev_btn = Gtk.Button()
         prev_btn.set_icon_name("go-previous-symbolic")
@@ -818,16 +947,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         notes_scroll = Gtk.ScrolledWindow()
         notes_scroll.set_vexpand(True)
         notes_scroll.set_hexpand(True)
-        _src_buf = GtkSource.Buffer()
-        _src_buf.set_language(GtkSource.LanguageManager.get_default().get_language("markdown"))
-        _src_buf.set_style_scheme(GtkSource.StyleSchemeManager.get_default().get_scheme(_src_scheme))
-        self._notes_view = GtkSource.View.new_with_buffer(_src_buf)
-        self._notes_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._notes_view.add_css_class("notes-view")
-        self._notes_view.set_left_margin(10)
-        self._notes_view.set_right_margin(10)
-        self._notes_view.set_top_margin(6)
-        self._notes_view.set_bottom_margin(10)
+        self._notes_view = MarkdownNotesView(_src_scheme)
         notes_scroll.set_child(self._notes_view)
         self._notes_box.append(notes_scroll)
 
@@ -929,7 +1049,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.go_to_page(idx)
 
     def _commit_note(self):
-        if not self._path:
+        if not self._path and not self._notes_path:
             return
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
@@ -979,18 +1099,69 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         if path.lower().endswith(".pptx"):
             self._convert_pptx_then_open(path)
             return
+        if path.lower().endswith(".md"):
+            self._open_markdown(path)
+            return
         self._path = path
+        self._notes_path = None
         self.set_title(f"PDF Editor — {os.path.basename(path)}")
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._obsidian_btn.set_sensitive(True)
 
-    def _on_open_obsidian(self, _btn):
-        if not self._path:
+    def _open_markdown(self, md_path):
+        # If there's an associated PDF (e.g. lecture-notes.md → lecture.pdf), open it.
+        pdf_path = None
+        if md_path.endswith("-notes.md"):
+            candidate = md_path[:-len("-notes.md")] + ".pdf"
+            if os.path.exists(candidate):
+                pdf_path = candidate
+        if pdf_path:
+            self.open_file(pdf_path)
             return
-        notes = notes_path_for(self._path)
-        # Ensure the file exists so Obsidian can open it
+        # Notes-only mode: no PDF, load markdown directly into notes panel.
+        self._path = None
+        self._notes_path = md_path
+        self.set_title(f"PDF Editor — {os.path.basename(md_path)}")
+        self.notes_model = NotesModel()
+        self.notes_model.load(md_path)
+        self._page_label.set_label("—")
+        self._obsidian_btn.set_sensitive(True)
+        # Show page 0 notes; canvas stays in "no PDF" placeholder state.
+        self._notes_view.get_buffer().set_text(self.notes_model.get(0))
+
+    def _on_new_pdf(self, _btn):
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Create new blank PDF")
+        dialog.set_initial_name("notes.pdf")
+        f = Gtk.FileFilter()
+        f.set_name("PDF files")
+        f.add_pattern("*.pdf")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        dialog.set_filters(store)
+        dialog.save(self, None, self._new_pdf_done)
+
+    def _new_pdf_done(self, dialog, result):
+        try:
+            file = dialog.save_finish(result)
+            if not file:
+                return
+            path = file.get_path()
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            surf = cairo.PDFSurface(path, 595, 842)  # A4 in PDF points (72 dpi)
+            cairo.Context(surf).show_page()
+            surf.finish()
+            self.open_file(path)
+        except Exception as e:
+            self._show_error("Could not create PDF", str(e))
+
+    def _on_open_obsidian(self, _btn):
+        notes = notes_path_for(self._path) if self._path else self._notes_path
+        if not notes:
+            return
         if not os.path.exists(notes):
             self._commit_note()
             self.notes_model.save(notes)
@@ -1047,12 +1218,15 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._show_error("Could not open file", str(e))
 
     def _on_save(self, _btn=None):
-        if not self._path:
+        notes_file = notes_path_for(self._path) if self._path else self._notes_path
+        if not self._path and not notes_file:
             return
         try:
             self._commit_note()
-            self.canvas.save(self._path)
-            self.notes_model.save(notes_path_for(self._path))
+            if self._path:
+                self.canvas.save(self._path)
+            if notes_file:
+                self.notes_model.save(notes_file)
             toast = Adw.Toast.new("Saved")
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
