@@ -8,6 +8,7 @@ import threading
 import tempfile
 import logging
 import atexit
+import urllib.parse
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 _log_path = None
@@ -742,6 +743,14 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
         header.pack_end(self._notes_toggle)
 
+        # open notes in Obsidian
+        self._obsidian_btn = Gtk.Button()
+        self._obsidian_btn.set_icon_name("text-editor-symbolic")
+        self._obsidian_btn.set_tooltip_text("Open notes in Obsidian")
+        self._obsidian_btn.set_sensitive(False)
+        self._obsidian_btn.connect("clicked", self._on_open_obsidian)
+        header.pack_end(self._obsidian_btn)
+
         # shortcuts help
         help_btn = Gtk.MenuButton()
         help_btn.set_label("?")
@@ -926,6 +935,21 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
+        self._obsidian_btn.set_sensitive(True)
+
+    def _on_open_obsidian(self, _btn):
+        if not self._path:
+            return
+        notes = notes_path_for(self._path)
+        # Ensure the file exists so Obsidian can open it
+        if not os.path.exists(notes):
+            self._commit_note()
+            self.notes_model.save(notes)
+        uri = "obsidian://open?path=" + urllib.parse.quote(os.path.abspath(notes))
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except Exception as e:
+            self._show_error("Could not open Obsidian", str(e))
 
     def _convert_pptx_then_open(self, pptx_path):
         toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
