@@ -2,6 +2,8 @@
 
 A minimal GTK4/libadwaita PDF viewer and annotation tool, designed for [Omarchy](https://omarchy.com) but usable on any Linux desktop.
 
+![Screenshot](screenshot.png)
+
 ## Features
 
 - **View PDFs** with pan and zoom (scroll, Ctrl+scroll, or drag-to-zoom)
