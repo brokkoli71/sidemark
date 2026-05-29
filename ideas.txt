@@ -1,12 +1,13 @@
-- I want all pages scrollable after each other like if I open a pdf in
-  the browser. but be aware that the programm does not crash for large number
-  of pdf pages.
-- what about the selecting text? on pressing alt and click, I
-  form a blue rectangle but no selection.this should be similar to selecting
-  text in a browser in a pdf. what hurdles when implementing would you expect?
-- ocr the document before opening.
-- render markdown. reflect on if this be difficult when I currently edit a line. how should this be rendered
-- debug output. if a error happens, I want to be able to copy the error message to provide it to you
-- also, when pressing my logitech mx3 master thumb button I want to pan as well. 
-- also, this application should be the default application to open pdfs.
-- pptx files should automatically be converted to pdfs and then opened
+# Feature Tracker
+
+| # | Feature | Feasibility | Status | Notes |
+|---|---------|-------------|--------|-------|
+| 1 | Continuous page scroll (all pages stacked, browser-style) | Medium | Open | Requires lazy rendering to avoid OOM on large PDFs; significant canvas refactor |
+| 2 | Text selection (Alt+drag copies text like a browser) | Easy | Done | Fixed Poppler Y-axis flip and GTK4 clipboard API |
+| 3 | OCR document before opening | Easy–Medium | Open | Needs `ocrmypdf` installed; requires progress indicator for large files |
+| 4 | Render markdown in notes panel | Medium | Open | Easiest approach: edit/preview toggle; live render needs TextTag bookkeeping or WebKitGTK |
+| 5 | Copy error messages to clipboard | Easy | Done | Errors show in Adw.AlertDialog with a Copy Error button |
+| 6 | MX Master thumb button (btn 277) toggles pan mode | Medium | Done | GTK4/Wayland cancels non-standard button sequences; solved with GestureSingle toggle (press once to start, press again to stop) |
+| 7 | Mouse buttons 8/9 navigate previous/next page | Easy | Done | Added alongside thumb button work |
+| 8 | Set as default application for PDFs | Easy | Done | .desktop file registered via xdg-mime |
+| 9 | Auto-convert PPTX to PDF on open | Easy | Done | LibreOffice runs in background thread; shows Converting… toast |
