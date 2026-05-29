@@ -592,11 +592,19 @@ class TestTextSelectionCoords(unittest.TestCase):
         self.assertAlmostEqual(rect[1], 842 - 200)  # y1 = bottom of selection in Poppler coords
         self.assertAlmostEqual(rect[3], 842 - 100)  # y2 = top of selection in Poppler coords
 
-    def test_x_coordinates_not_flipped(self):
+    def test_x_coordinates_preserved_for_single_line(self):
+        # y-span of 3 points → single-line → exact x coords kept
         c, pg = self._canvas()
-        rect = self._select(c, pg, (50, 100), (250, 300))
+        rect = self._select(c, pg, (50, 100), (250, 103))
         self.assertAlmostEqual(rect[0], 50.0)
         self.assertAlmostEqual(rect[2], 250.0)
+
+    def test_x_extends_to_page_width_for_multiline(self):
+        # y-span of 200 points → multi-line → x snapped to [0, page_width]
+        c, pg = self._canvas(pw=595)
+        rect = self._select(c, pg, (50, 100), (250, 300))
+        self.assertAlmostEqual(rect[0], 0.0)
+        self.assertAlmostEqual(rect[2], 595.0)
 
     def test_y1_always_less_than_y2(self):
         # Poppler rect must be lower-left → upper-right (y1 ≤ y2).

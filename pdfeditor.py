@@ -279,20 +279,26 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.restore()
             ctx.stroke()
 
-        # text-selection rubber-band
-        if self._text_selecting and self._text_select_start and self._text_select_end:
-            tx1 = min(self._text_select_start[0], self._text_select_end[0])
-            ty1 = min(self._text_select_start[1], self._text_select_end[1])
-            tw  = abs(self._text_select_end[0] - self._text_select_start[0])
-            th  = abs(self._text_select_end[1] - self._text_select_start[1])
-            ctx.set_source_rgba(0.2, 0.5, 0.9, 0.15)
-            ctx.rectangle(tx1, ty1, tw, th)
-            ctx.fill()
-            ctx.set_source_rgba(0.2, 0.5, 0.9, 0.75)
-            ctx.set_line_width(1.5)
-            ctx.set_dash([])
-            ctx.rectangle(tx1, ty1, tw, th)
-            ctx.stroke()
+        # text-selection glyph highlights
+        if self._text_selecting and self._text_select_start and self._text_select_end and self.page:
+            x1, y1 = self._screen_to_pdf(*self._text_select_start)
+            x2, y2 = self._screen_to_pdf(*self._text_select_end)
+            rect = self._build_selection_rect(x1, y1, x2, y2)
+            try:
+                region = self.page.get_selected_region(1.0, Poppler.SelectionStyle.GLYPH, rect)
+                n = region.num_rectangles()
+                if n > 0:
+                    ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
+                    ctx.save()
+                    ctx.translate(self.offset_x, self.offset_y)
+                    ctx.scale(self.scale, self.scale)
+                    for i in range(n):
+                        r = region.get_rectangle(i)
+                        ctx.rectangle(r.x, r.y, r.width, r.height)
+                    ctx.fill()
+                    ctx.restore()
+            except Exception:
+                pass  # page has no text layer
 
         # zoom-selection rubber-band
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
@@ -458,19 +464,30 @@ class PDFCanvas(Gtk.DrawingArea):
             self.current_stroke = []
         self.queue_draw()
 
+    def _build_selection_rect(self, x1, y1, x2, y2):
+        """Build a Poppler rect from PDF screen coords (Y down).
+        Multi-line selections extend to full page width so complete lines
+        are captured in reading order rather than a geometric clip."""
+        py_min, py_max = min(y1, y2), max(y1, y2)
+        rect = Poppler.Rectangle()
+        if py_max - py_min > 5:  # spans more than one line → full width
+            rect.x1 = 0
+            rect.x2 = self.page_width
+        else:
+            rect.x1 = min(x1, x2)
+            rect.x2 = max(x1, x2)
+        rect.y1 = self.page_height - py_max   # Poppler Y=0 at bottom
+        rect.y2 = self.page_height - py_min
+        return rect
+
     def _finish_text_selection(self):
         if not self.page or not self._text_select_start or not self._text_select_end:
             return
         x1, y1 = self._screen_to_pdf(*self._text_select_start)
         x2, y2 = self._screen_to_pdf(*self._text_select_end)
-        rect = Poppler.Rectangle()
-        rect.x1 = min(x1, x2)
-        rect.y1 = self.page_height - max(y1, y2)   # Poppler Y=0 at bottom
-        rect.x2 = max(x1, x2)
-        rect.y2 = self.page_height - min(y1, y2)
+        rect = self._build_selection_rect(x1, y1, x2, y2)
         text = self.page.get_selected_text(Poppler.SelectionStyle.GLYPH, rect)
         if text:
-            # GTK4 clipboard API (set_text doesn't exist on Gdk.Clipboard)
             content = Gdk.ContentProvider.new_for_value(GLib.Variant('s', text))
             Gdk.Display.get_default().get_clipboard().set_content(content)
         if self.on_text_copied:
