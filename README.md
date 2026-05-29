@@ -1,6 +1,6 @@
-# PDF Editor for Omarchy
+# PDF Editor
 
-A minimal GTK4/libadwaita PDF viewer and annotation tool, designed for [Omarchy](https://omarchy.com) but usable on any Linux desktop.
+A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux.
 
 ![Screenshot](screenshot.png)
 
@@ -12,7 +12,8 @@ A minimal GTK4/libadwaita PDF viewer and annotation tool, designed for [Omarchy]
 - **Live markdown notes** in a resizable sidebar with syntax highlighting and Ctrl+B/I/E shortcuts
 - **Save in place** — annotations are written back into the PDF
 - **Open markdown files** directly — notes-only mode with no PDF required
-- Picks up background/accent colors from `~/.config/omarchy/current/theme/colors.toml`
+- **Obsidian integration** — one-click button opens the notes file in Obsidian
+- Automatically picks up colors from [Omarchy](https://omarchy.com) if installed; otherwise uses warm paper defaults
 
 ## Installation
 
@@ -44,10 +45,18 @@ cd pdf-editor-omarchy
 python pdfeditor.py [file.pdf]
 ```
 
-**Dependencies** (Arch / EndeavourOS):
+**Dependencies:**
 
+Arch / EndeavourOS:
 ```bash
 sudo pacman -S python python-gobject gtk4 libadwaita poppler-glib python-cairo gtksourceview5
+```
+
+Ubuntu / Debian:
+```bash
+sudo apt install python3 python3-gi python3-gi-cairo \
+  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-poppler-0.18 gir1.2-gtksource-5 \
+  libgtk-4-1 libadwaita-1-0 libpoppler-glib8 libgtksourceview-5-0
 ```
 
 ## Usage
