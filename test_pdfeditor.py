@@ -325,6 +325,107 @@ class TestNotes(unittest.TestCase):
             os.unlink(path)
 
 
+# ── eraser ───────────────────────────────────────────────────────────────────
+
+class TestEraser(unittest.TestCase):
+    def _canvas_with_pdf(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        make_pdf(path)
+        canvas.load(path)
+        self._tmp = path
+        return canvas
+
+    def tearDown(self):
+        if hasattr(self, "_tmp") and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def test_stroke_hits_on_segment(self):
+        self.assertTrue(PDFCanvas._stroke_hits([(0, 0), (100, 0)], 50, 0, 5.0))
+
+    def test_stroke_hits_near_endpoint(self):
+        self.assertTrue(PDFCanvas._stroke_hits([(10, 10)], 12, 10, 5.0))
+
+    def test_stroke_misses_far_point(self):
+        self.assertFalse(PDFCanvas._stroke_hits([(0, 0), (100, 0)], 50, 20, 5.0))
+
+    def test_erase_removes_hit_stroke(self):
+        canvas = self._canvas_with_pdf()
+        canvas.scale = 1.0
+        canvas.offset_x = 0.0
+        canvas.offset_y = 0.0
+        canvas.strokes.append({"pts": [(10, 10), (50, 10)], "color": (0,0,1,1), "width": 2})
+        canvas._erase_at(30, 10)   # screen == PDF when scale=1, offset=0
+        self.assertEqual(len(canvas.strokes), 0)
+
+    def test_erase_keeps_non_hit_stroke(self):
+        canvas = self._canvas_with_pdf()
+        canvas.scale = 1.0
+        canvas.offset_x = 0.0
+        canvas.offset_y = 0.0
+        canvas.strokes.append({"pts": [(10, 10), (50, 10)], "color": (0,0,1,1), "width": 2})
+        canvas._erase_at(200, 200)
+        self.assertEqual(len(canvas.strokes), 1)
+
+    def test_erase_only_removes_hit_stroke(self):
+        canvas = self._canvas_with_pdf()
+        canvas.scale = 1.0
+        canvas.offset_x = 0.0
+        canvas.offset_y = 0.0
+        canvas.strokes.append({"pts": [(10, 10), (50, 10)], "color": (0,0,1,1), "width": 2})
+        canvas.strokes.append({"pts": [(200, 200), (300, 200)], "color": (1,0,0,1), "width": 2})
+        canvas._erase_at(30, 10)
+        self.assertEqual(len(canvas.strokes), 1)
+        self.assertEqual(canvas.strokes[0]["color"], (1, 0, 0, 1))
+
+
+# ── cached rendering ─────────────────────────────────────────────────────────
+
+class TestRendering(unittest.TestCase):
+    def _canvas_with_pdf(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        make_pdf(path)
+        canvas.load(path)
+        self._tmp = path
+        return canvas
+
+    def tearDown(self):
+        if hasattr(self, "_tmp") and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def test_rerender_creates_surface(self):
+        canvas = self._canvas_with_pdf()
+        canvas._page_surface = None
+        canvas._rerender_now()
+        self.assertIsNotNone(canvas._page_surface)
+
+    def test_surface_scale_stored(self):
+        canvas = self._canvas_with_pdf()
+        canvas.scale = 1.5
+        canvas._page_surface = None
+        canvas._rerender_now()
+        self.assertAlmostEqual(canvas._surface_scale, 1.5)
+
+    def test_load_page_clears_cache(self):
+        canvas = self._canvas_with_pdf()
+        canvas._rerender_now()
+        self.assertIsNotNone(canvas._page_surface)
+        canvas._load_page(0)  # reload same page to trigger cache clear
+        self.assertIsNone(canvas._page_surface)
+
+    def test_scale_clamped(self):
+        canvas = self._canvas_with_pdf()
+        canvas.scale = 10.0  # above cap
+        canvas._rerender_now()
+        self.assertAlmostEqual(canvas._surface_scale, 4.0)
+        canvas.scale = 0.1   # below floor
+        canvas._rerender_now()
+        self.assertAlmostEqual(canvas._surface_scale, 0.5)
+
+
 # ── theme loading ─────────────────────────────────────────────────────────────
 
 class TestTheme(unittest.TestCase):

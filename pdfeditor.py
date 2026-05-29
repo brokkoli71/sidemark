@@ -3,6 +3,9 @@ import sys
 import os
 import math
 import re
+import subprocess
+import threading
+import tempfile
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -43,6 +46,22 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zoom_start = None        # screen (x, y)
         self._zoom_end = None          # screen (x, y), constrained
 
+        # cached page surface
+        self._page_surface = None      # cairo.ImageSurface rendered at _surface_scale
+        self._surface_scale = 0.0
+        self._rerender_id = None       # GLib timeout handle
+
+        self._erasing = False
+
+        self._panning = False
+        self._pan_start_offset = (0.0, 0.0)
+
+        self._text_selecting = False
+        self._text_select_start = None   # screen (x, y)
+        self._text_select_end = None     # screen (x, y)
+
+        self.on_text_copied = None       # callback(text_or_None)
+
         self.set_draw_func(self._draw)
         self.set_focusable(True)
         self.set_can_focus(True)
@@ -81,6 +100,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self.current_page_idx = idx
         self.page = self.document.get_page(idx)
         self.page_width, self.page_height = self.page.get_size()
+        self._page_surface = None
+        self._surface_scale = 0.0
+        if self._rerender_id is not None:
+            GLib.source_remove(self._rerender_id)
+            self._rerender_id = None
         self._fit_page()
         self.queue_draw()
         if self.on_page_changed:
@@ -106,6 +130,33 @@ class PDFCanvas(Gtk.DrawingArea):
             self.scale = min(w / self.page_width, h / self.page_height) * 0.95
             self.offset_x = (w - self.page_width * self.scale) / 2
             self.offset_y = (h - self.page_height * self.scale) / 2
+
+    def _rerender_now(self):
+        if not self.page:
+            return
+        sf = self.get_scale_factor()          # 2 on HiDPI, 1 otherwise
+        logical_scale = min(max(self.scale, 0.5), 4.0)
+        device_scale = logical_scale * sf     # device pixels per PDF point
+        w = max(1, int(self.page_width  * device_scale))
+        h = max(1, int(self.page_height * device_scale))
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        surf.set_device_scale(sf, sf)         # expose surface in logical pixels
+        sctx = cairo.Context(surf)
+        sctx.scale(logical_scale, logical_scale)
+        self.page.render(sctx)
+        self._page_surface = surf
+        self._surface_scale = logical_scale   # logical pixels per PDF point
+
+    def _schedule_rerender(self):
+        if self._rerender_id is not None:
+            GLib.source_remove(self._rerender_id)
+        self._rerender_id = GLib.timeout_add(120, self._on_rerender_timeout)
+
+    def _on_rerender_timeout(self):
+        self._rerender_id = None
+        self._rerender_now()
+        self.queue_draw()
+        return False
 
     def _screen_to_pdf(self, sx, sy):
         return (sx - self.offset_x) / self.scale, (sy - self.offset_y) / self.scale
@@ -139,10 +190,16 @@ class PDFCanvas(Gtk.DrawingArea):
                       self.page_width * self.scale, self.page_height * self.scale)
         ctx.fill()
 
+        if self._page_surface is None:
+            self._rerender_now()
+
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
-        ctx.scale(self.scale, self.scale)
-        self.page.render(ctx)
+        blit_scale = self.scale / self._surface_scale
+        ctx.scale(blit_scale, blit_scale)
+        ctx.set_source_surface(self._page_surface, 0, 0)
+        ctx.get_source().set_filter(cairo.Filter.BILINEAR)
+        ctx.paint()
         ctx.restore()
 
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
@@ -172,6 +229,21 @@ class PDFCanvas(Gtk.DrawingArea):
             for pt in pts[1:]:
                 ctx.line_to(*pt)
             ctx.restore()
+            ctx.stroke()
+
+        # text-selection rubber-band
+        if self._text_selecting and self._text_select_start and self._text_select_end:
+            tx1 = min(self._text_select_start[0], self._text_select_end[0])
+            ty1 = min(self._text_select_start[1], self._text_select_end[1])
+            tw  = abs(self._text_select_end[0] - self._text_select_start[0])
+            th  = abs(self._text_select_end[1] - self._text_select_start[1])
+            ctx.set_source_rgba(0.2, 0.5, 0.9, 0.15)
+            ctx.rectangle(tx1, ty1, tw, th)
+            ctx.fill()
+            ctx.set_source_rgba(0.2, 0.5, 0.9, 0.75)
+            ctx.set_line_width(1.5)
+            ctx.set_dash([])
+            ctx.rectangle(tx1, ty1, tw, th)
             ctx.stroke()
 
         # zoom-selection rubber-band
@@ -211,21 +283,64 @@ class PDFCanvas(Gtk.DrawingArea):
         self.scale = max(0.1, min(20.0, self.scale * factor))
         self.offset_x = mx - pdf_x * self.scale
         self.offset_y = my - pdf_y * self.scale
+        self._schedule_rerender()
         self.queue_draw()
         return True
 
     def _on_drag_begin(self, gesture, start_x, start_y):
+        if gesture.get_current_button() == 3:
+            self._erasing = True
+            self._panning = False
+            self._text_selecting = False
+            self._zoom_selecting = False
+            self._erase_at(start_x, start_y)
+            return
+        if gesture.get_current_button() == 8:  # MX Master thumb button
+            self._panning = True
+            self._pan_start_offset = (self.offset_x, self.offset_y)
+            self._erasing = False
+            self._text_selecting = False
+            self._zoom_selecting = False
+            return
+        self._erasing = False
         state = gesture.get_current_event_state()
-        if state & Gdk.ModifierType.SHIFT_MASK:
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            self._panning = True
+            self._pan_start_offset = (self.offset_x, self.offset_y)
+            self._text_selecting = False
+            self._zoom_selecting = False
+        elif state & Gdk.ModifierType.ALT_MASK:
+            self._text_selecting = True
+            self._text_select_start = (start_x, start_y)
+            self._text_select_end = (start_x, start_y)
+            self._panning = False
+            self._zoom_selecting = False
+        elif state & Gdk.ModifierType.SHIFT_MASK:
             self._zoom_selecting = True
             self._zoom_start = (start_x, start_y)
             self._zoom_end = (start_x, start_y)
+            self._panning = False
+            self._text_selecting = False
         else:
             self._zoom_selecting = False
+            self._panning = False
+            self._text_selecting = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
+        if self._erasing:
+            self._erase_at(sx + offset_x, sy + offset_y)
+            return
+        if self._panning:
+            self.offset_x = self._pan_start_offset[0] + offset_x
+            self.offset_y = self._pan_start_offset[1] + offset_y
+            self.queue_draw()
+            return
+        if self._text_selecting:
+            self._text_select_end = (sx + offset_x, sy + offset_y)
+            self.queue_draw()
+            return
         if self._zoom_selecting:
             self._zoom_end = self._constrain_zoom_end(sx, sy, sx + offset_x, sy + offset_y)
         else:
@@ -233,6 +348,19 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
+        if self._erasing:
+            self._erasing = False
+            return
+        if self._panning:
+            self._panning = False
+            return
+        if self._text_selecting:
+            self._finish_text_selection()
+            self._text_selecting = False
+            self._text_select_start = None
+            self._text_select_end = None
+            self.queue_draw()
+            return
         if self._zoom_selecting:
             if self._zoom_start and self._zoom_end:
                 dx = abs(self._zoom_end[0] - self._zoom_start[0])
@@ -240,7 +368,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 if dx >= 8 and dy >= 8:
                     self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
                 else:
-                    self.zoom_back()   # Shift+click with no rect → step back
+                    self.zoom_to_fit()   # Shift+click with no rect → fit page
             self._zoom_selecting = False
             self._zoom_start = None
             self._zoom_end = None
@@ -253,6 +381,51 @@ class PDFCanvas(Gtk.DrawingArea):
                 })
             self.current_stroke = []
         self.queue_draw()
+
+    def _finish_text_selection(self):
+        if not self.page or not self._text_select_start or not self._text_select_end:
+            return
+        x1, y1 = self._screen_to_pdf(*self._text_select_start)
+        x2, y2 = self._screen_to_pdf(*self._text_select_end)
+        rect = Poppler.Rectangle()
+        rect.x1 = min(x1, x2)
+        rect.y1 = self.page_height - max(y1, y2)   # Poppler Y=0 at bottom
+        rect.x2 = max(x1, x2)
+        rect.y2 = self.page_height - min(y1, y2)
+        text = self.page.get_selected_text(Poppler.SelectionStyle.GLYPH, rect)
+        if text:
+            Gdk.Display.get_default().get_clipboard().set_text(text, -1)
+        if self.on_text_copied:
+            self.on_text_copied(text)
+
+    def _erase_at(self, sx, sy):
+        px, py = self._screen_to_pdf(sx, sy)
+        before = len(self.strokes)
+        self.all_strokes[self.current_page_idx] = [
+            s for s in self.strokes
+            if not self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0)
+        ]
+        if len(self.strokes) != before:
+            self.queue_draw()
+
+    @staticmethod
+    def _stroke_hits(pts, px, py, radius):
+        if not pts:
+            return False
+        if len(pts) == 1:
+            return math.hypot(px - pts[0][0], py - pts[0][1]) <= radius
+        for i in range(len(pts) - 1):
+            x1, y1 = pts[i]
+            x2, y2 = pts[i + 1]
+            dx, dy = x2 - x1, y2 - y1
+            if dx == 0 and dy == 0:
+                d = math.hypot(px - x1, py - y1)
+            else:
+                t = max(0.0, min(1.0, ((px - x1)*dx + (py - y1)*dy) / (dx*dx + dy*dy)))
+                d = math.hypot(px - x1 - t*dx, py - y1 - t*dy)
+            if d <= radius:
+                return True
+        return False
 
     def _constrain_zoom_end(self, sx, sy, ex, ey):
         """Constrain (ex, ey) so the rect has the same aspect ratio as the canvas."""
@@ -280,11 +453,20 @@ class PDFCanvas(Gtk.DrawingArea):
         self.scale = new_scale
         self.offset_x = (cw - pdf_w * new_scale) / 2 - px1 * new_scale
         self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
+        self._schedule_rerender()
 
     def zoom_back(self):
         if self._zoom_stack:
             self.scale, self.offset_x, self.offset_y = self._zoom_stack.pop()
+            self._schedule_rerender()
             self.queue_draw()
+
+    def zoom_to_fit(self):
+        """Reset to fit-page view, clearing the entire zoom history."""
+        self._zoom_stack.clear()
+        self._fit_page()
+        self._schedule_rerender()
+        self.queue_draw()
 
     def undo_last(self):
         if self.strokes:
@@ -412,6 +594,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.set_vexpand(True)
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._on_page_changed
+        self.canvas.on_text_copied = self._on_text_copied
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -429,6 +612,14 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 font-size: 13px;
                 background-color: {bg_hex};
                 color: {fg_hex};
+            }}
+            .shortcut-key {{
+                font-family: monospace;
+                font-size: 12px;
+                background-color: shade({bg_hex}, 0.93);
+                border: 1px solid shade({bg_hex}, 0.82);
+                border-radius: 3px;
+                padding: 1px 5px;
             }}
         """.encode()
         provider = Gtk.CssProvider()
@@ -529,6 +720,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
         header.pack_end(self._notes_toggle)
 
+        # shortcuts help
+        help_btn = Gtk.MenuButton()
+        help_btn.set_label("?")
+        help_btn.set_tooltip_text("Keyboard shortcuts")
+        help_btn.set_popover(self._build_shortcuts_popover())
+        header.pack_end(help_btn)
+
         # ── notes panel ───────────────────────────────────────────────────────
         self._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
@@ -572,6 +770,60 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         key_ctrl.connect("key-pressed", self._on_key)
         self.add_controller(key_ctrl)
 
+    # ── shortcuts popover ─────────────────────────────────────────────────────
+
+    def _build_shortcuts_popover(self):
+        shortcuts = [
+            ("Draw",          None),
+            ("Left-drag",     "Draw stroke"),
+            ("Right-drag",    "Erase stroke"),
+            ("Ctrl+Z",        "Undo last stroke"),
+            ("Text",          None),
+            ("Alt+Drag",      "Select & copy text"),
+            ("Navigate",      None),
+            ("PageDown",      "Next page"),
+            ("PageUp",        "Previous page"),
+            ("Zoom & Pan",    None),
+            ("Ctrl+Scroll",   "Zoom in / out"),
+            ("Scroll",        "Pan"),
+            ("Ctrl+Drag",     "Pan"),
+            ("Shift+Drag",    "Zoom to region"),
+            ("Shift+Click",   "Fit page"),
+            ("File",          None),
+            ("Ctrl+S",        "Save"),
+            ("Ctrl+\\",       "Toggle notes"),
+        ]
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(5)
+        grid.set_column_spacing(12)
+        grid.set_margin_start(16)
+        grid.set_margin_end(16)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+
+        row = 0
+        for key, desc in shortcuts:
+            if desc is None:
+                heading = Gtk.Label(label=key)
+                heading.add_css_class("dim-label")
+                heading.set_xalign(0)
+                heading.set_margin_top(8 if row > 0 else 0)
+                grid.attach(heading, 0, row, 2, 1)
+            else:
+                key_lbl = Gtk.Label(label=key)
+                key_lbl.add_css_class("shortcut-key")
+                key_lbl.set_xalign(1)
+                desc_lbl = Gtk.Label(label=desc)
+                desc_lbl.set_xalign(0)
+                grid.attach(key_lbl,  0, row, 1, 1)
+                grid.attach(desc_lbl, 1, row, 1, 1)
+            row += 1
+
+        popover = Gtk.Popover()
+        popover.set_child(grid)
+        return popover
+
     # ── page & notes handshake ────────────────────────────────────────────────
 
     def _on_realize(self, _widget):
@@ -609,6 +861,29 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     # ── standard helpers ──────────────────────────────────────────────────────
 
+    def _show_error(self, title, detail):
+        dlg = Adw.AlertDialog.new(title, detail)
+        dlg.add_response("close", "Close")
+        dlg.add_response("copy", "Copy Error")
+        dlg.set_default_response("close")
+        def on_response(d, r):
+            if r == "copy":
+                Gdk.Display.get_default().get_clipboard().set_text(detail, -1)
+        dlg.connect("response", on_response)
+        dlg.present(self)
+
+    def _on_text_copied(self, text):
+        if text:
+            preview = text[:48].replace("\n", " ")
+            if len(text) > 48:
+                preview += "…"
+            msg = f"Copied: \"{preview}\""
+        else:
+            msg = "No text in selection"
+        toast = Adw.Toast.new(msg)
+        toast.set_timeout(2)
+        self.toast_overlay.add_toast(toast)
+
     def _on_width_changed(self, scale):
         self.canvas.pen_width = scale.get_value()
 
@@ -617,17 +892,48 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.pen_color = (rgba.red, rgba.green, rgba.blue, rgba.alpha)
 
     def open_file(self, path):
+        if path.lower().endswith(".pptx"):
+            self._convert_pptx_then_open(path)
+            return
         self._path = path
         self.set_title(f"PDF Editor — {os.path.basename(path)}")
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
 
+    def _convert_pptx_then_open(self, pptx_path):
+        toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
+        toast.set_timeout(0)
+        self.toast_overlay.add_toast(toast)
+        out_dir = tempfile.mkdtemp(prefix="pdfeditor-")
+        base = os.path.splitext(os.path.basename(pptx_path))[0]
+
+        def run():
+            try:
+                subprocess.run(
+                    ["libreoffice", "--headless", "--convert-to", "pdf",
+                     "--outdir", out_dir, pptx_path],
+                    check=True, capture_output=True,
+                )
+                pdf_path = os.path.join(out_dir, base + ".pdf")
+                GLib.idle_add(lambda: (toast.dismiss(), self.open_file(pdf_path)) and None)
+            except FileNotFoundError:
+                GLib.idle_add(lambda: (toast.dismiss(),
+                    self._show_error("Conversion failed",
+                        "LibreOffice not found. Install it with:\n  pacman -S libreoffice-still")) and None)
+            except subprocess.CalledProcessError as e:
+                msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
+                GLib.idle_add(lambda: (toast.dismiss(),
+                    self._show_error("Conversion failed", msg)) and None)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _on_open(self, _btn):
         dialog = Gtk.FileDialog.new()
         f = Gtk.FileFilter()
-        f.set_name("PDF files")
+        f.set_name("PDF / PPTX files")
         f.add_pattern("*.pdf")
+        f.add_pattern("*.pptx")
         filters = Gio.ListStore.new(Gtk.FileFilter)
         filters.append(f)
         dialog.set_filters(filters)
@@ -638,8 +944,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             file = dialog.open_finish(result)
             if file:
                 self.open_file(file.get_path())
-        except Exception:
-            pass
+        except Exception as e:
+            self._show_error("Could not open file", str(e))
 
     def _on_save(self, _btn=None):
         if not self._path:
@@ -652,9 +958,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
         except Exception as e:
-            toast = Adw.Toast.new(f"Save failed: {e}")
-            toast.set_timeout(4)
-            self.toast_overlay.add_toast(toast)
+            self._show_error("Save failed", str(e))
 
     def _on_key(self, ctrl, keyval, keycode, state):
         if state & Gdk.ModifierType.CONTROL_MASK:

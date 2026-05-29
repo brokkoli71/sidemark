@@ -1,3 +1,9 @@
+- I want all pages scrollable after each other like if I open a pdf in
+  the browser. but be aware that the programm does not crash for large number
+  of pdf pages.
+- what about the selecting text? on pressing alt and click, I
+  form a blue rectangle but no selection.this should be similar to selecting
+  text in a browser in a pdf. what hurdles when implementing would you expect?
 - ocr the document before opening.
 - render markdown. reflect on if this be difficult when I currently edit a line. how should this be rendered
 - debug output. if a error happens, I want to be able to copy the error message to provide it to you
