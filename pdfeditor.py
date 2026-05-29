@@ -41,7 +41,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Poppler", "0.18")
-from gi.repository import Gtk, Adw, Gdk, Poppler, GLib, Gio
+gi.require_version("GtkSource", "5")
+from gi.repository import Gtk, Adw, Gdk, Poppler, GLib, Gio, GtkSource
 import cairo
 
 
@@ -64,7 +65,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.current_stroke = []
 
         self.pen_color = (0.05, 0.05, 0.8, 0.9)
-        self.pen_width = 1.0
+        self.pen_width = 2.0
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
@@ -533,7 +534,10 @@ class PDFCanvas(Gtk.DrawingArea):
 
 def _load_theme():
     """Read background/foreground/accent from the current omarchy theme."""
-    defaults = {"background": "#fdf6ee", "foreground": "#22211d", "accent": "#85b34c"}
+    defaults = {
+        "background": "#fdf6ee", "foreground": "#22211d", "accent": "#85b34c",
+        "color1": "#df2b0d", "color3": "#8a6c3e", "color6": "#3d6b52", "color8": "#a09080",
+    }
     path = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
     try:
         with open(path) as f:
@@ -609,6 +613,16 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         fg = _hex_to_rgb(theme["foreground"])
         acc = _hex_to_rgb(theme["accent"])
         surround = tuple(b + 0.12 * (f - b) for b, f in zip(bg, fg))
+        _lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
+        _src_scheme = "Adwaita-dark" if _lum < 0.5 else "Adwaita"
+        self._swatch_presets = [
+            ("Accent", acc),
+            ("Red",    _hex_to_rgb(theme["color1"])),
+            ("Black",  _hex_to_rgb(theme["foreground"])),
+            ("Brown",  _hex_to_rgb(theme["color3"])),
+            ("Teal",   _hex_to_rgb(theme["color6"])),
+            ("Gray",   _hex_to_rgb(theme["color8"])),
+        ]
 
         self.canvas = PDFCanvas()
         self.canvas.surround_color = surround
@@ -644,9 +658,21 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 border-radius: 3px;
                 padding: 1px 5px;
             }}
-        """.encode()
+            .pen-swatch {{
+                min-width: 22px;
+                min-height: 22px;
+                padding: 0;
+                border-radius: 4px;
+                border: 1px solid shade({bg_hex}, 0.75);
+            }}
+            .pen-swatch:hover {{ border: 2px solid {fg_hex}; }}
+        """
+        for i, (_, rgb) in enumerate(self._swatch_presets):
+            css += f"\n            .pen-swatch-{i} {{ background: " \
+                   + "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in rgb)) \
+                   + "; }"
         provider = Gtk.CssProvider()
-        provider.load_from_data(css)
+        provider.load_from_data(css.encode())
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
@@ -704,7 +730,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         popover_box.append(width_label)
 
         self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5.0, 0.1)
-        self._width_scale.set_value(1.0)
+        self._width_scale.set_value(2.0)
         self._width_scale.set_draw_value(True)
         self._width_scale.set_size_request(200, -1)
         self._width_scale.connect("value-changed", self._on_width_changed)
@@ -725,6 +751,26 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         color_row.append(color_label)
         color_row.append(self._color_btn)
         popover_box.append(color_row)
+
+        swatches_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        swatches_box.set_margin_top(2)
+        for i, (name, rgb) in enumerate(self._swatch_presets):
+            swatch = Gtk.Button()
+            swatch.set_tooltip_text(name)
+            swatch.add_css_class("pen-swatch")
+            swatch.add_css_class(f"pen-swatch-{i}")
+
+            def _make_handler(r, g, b):
+                def _on_click(_btn):
+                    rgba = Gdk.RGBA()
+                    rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
+                    self._color_btn.set_rgba(rgba)
+                    self.canvas.pen_color = (r, g, b, 1.0)
+                return _on_click
+
+            swatch.connect("clicked", _make_handler(*rgb))
+            swatches_box.append(swatch)
+        popover_box.append(swatches_box)
 
         popover = Gtk.Popover()
         popover.set_child(popover_box)
@@ -772,7 +818,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         notes_scroll = Gtk.ScrolledWindow()
         notes_scroll.set_vexpand(True)
         notes_scroll.set_hexpand(True)
-        self._notes_view = Gtk.TextView()
+        _src_buf = GtkSource.Buffer()
+        _src_buf.set_language(GtkSource.LanguageManager.get_default().get_language("markdown"))
+        _src_buf.set_style_scheme(GtkSource.StyleSchemeManager.get_default().get_scheme(_src_scheme))
+        self._notes_view = GtkSource.View.new_with_buffer(_src_buf)
         self._notes_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self._notes_view.add_css_class("notes-view")
         self._notes_view.set_left_margin(10)
