@@ -1,5 +1,5 @@
 # Maintainer: Hannes Spitz <h.spitz@outlook.de>
-pkgname=pdf-editor-omarchy
+pkgname=pdf-editor-omarchy-git
 pkgver=r1.0
 pkgrel=1
 pkgdesc="PDF annotation and note-taking app with live markdown sidebar, designed for Omarchy"
@@ -19,7 +19,7 @@ optdepends=(
     'librsvg: render PNG icon sizes at install time'
     'libreoffice: convert PPTX files to PDF'
 )
-source=("$pkgname::git+https://github.com/brokkoli71/pdf-editor-omarchy.git")
+source=("pdf-editor-omarchy::git+https://github.com/brokkoli71/pdf-editor-omarchy.git")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -28,11 +28,11 @@ pkgver() {
 }
 
 package() {
-    cd "$srcdir/$pkgname"
+    cd "$srcdir/pdf-editor-omarchy"
 
     # Main script
     install -Dm755 pdfeditor.py \
-        "$pkgdir/usr/share/$pkgname/pdfeditor.py"
+        "$pkgdir/usr/share/pdf-editor-omarchy/pdfeditor.py"
 
     # Wrapper in PATH
     install -dm755 "$pkgdir/usr/bin"
