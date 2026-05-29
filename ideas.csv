@@ -1,0 +1,10 @@
+#,Feature,Feasibility,Status,Notes
+1,Continuous page scroll (all pages stacked browser-style),Medium,Open,Requires lazy rendering to avoid OOM on large PDFs; significant canvas refactor
+2,Text selection (Alt+drag copies text like a browser),Easy,Done,Fixed Poppler Y-axis flip and GTK4 clipboard API
+3,OCR document before opening,Easy-Medium,Open,Needs ocrmypdf installed; requires progress indicator for large files
+4,Render markdown in notes panel,Medium,Open,Easiest approach: edit/preview toggle; live render needs TextTag bookkeeping or WebKitGTK
+5,Copy error messages to clipboard,Easy,Done,Errors show in Adw.AlertDialog with a Copy Error button
+6,MX Master thumb button (btn 277) toggles pan mode,Medium,Done,"GTK4/Wayland cancels non-standard button sequences; solved with GestureSingle toggle (press once to start, press again to stop)"
+7,Mouse buttons 8/9 navigate previous/next page,Easy,Done,Added alongside thumb button work
+8,Set as default application for PDFs,Easy,Done,.desktop file registered via xdg-mime
+9,Auto-convert PPTX to PDF on open,Easy,Done,LibreOffice runs in background thread; shows Converting toast
