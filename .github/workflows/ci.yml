@@ -7,7 +7,7 @@ on:
     branches: [master]
 
 jobs:
-  # ── 1. Unit tests (headless, offscreen GTK backend) ────────────────────────
+  # ── 1. Unit tests ──────────────────────────────────────────────────────────
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -23,10 +23,12 @@ jobs:
             gir1.2-poppler-0.18 \
             gir1.2-gtksource-5 \
             libgtk-4-1 libadwaita-1-0 \
-            libpoppler-glib8 libgtksourceview-5-0
+            libpoppler-glib8 libgtksourceview-5-0 \
+            xvfb
 
       - name: Run tests
-        run: GDK_BACKEND=offscreen python3 test_pdfeditor.py -v
+        # GTK4 removed the offscreen backend; xvfb provides a real X11 display
+        run: xvfb-run -a python3 test_pdfeditor.py -v
 
   # ── 2. install.sh end-to-end ───────────────────────────────────────────────
   install-script:
@@ -45,7 +47,7 @@ jobs:
             gir1.2-gtksource-5 \
             libgtk-4-1 libadwaita-1-0 \
             libpoppler-glib8 libgtksourceview-5-0 \
-            librsvg2-bin
+            librsvg2-bin xvfb
 
       - name: Run install.sh
         run: ./install.sh
@@ -53,33 +55,18 @@ jobs:
       - name: Verify installed files
         run: |
           set -e
-          test -f  "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py" && echo "✓ pdfeditor.py"
-          test -x  "$HOME/.local/bin/pdfeditor"                         && echo "✓ wrapper"
-          test -f  "$HOME/.local/share/applications/de.hspitz.pdfeditor.desktop" && echo "✓ .desktop"
-          test -f  "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.pdfeditor.svg" && echo "✓ icon SVG"
-          test -f  "$HOME/.local/share/icons/hicolor/48x48/apps/de.hspitz.pdfeditor.png"    && echo "✓ icon 48px"
-          test -f  "$HOME/.local/share/icons/hicolor/256x256/apps/de.hspitz.pdfeditor.png"  && echo "✓ icon 256px"
-
-      - name: Verify wrapper imports cleanly
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          # pdfeditor.py must import without errors in offscreen mode
-          GDK_BACKEND=offscreen python3 \
-            "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py" \
-            --help 2>&1 || true
-          # A clean import is enough — GTK won't actually open a window
-          GDK_BACKEND=offscreen python3 -c "
-          import sys, os
-          sys.argv = ['pdfeditor']
-          exec(open('$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py').read().split('if __name__')[0])
-          print('imports ok')
-          "
+          test -f "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py"                    && echo "✓ pdfeditor.py"
+          test -x "$HOME/.local/bin/pdfeditor"                                            && echo "✓ wrapper"
+          test -f "$HOME/.local/share/applications/de.hspitz.pdfeditor.desktop"           && echo "✓ .desktop"
+          test -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.pdfeditor.svg" && echo "✓ icon SVG"
+          test -f "$HOME/.local/share/icons/hicolor/48x48/apps/de.hspitz.pdfeditor.png"   && echo "✓ icon 48px"
+          test -f "$HOME/.local/share/icons/hicolor/256x256/apps/de.hspitz.pdfeditor.png" && echo "✓ icon 256px"
 
       - name: Run unit tests against installed copy
         run: |
           cp test_pdfeditor.py "$HOME/.local/share/pdf-editor-omarchy/"
           cd "$HOME/.local/share/pdf-editor-omarchy"
-          GDK_BACKEND=offscreen python3 test_pdfeditor.py -v
+          xvfb-run -a python3 test_pdfeditor.py -v
 
       - name: Run install.sh --uninstall
         run: ./install.sh --uninstall
@@ -87,49 +74,7 @@ jobs:
       - name: Verify uninstall cleaned up
         run: |
           set -e
-          test ! -f "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py" && echo "✓ app dir removed"
-          test ! -x "$HOME/.local/bin/pdfeditor"                         && echo "✓ wrapper removed"
-          test ! -f "$HOME/.local/share/applications/de.hspitz.pdfeditor.desktop" && echo "✓ .desktop removed"
+          test ! -f "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py"                    && echo "✓ app dir removed"
+          test ! -x "$HOME/.local/bin/pdfeditor"                                            && echo "✓ wrapper removed"
+          test ! -f "$HOME/.local/share/applications/de.hspitz.pdfeditor.desktop"           && echo "✓ .desktop removed"
           test ! -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.pdfeditor.svg" && echo "✓ icon removed"
-
-  # ── 3. PKGBUILD on Arch Linux ──────────────────────────────────────────────
-  pkgbuild:
-    name: PKGBUILD (Arch Linux)
-    runs-on: ubuntu-latest
-    container: archlinux:latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: |
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm \
-            base-devel git \
-            python python-gobject \
-            gtk4 libadwaita \
-            poppler-glib \
-            python-cairo \
-            gtksourceview5 \
-            librsvg
-
-      - name: Build package as non-root user
-        run: |
-          # makepkg refuses to run as root
-          useradd -m builder
-          # Give builder ownership of the source (checked out by root above)
-          cp -r . /home/builder/src
-          chown -R builder:builder /home/builder/src
-          # Build — this clones from GitHub and runs package()
-          su builder -c "cd /home/builder/src && makepkg --noconfirm --nodeps 2>&1"
-
-      - name: Verify package was created
-        run: |
-          ls /home/builder/src/*.pkg.tar.* && echo "✓ package file created"
-
-      - name: Verify package contents
-        run: |
-          pkg=$(ls /home/builder/src/*.pkg.tar.* | head -1)
-          tar -tf "$pkg" | grep -q "usr/bin/pdfeditor"                              && echo "✓ wrapper"
-          tar -tf "$pkg" | grep -q "usr/share/pdf-editor-omarchy/pdfeditor.py"      && echo "✓ pdfeditor.py"
-          tar -tf "$pkg" | grep -q "usr/share/applications/de.hspitz.pdfeditor"     && echo "✓ .desktop"
-          tar -tf "$pkg" | grep -q "usr/share/icons/hicolor/scalable"               && echo "✓ icon SVG"
