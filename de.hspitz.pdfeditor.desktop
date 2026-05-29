@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=PDF Editor
+Comment=View and annotate PDF files with markdown notes
+Exec=pdfeditor %f
+Icon=de.hspitz.pdfeditor
+Type=Application
+Categories=Office;Viewer;
+MimeType=application/pdf;application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.presentationml.presentation;text/markdown;text/x-markdown;
+StartupNotify=true
