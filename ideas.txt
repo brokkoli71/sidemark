@@ -1,0 +1,6 @@
+- ocr the document before opening.
+- render markdown. reflect on if this be difficult when I currently edit a line. how should this be rendered
+- debug output. if a error happens, I want to be able to copy the error message to provide it to you
+- also, when pressing my logitech mx3 master thumb button I want to pan as well. 
+- also, this application should be the default application to open pdfs.
+- pptx files should automatically be converted to pdfs and then opened
