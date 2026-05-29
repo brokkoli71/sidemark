@@ -653,6 +653,99 @@ class MarkdownNotesView(GtkSource.View):
         buf.connect("notify::cursor-position", self._on_cursor_moved)
         buf.connect("changed", self._on_changed)
 
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_key)
+        self.add_controller(key)
+
+    # ── formatting shortcuts ──────────────────────────────────────────────────
+
+    def _on_key(self, ctrl, keyval, keycode, state):
+        if not (state & Gdk.ModifierType.CONTROL_MASK):
+            return False
+        if keyval == Gdk.KEY_b:
+            self._wrap_selection("**")
+            return True
+        if keyval == Gdk.KEY_i:
+            self._wrap_selection("*")
+            return True
+        if keyval == Gdk.KEY_e:
+            self._wrap_selection("`")
+            return True
+        return False
+
+    def _wrap_selection(self, marker):
+        """Wrap selection in marker, or unwrap if already wrapped. Selection is preserved.
+
+        Auto-expand: if the selection is exactly inside an existing marker pair
+        (e.g. cursor is on 'world' inside '**world**') the selection is silently
+        expanded to include the markers before the toggle check, so Ctrl+B twice
+        always round-trips to plain text.
+        """
+        buf = self.get_buffer()
+        if not buf.get_has_selection():
+            return
+        s = buf.get_iter_at_mark(buf.get_selection_bound())
+        e = buf.get_iter_at_mark(buf.get_insert())
+        if s.compare(e) > 0:
+            s, e = e, s
+
+        # Auto-expand if the selection sits inside marker…marker
+        s, e = self._expand_to_markers(buf, s, e, marker)
+
+        text = buf.get_text(s, e, False)
+        m = len(marker)
+        # Already wrapped check (single * must not be part of **)
+        already = (
+            text.startswith(marker) and text.endswith(marker) and len(text) > 2 * m
+            and not (m == 1 and (text.startswith(marker * 2) or text.endswith(marker * 2)))
+        )
+        buf.begin_user_action()
+        try:
+            buf.delete(s, e)
+            ins = buf.get_iter_at_mark(buf.get_insert())
+            if already:
+                inner = text[m:-m]
+                buf.insert(ins, inner)
+                inner_len = len(inner)
+            else:
+                buf.insert(ins, marker + text + marker)
+                inner_len = len(text)
+            # Re-select just the inner content
+            end_it = buf.get_iter_at_mark(buf.get_insert())
+            if not already:
+                end_it.backward_chars(m)
+            start_it = end_it.copy()
+            start_it.backward_chars(inner_len)
+            buf.select_range(start_it, end_it)
+        finally:
+            buf.end_user_action()
+
+    @staticmethod
+    def _expand_to_markers(buf, s, e, marker):
+        """If the m chars before s and after e both equal marker, return the expanded range."""
+        m = len(marker)
+        pre_s = s.copy()
+        if not pre_s.backward_chars(m):
+            return s, e
+        if buf.get_text(pre_s, s, False) != marker:
+            return s, e
+        # Single * must not be part of **: check char before the marker
+        if m == 1:
+            guard = pre_s.copy()
+            if guard.backward_chars(1) and buf.get_text(guard, pre_s, False) == marker:
+                return s, e
+        post_e = e.copy()
+        post_e.forward_chars(m)
+        if buf.get_text(e, post_e, False) != marker:
+            return s, e
+        # Single * must not be part of **: check char after the marker
+        if m == 1:
+            guard = post_e.copy()
+            nxt = post_e.copy()
+            if nxt.forward_chars(1) and buf.get_text(guard, nxt, False) == marker:
+                return s, e
+        return pre_s, post_e
+
     # ── signal handlers ───────────────────────────────────────────────────────
 
     def _on_cursor_moved(self, buf, _):

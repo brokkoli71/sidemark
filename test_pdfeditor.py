@@ -538,5 +538,95 @@ class TestNeedsFit(unittest.TestCase):
         self.assertAlmostEqual(pdf_x, c.page_width  / 2, places=1)
         self.assertAlmostEqual(pdf_y, c.page_height / 2, places=1)
 
+# ── markdown formatting shortcuts ────────────────────────────────────────────
+
+class TestMarkdownFormatting(unittest.TestCase):
+
+    def _view(self):
+        from pdfeditor import MarkdownNotesView
+        return MarkdownNotesView()
+
+    def _set(self, buf, text, sel_start, sel_end):
+        buf.set_text(text)
+        s = buf.get_start_iter(); s.forward_chars(sel_start)
+        e = buf.get_start_iter(); e.forward_chars(sel_end)
+        buf.select_range(s, e)
+
+    def _text(self, buf):
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def test_bold_wraps_selection(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello world", 6, 11)
+        v._wrap_selection("**")
+        self.assertEqual(self._text(buf), "hello **world**")
+
+    def test_italic_wraps_selection(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello world", 6, 11)
+        v._wrap_selection("*")
+        self.assertEqual(self._text(buf), "hello *world*")
+
+    def test_code_wraps_selection(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "run foo", 4, 7)
+        v._wrap_selection("`")
+        self.assertEqual(self._text(buf), "run `foo`")
+
+    def test_no_selection_does_nothing(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("hello"); buf.place_cursor(buf.get_end_iter())
+        v._wrap_selection("**")
+        self.assertEqual(self._text(buf), "hello")
+
+    def test_wrap_right_to_left_drag(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("hello world")
+        s = buf.get_start_iter(); s.forward_chars(6)
+        e = buf.get_start_iter(); e.forward_chars(11)
+        buf.select_range(e, s)   # reversed drag
+        v._wrap_selection("**")
+        self.assertEqual(self._text(buf), "hello **world**")
+
+    def test_bold_unwraps_when_markers_selected(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello **world**", 6, 15)   # select "**world**"
+        v._wrap_selection("**")
+        self.assertEqual(self._text(buf), "hello world")
+
+    def test_bold_unwraps_when_inner_text_selected(self):
+        # Select just "world" (no markers) inside **world** — should still unwrap
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello **world**", 8, 13)   # select "world"
+        v._wrap_selection("**")
+        self.assertEqual(self._text(buf), "hello world")
+
+    def test_italic_does_not_unwrap_bold(self):
+        # Selecting **bold** and pressing Ctrl+I should add italic, not strip bold
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "**bold**", 0, 8)
+        v._wrap_selection("*")
+        self.assertEqual(self._text(buf), "***bold***")   # bold+italic
+
+    def test_selection_preserved_after_wrap(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello world", 6, 11)
+        v._wrap_selection("**")
+        # Selection should cover "world" (not the markers)
+        s = buf.get_iter_at_mark(buf.get_selection_bound())
+        e = buf.get_iter_at_mark(buf.get_insert())
+        if s.compare(e) > 0: s, e = e, s
+        self.assertEqual(buf.get_text(s, e, False), "world")
+
+    def test_selection_preserved_after_unwrap(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "**world**", 0, 9)
+        v._wrap_selection("**")
+        s = buf.get_iter_at_mark(buf.get_selection_bound())
+        e = buf.get_iter_at_mark(buf.get_insert())
+        if s.compare(e) > 0: s, e = e, s
+        self.assertEqual(buf.get_text(s, e, False), "world")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
