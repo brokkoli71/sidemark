@@ -1,6 +1,6 @@
 #,Feature,Feasibility,Status,Notes
 1,Continuous page scroll (all pages stacked browser-style),Medium,Open,Requires lazy rendering to avoid OOM on large PDFs; significant canvas refactor
-2,Text selection (Alt+drag copies text like a browser),Easy,Done,Fixed Poppler Y-axis flip and GTK4 clipboard API
+2,Text selection (Alt+drag copies text like a browser),N/A,Dropped,GTK4/Cairo has no native text layer equivalent to PDF.js DOM overlay; proper browser-like selection is impractical without WebKitGTK
 3,OCR document before opening,Easy-Medium,Open,Needs ocrmypdf installed; requires progress indicator for large files
 4,Render markdown in notes panel,Medium,Open,Easiest approach: edit/preview toggle; live render needs TextTag bookkeeping or WebKitGTK
 5,Copy error messages to clipboard,Easy,Done,Errors show in Adw.AlertDialog with a Copy Error button
