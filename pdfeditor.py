@@ -19,7 +19,7 @@ def _setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
     _log_path = os.path.join(LOG_DIR, f"session_{os.getpid()}.log")
     handler = logging.FileHandler(_log_path)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", "%H:%M:%S"))
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     logger.info("session started")
@@ -87,7 +87,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self._panning = False
         self._pan_start_offset = (0.0, 0.0)
 
-        self._ignoring = False  # True while a button-8/9/10 drag sequence is active
+        self._ignoring = False  # True while a button-8/9 drag sequence is active
+
+        self._thumb_panning = False
+        self._thumb_origin = (0.0, 0.0)
+        self._thumb_start_offset = (0.0, 0.0)
 
         self._text_selecting = False
         self._text_select_start = None   # screen (x, y)
@@ -118,6 +122,13 @@ class PDFCanvas(Gtk.DrawingArea):
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end", self._on_drag_end)
         self.add_controller(drag)
+
+        thumb = Gtk.GestureSingle()
+        thumb.set_button(10)
+        thumb.set_exclusive(True)
+        thumb.connect("begin", self._on_thumb_begin)
+        thumb.connect("end", self._on_thumb_end)
+        self.add_controller(thumb)
 
 
     # ── page management ──────────────────────────────────────────────────────
@@ -302,7 +313,24 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── input handlers ────────────────────────────────────────────────────────
 
+    def _on_thumb_begin(self, gesture, sequence):
+        if self._thumb_panning:
+            logger.debug("thumb pan stop")
+            self._thumb_panning = False
+        else:
+            logger.debug(f"thumb pan start at ({self._mouse_x:.0f},{self._mouse_y:.0f})")
+            self._thumb_panning = True
+            self._thumb_origin = (self._mouse_x, self._mouse_y)
+            self._thumb_start_offset = (self.offset_x, self.offset_y)
+
+    def _on_thumb_end(self, gesture, sequence):
+        pass  # ignored — toggle mode, only begin matters
+
     def _on_motion(self, ctrl, x, y):
+        if self._thumb_panning:
+            self.offset_x = self._thumb_start_offset[0] + (x - self._thumb_origin[0])
+            self.offset_y = self._thumb_start_offset[1] + (y - self._thumb_origin[1])
+            self.queue_draw()
         self._mouse_x = x
         self._mouse_y = y
 
@@ -340,12 +368,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.on_nav_button(-1 if btn == 8 else 1)
             return
         if btn == 10:
-            self._ignoring = False
-            self._panning = True
-            self._pan_start_offset = (self.offset_x, self.offset_y)
-            self._erasing = False
-            self._text_selecting = False
-            self._zoom_selecting = False
+            self._ignoring = True  # GestureSingle owns this sequence
             return
         self._ignoring = False
         self._erasing = False
