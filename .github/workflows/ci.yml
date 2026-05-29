@@ -7,33 +7,55 @@ on:
     branches: [master]
 
 jobs:
-  # Unit tests on Arch Linux — the target platform ships the GTK4 offscreen
-  # backend so GDK_BACKEND=offscreen works with no display setup at all.
+  # Unit tests — GTK4 needs a real compositor even for headless widget
+  # construction. Weston's headless backend provides a Wayland socket
+  # with no screen/GPU required.
   unit-tests:
-    name: Unit tests (Arch Linux)
+    name: Unit tests
     runs-on: ubuntu-latest
-    container: archlinux:latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm \
-            python python-gobject python-cairo \
-            gtk4 libadwaita poppler-glib gtksourceview5
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            python3 python3-gi python3-gi-cairo \
+            gir1.2-gtk-4.0 gir1.2-adw-1 \
+            gir1.2-poppler-0.18 gir1.2-gtksource-5 \
+            libgtk-4-1 libadwaita-1-0 \
+            libpoppler-glib8 libgtksourceview-5-0 \
+            weston
+
+      - name: Start headless Wayland compositor
+        run: |
+          mkdir -p /tmp/xrt
+          chmod 700 /tmp/xrt
+          XDG_RUNTIME_DIR=/tmp/xrt \
+            weston --backend=headless --socket=wayland-ci --idle-time=0 &
+          # Wait for the socket to appear (up to 5 s)
+          for i in $(seq 10); do
+            [ -S /tmp/xrt/wayland-ci ] && break
+            sleep 0.5
+          done
+          test -S /tmp/xrt/wayland-ci || { echo "weston failed to start"; exit 1; }
+          echo "XDG_RUNTIME_DIR=/tmp/xrt"  >> "$GITHUB_ENV"
+          echo "WAYLAND_DISPLAY=wayland-ci" >> "$GITHUB_ENV"
 
       - name: Run tests
-        run: GDK_BACKEND=offscreen python3 test_pdfeditor.py -v
+        env:
+          GDK_BACKEND: wayland
+        run: python3 test_pdfeditor.py -v
 
-  # Verify install.sh places every expected file in the right location.
-  # No Python execution — just file-system checks.
+  # Install script — just verifies files land in the right places.
+  # No Python execution so no compositor needed.
   install-script:
-    name: install.sh (Ubuntu)
+    name: install.sh
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install runtime dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
