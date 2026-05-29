@@ -533,14 +533,16 @@ class PDFCanvas(Gtk.DrawingArea):
 
 
 def _load_theme():
-    """Read background/foreground/accent from the current omarchy theme."""
+    """Read background/foreground/accent — tries Omarchy, then GNOME, then KDE."""
     defaults = {
         "background": "#fdf6ee", "foreground": "#22211d", "accent": "#85b34c",
         "color1": "#df2b0d", "color3": "#8a6c3e", "color6": "#3d6b52", "color8": "#a09080",
     }
-    path = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
+
+    # ── Omarchy ───────────────────────────────────────────────────────────────
+    omarchy = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
     try:
-        with open(path) as f:
+        with open(omarchy) as f:
             for line in f:
                 line = line.strip()
                 if " = " in line and not line.startswith("#"):
@@ -548,8 +550,57 @@ def _load_theme():
                     k = k.strip()
                     if k in defaults:
                         defaults[k] = v.strip().strip('"')
+        return defaults   # Omarchy wins outright
     except OSError:
         pass
+
+    # ── GNOME (gsettings) ─────────────────────────────────────────────────────
+    try:
+        import subprocess
+        def _gs(key):
+            r = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.interface", key],
+                capture_output=True, text=True, timeout=1,
+            )
+            return r.stdout.strip().strip("'") if r.returncode == 0 else None
+
+        _GNOME_ACCENTS = {
+            "blue": "#3584e4", "teal": "#2190a4", "green": "#3a944a",
+            "yellow": "#c88800", "orange": "#ed5b00", "red": "#e62d42",
+            "pink": "#d56199", "purple": "#9141ac", "slate": "#6f8396",
+        }
+        accent = _gs("accent-color")
+        if accent in _GNOME_ACCENTS:
+            defaults["accent"] = _GNOME_ACCENTS[accent]
+        if _gs("color-scheme") == "prefer-dark":
+            defaults["background"] = "#242424"
+            defaults["foreground"] = "#e5e5e5"
+    except Exception:
+        pass
+
+    # ── KDE Plasma (kdeglobals) ───────────────────────────────────────────────
+    try:
+        import configparser
+        cfg = configparser.ConfigParser(strict=False)
+        cfg.read(os.path.expanduser("~/.config/kdeglobals"))
+
+        def _rgb(s):
+            r, g, b = [int(x.strip()) for x in s.split(",")]
+            return "#{:02x}{:02x}{:02x}".format(r, g, b)
+
+        # Accent: Plasma 5.25+ puts it in [General], older in [Colors:Button]
+        for sec, key in [("General", "AccentColor"), ("Colors:Button", "FocusDecoration")]:
+            if cfg.has_option(sec, key):
+                defaults["accent"] = _rgb(cfg[sec][key])
+                break
+        # Dark mode: colour scheme name contains "Dark"
+        if cfg.has_option("General", "ColorScheme"):
+            if "dark" in cfg["General"]["ColorScheme"].lower():
+                defaults["background"] = "#1e1e2e"
+                defaults["foreground"] = "#cdd6f4"
+    except Exception:
+        pass
+
     return defaults
 
 
