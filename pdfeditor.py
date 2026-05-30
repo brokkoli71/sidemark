@@ -17,11 +17,17 @@ logger = logging.getLogger(__name__)
 
 def _setup_logging():
     global _log_path
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", "%H:%M:%S")
+    # Always log to stderr so running from a terminal shows output immediately
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+    # Also write to file for post-mortem inspection
     os.makedirs(LOG_DIR, exist_ok=True)
     _log_path = os.path.join(LOG_DIR, f"session_{os.getpid()}.log")
-    handler = logging.FileHandler(_log_path)
-    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", "%H:%M:%S"))
-    logger.addHandler(handler)
+    file_handler = logging.FileHandler(_log_path)
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
     logger.setLevel(logging.DEBUG)
     logger.info("session started")
     atexit.register(_cleanup_log)
@@ -135,10 +141,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self.document = fitz.open(path)
         self.n_pages = len(self.document)
         self.current_stroke = []
-        # Read existing ink annotations so previously-saved strokes are erasable
         self.all_strokes = {}
+        total_annots = 0
         for i in range(self.n_pages):
-            for annot in self.document[i].annots(types=[fitz.PDF_ANNOT_INK]):
+            page = self.document[i]   # keep reference alive while reading annotations
+            for annot in page.annots(types=[fitz.PDF_ANNOT_INK]):
                 color = tuple(annot.colors.get("stroke", (0.05, 0.05, 0.8)))
                 width = annot.border.get("width", 2.0)
                 for polyline in annot.vertices:
@@ -148,6 +155,8 @@ class PDFCanvas(Gtk.DrawingArea):
                             "color": color,
                             "width": width,
                         })
+                        total_annots += 1
+        logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
         self._load_page(0)
 
     def _load_page(self, idx):
@@ -192,7 +201,7 @@ class PDFCanvas(Gtk.DrawingArea):
         sf = self.get_scale_factor()
         logical_scale = min(max(self.scale, 0.5), 4.0)
         device_scale  = logical_scale * sf
-        pix = self.page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True)
+        pix = self.page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True, annots=False)
         w, h = pix.width, pix.height
         # fitz RGBA → cairo ARGB32 (BGRA in memory on little-endian): swap R and B channels
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 4).copy()
@@ -269,25 +278,24 @@ class PDFCanvas(Gtk.DrawingArea):
                              "color": self.pen_color,
                              "width": self.pen_width})
 
+        ctx.save()
+        ctx.translate(self.offset_x, self.offset_y)
+        ctx.scale(self.scale, self.scale)
         for stroke in to_draw:
             pts = stroke["pts"]
             r, g, b = stroke["color"]
             ctx.set_source_rgb(r, g, b)
-            ctx.set_line_width(stroke["width"])
+            ctx.set_line_width(stroke["width"])   # PDF units — scales with zoom
             if len(pts) < 2:
                 if pts:
-                    sx, sy = self._pdf_to_screen(*pts[0])
-                    ctx.arc(sx, sy, stroke["width"] / 2, 0, 2 * math.pi)
+                    ctx.arc(pts[0][0], pts[0][1], stroke["width"] / 2, 0, 2 * math.pi)
                     ctx.fill()
                 continue
-            ctx.save()
-            ctx.translate(self.offset_x, self.offset_y)
-            ctx.scale(self.scale, self.scale)
             ctx.move_to(*pts[0])
             for pt in pts[1:]:
                 ctx.line_to(*pt)
-            ctx.restore()
             ctx.stroke()
+        ctx.restore()
 
         # zoom-selection rubber-band
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
@@ -437,6 +445,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
         before = len(self.strokes)
+        logger.debug(f"erase_at screen=({sx:.1f},{sy:.1f}) pdf=({px:.1f},{py:.1f}) strokes_on_page={before}")
         self.all_strokes[self.current_page_idx] = [
             s for s in self.strokes
             if not self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0)
@@ -513,23 +522,24 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def save(self, path):
         tmp = path + ".tmp"
-        doc = fitz.open(path)           # fresh instance — self.document stays open for rendering
+        doc = fitz.open(path)
+        total_written = 0
         for i in range(self.n_pages):
             page = doc[i]
-            # Remove any ink annotations from previous sessions
             for annot in list(page.annots(types=[fitz.PDF_ANNOT_INK])):
                 page.delete_annot(annot)
-            # Write current strokes as individual ink annotations (each one independently erasable)
             for stroke in self.all_strokes.get(i, []):
                 pts = stroke["pts"]
                 if not pts:
                     continue
-                polyline = pts if len(pts) > 1 else [pts[0], pts[0]]  # PDF annots need ≥2 pts
+                polyline = pts if len(pts) > 1 else [pts[0], pts[0]]
                 r, g, b = stroke["color"]
                 annot = page.add_ink_annot([polyline])
                 annot.set_colors(stroke=(r, g, b))
                 annot.set_border(width=stroke["width"])
                 annot.update()
+                total_written += 1
+        logger.info(f"save: {path} — wrote {total_written} ink annotation(s)")
         doc.save(tmp, garbage=4, deflate=True)
         doc.close()
         os.replace(tmp, path)
@@ -1231,7 +1241,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         dlg.set_default_response("close")
         def on_response(d, r):
             if r == "copy":
-                Gdk.Display.get_default().get_clipboard().set_text(detail, -1)
+                content = Gdk.ContentProvider.new_for_value(GLib.Variant('s', detail))
+                Gdk.Display.get_default().get_clipboard().set_content(content)
         dlg.connect("response", on_response)
         dlg.present(self)
 
