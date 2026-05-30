@@ -2,6 +2,8 @@
 
 A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux.
 
+![Demo](demo.gif)
+
 ![Screenshot](screenshot.png)
 
 ## Features
