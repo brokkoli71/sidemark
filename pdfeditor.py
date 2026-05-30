@@ -40,10 +40,11 @@ def _cleanup_log():
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-gi.require_version("Poppler", "0.18")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, Poppler, GLib, Gio, GtkSource
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource
 import cairo
+import fitz          # PyMuPDF
+import numpy as np
 
 
 class PDFCanvas(Gtk.DrawingArea):
@@ -64,7 +65,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.all_strokes = {}
         self.current_stroke = []
 
-        self.pen_color = (0.05, 0.05, 0.8, 0.9)
+        self.pen_color = (0.05, 0.05, 0.8)   # RGB — PDF ink annotations have no alpha
         self.pen_width = 2.0
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
@@ -131,17 +132,29 @@ class PDFCanvas(Gtk.DrawingArea):
     # ── page management ──────────────────────────────────────────────────────
 
     def load(self, path):
-        uri = GLib.filename_to_uri(os.path.abspath(path), None)
-        self.document = Poppler.Document.new_from_file(uri, None)
-        self.n_pages = self.document.get_n_pages()
-        self.all_strokes = {}
+        self.document = fitz.open(path)
+        self.n_pages = len(self.document)
         self.current_stroke = []
+        # Read existing ink annotations so previously-saved strokes are erasable
+        self.all_strokes = {}
+        for i in range(self.n_pages):
+            for annot in self.document[i].annots(types=[fitz.PDF_ANNOT_INK]):
+                color = tuple(annot.colors.get("stroke", (0.05, 0.05, 0.8)))
+                width = annot.border.get("width", 2.0)
+                for polyline in annot.vertices:
+                    if polyline:
+                        self.all_strokes.setdefault(i, []).append({
+                            "pts":   [tuple(pt) for pt in polyline],
+                            "color": color,
+                            "width": width,
+                        })
         self._load_page(0)
 
     def _load_page(self, idx):
         self.current_page_idx = idx
-        self.page = self.document.get_page(idx)
-        self.page_width, self.page_height = self.page.get_size()
+        self.page = self.document[idx]
+        self.page_width  = self.page.rect.width
+        self.page_height = self.page.rect.height
         self._page_surface = None
         self._surface_scale = 0.0
         if self._rerender_id is not None:
@@ -176,18 +189,18 @@ class PDFCanvas(Gtk.DrawingArea):
     def _rerender_now(self):
         if not self.page:
             return
-        sf = self.get_scale_factor()          # 2 on HiDPI, 1 otherwise
+        sf = self.get_scale_factor()
         logical_scale = min(max(self.scale, 0.5), 4.0)
-        device_scale = logical_scale * sf     # device pixels per PDF point
-        w = max(1, int(self.page_width  * device_scale))
-        h = max(1, int(self.page_height * device_scale))
-        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
-        surf.set_device_scale(sf, sf)         # expose surface in logical pixels
-        sctx = cairo.Context(surf)
-        sctx.scale(logical_scale, logical_scale)
-        self.page.render(sctx)
+        device_scale  = logical_scale * sf
+        pix = self.page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True)
+        w, h = pix.width, pix.height
+        # fitz RGBA → cairo ARGB32 (BGRA in memory on little-endian): swap R and B channels
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 4).copy()
+        arr[:, :, [0, 2]] = arr[:, :, [2, 0]]
+        surf = cairo.ImageSurface.create_for_data(arr, cairo.FORMAT_ARGB32, w, h)
+        surf.set_device_scale(sf, sf)
         self._page_surface = surf
-        self._surface_scale = logical_scale   # logical pixels per PDF point
+        self._surface_scale = logical_scale
 
     def _schedule_rerender(self):
         if self._rerender_id is not None:
@@ -258,8 +271,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
         for stroke in to_draw:
             pts = stroke["pts"]
-            r, g, b, a = stroke["color"]
-            ctx.set_source_rgba(r, g, b, a)
+            r, g, b = stroke["color"]
+            ctx.set_source_rgb(r, g, b)
             ctx.set_line_width(stroke["width"])
             if len(pts) < 2:
                 if pts:
@@ -500,35 +513,25 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def save(self, path):
         tmp = path + ".tmp"
-        first = self.document.get_page(0)
-        fw, fh = first.get_size()
-        surface = cairo.PDFSurface(tmp, fw, fh)
-        ctx = cairo.Context(surface)
-        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
-
+        doc = fitz.open(path)           # fresh instance — self.document stays open for rendering
         for i in range(self.n_pages):
-            pg = self.document.get_page(i)
-            pw, ph = pg.get_size()
-            surface.set_size(pw, ph)
-            pg.render(ctx)
+            page = doc[i]
+            # Remove any ink annotations from previous sessions
+            for annot in list(page.annots(types=[fitz.PDF_ANNOT_INK])):
+                page.delete_annot(annot)
+            # Write current strokes as individual ink annotations (each one independently erasable)
             for stroke in self.all_strokes.get(i, []):
                 pts = stroke["pts"]
-                r, g, b, a = stroke["color"]
-                ctx.set_source_rgba(r, g, b, a)
-                ctx.set_line_width(stroke["width"])
-                if len(pts) < 2:
-                    if pts:
-                        ctx.arc(pts[0][0], pts[0][1], stroke["width"] / 2, 0, 2 * math.pi)
-                        ctx.fill()
+                if not pts:
                     continue
-                ctx.move_to(*pts[0])
-                for pt in pts[1:]:
-                    ctx.line_to(*pt)
-                ctx.stroke()
-            ctx.show_page()
-
-        surface.finish()
+                polyline = pts if len(pts) > 1 else [pts[0], pts[0]]  # PDF annots need ≥2 pts
+                r, g, b = stroke["color"]
+                annot = page.add_ink_annot([polyline])
+                annot.set_colors(stroke=(r, g, b))
+                annot.set_border(width=stroke["width"])
+                annot.update()
+        doc.save(tmp, garbage=4, deflate=True)
+        doc.close()
         os.replace(tmp, path)
 
 
@@ -1020,7 +1023,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         init_rgba.red, init_rgba.green, init_rgba.blue, init_rgba.alpha = *acc, 1.0
         self._color_btn.set_rgba(init_rgba)
         self._color_btn.connect("notify::rgba", self._on_color_changed)
-        self.canvas.pen_color = (*acc, 1.0)
+        self.canvas.pen_color = acc
         color_row.append(color_label)
         color_row.append(self._color_btn)
         popover_box.append(color_row)
@@ -1038,7 +1041,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                     rgba = Gdk.RGBA()
                     rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
                     self._color_btn.set_rgba(rgba)
-                    self.canvas.pen_color = (r, g, b, 1.0)
+                    self.canvas.pen_color = (r, g, b)
                 return _on_click
 
             swatch.connect("clicked", _make_handler(*rgb))
@@ -1237,7 +1240,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     def _on_color_changed(self, btn, _param=None):
         rgba = btn.get_rgba()
-        self.canvas.pen_color = (rgba.red, rgba.green, rgba.blue, rgba.alpha)
+        self.canvas.pen_color = (rgba.red, rgba.green, rgba.blue)
 
     def open_file(self, path):
         if path.lower().endswith(".pptx"):

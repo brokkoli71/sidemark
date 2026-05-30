@@ -50,8 +50,10 @@ check_py "import gi; gi.require_version('Gtk','4.0'); from gi.repository import 
     "gtk4" "gtk4"
 check_py "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" \
     "libadwaita" "libadwaita"
-check_py "import gi; gi.require_version('Poppler','0.18'); from gi.repository import Poppler" \
-    "poppler-glib" "poppler-glib"
+check_py "import fitz" \
+    "python-pymupdf" "python-pymupdf"
+check_py "import numpy" \
+    "python-numpy" "python-numpy"
 check_py "import cairo" \
     "python-cairo" "python-cairo"
 check_py "import gi; gi.require_version('GtkSource','5'); from gi.repository import GtkSource" \

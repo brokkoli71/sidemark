@@ -49,14 +49,15 @@ python pdfeditor.py [file.pdf]
 
 Arch / EndeavourOS:
 ```bash
-sudo pacman -S python python-gobject gtk4 libadwaita poppler-glib python-cairo gtksourceview5
+sudo pacman -S python python-gobject gtk4 libadwaita python-pymupdf python-numpy python-cairo gtksourceview5
 ```
 
 Ubuntu / Debian:
 ```bash
-sudo apt install python3 python3-gi python3-gi-cairo \
-  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-poppler-0.18 gir1.2-gtksource-5 \
-  libgtk-4-1 libadwaita-1-0 libpoppler-glib8 libgtksourceview-5-0
+sudo apt install python3 python3-gi python3-gi-cairo python3-numpy \
+  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtksource-5 \
+  libgtk-4-1 libadwaita-1-0 libgtksourceview-5-0
+pip install pymupdf
 ```
 
 ## Usage

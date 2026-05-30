@@ -15,9 +15,9 @@ os.environ.setdefault("GDK_BACKEND", "offscreen")
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-gi.require_version("Poppler", "0.18")
-from gi.repository import Gtk, Adw, GLib, Gdk, Poppler
+from gi.repository import Gtk, Adw, GLib, Gdk
 import cairo
+import fitz
 import unittest.mock as mock
 
 # Bootstrap Adw so widget construction works without a real display
@@ -194,44 +194,57 @@ class TestStrokes(unittest.TestCase):
 class TestSave(unittest.TestCase):
     def setUp(self):
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            self._tmp_in = f.name
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            self._tmp_out = f.name
-        make_pdf(self._tmp_in, n_pages=2)
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=2)
 
     def tearDown(self):
-        for p in (self._tmp_in, self._tmp_out):
+        for p in [self._tmp, self._tmp + ".tmp"]:
             if os.path.exists(p):
                 os.unlink(p)
 
     def test_save_produces_valid_pdf(self):
-        from gi.repository import Poppler
         canvas = PDFCanvas()
-        canvas.load(self._tmp_in)
-        canvas.strokes.append({"pts": [(10, 10), (100, 100)], "color": (0, 0, 1, 1), "width": 2})
-        canvas.save(self._tmp_out)
-        self.assertTrue(os.path.getsize(self._tmp_out) > 0)
-        # Re-open and verify page count is preserved
-        uri = GLib.filename_to_uri(os.path.abspath(self._tmp_out), None)
-        doc = Poppler.Document.new_from_file(uri, None)
-        self.assertEqual(doc.get_n_pages(), 2)
+        canvas.load(self._tmp)
+        canvas.strokes.append({"pts": [(10, 10), (100, 100)], "color": (0, 0, 1), "width": 2})
+        canvas.save(self._tmp)
+        self.assertTrue(os.path.getsize(self._tmp) > 0)
+        doc = fitz.open(self._tmp)
+        self.assertEqual(len(doc), 2)
+        doc.close()
 
-    def test_save_does_not_corrupt_source(self):
+    def test_strokes_survive_round_trip(self):
+        # Strokes saved as ink annotations must be readable back as strokes.
         canvas = PDFCanvas()
-        canvas.load(self._tmp_in)
-        canvas.save(self._tmp_out)
-        # Source file must still be a valid PDF
-        from gi.repository import Poppler
-        uri = GLib.filename_to_uri(os.path.abspath(self._tmp_in), None)
-        doc = Poppler.Document.new_from_file(uri, None)
-        self.assertEqual(doc.get_n_pages(), 2)
+        canvas.load(self._tmp)
+        canvas.strokes.append({"pts": [(10, 10), (50, 50)], "color": (1, 0, 0), "width": 3})
+        canvas.save(self._tmp)
+        canvas2 = PDFCanvas()
+        canvas2.load(self._tmp)
+        self.assertEqual(len(canvas2.strokes), 1)
+        self.assertAlmostEqual(canvas2.strokes[0]["width"], 3.0, places=0)
+        self.assertEqual(len(canvas2.strokes[0]["pts"]), 2)
+
+    def test_erase_after_reload(self):
+        # The core motivation for the PyMuPDF migration: strokes loaded from
+        # a saved file must be individually erasable.
+        canvas = PDFCanvas()
+        canvas.load(self._tmp)
+        canvas.strokes.append({"pts": [(10, 10), (50, 10)], "color": (0, 0, 1), "width": 2})
+        canvas.save(self._tmp)
+        canvas2 = PDFCanvas()
+        canvas2.load(self._tmp)
+        self.assertEqual(len(canvas2.strokes), 1)
+        canvas2.scale = 1.0
+        canvas2.offset_x = 0.0
+        canvas2.offset_y = 0.0
+        canvas2._erase_at(30, 10)   # hit the stroke
+        self.assertEqual(len(canvas2.strokes), 0)
 
     def test_save_overwrites_atomically(self):
-        # .tmp file must not survive after save
         canvas = PDFCanvas()
-        canvas.load(self._tmp_in)
-        canvas.save(self._tmp_out)
-        self.assertFalse(os.path.exists(self._tmp_out + ".tmp"))
+        canvas.load(self._tmp)
+        canvas.save(self._tmp)
+        self.assertFalse(os.path.exists(self._tmp + ".tmp"))
 
 
 # ── notes model ──────────────────────────────────────────────────────────────
