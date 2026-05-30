@@ -526,11 +526,11 @@ class PDFCanvas(Gtk.DrawingArea):
     # ── save ──────────────────────────────────────────────────────────────────
 
     def save(self, path):
+        """Save via self.document so structural changes (inserted pages) are preserved."""
         tmp = path + ".tmp"
-        doc = fitz.open(path)
         total_written = 0
         for i in range(self.n_pages):
-            page = doc[i]
+            page = self.document[i]
             for annot in list(page.annots(types=[fitz.PDF_ANNOT_INK])):
                 page.delete_annot(annot)
             for stroke in self.all_strokes.get(i, []):
@@ -545,9 +545,23 @@ class PDFCanvas(Gtk.DrawingArea):
                 annot.update()
                 total_written += 1
         logger.info(f"save: {path} — wrote {total_written} ink annotation(s)")
-        doc.save(tmp, garbage=4, deflate=True)
-        doc.close()
+        self.document.save(tmp, garbage=4, deflate=True)
         os.replace(tmp, path)
+        # Reopen so self.document reflects the saved state cleanly
+        self.document = fitz.open(path)
+
+    def add_blank_page(self):
+        """Insert a blank page with the same dimensions as the current page, after it."""
+        idx = self.current_page_idx + 1
+        pw, ph = self.page_width, self.page_height
+        self.document.insert_page(idx, width=pw, height=ph)
+        # Shift all stroke entries at or beyond the insertion point up by one
+        self.all_strokes = {
+            (k + 1 if k >= idx else k): v
+            for k, v in self.all_strokes.items()
+        }
+        self.n_pages = len(self.document)
+        self._load_page(idx)   # navigate to the new blank page
 
 
 def _load_theme():
@@ -993,11 +1007,17 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         next_btn.set_tooltip_text("Next page (PageDown)")
         next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
 
+        add_page_btn = Gtk.Button()
+        add_page_btn.set_icon_name("list-add-symbolic")
+        add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
+        add_page_btn.connect("clicked", lambda _: self._add_blank_page())
+
         nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
         nav_box.append(prev_btn)
         nav_box.append(self._page_label)
         nav_box.append(next_btn)
+        nav_box.append(add_page_btn)
         header.set_title_widget(nav_box)
 
         undo_btn = Gtk.Button()
@@ -1150,6 +1170,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
+            ("Ctrl+Shift+N",  "Add blank page after current"),
             ("Zoom & Pan",    None),
             ("Ctrl+Scroll",   "Zoom in / out"),
             ("Scroll",        "Pan"),
@@ -1206,6 +1227,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._saved_pane_pos = pos
         self._paned.set_position(pos)
         return False
+
+    def _add_blank_page(self):
+        if not self.canvas.document:
+            return
+        self.canvas.add_blank_page()
+        self._mark_dirty()
 
     # ── dirty tracking ────────────────────────────────────────────────────────
 
@@ -1494,6 +1521,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_backslash:
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
+                return True
+            if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_N:
+                self._add_blank_page()
                 return True
         if keyval == Gdk.KEY_Page_Down:
             self._go_to_page(self.canvas.current_page_idx + 1)
