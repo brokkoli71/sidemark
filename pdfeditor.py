@@ -76,6 +76,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self.on_page_changed = None  # callback(current_idx, n_pages)
         self.on_nav_button = None    # callback(delta: int) for back/forward buttons
+        self.on_change = None        # callback() whenever strokes are modified
 
         # zoom-to-region state
         self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
@@ -436,6 +437,8 @@ class PDFCanvas(Gtk.DrawingArea):
                     "color": self.pen_color,
                     "width": self.pen_width,
                 })
+                if self.on_change:
+                    self.on_change()
             self.current_stroke = []
         self.queue_draw()
 
@@ -449,6 +452,8 @@ class PDFCanvas(Gtk.DrawingArea):
             if not self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0)
         ]
         if len(self.strokes) != before:
+            if self.on_change:
+                self.on_change()
             self.queue_draw()
 
     @staticmethod
@@ -514,6 +519,8 @@ class PDFCanvas(Gtk.DrawingArea):
     def undo_last(self):
         if self.strokes:
             self.strokes.pop()
+            if self.on_change:
+                self.on_change()
             self.queue_draw()
 
     # ── save ──────────────────────────────────────────────────────────────────
@@ -885,6 +892,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.set_default_size(1280, 800)
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
+        self._is_untitled = False  # True when working on an auto-created blank (no saved path yet)
+        self._dirty = False
+        self._suppress_dirty = False
         self.notes_model = NotesModel()
 
         theme = _load_theme()
@@ -909,7 +919,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.set_vexpand(True)
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._on_page_changed
-
+        self.canvas.on_change = self._mark_dirty
         self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
 
         # ── CSS ───────────────────────────────────────────────────────────────
@@ -1103,6 +1113,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         notes_scroll.set_vexpand(True)
         notes_scroll.set_hexpand(True)
         self._notes_view = MarkdownNotesView(_src_scheme)
+        self._notes_view.get_buffer().connect("changed", self._on_notes_changed)
         notes_scroll.set_child(self._notes_view)
         self._notes_box.append(notes_scroll)
 
@@ -1116,6 +1127,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._paned.set_resize_end_child(True)
         self._paned.set_shrink_end_child(True)
         self.connect("realize", self._on_realize)
+        self.connect("close-request", self._on_close_request)
 
         self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(self._paned)
@@ -1195,6 +1207,48 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._paned.set_position(pos)
         return False
 
+    # ── dirty tracking ────────────────────────────────────────────────────────
+
+    def _mark_dirty(self, *_):
+        if not self._suppress_dirty:
+            self._dirty = True
+
+    def _on_notes_changed(self, _buf):
+        self._mark_dirty()
+
+    def _clear_dirty(self):
+        self._dirty = False
+
+    # ── unsaved-changes dialog ────────────────────────────────────────────────
+
+    def _on_close_request(self, _win):
+        if not self._dirty:
+            return False   # allow close
+        self._ask_save_then(self.destroy)
+        return True        # block default close; destroy() called from dialog
+
+    def _ask_save_then(self, callback):
+        dlg = Adw.AlertDialog.new(
+            "Unsaved changes",
+            "Save before continuing?",
+        )
+        dlg.add_response("discard", "Discard")
+        dlg.add_response("cancel",  "Cancel")
+        dlg.add_response("save",    "Save")
+        dlg.set_default_response("save")
+        dlg.set_close_response("cancel")
+        def on_response(d, r):
+            if r == "save":
+                self._on_save()
+                callback()
+            elif r == "discard":
+                callback()
+            # cancel: do nothing
+        dlg.connect("response", on_response)
+        dlg.present(self)
+
+    # ── page & notes handshake ────────────────────────────────────────────────
+
     def _on_page_changed(self, idx, n):
         self._page_label.set_label(f"{idx + 1} / {n}")
         self._restore_note()
@@ -1204,15 +1258,17 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.go_to_page(idx)
 
     def _commit_note(self):
-        if not self._path and not self._notes_path:
+        if not self._path and not self._notes_path and not self._is_untitled:
             return
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
         self.notes_model.set(self.canvas.current_page_idx, text)
 
     def _restore_note(self):
+        self._suppress_dirty = True
         text = self.notes_model.get(self.canvas.current_page_idx)
         self._notes_view.get_buffer().set_text(text)
+        self._suppress_dirty = False
 
     def _on_notes_toggled(self, btn):
         if btn.get_active():
@@ -1252,6 +1308,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.pen_color = (rgba.red, rgba.green, rgba.blue)
 
     def open_file(self, path):
+        if self._dirty:
+            self._ask_save_then(lambda: self._do_open_file(path))
+        else:
+            self._do_open_file(path)
+
+    def _do_open_file(self, path):
         if path.lower().endswith(".pptx"):
             self._convert_pptx_then_open(path)
             return
@@ -1260,11 +1322,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             return
         self._path = path
         self._notes_path = None
+        self._is_untitled = False
         self.set_title(f"PDF Editor — {os.path.basename(path)}")
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._obsidian_btn.set_sensitive(True)
+        self._clear_dirty()
 
     def _open_markdown(self, md_path):
         # If there's an associated PDF (e.g. lecture-notes.md → lecture.pdf), open it.
@@ -1288,8 +1352,27 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._notes_view.get_buffer().set_text(self.notes_model.get(0))
 
     def _on_new_pdf(self, _btn):
+        if self._dirty:
+            self._ask_save_then(self._create_blank)
+        else:
+            self._create_blank()
+
+    def _create_blank(self):
+        """Open a blank A4 page — user will be prompted for a name on first save."""
+        fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="pdfeditor_blank_")
+        os.close(fd)
+        surf = cairo.PDFSurface(tmp, 595, 842)
+        cairo.Context(surf).show_page()
+        surf.finish()
+        self._do_open_file(tmp)
+        self._path = tmp           # track temp file so canvas.save() works
+        self._is_untitled = True
+        self.set_title("PDF Editor — Untitled")
+        self._clear_dirty()
+
+    def _on_save_as(self):
         dialog = Gtk.FileDialog.new()
-        dialog.set_title("Create new blank PDF")
+        dialog.set_title("Save PDF as…")
         dialog.set_initial_name("notes.pdf")
         f = Gtk.FileFilter()
         f.set_name("PDF files")
@@ -1297,9 +1380,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         store = Gio.ListStore.new(Gtk.FileFilter)
         store.append(f)
         dialog.set_filters(store)
-        dialog.save(self, None, self._new_pdf_done)
+        dialog.save(self, None, self._save_as_done)
 
-    def _new_pdf_done(self, dialog, result):
+    def _save_as_done(self, dialog, result):
         try:
             file = dialog.save_finish(result)
             if not file:
@@ -1307,12 +1390,20 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             path = file.get_path()
             if not path.lower().endswith(".pdf"):
                 path += ".pdf"
-            surf = cairo.PDFSurface(path, 595, 842)  # A4 in PDF points (72 dpi)
-            cairo.Context(surf).show_page()
-            surf.finish()
-            self.open_file(path)
+            import shutil
+            shutil.copy2(self._path, path)   # copy blank/temp as starting point
+            old_tmp = self._path if self._is_untitled else None
+            self._path = path
+            self._is_untitled = False
+            self.set_title(f"PDF Editor — {os.path.basename(path)}")
+            self._on_save()
+            if old_tmp and os.path.exists(old_tmp):
+                try:
+                    os.unlink(old_tmp)
+                except OSError:
+                    pass
         except Exception as e:
-            self._show_error("Could not create PDF", str(e))
+            self._show_error("Could not save", str(e))
 
     def _on_open_obsidian(self, _btn):
         notes = notes_path_for(self._path) if self._path else self._notes_path
@@ -1374,6 +1465,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._show_error("Could not open file", str(e))
 
     def _on_save(self, _btn=None):
+        if self._is_untitled:
+            self._on_save_as()
+            return
         notes_file = notes_path_for(self._path) if self._path else self._notes_path
         if not self._path and not notes_file:
             return
@@ -1383,6 +1477,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 self.canvas.save(self._path)
             if notes_file:
                 self.notes_model.save(notes_file)
+            self._clear_dirty()
             toast = Adw.Toast.new("Saved")
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
@@ -1422,6 +1517,8 @@ class PDFEditorApp(Adw.Application):
         win.present()
         if self._initial_file:
             win.open_file(self._initial_file)
+        else:
+            GLib.idle_add(win._create_blank)
 
     def run_with_file(self, path):
         self._initial_file = path
