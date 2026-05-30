@@ -37,7 +37,7 @@ fi
 step "Checking dependencies…"
 
 check_py() {
-    python3 -c "$1" 2>/dev/null || \
+    /usr/bin/python3 -c "$1" 2>/dev/null || \
         fail "Missing: $2  →  sudo pacman -S $3"
 }
 
