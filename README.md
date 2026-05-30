@@ -8,14 +8,16 @@ A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux.
 
 ## Features
 
-- **View PDFs** with pan and zoom (scroll, Ctrl+scroll, or drag-to-zoom)
-- **Draw annotations** directly on pages with a configurable pen (color, width)
-- **Undo** strokes one at a time
-- **Live markdown notes** in a resizable sidebar with syntax highlighting and Ctrl+B/I/E shortcuts
-- **Save in place** — annotations are written back into the PDF
+- **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable after reopening
+- **Erase strokes** by right-click-dragging over them — works on strokes from previous sessions too
+- **Add and delete pages** — insert blank pages with the same dimensions as the current page
+- **Text selection** — Alt+drag highlights words and copies them to the clipboard
+- **Live markdown notes** sidebar with syntax highlighting, Typora-style rendering, and Ctrl+B/I/E formatting shortcuts
 - **Open markdown files** directly — notes-only mode with no PDF required
-- **Obsidian integration** — one-click button opens the notes file in Obsidian
-- Automatically picks up colors from [Omarchy](https://omarchy.com) if installed; otherwise uses warm paper defaults
+- **Obsidian integration** — one-click button to open the notes file in Obsidian
+- **New blank PDF** on startup — start drawing immediately, save with a name when ready
+- Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files
+- Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
 
 ## Installation
 
@@ -33,7 +35,7 @@ cd pdf-editor-omarchy
 ./install.sh
 ```
 
-This installs the app, creates a launcher entry, and registers it as the default handler for PDF and Markdown files. To uninstall:
+Installs the app, creates a launcher entry, and registers it as the default handler for PDF and Markdown files.
 
 ```bash
 ./install.sh --uninstall
@@ -45,6 +47,7 @@ This installs the app, creates a launcher entry, and registers it as the default
 git clone https://github.com/brokkoli71/pdf-editor-omarchy
 cd pdf-editor-omarchy
 python pdfeditor.py [file.pdf]
+# Add -v / --verbose for debug logging
 ```
 
 **Dependencies:**
@@ -62,33 +65,51 @@ sudo apt install python3 python3-gi python3-gi-cairo python3-numpy \
 pip install pymupdf
 ```
 
-## Usage
+## Shortcuts
 
-Open a file from the command line or via the **Open** button. Use **New** to create a blank A4 PDF.
+### Annotation
 
-## Keyboard shortcuts
+| Input | Action |
+|-------|--------|
+| Left-drag | Draw stroke |
+| Right-drag | Erase stroke (including from previous sessions) |
+| `Ctrl+Z` | Undo last stroke |
+| `Alt+drag` | Select & copy text (word-level highlight) |
+
+### Pages
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+S` | Save |
-| `Ctrl+Z` | Undo last stroke |
-| `Ctrl+\` | Toggle notes panel |
 | `PageDown` | Next page |
 | `PageUp` | Previous page |
-| `Ctrl+B` | Bold selected text in notes |
-| `Ctrl+I` | Italic selected text in notes |
-| `Ctrl+E` | Inline code selected text in notes |
+| `Ctrl+Shift+N` | Add blank page after current |
+| `Ctrl+Shift+Delete` | Delete current page |
 
-## Zoom & pan
+### Zoom & pan
 
 | Input | Action |
 |-------|--------|
 | Scroll | Pan |
-| Ctrl + scroll | Zoom in/out (cursor-anchored) |
-| Ctrl + drag | Pan |
-| Shift + drag | Zoom to region |
-| Shift + click | Fit page |
+| `Ctrl+scroll` | Zoom in/out (cursor-anchored) |
+| `Ctrl+drag` | Pan |
+| `Shift+drag` | Zoom to region |
+| `Shift+click` | Fit page |
 
-## Notes
+### Notes
 
-Notes are saved alongside the PDF as `<filename>-notes.md`, using invisible `<!-- page:N -->` markers so the file renders cleanly in any Markdown viewer or Obsidian vault.
+| Key | Action |
+|-----|--------|
+| `Ctrl+B` | Bold selection |
+| `Ctrl+I` | Italic selection |
+| `Ctrl+E` | Inline code selection |
+| `Ctrl+\` | Toggle notes panel |
+
+### File
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+S` | Save (prompts for name if untitled) |
+
+## Notes format
+
+Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault.
