@@ -1,21 +1,19 @@
 # PDF Editor
 
-A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux.
+A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux, designed to be used e.g. for lecture note taking
 
 ![Screenshot](screenshot.png)
 
 ## Features
 
-- **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable after reopening
-- **Erase strokes** by right-click-dragging over them — works on strokes from previous sessions too
-- **Add and delete pages** — insert blank pages with the same dimensions as the current page
+- **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable by right-click-dragging
+- **Live markdown notes** linked to PDF pages
+- **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
+- **Add and delete pages** — insert blank pages with same dimensions
 - **Text selection** — Alt+drag highlights words and copies them to the clipboard
-- **Live markdown notes** sidebar with syntax highlighting, Typora-style rendering, and Ctrl+B/I/E formatting shortcuts
-- **Open markdown files** directly — notes-only mode with no PDF required
 - **Obsidian integration** — one-click button to open the notes file in Obsidian
-- **New blank PDF** on startup — start drawing immediately, save with a name when ready
-- Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files
-- Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
+- **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files
+- **Design Scheme** — Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
 
 ## Installation
 
