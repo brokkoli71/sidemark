@@ -563,6 +563,23 @@ class PDFCanvas(Gtk.DrawingArea):
         self.n_pages = len(self.document)
         self._load_page(idx)   # navigate to the new blank page
 
+    def delete_current_page(self):
+        """Delete the current page. Refused if it's the last one."""
+        if self.n_pages <= 1:
+            return False
+        idx = self.current_page_idx
+        self.document.delete_page(idx)
+        # Remove strokes for deleted page; shift later pages down by one
+        self.all_strokes = {
+            (k - 1 if k > idx else k): v
+            for k, v in self.all_strokes.items()
+            if k != idx
+        }
+        self.n_pages = len(self.document)
+        new_idx = min(idx, self.n_pages - 1)
+        self._load_page(new_idx)
+        return True
+
 
 def _load_theme():
     """Read background/foreground/accent — tries Omarchy, then GNOME, then KDE."""
@@ -1012,12 +1029,18 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
         add_page_btn.connect("clicked", lambda _: self._add_blank_page())
 
+        del_page_btn = Gtk.Button()
+        del_page_btn.set_icon_name("list-remove-symbolic")
+        del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
+        del_page_btn.connect("clicked", lambda _: self._delete_current_page())
+
         nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
         nav_box.append(prev_btn)
         nav_box.append(self._page_label)
         nav_box.append(next_btn)
         nav_box.append(add_page_btn)
+        nav_box.append(del_page_btn)
         header.set_title_widget(nav_box)
 
         undo_btn = Gtk.Button()
@@ -1171,6 +1194,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
             ("Ctrl+Shift+N",  "Add blank page after current"),
+            ("Ctrl+Shift+Del","Delete current page"),
             ("Zoom & Pan",    None),
             ("Ctrl+Scroll",   "Zoom in / out"),
             ("Scroll",        "Pan"),
@@ -1232,6 +1256,18 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         if not self.canvas.document:
             return
         self.canvas.add_blank_page()
+        self._mark_dirty()
+
+    def _delete_current_page(self):
+        if not self.canvas.document:
+            return
+        if self.canvas.n_pages <= 1:
+            toast = Adw.Toast.new("Cannot delete the only page")
+            toast.set_timeout(2)
+            self.toast_overlay.add_toast(toast)
+            return
+        self._commit_note()
+        self.canvas.delete_current_page()
         self._mark_dirty()
 
     # ── dirty tracking ────────────────────────────────────────────────────────
@@ -1524,6 +1560,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 return True
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_N:
                 self._add_blank_page()
+                return True
+            if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_Delete:
+                self._delete_current_page()
                 return True
         if keyval == Gdk.KEY_Page_Down:
             self._go_to_page(self.canvas.current_page_idx + 1)
