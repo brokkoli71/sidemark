@@ -491,7 +491,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._selected_words = []
         self.queue_draw()
         if text:
-            content = Gdk.ContentProvider.new_for_value(GLib.Variant('s', text))
+            content = Gdk.ContentProvider.new_for_bytes(
+                "text/plain;charset=utf-8",
+                GLib.Bytes.new(text.encode("utf-8")))
             Gdk.Display.get_default().get_clipboard().set_content(content)
         if self.on_text_copied:
             self.on_text_copied(text)
