@@ -101,6 +101,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
+        # word-level text selection (Alt+drag)
+        self._text_selecting = False
+        self._selected_words = []   # fitz word tuples currently highlighted
+        self._page_words = []       # cached for current page
+        self.on_text_copied = None  # callback(text_or_None)
+
 
         self.set_draw_func(self._draw)
         self.set_focusable(True)
@@ -169,6 +175,8 @@ class PDFCanvas(Gtk.DrawingArea):
             GLib.source_remove(self._rerender_id)
             self._rerender_id = None
         self._needs_fit = True   # re-fit on first draw with real canvas dimensions
+        self._page_words = self.page.get_text("words")   # cache for text selection
+        self._selected_words = []
         self.queue_draw()
         if self.on_page_changed:
             self.on_page_changed(idx, self.n_pages)
@@ -296,6 +304,17 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
         ctx.restore()
 
+        # word-selection highlights
+        if self._selected_words:
+            ctx.save()
+            ctx.translate(self.offset_x, self.offset_y)
+            ctx.scale(self.scale, self.scale)
+            ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
+            for w in self._selected_words:
+                ctx.rectangle(w[0], w[1], w[2] - w[0], w[3] - w[1])
+                ctx.fill()
+            ctx.restore()
+
         # zoom-selection rubber-band
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
             x1 = min(self._zoom_start[0], self._zoom_end[0])
@@ -378,14 +397,22 @@ class PDFCanvas(Gtk.DrawingArea):
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
             self._pan_start_offset = (self.offset_x, self.offset_y)
+            self._text_selecting = False
+            self._zoom_selecting = False
+        elif state & Gdk.ModifierType.ALT_MASK:
+            self._text_selecting = True
+            self._selected_words = []
+            self._panning = False
             self._zoom_selecting = False
         elif state & Gdk.ModifierType.SHIFT_MASK:
             self._zoom_selecting = True
             self._zoom_start = (start_x, start_y)
             self._zoom_end = (start_x, start_y)
+            self._text_selecting = False
             self._panning = False
         else:
             self._zoom_selecting = False
+            self._text_selecting = False
             self._panning = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
@@ -400,6 +427,12 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._panning:
             self.offset_x = self._pan_start_offset[0] + offset_x
             self.offset_y = self._pan_start_offset[1] + offset_y
+            self.queue_draw()
+            return
+        if self._text_selecting:
+            px0, py0 = self._screen_to_pdf(sx, sy)
+            px1, py1 = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            self._selected_words = self._words_in_rect(px0, py0, px1, py1)
             self.queue_draw()
             return
         if self._zoom_selecting:
@@ -418,6 +451,10 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._panning:
             self._panning = False
+            return
+        if self._text_selecting:
+            self._text_selecting = False
+            self._finish_text_selection()
             return
         if self._zoom_selecting:
             if self._zoom_start and self._zoom_end:
@@ -441,6 +478,45 @@ class PDFCanvas(Gtk.DrawingArea):
                     self.on_change()
             self.current_stroke = []
         self.queue_draw()
+
+    def _words_in_rect(self, px0, py0, px1, py1):
+        """Return fitz word tuples whose bounding boxes overlap the given PDF rect."""
+        rx0, rx1 = min(px0, px1), max(px0, px1)
+        ry0, ry1 = min(py0, py1), max(py0, py1)
+        return [w for w in self._page_words
+                if w[0] < rx1 and w[2] > rx0 and w[1] < ry1 and w[3] > ry0]
+
+    def _finish_text_selection(self):
+        text = self._words_to_text(self._selected_words)
+        self._selected_words = []
+        self.queue_draw()
+        if text:
+            content = Gdk.ContentProvider.new_for_value(GLib.Variant('s', text))
+            Gdk.Display.get_default().get_clipboard().set_content(content)
+        if self.on_text_copied:
+            self.on_text_copied(text)
+
+    @staticmethod
+    def _words_to_text(words):
+        """Join fitz word tuples in reading order, preserving line/paragraph breaks."""
+        if not words:
+            return ""
+        # fitz words: (x0,y0,x1,y1, word, block_no, line_no, word_no)
+        ordered = sorted(words, key=lambda w: (w[5], w[6], w[7]))
+        parts = []
+        prev_block = prev_line = None
+        for w in ordered:
+            block, line = w[5], w[6]
+            if prev_block is not None:
+                if block != prev_block:
+                    parts.append("\n\n")
+                elif line != prev_line:
+                    parts.append("\n")
+                else:
+                    parts.append(" ")
+            parts.append(w[4])
+            prev_block, prev_line = block, line
+        return "".join(parts)
 
 
     def _erase_at(self, sx, sy):
@@ -951,6 +1027,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.set_hexpand(True)
         self.canvas.on_page_changed = self._on_page_changed
         self.canvas.on_change = self._mark_dirty
+        self.canvas.on_text_copied = self._on_text_copied
         self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
 
         # ── CSS ───────────────────────────────────────────────────────────────
@@ -1190,6 +1267,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Ctrl+Z",        "Undo last stroke"),
             ("Text",          None),
 
+            ("Text",          None),
+            ("Alt+Drag",      "Select & copy text (word-level)"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
@@ -1362,6 +1441,18 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 Gdk.Display.get_default().get_clipboard().set_content(content)
         dlg.connect("response", on_response)
         dlg.present(self)
+
+    def _on_text_copied(self, text):
+        if text:
+            preview = text[:48].replace("\n", " ")
+            if len(text) > 48:
+                preview += "…"
+            msg = f"Copied: \"{preview}\""
+        else:
+            msg = "No text in selection"
+        toast = Adw.Toast.new(msg)
+        toast.set_timeout(2)
+        self.toast_overlay.add_toast(toast)
 
     def _on_width_changed(self, scale):
         self.canvas.pen_width = scale.get_value()
