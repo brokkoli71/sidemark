@@ -15,21 +15,19 @@ _log_path = None
 logger = logging.getLogger(__name__)
 
 
-def _setup_logging():
+def _setup_logging(verbose=False):
     global _log_path
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", "%H:%M:%S")
-    # Always log to stderr so running from a terminal shows output immediately
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
     logger.addHandler(stream_handler)
-    # Also write to file for post-mortem inspection
     os.makedirs(LOG_DIR, exist_ok=True)
     _log_path = os.path.join(LOG_DIR, f"session_{os.getpid()}.log")
     file_handler = logging.FileHandler(_log_path)
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
-    logger.setLevel(logging.DEBUG)
-    logger.info("session started")
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.info("session started" + (" (verbose)" if verbose else ""))
     atexit.register(_cleanup_log)
 
 
@@ -318,10 +316,10 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_thumb_begin(self, gesture, sequence):
         if self._thumb_panning:
-            logger.debug("thumb pan stop")
+            pass
             self._thumb_panning = False
         else:
-            logger.debug(f"thumb pan start at ({self._mouse_x:.0f},{self._mouse_y:.0f})")
+            logger.debug(f"thumb pan start ({self._mouse_x:.0f},{self._mouse_y:.0f})")
             self._thumb_panning = True
             self._thumb_origin = (self._mouse_x, self._mouse_y)
             self._thumb_start_offset = (self.offset_x, self.offset_y)
@@ -364,7 +362,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._erase_at(start_x, start_y)
             return
         btn = gesture.get_current_button()
-        logger.debug(f"drag-begin button={btn}")
+        logger.debug(f"drag begin btn={btn}")
         if btn in (8, 9):
             self._ignoring = True
             if self.on_nav_button:
@@ -393,7 +391,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_drag_update(self, gesture, offset_x, offset_y):
         if self._ignoring:
             return
-        logger.debug(f"drag-update btn={gesture.get_current_button()} panning={self._panning} offset=({offset_x:.0f},{offset_y:.0f})")
+        logger.debug(f"drag update offset=({offset_x:.0f},{offset_y:.0f})")
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
         if self._erasing:
             self._erase_at(sx + offset_x, sy + offset_y)
@@ -410,7 +408,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
-        logger.debug(f"drag-end btn={gesture.get_current_button() if gesture else '?'} offset=({offset_x:.0f},{offset_y:.0f})")
+        logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
         if self._ignoring:
             self._ignoring = False
             return
@@ -445,7 +443,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
         before = len(self.strokes)
-        logger.debug(f"erase_at screen=({sx:.1f},{sy:.1f}) pdf=({px:.1f},{py:.1f}) strokes_on_page={before}")
+        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) strokes={before}")
         self.all_strokes[self.current_page_idx] = [
             s for s in self.strokes
             if not self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0)
@@ -1431,10 +1429,13 @@ class PDFEditorApp(Adw.Application):
 
 
 def main():
-    _setup_logging()
+    args = sys.argv[1:]
+    verbose = "--verbose" in args or "-v" in args
+    args = [a for a in args if a not in ("--verbose", "-v")]
+    _setup_logging(verbose=verbose)
     app = PDFEditorApp()
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
+    if args:
+        path = args[0]
         if not os.path.isfile(path):
             print(f"File not found: {path}", file=sys.stderr)
             sys.exit(1)
