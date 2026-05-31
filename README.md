@@ -1,6 +1,6 @@
 # Sidemark
 
-A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux, designed to be used e.g. for lecture note taking
+Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes panel. Designed for lecture note taking. Draw directly on slides, while writing structured notes beside them.
 
 ![Screenshot](screenshot.png)
 
