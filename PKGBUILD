@@ -1,10 +1,10 @@
 # Maintainer: Hannes Spitz <h.spitz@outlook.de>
-pkgname=pdf-editor-omarchy-git
+pkgname=sidemark-git
 pkgver=r61.02f4ca4
 pkgrel=1
-pkgdesc="PDF annotation and note-taking app with live markdown sidebar, designed for Omarchy"
+pkgdesc="PDF viewer and annotator with a live markdown notes sidebar"
 arch=('any')
-url="https://github.com/brokkoli71/pdf-editor-omarchy"
+url="https://github.com/brokkoli71/sidemark"
 license=('MIT')
 depends=(
     'python'
@@ -20,36 +20,36 @@ optdepends=(
     'librsvg: render PNG icon sizes at install time'
     'libreoffice: convert PPTX files to PDF'
 )
-source=("pdf-editor-omarchy::git+https://github.com/brokkoli71/pdf-editor-omarchy.git")
+source=("sidemark::git+https://github.com/brokkoli71/sidemark.git")
 sha256sums=('SKIP')
 
 pkgver() {
-    cd "$srcdir/pdf-editor-omarchy"
+    cd "$srcdir/sidemark"
     printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 package() {
-    cd "$srcdir/pdf-editor-omarchy"
+    cd "$srcdir/sidemark"
 
     # Main script
-    install -Dm755 pdfeditor.py \
-        "$pkgdir/usr/share/pdf-editor-omarchy/pdfeditor.py"
+    install -Dm755 sidemark.py \
+        "$pkgdir/usr/share/sidemark/sidemark.py"
 
     # Wrapper in PATH
     install -dm755 "$pkgdir/usr/bin"
-    cat > "$pkgdir/usr/bin/pdfeditor" <<'EOF'
+    cat > "$pkgdir/usr/bin/sidemark" <<'EOF'
 #!/bin/sh
-exec /usr/bin/python3 /usr/share/pdf-editor-omarchy/pdfeditor.py "$@"
+exec /usr/bin/python3 /usr/share/sidemark/sidemark.py "$@"
 EOF
-    chmod 755 "$pkgdir/usr/bin/pdfeditor"
+    chmod 755 "$pkgdir/usr/bin/sidemark"
 
     # Desktop entry
-    install -Dm644 de.hspitz.pdfeditor.desktop \
-        "$pkgdir/usr/share/applications/de.hspitz.pdfeditor.desktop"
+    install -Dm644 de.hspitz.sidemark.desktop \
+        "$pkgdir/usr/share/applications/de.hspitz.sidemark.desktop"
 
     # SVG icon (always)
     install -Dm644 icon.svg \
-        "$pkgdir/usr/share/icons/hicolor/scalable/apps/de.hspitz.pdfeditor.svg"
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/de.hspitz.sidemark.svg"
 
     # PNG icons (if librsvg is present on the build machine)
     if command -v rsvg-convert >/dev/null 2>&1; then
@@ -57,7 +57,7 @@ EOF
             install -dm755 \
                 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
             rsvg-convert icon.svg -w "$size" -h "$size" \
-                -o "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/de.hspitz.pdfeditor.png"
+                -o "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/de.hspitz.sidemark.png"
         done
     fi
 }

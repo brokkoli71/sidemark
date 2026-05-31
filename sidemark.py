@@ -997,7 +997,7 @@ class MarkdownNotesView(GtkSource.View):
 
 class PDFEditorWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="PDF Editor")
+        super().__init__(application=app, title="Sidemark")
         self.set_default_size(1280, 800)
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
@@ -1479,7 +1479,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._path = path
         self._notes_path = None
         self._is_untitled = False
-        self.set_title(f"PDF Editor — {os.path.basename(path)}")
+        self.set_title(f"Sidemark — {os.path.basename(path)}")
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
@@ -1499,7 +1499,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         # Notes-only mode: no PDF, load markdown directly into notes panel.
         self._path = None
         self._notes_path = md_path
-        self.set_title(f"PDF Editor — {os.path.basename(md_path)}")
+        self.set_title(f"Sidemark — {os.path.basename(md_path)}")
         self.notes_model = NotesModel()
         self.notes_model.load(md_path)
         self._page_label.set_label("—")
@@ -1515,7 +1515,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     def _create_blank(self):
         """Open a blank A4 page — user will be prompted for a name on first save."""
-        fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="pdfeditor_blank_")
+        fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="sidemark_blank_")
         os.close(fd)
         surf = cairo.PDFSurface(tmp, 595, 842)
         cairo.Context(surf).show_page()
@@ -1523,7 +1523,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._do_open_file(tmp)
         self._path = tmp           # track temp file so canvas.save() works
         self._is_untitled = True
-        self.set_title("PDF Editor — Untitled")
+        self.set_title("Sidemark — Untitled")
         self._clear_dirty()
 
     def _on_save_as(self):
@@ -1551,7 +1551,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             old_tmp = self._path if self._is_untitled else None
             self._path = path
             self._is_untitled = False
-            self.set_title(f"PDF Editor — {os.path.basename(path)}")
+            self.set_title(f"Sidemark — {os.path.basename(path)}")
             self._on_save()
             if old_tmp and os.path.exists(old_tmp):
                 try:
@@ -1578,7 +1578,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
         toast.set_timeout(0)
         self.toast_overlay.add_toast(toast)
-        out_dir = tempfile.mkdtemp(prefix="pdfeditor-")
+        out_dir = tempfile.mkdtemp(prefix="sidemark-")
         base = os.path.splitext(os.path.basename(pptx_path))[0]
 
         def run():
@@ -1669,7 +1669,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 class PDFEditorApp(Adw.Application):
     def __init__(self):
         super().__init__(
-            application_id="de.hspitz.pdfeditor",
+            application_id="de.hspitz.sidemark",
             flags=Gio.ApplicationFlags.NON_UNIQUE,
         )
         self._initial_file = None

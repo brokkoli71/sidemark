@@ -1,8 +1,8 @@
 [Desktop Entry]
-Name=PDF Editor
+Name=Sidemark
 Comment=View and annotate PDF files with markdown notes
-Exec=pdfeditor %f
-Icon=de.hspitz.pdfeditor
+Exec=sidemark %f
+Icon=de.hspitz.sidemark
 Type=Application
 Categories=Office;Viewer;
 MimeType=application/pdf;application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.presentationml.presentation;text/markdown;text/x-markdown;

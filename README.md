@@ -1,4 +1,4 @@
-# PDF Editor
+# Sidemark
 
 A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux, designed to be used e.g. for lecture note taking
 
@@ -20,14 +20,14 @@ A minimal GTK4/libadwaita PDF viewer and annotation tool for Linux, designed to 
 ### AUR (Arch Linux / Omarchy)
 
 ```bash
-yay -S pdf-editor-omarchy-git
+yay -S sidemark-git
 ```
 
 ### install.sh (any Linux)
 
 ```bash
-git clone https://github.com/brokkoli71/pdf-editor-omarchy
-cd pdf-editor-omarchy
+git clone https://github.com/brokkoli71/sidemark
+cd sidemark
 ./install.sh
 ```
 
@@ -40,9 +40,9 @@ Installs the app, creates a launcher entry, and registers it as the default hand
 ### Run directly (no install)
 
 ```bash
-git clone https://github.com/brokkoli71/pdf-editor-omarchy
-cd pdf-editor-omarchy
-python pdfeditor.py [file.pdf]
+git clone https://github.com/brokkoli71/sidemark
+cd sidemark
+python sidemark.py [file.pdf]
 # Add -v / --verbose for debug logging
 ```
 

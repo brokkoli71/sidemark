@@ -1,15 +1,15 @@
 #!/bin/bash
-# install.sh — user-local install for PDF Editor
+# install.sh — user-local install for Sidemark
 # Usage:  ./install.sh            install
 #         ./install.sh --uninstall remove everything
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="$HOME/.local/share/pdf-editor-omarchy"
+INSTALL_DIR="$HOME/.local/share/sidemark"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 ICON_BASE="$HOME/.local/share/icons/hicolor"
-DESKTOP_ID="de.hspitz.pdfeditor"
+DESKTOP_ID="de.hspitz.sidemark"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
 ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
@@ -19,9 +19,9 @@ step() { echo -e "\n${BOLD}$1${NC}"; }
 
 # ── uninstall ──────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then
-    step "Uninstalling PDF Editor…"
+    step "Uninstalling Sidemark…"
     rm -rf  "$INSTALL_DIR"
-    rm -f   "$BIN_DIR/pdfeditor"
+    rm -f   "$BIN_DIR/sidemark"
     rm -f   "$DESKTOP_DIR/$DESKTOP_ID.desktop"
     rm -f   "$ICON_BASE/scalable/apps/$DESKTOP_ID.svg"
     for size in 16 32 48 64 128 256; do
@@ -77,19 +77,19 @@ for size in 16 32 48 64 128 256; do
 done
 
 # Main script
-install -m 755 "$SCRIPT_DIR/pdfeditor.py" "$INSTALL_DIR/pdfeditor.py"
-ok "pdfeditor.py  →  $INSTALL_DIR/"
+install -m 755 "$SCRIPT_DIR/sidemark.py" "$INSTALL_DIR/sidemark.py"
+ok "sidemark.py  →  $INSTALL_DIR/"
 
-# Wrapper so 'pdfeditor' works from any shell / Exec line
-cat > "$BIN_DIR/pdfeditor" <<EOF
+# Wrapper so 'sidemark' works from any shell / Exec line
+cat > "$BIN_DIR/sidemark" <<EOF
 #!/bin/sh
-exec /usr/bin/python3 "$INSTALL_DIR/pdfeditor.py" "\$@"
+exec /usr/bin/python3 "$INSTALL_DIR/sidemark.py" "\$@"
 EOF
-chmod 755 "$BIN_DIR/pdfeditor"
-ok "wrapper        →  $BIN_DIR/pdfeditor"
+chmod 755 "$BIN_DIR/sidemark"
+ok "wrapper        →  $BIN_DIR/sidemark"
 
 # Desktop entry
-install -m 644 "$SCRIPT_DIR/de.hspitz.pdfeditor.desktop" \
+install -m 644 "$SCRIPT_DIR/de.hspitz.sidemark.desktop" \
     "$DESKTOP_DIR/$DESKTOP_ID.desktop"
 ok ".desktop file  →  $DESKTOP_DIR/"
 
@@ -124,5 +124,5 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 
 echo -e "\n${GREEN}${BOLD}Done!${NC}"
-echo "  Launch:    pdfeditor [file.pdf]"
+echo "  Launch:    sidemark [file.pdf]"
 echo "  Uninstall: ./install.sh --uninstall"

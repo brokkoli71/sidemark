@@ -74,12 +74,12 @@ jobs:
       - name: Verify installed files
         run: |
           set -e
-          test -f "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py"                     && echo "✓ pdfeditor.py"
-          test -x "$HOME/.local/bin/pdfeditor"                                             && echo "✓ wrapper"
-          test -f "$HOME/.local/share/applications/de.hspitz.pdfeditor.desktop"            && echo "✓ .desktop"
-          test -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.pdfeditor.svg" && echo "✓ icon SVG"
-          test -f "$HOME/.local/share/icons/hicolor/48x48/apps/de.hspitz.pdfeditor.png"    && echo "✓ icon 48px"
-          test -f "$HOME/.local/share/icons/hicolor/256x256/apps/de.hspitz.pdfeditor.png"  && echo "✓ icon 256px"
+          test -f "$HOME/.local/share/sidemark/sidemark.py"                              && echo "✓ sidemark.py"
+          test -x "$HOME/.local/bin/sidemark"                                            && echo "✓ wrapper"
+          test -f "$HOME/.local/share/applications/de.hspitz.sidemark.desktop"           && echo "✓ .desktop"
+          test -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.sidemark.svg" && echo "✓ icon SVG"
+          test -f "$HOME/.local/share/icons/hicolor/48x48/apps/de.hspitz.sidemark.png"   && echo "✓ icon 48px"
+          test -f "$HOME/.local/share/icons/hicolor/256x256/apps/de.hspitz.sidemark.png" && echo "✓ icon 256px"
 
       - name: Run install.sh --uninstall
         run: ./install.sh --uninstall
@@ -87,7 +87,7 @@ jobs:
       - name: Verify uninstall cleaned up
         run: |
           set -e
-          test ! -f "$HOME/.local/share/pdf-editor-omarchy/pdfeditor.py"                     && echo "✓ app dir gone"
-          test ! -x "$HOME/.local/bin/pdfeditor"                                             && echo "✓ wrapper gone"
-          test ! -f "$HOME/.local/share/applications/de.hspitz.pdfeditor.desktop"            && echo "✓ .desktop gone"
-          test ! -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.pdfeditor.svg" && echo "✓ icon gone"
+          test ! -f "$HOME/.local/share/sidemark/sidemark.py"                              && echo "✓ app dir gone"
+          test ! -x "$HOME/.local/bin/sidemark"                                            && echo "✓ wrapper gone"
+          test ! -f "$HOME/.local/share/applications/de.hspitz.sidemark.desktop"           && echo "✓ .desktop gone"
+          test ! -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.sidemark.svg" && echo "✓ icon gone"
