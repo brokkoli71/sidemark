@@ -1,6 +1,6 @@
 # Sidemark
 
-Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes panel. Designed for lecture note taking. Draw directly on slides, while writing structured notes beside them.
+Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes panel. Open a PDF — lecture slides, papers, or any document — draw directly on it, and write structured notes beside it.
 
 ![Screenshot](screenshot.png)
 
