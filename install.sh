@@ -33,34 +33,71 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     exit 0
 fi
 
+# ── distro detection ──────────────────────────────────────────────────────────
+_DISTRO="unknown"
+if   command -v pacman &>/dev/null; then _DISTRO="arch"
+elif command -v apt    &>/dev/null; then _DISTRO="deb"
+elif command -v dnf    &>/dev/null; then _DISTRO="rpm"
+fi
+
+# Print the right install hint for the detected distro.
+# Args: arch-hint  deb-hint  rpm-hint
+_hint() {
+    case "$_DISTRO" in
+        arch) echo "sudo pacman -S $1" ;;
+        deb)  echo "sudo apt install $2" ;;
+        rpm)  echo "sudo dnf install $3" ;;
+        *)    echo "install: arch=$1  deb=$2  rpm=$3" ;;
+    esac
+}
+
 # ── dependency check ───────────────────────────────────────────────────────────
 step "Checking dependencies…"
 
+# check_py TEST ARCH_PKG DEB_PKGS RPM_PKG
 check_py() {
     /usr/bin/python3 -c "$1" 2>/dev/null || \
-        fail "Missing: $2  →  sudo pacman -S $3"
+        fail "Missing: $2  →  $(_hint "$2" "$3" "$4")"
 }
 
-command -v python3 >/dev/null 2>&1 || \
-    fail "python3 not found  →  sudo pacman -S python"
+if ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 not found  →  $(_hint python python3 python3)"
+fi
 
 check_py "import gi" \
-    "python-gobject" "python-gobject"
+    "python-gobject" \
+    "python3-gi python3-gi-cairo" \
+    "python3-gobject"
 check_py "import gi; gi.require_version('Gtk','4.0'); from gi.repository import Gtk" \
-    "gtk4" "gtk4"
+    "gtk4" \
+    "gir1.2-gtk-4.0 libgtk-4-1" \
+    "gtk4"
 check_py "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" \
-    "libadwaita" "libadwaita"
-check_py "import fitz" \
-    "python-pymupdf" "python-pymupdf"
+    "libadwaita" \
+    "gir1.2-adw-1 libadwaita-1-0" \
+    "libadwaita"
+# PyMuPDF: Arch has it in pacman; Debian/Ubuntu/Fedora need pip
+if ! /usr/bin/python3 -c "import fitz" 2>/dev/null; then
+    case "$_DISTRO" in
+        arch) fail "Missing: python-pymupdf  →  sudo pacman -S python-pymupdf" ;;
+        *)    fail "Missing: pymupdf  →  pip install pymupdf" ;;
+    esac
+fi
 check_py "import numpy" \
-    "python-numpy" "python-numpy"
+    "python-numpy" \
+    "python3-numpy" \
+    "python3-numpy"
 check_py "import cairo" \
-    "python-cairo" "python-cairo"
+    "python-cairo" \
+    "python3-gi-cairo" \
+    "python3-cairo"
 check_py "import gi; gi.require_version('GtkSource','5'); from gi.repository import GtkSource" \
-    "gtksourceview5" "gtksourceview5"
+    "gtksourceview5" \
+    "gir1.2-gtksource-5 libgtksourceview-5-0" \
+    "gtksourceview5"
 
 if ! find /usr/share/icons/Adwaita -name "go-next-symbolic*" 2>/dev/null | grep -q .; then
-    warn "adwaita-icon-theme not found — icons may be missing.  →  sudo pacman -S adwaita-icon-theme"
+    warn "adwaita-icon-theme not found — icons may be missing.  →  $(_hint adwaita-icon-theme adwaita-icon-theme adwaita-icon-theme)"
 fi
 
 ok "All required dependencies present."
