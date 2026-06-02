@@ -99,12 +99,12 @@ class TestZoomToRegion(unittest.TestCase):
 
     def test_zoom_back_restores_state(self):
         c = self._canvas()
-        original = (c.scale, c.offset_x, c.offset_y)
+        original = (c.scale, c.offset_x, c.scroll_y)
         c._execute_zoom_to_rect((100, 100), (300, 250))
         c.zoom_back()
         self.assertAlmostEqual(c.scale, original[0])
         self.assertAlmostEqual(c.offset_x, original[1])
-        self.assertAlmostEqual(c.offset_y, original[2])
+        self.assertAlmostEqual(c.scroll_y, original[2])
         self.assertEqual(len(c._zoom_stack), 0)
 
     def test_zoom_back_on_empty_stack_does_not_raise(self):
@@ -412,32 +412,34 @@ class TestRendering(unittest.TestCase):
 
     def test_rerender_creates_surface(self):
         canvas = self._canvas_with_pdf()
-        canvas._page_surface = None
+        canvas._surfaces.clear()
         canvas._rerender_now()
-        self.assertIsNotNone(canvas._page_surface)
+        self.assertGreater(len(canvas._surfaces), 0)
 
     def test_surface_scale_stored(self):
         canvas = self._canvas_with_pdf()
         canvas.scale = 1.5
-        canvas._page_surface = None
+        canvas._surfaces.clear()
         canvas._rerender_now()
-        self.assertAlmostEqual(canvas._surface_scale, 1.5)
+        self.assertAlmostEqual(canvas._surface_scales.get(0), 1.5)
 
     def test_load_page_clears_cache(self):
         canvas = self._canvas_with_pdf()
         canvas._rerender_now()
-        self.assertIsNotNone(canvas._page_surface)
-        canvas._load_page(0)  # reload same page to trigger cache clear
-        self.assertIsNone(canvas._page_surface)
+        self.assertGreater(len(canvas._surfaces), 0)
+        canvas._load_page(0)
+        self.assertEqual(len(canvas._surfaces), 0)
 
     def test_scale_clamped(self):
         canvas = self._canvas_with_pdf()
         canvas.scale = 10.0  # above cap
+        canvas._surfaces.clear()
         canvas._rerender_now()
-        self.assertAlmostEqual(canvas._surface_scale, 4.0)
+        self.assertAlmostEqual(canvas._surface_scales.get(0), 4.0)
         canvas.scale = 0.1   # below floor
+        canvas._surfaces.clear()
         canvas._rerender_now()
-        self.assertAlmostEqual(canvas._surface_scale, 0.5)
+        self.assertAlmostEqual(canvas._surface_scales.get(0), 0.5)
 
 
 # ── theme loading ─────────────────────────────────────────────────────────────
@@ -532,13 +534,12 @@ class TestNeedsFit(unittest.TestCase):
         self.assertTrue(c._needs_fit)
 
     def test_page_fits_inside_canvas_after_draw(self):
+        # Continuous scroll fits to width only; page may be taller than viewport.
         c = self._canvas()
         W, H = 800, 600
         self._draw(c, W, H)
         self.assertGreaterEqual(c.offset_x, 0)
-        self.assertGreaterEqual(c.offset_y, 0)
-        self.assertLessEqual(c.offset_x + c.page_width  * c.scale, W + 1e-6)
-        self.assertLessEqual(c.offset_y + c.page_height * c.scale, H + 1e-6)
+        self.assertLessEqual(c.offset_x + c.page_width * c.scale, W + 1e-6)
 
     def test_screen_to_pdf_maps_page_center_correctly(self):
         # After a real draw the page centre in screen coords should round-trip

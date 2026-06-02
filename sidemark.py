@@ -51,6 +51,9 @@ import fitz          # PyMuPDF
 import numpy as np
 
 
+_PAGE_GAP = 20   # pixels between pages (constant, zoom-independent)
+
+
 class PDFCanvas(Gtk.DrawingArea):
     def __init__(self):
         super().__init__()
@@ -63,58 +66,60 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self.scale = 1.0
         self.offset_x = 0.0
-        self.offset_y = 0.0
+        self.offset_y = 10.0   # top margin above first page (px, constant)
+        self.scroll_y = 0.0    # vertical scroll (px from virtual top)
+
+        # per-page layout (built by _compute_page_layout after load)
+        self._page_sizes = []      # [(width, height), ...]  in PDF units
+        self._page_pdf_tops = []   # cumulative PDF-unit heights above each page
+
+        self._gesture_page = 0     # page the current gesture started on
 
         # {page_idx: [{"pts": [...], "color": (r,g,b,a), "width": float}]}
         self.all_strokes = {}
         self.current_stroke = []
 
-        self.pen_color = (0.05, 0.05, 0.8)   # RGB — PDF ink annotations have no alpha
+        self.pen_color = (0.05, 0.05, 0.8)
         self.pen_width = 2.0
-        self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
-        self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
+        self.surround_color = (0.910, 0.867, 0.824)
+        self.zoom_accent = (0.52, 0.70, 0.30)
 
         self.on_page_changed = None    # callback(current_idx, n_pages)
-        self.on_nav_button = None     # callback(delta: int) for back/forward buttons
-        self.on_change = None         # callback() whenever strokes are modified
+        self.on_nav_button = None      # callback(delta: int)
+        self.on_change = None          # callback() on stroke changes
         self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
         self.on_anchor_clicked = None  # callback(anchor_index)
 
-        self._anchors = {}         # {page_idx: [(x, y), ...]}
-        self._active_anchors = set()  # indices highlighted on current page
+        self._anchors = {}
+        self._active_anchors = set()
 
-        self.search_rects = []          # fitz.Rect hits for current page
-        self.search_current_rect = None # the active match rect
+        self.search_rects = []
+        self.search_current_rect = None
 
-        # zoom-to-region state
-        self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
+        # zoom-to-region — stack stores (scale, offset_x, scroll_y)
+        self._zoom_stack = []
         self._zoom_selecting = False
-        self._zoom_start = None        # screen (x, y)
-        self._zoom_end = None          # screen (x, y), constrained
+        self._zoom_start = None
+        self._zoom_end = None
 
-        # cached page surface
-        self._page_surface = None      # cairo.ImageSurface rendered at _surface_scale
-        self._surface_scale = 0.0
-        self._rerender_id = None       # GLib timeout handle
-        self._needs_fit = False        # refit on first draw after load (canvas may not be allocated yet)
+        # per-page surface cache
+        self._surfaces = {}         # {page_idx: cairo.ImageSurface}
+        self._surface_scales = {}   # {page_idx: logical_scale at render time}
+        self._rerender_id = None
+        self._needs_fit = False
 
         self._erasing = False
-
         self._panning = False
         self._pan_start_offset = (0.0, 0.0)
-
-        self._ignoring = False  # True while a button-8/9 drag sequence is active
-
+        self._ignoring = False
         self._thumb_panning = False
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
-        # word-level text selection (Alt+drag)
         self._text_selecting = False
-        self._selected_words = []   # fitz word tuples currently highlighted
-        self._page_words = []       # cached for current page
-        self.on_text_copied = None  # callback(text_or_None)
-
+        self._selected_words = []
+        self._page_words = []
+        self.on_text_copied = None
 
         self.set_draw_func(self._draw)
         self.set_focusable(True)
@@ -162,7 +167,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.all_strokes = {}
         total_annots = 0
         for i in range(self.n_pages):
-            page = self.document[i]   # keep reference alive while reading annotations
+            page = self.document[i]
             for annot in page.annots(types=[fitz.PDF_ANNOT_INK]):
                 color = tuple(annot.colors.get("stroke", (0.05, 0.05, 0.8)))
                 width = annot.border.get("width", 2.0)
@@ -175,21 +180,38 @@ class PDFCanvas(Gtk.DrawingArea):
                         })
                         total_annots += 1
         logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
+        self._compute_page_layout()
         self._load_page(0)
+
+    def _compute_page_layout(self):
+        """Build _page_sizes and _page_pdf_tops from the current document."""
+        self._page_sizes = []
+        self._page_pdf_tops = []
+        top = 0.0
+        for i in range(self.n_pages):
+            pg = self.document[i]
+            w, h = pg.rect.width, pg.rect.height
+            self._page_sizes.append((w, h))
+            self._page_pdf_tops.append(top)
+            top += h
 
     def _load_page(self, idx):
         self.current_page_idx = idx
         self.page = self.document[idx]
-        self.page_width  = self.page.rect.width
-        self.page_height = self.page.rect.height
-        self._page_surface = None
-        self._surface_scale = 0.0
+        if self._page_sizes:
+            self.page_width, self.page_height = self._page_sizes[idx]
+        else:
+            self.page_width  = self.page.rect.width
+            self.page_height = self.page.rect.height
+        self._surfaces.clear()
+        self._surface_scales.clear()
         if self._rerender_id is not None:
             GLib.source_remove(self._rerender_id)
             self._rerender_id = None
-        self._needs_fit = True   # re-fit on first draw with real canvas dimensions
-        self._page_words = self.page.get_text("words")   # cache for text selection
+        self._needs_fit = True
+        self._page_words = self.page.get_text("words")
         self._selected_words = []
+        self.scroll_y = 0.0
         self.queue_draw()
         if self.on_page_changed:
             self.on_page_changed(idx, self.n_pages)
@@ -198,38 +220,114 @@ class PDFCanvas(Gtk.DrawingArea):
         if not self.document:
             return
         idx = max(0, min(self.n_pages - 1, idx))
+        # Scroll so the top of the target page is near the top of the viewport
+        if self._page_pdf_tops:
+            self.scroll_y = self._page_pdf_tops[idx] * self.scale + idx * _PAGE_GAP
         if idx != self.current_page_idx:
-            self._load_page(idx)
+            self.current_page_idx = idx
+            self.page = self.document[idx]
+            if self._page_sizes:
+                self.page_width, self.page_height = self._page_sizes[idx]
+            self._page_words = self.page.get_text("words")
+            self._selected_words = []
+            if self.on_page_changed:
+                self.on_page_changed(idx, self.n_pages)
+        self.queue_draw()
 
     @property
     def strokes(self):
         return self.all_strokes.setdefault(self.current_page_idx, [])
 
-    # ── layout ───────────────────────────────────────────────────────────────
+    # ── layout helpers ───────────────────────────────────────────────────────
 
-    def _fit_page(self):
+    def _page_top_screen(self, i):
+        """Screen-y of the top edge of page i given current scroll_y and scale."""
+        if not self._page_pdf_tops or i >= len(self._page_pdf_tops):
+            return self.offset_y  # fallback for no document / tests
+        return self.offset_y + self._page_pdf_tops[i] * self.scale + i * _PAGE_GAP - self.scroll_y
+
+    def _page_at_screen(self, sy):
+        """Return the page index whose vertical range contains sy (or nearest)."""
+        if not self._page_sizes:
+            return 0
+        best, best_dist = 0, float('inf')
+        for i, (pw, ph) in enumerate(self._page_sizes):
+            top = self._page_top_screen(i)
+            bot = top + ph * self.scale
+            if top <= sy <= bot:
+                return i
+            dist = min(abs(sy - top), abs(sy - bot))
+            if dist < best_dist:
+                best_dist, best = dist, i
+        return best
+
+    def _total_height_screen(self):
+        if not self._page_sizes:
+            return self.page_height * self.scale
+        return (sum(ph * self.scale for _, ph in self._page_sizes)
+                + (self.n_pages - 1) * _PAGE_GAP
+                + self.offset_y)
+
+    def _fit_width(self):
+        """Fit all pages to canvas width; scroll to current page."""
         w = self.get_width() or 800
-        h = self.get_height() or 600
-        if self.page_width and self.page_height:
-            self.scale = min(w / self.page_width, h / self.page_height) * 0.95
-            self.offset_x = (w - self.page_width * self.scale) / 2
-            self.offset_y = (h - self.page_height * self.scale) / 2
-
-    def _rerender_now(self):
-        if not self.page:
+        if not self._page_sizes:
+            if self.page_width:
+                self.scale = (w / self.page_width) * 0.95
+                self.offset_x = (w - self.page_width * self.scale) / 2
             return
+        max_pw = max(pw for pw, _ in self._page_sizes)
+        self.scale = (w / max_pw) * 0.95
+        self.offset_x = (w - max_pw * self.scale) / 2
+        i = self.current_page_idx
+        self.scroll_y = self._page_pdf_tops[i] * self.scale + i * _PAGE_GAP
+
+    def _update_current_page(self):
+        """Update current_page_idx to the most-visible page and fire callback."""
+        if not self._page_sizes:
+            return
+        h = self.get_height() or 600
+        best, best_overlap = 0, -1.0
+        for i, (pw, ph) in enumerate(self._page_sizes):
+            top = self._page_top_screen(i)
+            bot = top + ph * self.scale
+            overlap = min(bot, h) - max(top, 0.0)
+            if overlap > best_overlap:
+                best_overlap, best = overlap, i
+        if best != self.current_page_idx:
+            self.current_page_idx = best
+            self.page = self.document[best]
+            self.page_width, self.page_height = self._page_sizes[best]
+            self._page_words = self.page.get_text("words")
+            self._selected_words = []
+            if self.on_page_changed:
+                self.on_page_changed(best, self.n_pages)
+
+    # ── rendering ────────────────────────────────────────────────────────────
+
+    def _render_page(self, i):
+        if not self.document or i >= self.n_pages:
+            return
+        pg = self.document[i]
         sf = self.get_scale_factor()
         logical_scale = min(max(self.scale, 0.5), 4.0)
         device_scale  = logical_scale * sf
-        pix = self.page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True, annots=False)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True, annots=False)
         w, h = pix.width, pix.height
-        # fitz RGBA → cairo ARGB32 (BGRA in memory on little-endian): swap R and B channels
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 4).copy()
         arr[:, :, [0, 2]] = arr[:, :, [2, 0]]
         surf = cairo.ImageSurface.create_for_data(arr, cairo.FORMAT_ARGB32, w, h)
         surf.set_device_scale(sf, sf)
-        self._page_surface = surf
-        self._surface_scale = logical_scale
+        self._surfaces[i] = surf
+        self._surface_scales[i] = logical_scale
+
+    def _rerender_now(self):
+        if self._surfaces:
+            for i in list(self._surfaces.keys()):
+                self._render_page(i)
+        elif self.page:
+            self._render_page(self.current_page_idx)
+        self.queue_draw()
 
     def _schedule_rerender(self):
         if self._rerender_id is not None:
@@ -239,14 +337,17 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_rerender_timeout(self):
         self._rerender_id = None
         self._rerender_now()
-        self.queue_draw()
         return False
 
     def _screen_to_pdf(self, sx, sy):
-        return (sx - self.offset_x) / self.scale, (sy - self.offset_y) / self.scale
+        """Convert screen coords to PDF coords on _gesture_page."""
+        top = self._page_top_screen(self._gesture_page)
+        return (sx - self.offset_x) / self.scale, (sy - top) / self.scale
 
     def _pdf_to_screen(self, px, py):
-        return px * self.scale + self.offset_x, py * self.scale + self.offset_y
+        """Convert PDF coords on current_page_idx to screen coords."""
+        top = self._page_top_screen(self.current_page_idx)
+        return px * self.scale + self.offset_x, py * self.scale + top
 
     # ── drawing ───────────────────────────────────────────────────────────────
 
@@ -256,7 +357,6 @@ class PDFCanvas(Gtk.DrawingArea):
 
         if self.page is None:
             r, g, b = self.surround_color
-            # Placeholder text: foreground-ish tint derived from surround
             ctx.set_source_rgba(r * 0.6, g * 0.6, b * 0.6, 0.8)
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
             ctx.set_font_size(16)
@@ -268,106 +368,121 @@ class PDFCanvas(Gtk.DrawingArea):
 
         if self._needs_fit and width > 0 and height > 0:
             self._needs_fit = False
-            self._fit_page()
-        elif self.offset_x == 0 and self.offset_y == 0 and self.scale == 1.0:
-            self._fit_page()
+            self._fit_width()
 
-        ctx.set_source_rgb(1, 1, 1)
-        ctx.rectangle(self.offset_x, self.offset_y,
-                      self.page_width * self.scale, self.page_height * self.scale)
-        ctx.fill()
+        logical_scale = min(max(self.scale, 0.5), 4.0)
 
-        if self._page_surface is None:
-            self._rerender_now()
+        for i, (pw, ph) in enumerate(self._page_sizes):
+            page_top  = self._page_top_screen(i)
+            page_bot  = page_top + ph * self.scale
+            page_left = self.offset_x
 
-        ctx.save()
-        ctx.translate(self.offset_x, self.offset_y)
-        blit_scale = self.scale / self._surface_scale
-        ctx.scale(blit_scale, blit_scale)
-        ctx.set_source_surface(self._page_surface, 0, 0)
-        ctx.get_source().set_filter(cairo.Filter.BILINEAR)
-        ctx.paint()
-        ctx.restore()
-
-        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
-
-        to_draw = self.strokes[:]
-        if self.current_stroke:
-            to_draw.append({"pts": self.current_stroke,
-                             "color": self.pen_color,
-                             "width": self.pen_width})
-
-        ctx.save()
-        ctx.translate(self.offset_x, self.offset_y)
-        ctx.scale(self.scale, self.scale)
-        for stroke in to_draw:
-            pts = stroke["pts"]
-            r, g, b = stroke["color"]
-            ctx.set_source_rgb(r, g, b)
-            ctx.set_line_width(stroke["width"])   # PDF units — scales with zoom
-            if len(pts) < 2:
-                if pts:
-                    ctx.arc(pts[0][0], pts[0][1], stroke["width"] / 2, 0, 2 * math.pi)
-                    ctx.fill()
+            if page_bot < 0 or page_top > height:
                 continue
-            ctx.move_to(*pts[0])
-            for pt in pts[1:]:
-                ctx.line_to(*pt)
-            ctx.stroke()
-        ctx.restore()
 
-        # anchor markers
-        anchors = self._anchors.get(self.current_page_idx, [])
-        if anchors:
-            ctx.save()
-            ctx.translate(self.offset_x, self.offset_y)
-            ctx.scale(self.scale, self.scale)
-            r, g, b = self.zoom_accent
-            radius = 8.0 / self.scale
-            for i, (ax, ay) in enumerate(anchors):
-                if i in self._active_anchors:
-                    ctx.set_source_rgba(r, g, b, 0.3)
-                    ctx.arc(ax, ay, radius * 1.9, 0, 2 * math.pi)
+            # White page background
+            ctx.set_source_rgb(1, 1, 1)
+            ctx.rectangle(page_left, page_top, pw * self.scale, ph * self.scale)
+            ctx.fill()
+
+            # Render page surface if missing or stale
+            if (i not in self._surfaces
+                    or abs(self._surface_scales.get(i, 0) - logical_scale) > 0.05):
+                self._render_page(i)
+
+            surf = self._surfaces.get(i)
+            if surf:
+                ctx.save()
+                ctx.translate(page_left, page_top)
+                blit_scale = self.scale / self._surface_scales[i]
+                ctx.scale(blit_scale, blit_scale)
+                ctx.set_source_surface(surf, 0, 0)
+                ctx.get_source().set_filter(cairo.Filter.BILINEAR)
+                ctx.paint()
+                ctx.restore()
+
+            # Strokes for this page
+            strokes = self.all_strokes.get(i, [])
+            to_draw = strokes[:]
+            if i == self._gesture_page and self.current_stroke:
+                to_draw.append({"pts": self.current_stroke,
+                                 "color": self.pen_color,
+                                 "width": self.pen_width})
+            if to_draw:
+                ctx.save()
+                ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+                ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+                ctx.translate(page_left, page_top)
+                ctx.scale(self.scale, self.scale)
+                for stroke in to_draw:
+                    pts = stroke["pts"]
+                    r, g, b = stroke["color"][:3]
+                    ctx.set_source_rgb(r, g, b)
+                    ctx.set_line_width(stroke["width"])
+                    if len(pts) < 2:
+                        if pts:
+                            ctx.arc(pts[0][0], pts[0][1], stroke["width"] / 2, 0, 2 * math.pi)
+                            ctx.fill()
+                        continue
+                    ctx.move_to(*pts[0])
+                    for pt in pts[1:]:
+                        ctx.line_to(*pt)
+                    ctx.stroke()
+                ctx.restore()
+
+            # Anchor markers for this page
+            anchors = self._anchors.get(i, [])
+            if anchors:
+                ctx.save()
+                ctx.translate(page_left, page_top)
+                ctx.scale(self.scale, self.scale)
+                r, g, b = self.zoom_accent
+                radius = 8.0 / self.scale
+                for j, (ax, ay) in enumerate(anchors):
+                    active = (i == self.current_page_idx and j in self._active_anchors)
+                    if active:
+                        ctx.set_source_rgba(r, g, b, 0.3)
+                        ctx.arc(ax, ay, radius * 1.9, 0, 2 * math.pi)
+                        ctx.fill()
+                    ctx.set_source_rgba(r, g, b, 0.88)
+                    ctx.arc(ax, ay, radius, 0, 2 * math.pi)
                     ctx.fill()
-                ctx.set_source_rgba(r, g, b, 0.88)
-                ctx.arc(ax, ay, radius, 0, 2 * math.pi)
-                ctx.fill()
-                ctx.set_source_rgb(1, 1, 1)
-                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-                ctx.set_font_size(radius * 1.3)
-                label = str(i + 1)
-                ext = ctx.text_extents(label)
-                ctx.move_to(ax - ext.width / 2 - ext.x_bearing, ay - ext.height / 2 - ext.y_bearing)
-                ctx.show_text(label)
-            ctx.restore()
+                    ctx.set_source_rgb(1, 1, 1)
+                    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                    ctx.set_font_size(radius * 1.3)
+                    label = str(j + 1)
+                    ext = ctx.text_extents(label)
+                    ctx.move_to(ax - ext.width / 2 - ext.x_bearing,
+                                ay - ext.height / 2 - ext.y_bearing)
+                    ctx.show_text(label)
+                ctx.restore()
 
-        # search highlights
-        if self.search_rects:
-            ctx.save()
-            ctx.translate(self.offset_x, self.offset_y)
-            ctx.scale(self.scale, self.scale)
-            for rect in self.search_rects:
-                if rect == self.search_current_rect:
-                    ctx.set_source_rgba(1.0, 0.55, 0.0, 0.55)
-                else:
-                    ctx.set_source_rgba(1.0, 0.88, 0.0, 0.40)
-                ctx.rectangle(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0)
-                ctx.fill()
-            ctx.restore()
+            # Search highlights (current page only)
+            if i == self.current_page_idx and self.search_rects:
+                ctx.save()
+                ctx.translate(page_left, page_top)
+                ctx.scale(self.scale, self.scale)
+                for rect in self.search_rects:
+                    if rect == self.search_current_rect:
+                        ctx.set_source_rgba(1.0, 0.55, 0.0, 0.55)
+                    else:
+                        ctx.set_source_rgba(1.0, 0.88, 0.0, 0.40)
+                    ctx.rectangle(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0)
+                    ctx.fill()
+                ctx.restore()
 
-        # word-selection highlights
-        if self._selected_words:
-            ctx.save()
-            ctx.translate(self.offset_x, self.offset_y)
-            ctx.scale(self.scale, self.scale)
-            ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
-            for w in self._selected_words:
-                ctx.rectangle(w[0], w[1], w[2] - w[0], w[3] - w[1])
-                ctx.fill()
-            ctx.restore()
+            # Text-selection highlights
+            if i == self._gesture_page and self._selected_words:
+                ctx.save()
+                ctx.translate(page_left, page_top)
+                ctx.scale(self.scale, self.scale)
+                ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
+                for w in self._selected_words:
+                    ctx.rectangle(w[0], w[1], w[2] - w[0], w[3] - w[1])
+                    ctx.fill()
+                ctx.restore()
 
-        # zoom-selection rubber-band
+        # Zoom rubber-band (screen space)
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
             x1 = min(self._zoom_start[0], self._zoom_end[0])
             y1 = min(self._zoom_start[1], self._zoom_end[1])
@@ -388,48 +503,61 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_thumb_begin(self, gesture, sequence):
         if self._thumb_panning:
-            pass
             self._thumb_panning = False
         else:
             logger.debug(f"thumb pan start ({self._mouse_x:.0f},{self._mouse_y:.0f})")
             self._thumb_panning = True
             self._thumb_origin = (self._mouse_x, self._mouse_y)
-            self._thumb_start_offset = (self.offset_x, self.offset_y)
+            self._thumb_start_offset = (self.offset_x, self.scroll_y)
 
     def _on_thumb_end(self, gesture, sequence):
-        pass  # ignored — toggle mode, only begin matters
+        pass
 
     def _on_motion(self, ctrl, x, y):
         if self._thumb_panning:
             self.offset_x = self._thumb_start_offset[0] + (x - self._thumb_origin[0])
-            self.offset_y = self._thumb_start_offset[1] + (y - self._thumb_origin[1])
+            self.scroll_y = self._thumb_start_offset[1] - (y - self._thumb_origin[1])
             self.queue_draw()
         self._mouse_x = x
         self._mouse_y = y
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
-        if not (state & Gdk.ModifierType.CONTROL_MASK):
-            self.offset_x -= dx * 30
-            self.offset_y -= dy * 30
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            factor = 0.9 if dy > 0 else 1.1
+            mx, my = self._mouse_x, self._mouse_y
+            if self._page_pdf_tops:
+                pi = self._page_at_screen(my)
+                # Keep the PDF point under the mouse fixed:
+                # my = offset_y + (page_pdf_tops[pi] + pdf_y) * scale + pi*GAP - scroll_y
+                # Let K = page_pdf_tops[pi] + pdf_y  (invariant across zoom)
+                top_before = self._page_top_screen(pi)
+                pdf_y = (my - top_before) / self.scale
+                pdf_x = (mx - self.offset_x) / self.scale
+                K = self._page_pdf_tops[pi] + pdf_y
+                self.scale = max(0.1, min(20.0, self.scale * factor))
+                self.scroll_y = self.offset_y + K * self.scale + pi * _PAGE_GAP - my
+                self.offset_x = mx - pdf_x * self.scale
+            else:
+                self.scale = max(0.1, min(20.0, self.scale * factor))
+            self._schedule_rerender()
             self.queue_draw()
-            return True
-        factor = 0.9 if dy > 0 else 1.1
-        mx, my = self._mouse_x, self._mouse_y
-        pdf_x = (mx - self.offset_x) / self.scale
-        pdf_y = (my - self.offset_y) / self.scale
-        self.scale = max(0.1, min(20.0, self.scale * factor))
-        self.offset_x = mx - pdf_x * self.scale
-        self.offset_y = my - pdf_y * self.scale
-        self._schedule_rerender()
-        self.queue_draw()
+        else:
+            self.scroll_y += dy * 60
+            self.offset_x -= dx * 30
+            max_scroll = max(0.0, self._total_height_screen() - (self.get_height() or 600) + 50)
+            self.scroll_y = max(0.0, min(max_scroll, self.scroll_y))
+            self.queue_draw()
+            self._update_current_page()
         return True
 
     def _anchor_hit_test(self, sx, sy):
-        """Return index of anchor circle under screen point, or None."""
+        """Return index of anchor circle under screen point on current page, or None."""
         anchors = self._anchors.get(self.current_page_idx, [])
+        top = self._page_top_screen(self.current_page_idx)
         for i, (ax, ay) in enumerate(anchors):
-            scx, scy = self._pdf_to_screen(ax, ay)
+            scx = ax * self.scale + self.offset_x
+            scy = ay * self.scale + top
             if math.hypot(sx - scx, sy - scy) <= 10.0:
                 return i
         return None
@@ -439,19 +567,23 @@ class PDFCanvas(Gtk.DrawingArea):
         if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
             if self.page is None:
                 return
-            px, py = self._screen_to_pdf(x, y)
+            pi = self._page_at_screen(y)
+            top = self._page_top_screen(pi)
+            px = (x - self.offset_x) / self.scale
+            py = (y - top) / self.scale
             if self.on_anchor_placed:
-                self.on_anchor_placed(self.current_page_idx, round(px), round(py))
+                self.on_anchor_placed(pi, round(px), round(py))
 
     def _on_drag_begin(self, gesture, start_x, start_y):
-        if gesture.get_current_button() == 3:
+        btn = gesture.get_current_button()
+        if btn == 3:
+            self._gesture_page = self._page_at_screen(start_y)
             self._erasing = True
             self._panning = False
             self._text_selecting = False
             self._zoom_selecting = False
             self._erase_at(start_x, start_y)
             return
-        btn = gesture.get_current_button()
         logger.debug(f"drag begin btn={btn}")
         if btn in (8, 9):
             self._ignoring = True
@@ -459,17 +591,18 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.on_nav_button(1 if btn == 8 else -1)
             return
         if btn == 10:
-            self._ignoring = True  # GestureSingle owns this sequence
+            self._ignoring = True
             return
         self._ignoring = False
         self._erasing = False
+        self._gesture_page = self._page_at_screen(start_y)
         state = gesture.get_current_event_state()
         if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
-            self._ignoring = True  # anchor placed by GestureClick, suppress drag
+            self._ignoring = True
             return
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
-            self._pan_start_offset = (self.offset_x, self.offset_y)
+            self._pan_start_offset = (self.offset_x, self.scroll_y)
             self._text_selecting = False
             self._zoom_selecting = False
         elif state & Gdk.ModifierType.ALT_MASK:
@@ -505,7 +638,7 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._panning:
             self.offset_x = self._pan_start_offset[0] + offset_x
-            self.offset_y = self._pan_start_offset[1] + offset_y
+            self.scroll_y = self._pan_start_offset[1] - offset_y
             self.queue_draw()
             return
         if self._text_selecting:
@@ -543,13 +676,13 @@ class PDFCanvas(Gtk.DrawingArea):
                 if dx >= 8 and dy >= 8:
                     self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
                 else:
-                    self.zoom_to_fit()   # Shift+click with no rect → fit page
+                    self.zoom_to_fit()
             self._zoom_selecting = False
             self._zoom_start = None
             self._zoom_end = None
         else:
             if self.current_stroke:
-                self.strokes.append({
+                self.all_strokes.setdefault(self._gesture_page, []).append({
                     "pts": self.current_stroke,
                     "color": self.pen_color,
                     "width": self.pen_width,
@@ -560,7 +693,6 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _words_in_rect(self, px0, py0, px1, py1):
-        """Return fitz word tuples whose bounding boxes overlap the given PDF rect."""
         rx0, rx1 = min(px0, px1), max(px0, px1)
         ry0, ry1 = min(py0, py1), max(py0, py1)
         return [w for w in self._page_words
@@ -580,10 +712,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
     @staticmethod
     def _words_to_text(words):
-        """Join fitz word tuples in reading order, preserving line/paragraph breaks."""
         if not words:
             return ""
-        # fitz words: (x0,y0,x1,y1, word, block_no, line_no, word_no)
         ordered = sorted(words, key=lambda w: (w[5], w[6], w[7]))
         parts = []
         prev_block = prev_line = None
@@ -600,16 +730,16 @@ class PDFCanvas(Gtk.DrawingArea):
             prev_block, prev_line = block, line
         return "".join(parts)
 
-
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
-        before = len(self.strokes)
-        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) strokes={before}")
-        self.all_strokes[self.current_page_idx] = [
-            s for s in self.strokes
+        pi = self._gesture_page
+        before = len(self.all_strokes.get(pi, []))
+        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) page={pi} strokes={before}")
+        self.all_strokes[pi] = [
+            s for s in self.all_strokes.get(pi, [])
             if not self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0)
         ]
-        if len(self.strokes) != before:
+        if len(self.all_strokes[pi]) != before:
             if self.on_change:
                 self.on_change()
             self.queue_draw()
@@ -634,7 +764,6 @@ class PDFCanvas(Gtk.DrawingArea):
         return False
 
     def _constrain_zoom_end(self, sx, sy, ex, ey):
-        """Constrain (ex, ey) so the rect has the same aspect ratio as the canvas."""
         cw = self.get_width() or 800
         ch = self.get_height() or 600
         dx = ex - sx
@@ -646,7 +775,6 @@ class PDFCanvas(Gtk.DrawingArea):
         x2, y2 = max(start[0], end[0]), max(start[1], end[1])
         if x2 - x1 < 8 or y2 - y1 < 8:
             return
-        # Convert to PDF coords
         px1, py1 = self._screen_to_pdf(x1, y1)
         px2, py2 = self._screen_to_pdf(x2, y2)
         pdf_w, pdf_h = px2 - px1, py2 - py1
@@ -654,23 +782,29 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         cw = self.get_width() or 800
         ch = self.get_height() or 600
-        self._zoom_stack.append((self.scale, self.offset_x, self.offset_y))
+        self._zoom_stack.append((self.scale, self.offset_x, self.scroll_y))
         new_scale = min(cw / pdf_w, ch / pdf_h) * 0.97
+        pi = self._gesture_page
+        center_pdf_x = (px1 + px2) / 2
+        center_pdf_y = (py1 + py2) / 2
+        self.offset_x = cw / 2 - center_pdf_x * new_scale
+        if self._page_pdf_tops and pi < len(self._page_pdf_tops):
+            self.scroll_y = (self.offset_y
+                             + (self._page_pdf_tops[pi] + center_pdf_y) * new_scale
+                             + pi * _PAGE_GAP
+                             - ch / 2)
         self.scale = new_scale
-        self.offset_x = (cw - pdf_w * new_scale) / 2 - px1 * new_scale
-        self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
         self._schedule_rerender()
 
     def zoom_back(self):
         if self._zoom_stack:
-            self.scale, self.offset_x, self.offset_y = self._zoom_stack.pop()
+            self.scale, self.offset_x, self.scroll_y = self._zoom_stack.pop()
             self._schedule_rerender()
             self.queue_draw()
 
     def zoom_to_fit(self):
-        """Reset to fit-page view, clearing the entire zoom history."""
         self._zoom_stack.clear()
-        self._fit_page()
+        self._fit_width()
         self._schedule_rerender()
         self.queue_draw()
 
@@ -684,7 +818,6 @@ class PDFCanvas(Gtk.DrawingArea):
     # ── save ──────────────────────────────────────────────────────────────────
 
     def save(self, path):
-        """Save via self.document so structural changes (inserted pages) are preserved."""
         tmp = path + ".tmp"
         total_written = 0
         for i in range(self.n_pages):
@@ -696,7 +829,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 if not pts:
                     continue
                 polyline = pts if len(pts) > 1 else [pts[0], pts[0]]
-                r, g, b = stroke["color"]
+                r, g, b = stroke["color"][:3]
                 annot = page.add_ink_annot([polyline])
                 annot.set_colors(stroke=(r, g, b))
                 annot.set_border(width=stroke["width"])
@@ -705,35 +838,32 @@ class PDFCanvas(Gtk.DrawingArea):
         logger.info(f"save: {path} — wrote {total_written} ink annotation(s)")
         self.document.save(tmp, garbage=4, deflate=True)
         os.replace(tmp, path)
-        # Reopen so self.document reflects the saved state cleanly
         self.document = fitz.open(path)
 
     def add_blank_page(self):
-        """Insert a blank page with the same dimensions as the current page, after it."""
         idx = self.current_page_idx + 1
         pw, ph = self.page_width, self.page_height
         self.document.insert_page(idx, width=pw, height=ph)
-        # Shift all stroke entries at or beyond the insertion point up by one
         self.all_strokes = {
             (k + 1 if k >= idx else k): v
             for k, v in self.all_strokes.items()
         }
         self.n_pages = len(self.document)
-        self._load_page(idx)   # navigate to the new blank page
+        self._compute_page_layout()
+        self._load_page(idx)
 
     def delete_current_page(self):
-        """Delete the current page. Refused if it's the last one."""
         if self.n_pages <= 1:
             return False
         idx = self.current_page_idx
         self.document.delete_page(idx)
-        # Remove strokes for deleted page; shift later pages down by one
         self.all_strokes = {
             (k - 1 if k > idx else k): v
             for k, v in self.all_strokes.items()
             if k != idx
         }
         self.n_pages = len(self.document)
+        self._compute_page_layout()
         new_idx = min(idx, self.n_pages - 1)
         self._load_page(new_idx)
         return True
@@ -757,7 +887,7 @@ def _load_theme():
                     k = k.strip()
                     if k in defaults:
                         defaults[k] = v.strip().strip('"')
-        return defaults   # Omarchy wins outright
+        return defaults
     except OSError:
         pass
 
@@ -795,12 +925,10 @@ def _load_theme():
             r, g, b = [int(x.strip()) for x in s.split(",")]
             return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
-        # Accent: Plasma 5.25+ puts it in [General], older in [Colors:Button]
         for sec, key in [("General", "AccentColor"), ("Colors:Button", "FocusDecoration")]:
             if cfg.has_option(sec, key):
                 defaults["accent"] = _rgb(cfg[sec][key])
                 break
-        # Dark mode: colour scheme name contains "Dark"
         if cfg.has_option("General", "ColorScheme"):
             if "dark" in cfg["General"]["ColorScheme"].lower():
                 defaults["background"] = "#1e1e2e"
@@ -839,7 +967,6 @@ class NotesModel:
                 raw = f.read()
         except OSError:
             return
-        # Format: <!-- page:N --> delimiters (invisible in markdown viewers)
         parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
         for i in range(1, len(parts), 2):
             content = parts[i + 1].strip() if i + 1 < len(parts) else ""
@@ -866,14 +993,8 @@ class MarkdownNotesView(GtkSource.View):
     Cursor line: raw markdown visible for editing.
     """
 
-    # Combined regex — bold must come before italic so ** is consumed first.
-    # Italic uses [^*\n] to prevent matching across ** markers or newlines.
     _INLINE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
-
-    # Super/subscript: ^{content} or ^x  /  _{content} or _x
     _SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
-
-    # Symbol substitution table
     _SYMBOLS = {
         r'\sum': 'Σ', r'\prod': 'Π', r'\int': '∫',
         r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
@@ -908,7 +1029,6 @@ class MarkdownNotesView(GtkSource.View):
         buf.set_language(GtkSource.LanguageManager.get_default().get_language("markdown"))
         buf.set_style_scheme(GtkSource.StyleSchemeManager.get_default().get_scheme(scheme_id))
 
-        # Build TextTags
         tt = buf.get_tag_table()
         is_dark = scheme_id.endswith("dark")
 
@@ -924,7 +1044,7 @@ class MarkdownNotesView(GtkSource.View):
             "h2":          tag("h2",          weight=700, scale=1.25),
             "h3":          tag("h3",          weight=600, scale=1.1),
             "bold":        tag("bold",        weight=700),
-            "italic":      tag("italic",      style=2),   # Pango.Style.ITALIC
+            "italic":      tag("italic",      style=2),
             "code":        tag("code",        family="monospace",
                                background="#2d2d2d" if is_dark else "#f0f0f0",
                                foreground="#e06c75" if is_dark else "#c0392b"),
@@ -961,13 +1081,6 @@ class MarkdownNotesView(GtkSource.View):
         return False
 
     def _wrap_selection(self, marker):
-        """Wrap selection in marker, or unwrap if already wrapped. Selection is preserved.
-
-        Auto-expand: if the selection is exactly inside an existing marker pair
-        (e.g. cursor is on 'world' inside '**world**') the selection is silently
-        expanded to include the markers before the toggle check, so Ctrl+B twice
-        always round-trips to plain text.
-        """
         buf = self.get_buffer()
         if not buf.get_has_selection():
             return
@@ -976,12 +1089,10 @@ class MarkdownNotesView(GtkSource.View):
         if s.compare(e) > 0:
             s, e = e, s
 
-        # Auto-expand if the selection sits inside marker…marker
         s, e = self._expand_to_markers(buf, s, e, marker)
 
         text = buf.get_text(s, e, False)
         m = len(marker)
-        # Already wrapped check (single * must not be part of **)
         already = (
             text.startswith(marker) and text.endswith(marker) and len(text) > 2 * m
             and not (m == 1 and (text.startswith(marker * 2) or text.endswith(marker * 2)))
@@ -997,7 +1108,6 @@ class MarkdownNotesView(GtkSource.View):
             else:
                 buf.insert(ins, marker + text + marker)
                 inner_len = len(text)
-            # Re-select just the inner content
             end_it = buf.get_iter_at_mark(buf.get_insert())
             if not already:
                 end_it.backward_chars(m)
@@ -1009,14 +1119,12 @@ class MarkdownNotesView(GtkSource.View):
 
     @staticmethod
     def _expand_to_markers(buf, s, e, marker):
-        """If the m chars before s and after e both equal marker, return the expanded range."""
         m = len(marker)
         pre_s = s.copy()
         if not pre_s.backward_chars(m):
             return s, e
         if buf.get_text(pre_s, s, False) != marker:
             return s, e
-        # Single * must not be part of **: check char before the marker
         if m == 1:
             guard = pre_s.copy()
             if guard.backward_chars(1) and buf.get_text(guard, pre_s, False) == marker:
@@ -1025,7 +1133,6 @@ class MarkdownNotesView(GtkSource.View):
         post_e.forward_chars(m)
         if buf.get_text(e, post_e, False) != marker:
             return s, e
-        # Single * must not be part of **: check char after the marker
         if m == 1:
             guard = post_e.copy()
             nxt = post_e.copy()
@@ -1090,7 +1197,6 @@ class MarkdownNotesView(GtkSource.View):
         buf = self.get_buffer()
         self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
 
-        # Restore cursor line before clearing tags so its text is editable
         self._restore_line(buf, self._cursor_line)
 
         s, e = buf.get_start_iter(), buf.get_end_iter()
@@ -1130,7 +1236,6 @@ class MarkdownNotesView(GtkSource.View):
             if not on_cursor:
                 apply("hide", a, b)
 
-        # Heading
         m = re.match(r'^(#{1,3}) ', text)
         if m:
             lvl = len(m.group(1))
@@ -1138,33 +1243,31 @@ class MarkdownNotesView(GtkSource.View):
             hide(0, m.end())
             return
 
-        # Inline: bold / italic / code (combined regex handles priority)
         for m in self._INLINE.finditer(text):
             a, b = m.start(), m.end()
-            if m.group(1) is not None:       # **bold**
+            if m.group(1) is not None:
                 apply("bold", a + 2, b - 2)
                 hide(a, a + 2)
                 hide(b - 2, b)
-            elif m.group(2) is not None:     # *italic*
+            elif m.group(2) is not None:
                 apply("italic", a + 1, b - 1)
                 hide(a, a + 1)
                 hide(b - 1, b)
-            else:                            # `code`
+            else:
                 apply("code", a, b)
                 hide(a, a + 1)
                 hide(b - 1, b)
 
-        # Super/subscripts: ^{ab} ^x  _{ab} _x  — only rendered off cursor line
         if not on_cursor:
             for m in self._SCRIPT_RE.finditer(text):
                 a, b = m.start(), m.end()
                 tag_name = "superscript" if m.group(1) == '^' else "subscript"
-                if m.group(2) is not None:   # braced: ^{content}
-                    apply("hide", a, a + 2)  # hide ^{ or _{
+                if m.group(2) is not None:
+                    apply("hide", a, a + 2)
                     apply(tag_name, a + 2, b - 1)
-                    apply("hide", b - 1, b)  # hide }
-                else:                        # single char: ^x or _x
-                    apply("hide", a, a + 1)  # hide ^ or _
+                    apply("hide", b - 1, b)
+                else:
+                    apply("hide", a, a + 1)
                     apply(tag_name, a + 1, b)
 
 
@@ -1173,15 +1276,15 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Sidemark")
         self.set_default_size(1280, 800)
         self._path = None
-        self._notes_path = None   # set when a .md file is opened without an associated PDF
-        self._is_untitled = False  # True when working on an auto-created blank (no saved path yet)
+        self._notes_path = None
+        self._is_untitled = False
         self._dirty = False
         self._suppress_dirty = False
         self.notes_model = NotesModel()
-        self._anchor_line_nos = []  # line number in buffer for each anchor on current page
-        self._search_hits = {}      # {page_idx: [fitz.Rect, ...]}
-        self._search_matches = []   # [(page_idx, rect_idx), ...] flat list
-        self._search_current = -1   # index into _search_matches
+        self._anchor_line_nos = []
+        self._search_hits = {}
+        self._search_matches = []
+        self._search_current = -1
 
         theme = _load_theme()
         bg = _hex_to_rgb(theme["background"])
@@ -1313,7 +1416,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         save_btn.connect("clicked", self._on_save)
         header.pack_end(save_btn)
 
-        # pen settings popover
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         popover_box.set_margin_start(16)
         popover_box.set_margin_end(16)
@@ -1376,7 +1478,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         pen_btn.set_popover(popover)
         header.pack_end(pen_btn)
 
-        # notes toggle
         self._notes_toggle = Gtk.ToggleButton()
         self._notes_toggle.set_icon_name("view-sidebar-symbolic")
         self._notes_toggle.set_tooltip_text("Toggle notes (Ctrl+\\)")
@@ -1384,7 +1485,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
         header.pack_end(self._notes_toggle)
 
-        # open notes in Obsidian
         self._obsidian_btn = Gtk.Button()
         self._obsidian_btn.set_icon_name("text-editor-symbolic")
         self._obsidian_btn.set_tooltip_text("Open notes in Obsidian")
@@ -1392,7 +1492,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._obsidian_btn.connect("clicked", self._on_open_obsidian)
         header.pack_end(self._obsidian_btn)
 
-        # shortcuts help
         help_btn = Gtk.MenuButton()
         help_btn.set_label("?")
         help_btn.set_tooltip_text("Keyboard shortcuts")
@@ -1499,8 +1598,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Right-drag",    "Erase stroke"),
             ("Ctrl+Z",        "Undo last stroke"),
             ("Text",          None),
-
-            ("Text",          None),
             ("Alt+Drag",      "Select & copy text (word-level)"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Navigate",      None),
@@ -1510,10 +1607,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Ctrl+Shift+Del","Delete current page"),
             ("Zoom & Pan",    None),
             ("Ctrl+Scroll",   "Zoom in / out"),
-            ("Scroll",        "Pan"),
+            ("Scroll",        "Scroll / pan"),
             ("Ctrl+Drag",     "Pan"),
             ("Shift+Drag",    "Zoom to region"),
-            ("Shift+Click",   "Fit page"),
+            ("Shift+Click",   "Fit page width"),
             ("File",          None),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
@@ -1560,7 +1657,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         w = self.get_width()
         self._pane_init_tries += 1
         if w < 200 and self._pane_init_tries < 20:
-            return True  # retry until window has real width
+            return True
         pos = int(max(w, 1280) * 0.62)
         self._saved_pane_pos = pos
         self._paned.set_position(pos)
@@ -1601,9 +1698,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     def _on_close_request(self, _win):
         if not self._dirty:
-            return False   # allow close
+            return False
         self._ask_save_then(self.destroy)
-        return True        # block default close; destroy() called from dialog
+        return True
 
     def _ask_save_then(self, callback):
         dlg = Adw.AlertDialog.new(
@@ -1621,7 +1718,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 callback()
             elif r == "discard":
                 callback()
-            # cancel: do nothing
         dlg.connect("response", on_response)
         dlg.present(self)
 
@@ -1752,12 +1848,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self._hide_search()
-        self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
+        self.canvas.load(path)
         self._obsidian_btn.set_sensitive(True)
         self._clear_dirty()
 
     def _open_markdown(self, md_path):
-        # If there's an associated PDF (e.g. lecture-notes.md → lecture.pdf), open it.
         pdf_path = None
         if md_path.endswith("-notes.md"):
             candidate = md_path[:-len("-notes.md")] + ".pdf"
@@ -1766,7 +1861,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         if pdf_path:
             self.open_file(pdf_path)
             return
-        # Notes-only mode: no PDF, load markdown directly into notes panel.
         self._path = None
         self._notes_path = md_path
         self.set_title(f"Sidemark — {os.path.basename(md_path)}")
@@ -1774,7 +1868,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.notes_model.load(md_path)
         self._page_label.set_label("—")
         self._obsidian_btn.set_sensitive(True)
-        # Show page 0 notes; canvas stays in "no PDF" placeholder state.
         self._notes_view.get_buffer().set_text(self.notes_model.get(0))
 
     def _on_new_pdf(self, _btn):
@@ -1784,14 +1877,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._create_blank()
 
     def _create_blank(self):
-        """Open a blank A4 page — user will be prompted for a name on first save."""
         fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="sidemark_blank_")
         os.close(fd)
         surf = cairo.PDFSurface(tmp, 595, 842)
         cairo.Context(surf).show_page()
         surf.finish()
         self._do_open_file(tmp)
-        self._path = tmp           # track temp file so canvas.save() works
+        self._path = tmp
         self._is_untitled = True
         self.set_title("Sidemark — Untitled")
         self._clear_dirty()
@@ -1817,7 +1909,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             if not path.lower().endswith(".pdf"):
                 path += ".pdf"
             import shutil
-            shutil.copy2(self._path, path)   # copy blank/temp as starting point
+            shutil.copy2(self._path, path)
             old_tmp = self._path if self._is_untitled else None
             self._path = path
             self._is_untitled = False
@@ -1990,7 +2082,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self.canvas.queue_draw()
             return
         self._search_entry.remove_css_class("error")
-        # Start from the first match on or after the current page
         cur = self.canvas.current_page_idx
         start = next((k for k, (pi, _) in enumerate(self._search_matches) if pi >= cur), 0)
         self._go_to_match(start)
@@ -2013,7 +2104,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         page_idx, _ = self._search_matches[self._search_current]
         if page_idx != self.canvas.current_page_idx:
             self._commit_note()
-            self.canvas.go_to_page(page_idx)  # fires _on_page_changed → _update_search_canvas
+            self.canvas.go_to_page(page_idx)
         else:
             self._update_search_canvas()
         self._search_label.set_label(f"{self._search_current + 1} / {n}")
