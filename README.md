@@ -102,6 +102,22 @@ pip install pymupdf
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
 
+### Inline math (notes)
+
+Rendered on non-cursor lines; raw syntax restored when you move the cursor back to edit.
+
+| Syntax | Renders as |
+|--------|-----------|
+| `x^2` or `x^{n+1}` | superscript (until next space, or braced) |
+| `x_ij` or `x_{i,j}` | subscript (until next space, or braced) |
+| `\alpha` `\beta` … `\omega` | Greek letters (α β … ω) |
+| `\sum` `\prod` `\int` | Σ Π ∫ |
+| `\infty` `\approx` `\neq` `\leq` `\geq` | ∞ ≈ ≠ ≤ ≥ |
+| `\in` `\notin` `\subset` `\cup` `\cap` `\emptyset` | ∈ ∉ ⊂ ∪ ∩ ∅ |
+| `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
+
+Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and any Markdown viewer.
+
 ### Search
 
 | Key | Action |

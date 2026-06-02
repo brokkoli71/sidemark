@@ -870,6 +870,31 @@ class MarkdownNotesView(GtkSource.View):
     # Italic uses [^*\n] to prevent matching across ** markers or newlines.
     _INLINE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
 
+    # Super/subscript: ^{content} or ^x  /  _{content} or _x
+    _SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
+
+    # Symbol substitution table
+    _SYMBOLS = {
+        r'\sum': 'Σ', r'\prod': 'Π', r'\int': '∫',
+        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+        r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+        r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
+        r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
+        r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
+        r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+        r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
+        r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
+        r'\Psi': 'Ψ', r'\Omega': 'Ω',
+        r'\infty': '∞', r'\approx': '≈', r'\neq': '≠',
+        r'\leq': '≤', r'\geq': '≥', r'\pm': '±', r'\times': '×',
+        r'\div': '÷', r'\cdot': '·', r'\to': '→', r'\gets': '←',
+        r'\in': '∈', r'\notin': '∉', r'\subset': '⊂', r'\supset': '⊃',
+        r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅',
+        r'\forall': '∀', r'\exists': '∃',
+        r'\partial': '∂', r'\nabla': '∇',
+    }
+    _SYMBOL_RE = re.compile(r'\\([A-Za-z]+)')
+
     def __init__(self, scheme_id="Adwaita"):
         buf = GtkSource.Buffer()
         super().__init__(buffer=buf)
@@ -895,19 +920,23 @@ class MarkdownNotesView(GtkSource.View):
             return tg
 
         self._t = {
-            "h1":     tag("h1",     weight=700, scale=1.5),
-            "h2":     tag("h2",     weight=700, scale=1.25),
-            "h3":     tag("h3",     weight=600, scale=1.1),
-            "bold":   tag("bold",   weight=700),
-            "italic": tag("italic", style=2),   # Pango.Style.ITALIC
-            "code":   tag("code",   family="monospace",
-                          background="#2d2d2d" if is_dark else "#f0f0f0",
-                          foreground="#e06c75" if is_dark else "#c0392b"),
-            "hide":   tag("hide",   invisible=True),
+            "h1":          tag("h1",          weight=700, scale=1.5),
+            "h2":          tag("h2",          weight=700, scale=1.25),
+            "h3":          tag("h3",          weight=600, scale=1.1),
+            "bold":        tag("bold",        weight=700),
+            "italic":      tag("italic",      style=2),   # Pango.Style.ITALIC
+            "code":        tag("code",        family="monospace",
+                               background="#2d2d2d" if is_dark else "#f0f0f0",
+                               foreground="#e06c75" if is_dark else "#c0392b"),
+            "hide":        tag("hide",        invisible=True),
+            "superscript": tag("superscript", rise=4000,  scale=0.65),
+            "subscript":   tag("subscript",   rise=-2000, scale=0.65),
         }
 
         self._cursor_line = 0
         self._rehighlight_id = None
+        self._in_highlight = False
+        self._line_originals: dict[int, str] = {}
         buf.connect("notify::cursor-position", self._on_cursor_moved)
         buf.connect("changed", self._on_changed)
 
@@ -1013,7 +1042,8 @@ class MarkdownNotesView(GtkSource.View):
             self._schedule()
 
     def _on_changed(self, _buf):
-        self._schedule()
+        if not self._in_highlight:
+            self._schedule()
 
     def _schedule(self):
         if self._rehighlight_id is not None:
@@ -1022,19 +1052,69 @@ class MarkdownNotesView(GtkSource.View):
 
     # ── rendering ─────────────────────────────────────────────────────────────
 
+    def _apply_symbol_subs(self, text):
+        def _repl(m):
+            return self._SYMBOLS.get('\\' + m.group(1), m.group(0))
+        return self._SYMBOL_RE.sub(_repl, text)
+
+    def _buf_replace_line(self, buf, ln, new_text):
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        self._in_highlight = True
+        try:
+            buf.delete(ls, le)
+            ins = buf.get_iter_at_line(ln)[1]
+            buf.insert(ins, new_text)
+        finally:
+            self._in_highlight = False
+
+    def _restore_line(self, buf, ln):
+        original = self._line_originals.pop(ln, None)
+        if original is None:
+            return
+        ok, ls = buf.get_iter_at_line(ln)
+        if not ok:
+            return
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        if buf.get_text(ls, le, False) != original:
+            self._buf_replace_line(buf, ln, original)
+
     def _rehighlight(self):
         self._rehighlight_id = None
         buf = self.get_buffer()
+        self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+
+        # Restore cursor line before clearing tags so its text is editable
+        self._restore_line(buf, self._cursor_line)
+
         s, e = buf.get_start_iter(), buf.get_end_iter()
         for tg in self._t.values():
             buf.remove_tag(tg, s, e)
-        self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+
         for ln in range(buf.get_line_count()):
-            ls = buf.get_iter_at_line(ln)[1]
+            ok, ls = buf.get_iter_at_line(ln)
+            if not ok:
+                continue
             le = ls.copy()
             if not le.ends_line():
                 le.forward_to_line_end()
-            self._highlight_line(buf, ls, ln, buf.get_text(ls, le, False))
+            text = buf.get_text(ls, le, False)
+
+            if ln != self._cursor_line and ln not in self._line_originals:
+                subbed = self._apply_symbol_subs(text)
+                if subbed != text:
+                    self._line_originals[ln] = text
+                    self._buf_replace_line(buf, ln, subbed)
+                    ls = buf.get_iter_at_line(ln)[1]
+                    text = subbed
+
+            self._highlight_line(buf, ls, ln, text)
         return False
 
     def _highlight_line(self, buf, ls, ln, text):
@@ -1073,6 +1153,19 @@ class MarkdownNotesView(GtkSource.View):
                 apply("code", a, b)
                 hide(a, a + 1)
                 hide(b - 1, b)
+
+        # Super/subscripts: ^{ab} ^x  _{ab} _x  — only rendered off cursor line
+        if not on_cursor:
+            for m in self._SCRIPT_RE.finditer(text):
+                a, b = m.start(), m.end()
+                tag_name = "superscript" if m.group(1) == '^' else "subscript"
+                if m.group(2) is not None:   # braced: ^{content}
+                    apply("hide", a, a + 2)  # hide ^{ or _{
+                    apply(tag_name, a + 2, b - 1)
+                    apply("hide", b - 1, b)  # hide }
+                else:                        # single char: ^x or _x
+                    apply("hide", a, a + 1)  # hide ^ or _
+                    apply(tag_name, a + 1, b)
 
 
 class PDFEditorWindow(Gtk.ApplicationWindow):

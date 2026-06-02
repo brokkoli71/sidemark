@@ -641,5 +641,97 @@ class TestMarkdownFormatting(unittest.TestCase):
         self.assertEqual(buf.get_text(s, e, False), "world")
 
 
+class TestLatexFormatting(unittest.TestCase):
+
+    def _view(self):
+        from sidemark import MarkdownNotesView
+        return MarkdownNotesView()
+
+    # ── symbol substitution ───────────────────────────────────────────────────
+
+    def test_symbol_sub_single(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\alpha'), 'α')
+
+    def test_symbol_sub_in_sentence(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'let \alpha = 1'), 'let α = 1')
+
+    def test_symbol_sub_multiple(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\alpha + \beta'), 'α + β')
+
+    def test_symbol_sub_unknown_unchanged(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\frac'), r'\frac')
+
+    def test_symbol_sub_no_backslash_unchanged(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs('alpha'), 'alpha')
+
+    # ── script regex ──────────────────────────────────────────────────────────
+
+    def test_script_re_single_sup(self):
+        from sidemark import MarkdownNotesView
+        m = MarkdownNotesView._SCRIPT_RE.search('x^2')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), '^')
+        self.assertEqual(m.group(3), '2')
+
+    def test_script_re_multi_sup(self):
+        from sidemark import MarkdownNotesView
+        m = MarkdownNotesView._SCRIPT_RE.search('x^ab')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(3), 'ab')
+
+    def test_script_re_braced_sup(self):
+        from sidemark import MarkdownNotesView
+        m = MarkdownNotesView._SCRIPT_RE.search('x^{n+1}')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(2), 'n+1')
+
+    def test_script_re_sub(self):
+        from sidemark import MarkdownNotesView
+        m = MarkdownNotesView._SCRIPT_RE.search('x_ij')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), '_')
+        self.assertEqual(m.group(3), 'ij')
+
+    def test_script_re_breaks_at_space(self):
+        from sidemark import MarkdownNotesView
+        m = MarkdownNotesView._SCRIPT_RE.search('x^ab cd')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(3), 'ab')   # stops before space
+
+    def test_symbol_buffer_substitution(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\sum_{i=1}^n')
+        # Move cursor to line 1 (a different line) so line 0 is substituted
+        buf.insert(buf.get_end_iter(), '\nother line')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        # Trigger rehighlight synchronously
+        v._rehighlight()
+        ok, ls = buf.get_iter_at_line(0)
+        le = ls.copy(); le.forward_to_line_end()
+        result = buf.get_text(ls, le, False)
+        self.assertIn('Σ', result)
+        self.assertNotIn(r'\sum', result)
+
+    def test_symbol_restored_on_cursor_enter(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\alpha' + '\nother')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        v._rehighlight()
+        # Now move cursor back to line 0
+        buf.place_cursor(buf.get_iter_at_line(0)[1])
+        v._rehighlight()
+        ok, ls = buf.get_iter_at_line(0)
+        le = ls.copy(); le.forward_to_line_end()
+        result = buf.get_text(ls, le, False)
+        self.assertEqual(result, r'\alpha')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
