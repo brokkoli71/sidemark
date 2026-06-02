@@ -473,6 +473,7 @@ class TestTheme(unittest.TestCase):
         self.assertIn("accent", theme)
         self.assertTrue(theme["background"].startswith("#"))
 
+    @mock.patch("sys.platform", "linux")
     def test_load_theme_parses_toml_values(self):
         from sidemark import _load_theme
         import tempfile, unittest.mock as mock
