@@ -59,6 +59,10 @@ check_py "import cairo" \
 check_py "import gi; gi.require_version('GtkSource','5'); from gi.repository import GtkSource" \
     "gtksourceview5" "gtksourceview5"
 
+if ! find /usr/share/icons/Adwaita -name "go-next-symbolic*" 2>/dev/null | grep -q .; then
+    warn "adwaita-icon-theme not found — icons may be missing.  →  sudo pacman -S adwaita-icon-theme"
+fi
+
 ok "All required dependencies present."
 
 if command -v rsvg-convert >/dev/null 2>&1; then
