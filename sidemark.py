@@ -269,7 +269,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 + self.offset_y)
 
     def _fit_width(self):
-        """Fit all pages to canvas width; scroll to current page."""
+        """Fit all pages to canvas width; scroll to current page top."""
         w = self.get_width() or 800
         if not self._page_sizes:
             if self.page_width:
@@ -281,6 +281,26 @@ class PDFCanvas(Gtk.DrawingArea):
         self.offset_x = (w - max_pw * self.scale) / 2
         i = self.current_page_idx
         self.scroll_y = self._page_pdf_tops[i] * self.scale + i * _PAGE_GAP
+
+    def _fit_page(self):
+        """Fit current page to fill the canvas (match both width and height)."""
+        w = self.get_width() or 800
+        h = self.get_height() or 600
+        if not self._page_sizes:
+            if self.page_width and self.page_height:
+                self.scale = min(w / self.page_width, h / self.page_height) * 0.95
+                self.offset_x = (w - self.page_width * self.scale) / 2
+            return
+        i = self.current_page_idx
+        pw, ph = self._page_sizes[i]
+        self.scale = min(w / pw, h / ph) * 0.95
+        self.offset_x = (w - pw * self.scale) / 2
+        # Scroll so the current page is vertically centred in the viewport
+        page_top_desired = (h - ph * self.scale) / 2
+        self.scroll_y = (self.offset_y
+                         + self._page_pdf_tops[i] * self.scale
+                         + i * _PAGE_GAP
+                         - page_top_desired)
 
     def _update_current_page(self):
         """Update current_page_idx to the most-visible page and fire callback."""
@@ -804,7 +824,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def zoom_to_fit(self):
         self._zoom_stack.clear()
-        self._fit_width()
+        self._fit_page()
         self._schedule_rerender()
         self.queue_draw()
 
