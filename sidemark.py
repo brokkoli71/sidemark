@@ -740,11 +740,49 @@ class PDFCanvas(Gtk.DrawingArea):
 
 
 def _load_theme():
-    """Read background/foreground/accent — tries Omarchy, then GNOME, then KDE."""
+    """Read background/foreground/accent — tries macOS, then Omarchy, then GNOME, then KDE."""
     defaults = {
         "background": "#fdf6ee", "foreground": "#22211d", "accent": "#85b34c",
         "color1": "#df2b0d", "color3": "#8a6c3e", "color6": "#3d6b52", "color8": "#a09080",
     }
+
+    # ── macOS ─────────────────────────────────────────────────────────────────
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+
+            def _defaults(key):
+                r = subprocess.run(
+                    ["defaults", "read", "-g", key],
+                    capture_output=True, text=True, timeout=1,
+                )
+                return r.stdout.strip() if r.returncode == 0 else None
+
+            # Dark / light mode
+            if _defaults("AppleInterfaceStyle") == "Dark":
+                defaults["background"] = "#1e1e1e"
+                defaults["foreground"] = "#e5e5e5"
+
+            # Accent colour  (integer → hex)
+            _MACOS_ACCENTS = {
+                "-1": "#8e8e93",   # graphite
+                "0":  "#ff3b30",   # red
+                "1":  "#ff9500",   # orange
+                "2":  "#ffcc00",   # yellow
+                "3":  "#34c759",   # green
+                "4":  "#007aff",   # blue (system default)
+                "5":  "#af52de",   # purple
+                "6":  "#ff2d55",   # pink
+            }
+            accent_raw = _defaults("AppleAccentColor")
+            if accent_raw in _MACOS_ACCENTS:
+                defaults["accent"] = _MACOS_ACCENTS[accent_raw]
+            else:
+                defaults["accent"] = _MACOS_ACCENTS["4"]  # blue fallback
+
+            return defaults   # macOS wins outright
+        except Exception:
+            pass
 
     # ── Omarchy ───────────────────────────────────────────────────────────────
     omarchy = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")

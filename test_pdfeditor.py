@@ -641,5 +641,106 @@ class TestMarkdownFormatting(unittest.TestCase):
         self.assertEqual(buf.get_text(s, e, False), "world")
 
 
+
+# ── macOS theme detection ─────────────────────────────────────────────────────
+
+class TestMacOSTheme(unittest.TestCase):
+    """Tests for the macOS branch of _load_theme().
+
+    All tests mock subprocess.run so they run correctly on Linux CI.
+    """
+
+    def _load_theme(self):
+        from sidemark import _load_theme
+        return _load_theme
+
+    def _mock_defaults(self, interface_style=None, accent_color=None):
+        """Return a side_effect for subprocess.run that simulates macOS defaults."""
+        def side_effect(cmd, **kwargs):
+            result = mock.Mock()
+            if cmd == ["defaults", "read", "-g", "AppleInterfaceStyle"]:
+                if interface_style is not None:
+                    result.returncode = 0
+                    result.stdout = interface_style + "\n"
+                else:
+                    result.returncode = 1
+                    result.stdout = ""
+            elif cmd == ["defaults", "read", "-g", "AppleAccentColor"]:
+                if accent_color is not None:
+                    result.returncode = 0
+                    result.stdout = str(accent_color) + "\n"
+                else:
+                    result.returncode = 1
+                    result.stdout = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+        return side_effect
+
+    @mock.patch("sys.platform", "darwin")
+    def test_dark_mode_detected(self):
+        with mock.patch("subprocess.run", side_effect=self._mock_defaults(interface_style="Dark")):
+            theme = self._load_theme()()
+        self.assertEqual(theme["background"], "#1e1e1e")
+        self.assertEqual(theme["foreground"], "#e5e5e5")
+
+    @mock.patch("sys.platform", "darwin")
+    def test_light_mode_keeps_defaults(self):
+        # AppleInterfaceStyle absent (light mode — key doesn't exist)
+        with mock.patch("subprocess.run", side_effect=self._mock_defaults(interface_style=None)):
+            theme = self._load_theme()()
+        self.assertEqual(theme["background"], "#fdf6ee")   # default light bg
+        self.assertEqual(theme["foreground"], "#22211d")
+
+    @mock.patch("sys.platform", "darwin")
+    def test_accent_blue_default(self):
+        # No AppleAccentColor key → falls back to blue (#007aff)
+        with mock.patch("subprocess.run", side_effect=self._mock_defaults()):
+            theme = self._load_theme()()
+        self.assertEqual(theme["accent"], "#007aff")
+
+    @mock.patch("sys.platform", "darwin")
+    def test_accent_graphite(self):
+        with mock.patch("subprocess.run", side_effect=self._mock_defaults(accent_color=-1)):
+            theme = self._load_theme()()
+        self.assertEqual(theme["accent"], "#8e8e93")
+
+    @mock.patch("sys.platform", "darwin")
+    def test_accent_green(self):
+        with mock.patch("subprocess.run", side_effect=self._mock_defaults(accent_color=3)):
+            theme = self._load_theme()()
+        self.assertEqual(theme["accent"], "#34c759")
+
+    @mock.patch("sys.platform", "darwin")
+    def test_accent_purple(self):
+        with mock.patch("subprocess.run", side_effect=self._mock_defaults(accent_color=5)):
+            theme = self._load_theme()()
+        self.assertEqual(theme["accent"], "#af52de")
+
+    @mock.patch("sys.platform", "darwin")
+    def test_subprocess_exception_falls_through(self):
+        # If subprocess.run raises, _load_theme must still return a valid dict
+        with mock.patch("subprocess.run", side_effect=OSError("no defaults")):
+            theme = self._load_theme()()
+        self.assertIn("background", theme)
+        self.assertIn("accent", theme)
+
+    @mock.patch("sys.platform", "linux")
+    def test_macos_block_skipped_on_linux(self):
+        # On Linux the darwin branch must not run; subprocess.run should never
+        # be called for "defaults read" commands.
+        called_cmds = []
+        def track(cmd, **kwargs):
+            called_cmds.append(cmd)
+            r = mock.Mock(); r.returncode = 1; r.stdout = ""
+            return r
+        with mock.patch("subprocess.run", side_effect=track):
+            theme = self._load_theme()()
+        darwin_calls = [c for c in called_cmds if c and c[0] == "defaults"]
+        self.assertEqual(darwin_calls, [])
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
