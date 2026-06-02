@@ -9,8 +9,10 @@ import math
 import tempfile
 import unittest
 
-# Prevent GTK from trying to connect to a display
-os.environ.setdefault("GDK_BACKEND", "offscreen")
+# On Linux use the offscreen backend so no compositor is needed.
+# macOS doesn't have this backend — let GTK use its default (Quartz).
+if sys.platform != "darwin":
+    os.environ.setdefault("GDK_BACKEND", "offscreen")
 
 import gi
 gi.require_version("Gtk", "4.0")
