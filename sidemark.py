@@ -10,7 +10,7 @@ import logging
 import atexit
 import urllib.parse
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
 _log_path = None
 logger = logging.getLogger(__name__)
 
