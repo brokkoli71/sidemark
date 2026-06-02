@@ -21,12 +21,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y \
             python3 python3-gi python3-gi-cairo \
-            python3-pymupdf python3-numpy \
+            python3-numpy \
             gir1.2-gtk-4.0 gir1.2-adw-1 \
             gir1.2-gtksource-5 \
             libgtk-4-1 libadwaita-1-0 \
             libgtksourceview-5-0 \
             weston
+          pip install pymupdf
 
       - name: Start headless Wayland compositor
         run: |
@@ -61,12 +62,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y \
             python3 python3-gi python3-gi-cairo \
-            python3-pymupdf python3-numpy \
+            python3-numpy \
             gir1.2-gtk-4.0 gir1.2-adw-1 \
             gir1.2-gtksource-5 \
             libgtk-4-1 libadwaita-1-0 \
             libgtksourceview-5-0 \
             librsvg2-bin
+          pip install pymupdf
 
       - name: Run install.sh
         run: ./install.sh
