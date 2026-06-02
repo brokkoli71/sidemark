@@ -1,0 +1,8 @@
+# Sidemark macOS dependencies
+# Install with: brew bundle --file macos/Brewfile
+
+brew "pygobject3"
+brew "gtk4"
+brew "libadwaita"
+brew "gtksourceview5"
+brew "python-numpy"

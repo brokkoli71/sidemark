@@ -93,3 +93,17 @@ jobs:
           test ! -x "$HOME/.local/bin/sidemark"                                            && echo "✓ wrapper gone"
           test ! -f "$HOME/.local/share/applications/de.hspitz.sidemark.desktop"           && echo "✓ .desktop gone"
           test ! -f "$HOME/.local/share/icons/hicolor/scalable/apps/de.hspitz.sidemark.svg" && echo "✓ icon gone"
+
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install pygobject3 gtk4 libadwaita gtksourceview5 numpy
+          pip3 install --break-system-packages pymupdf
+
+      - name: Run tests
+        run: python3 test_pdfeditor.py -v
