@@ -83,6 +83,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._anchors = {}         # {page_idx: [(x, y), ...]}
         self._active_anchors = set()  # indices highlighted on current page
 
+        self.search_rects = []          # fitz.Rect hits for current page
+        self.search_current_rect = None # the active match rect
+
         # zoom-to-region state
         self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
         self._zoom_selecting = False
@@ -337,6 +340,20 @@ class PDFCanvas(Gtk.DrawingArea):
                 ext = ctx.text_extents(label)
                 ctx.move_to(ax - ext.width / 2 - ext.x_bearing, ay - ext.height / 2 - ext.y_bearing)
                 ctx.show_text(label)
+            ctx.restore()
+
+        # search highlights
+        if self.search_rects:
+            ctx.save()
+            ctx.translate(self.offset_x, self.offset_y)
+            ctx.scale(self.scale, self.scale)
+            for rect in self.search_rects:
+                if rect == self.search_current_rect:
+                    ctx.set_source_rgba(1.0, 0.55, 0.0, 0.55)
+                else:
+                    ctx.set_source_rgba(1.0, 0.88, 0.0, 0.40)
+                ctx.rectangle(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0)
+                ctx.fill()
             ctx.restore()
 
         # word-selection highlights
@@ -1069,6 +1086,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._suppress_dirty = False
         self.notes_model = NotesModel()
         self._anchor_line_nos = []  # line number in buffer for each anchor on current page
+        self._search_hits = {}      # {page_idx: [fitz.Rect, ...]}
+        self._search_matches = []   # [(page_idx, rect_idx), ...] flat list
+        self._search_current = -1   # index into _search_matches
 
         theme = _load_theme()
         bg = _hex_to_rgb(theme["background"])
@@ -1306,10 +1326,61 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         notes_scroll.set_child(self._notes_view)
         self._notes_box.append(notes_scroll)
 
+        # ── search bar ────────────────────────────────────────────────────────
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        search_box.set_margin_start(6)
+        search_box.set_margin_end(6)
+        search_box.set_margin_top(4)
+        search_box.set_margin_bottom(4)
+
+        self._search_entry = Gtk.SearchEntry()
+        self._search_entry.set_hexpand(True)
+        self._search_entry.set_placeholder_text("Search in PDF…")
+        self._search_entry.connect("search-changed", self._on_search_changed)
+        self._search_entry.connect("stop-search", lambda _: self._hide_search())
+        self._search_entry.connect("activate", lambda _: self._search_next())
+
+        search_key = Gtk.EventControllerKey()
+        search_key.connect("key-pressed", self._on_search_key)
+        self._search_entry.add_controller(search_key)
+
+        search_prev_btn = Gtk.Button()
+        search_prev_btn.set_icon_name("go-up-symbolic")
+        search_prev_btn.set_tooltip_text("Previous match")
+        search_prev_btn.connect("clicked", lambda _: self._search_prev())
+
+        search_next_btn = Gtk.Button()
+        search_next_btn.set_icon_name("go-down-symbolic")
+        search_next_btn.set_tooltip_text("Next match")
+        search_next_btn.connect("clicked", lambda _: self._search_next())
+
+        self._search_label = Gtk.Label(label="")
+        self._search_label.add_css_class("dim-label")
+        self._search_label.set_width_chars(7)
+
+        search_close_btn = Gtk.Button()
+        search_close_btn.set_icon_name("window-close-symbolic")
+        search_close_btn.connect("clicked", lambda _: self._hide_search())
+
+        search_box.append(self._search_entry)
+        search_box.append(search_prev_btn)
+        search_box.append(search_next_btn)
+        search_box.append(self._search_label)
+        search_box.append(search_close_btn)
+
+        self._search_revealer = Gtk.Revealer()
+        self._search_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._search_revealer.set_child(search_box)
+        self._search_revealer.set_reveal_child(False)
+
+        canvas_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        canvas_box.append(self._search_revealer)
+        canvas_box.append(self.canvas)
+
         # ── split pane ────────────────────────────────────────────────────────
         self._saved_pane_pos = 800
         self._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self._paned.set_start_child(self.canvas)
+        self._paned.set_start_child(canvas_box)
         self._paned.set_resize_start_child(True)
         self._paned.set_shrink_start_child(False)
         self._paned.set_end_child(self._notes_box)
@@ -1351,6 +1422,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Shift+Drag",    "Zoom to region"),
             ("Shift+Click",   "Fit page"),
             ("File",          None),
+            ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+\\",       "Toggle notes"),
         ]
@@ -1465,6 +1537,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _on_page_changed(self, idx, n):
         self._page_label.set_label(f"{idx + 1} / {n}")
         self._restore_note()
+        self._update_search_canvas()
 
     def _go_to_page(self, idx):
         self._commit_note()
@@ -1585,6 +1658,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.set_title(f"Sidemark — {os.path.basename(path)}")
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
+        self._hide_search()
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._obsidian_btn.set_sensitive(True)
         self._clear_dirty()
@@ -1745,6 +1819,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     def _on_key(self, ctrl, keyval, keycode, state):
         if state & Gdk.ModifierType.CONTROL_MASK:
+            if keyval == Gdk.KEY_f:
+                self._show_search()
+                return True
             if keyval == Gdk.KEY_s:
                 self._on_save()
                 return True
@@ -1767,6 +1844,97 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._go_to_page(self.canvas.current_page_idx - 1)
             return True
         return False
+
+
+    # ── search ────────────────────────────────────────────────────────────────
+
+    def _show_search(self):
+        self._search_revealer.set_reveal_child(True)
+        self._search_entry.grab_focus()
+
+    def _hide_search(self):
+        self._search_revealer.set_reveal_child(False)
+        self._search_entry.set_text("")
+        self._search_hits = {}
+        self._search_matches = []
+        self._search_current = -1
+        self._search_label.set_label("")
+        self.canvas.search_rects = []
+        self.canvas.search_current_rect = None
+        self.canvas.queue_draw()
+
+    def _on_search_key(self, ctrl, keyval, keycode, state):
+        if keyval == Gdk.KEY_Up:
+            self._search_prev()
+            return True
+        if keyval == Gdk.KEY_Down:
+            self._search_next()
+            return True
+        return False
+
+    def _on_search_changed(self, entry):
+        query = entry.get_text()
+        self._search_hits = {}
+        self._search_matches = []
+        self._search_current = -1
+        if not query or not self.canvas.document:
+            self._search_label.set_label("")
+            self.canvas.search_rects = []
+            self.canvas.search_current_rect = None
+            self.canvas.queue_draw()
+            return
+        for i in range(self.canvas.n_pages):
+            hits = self.canvas.document[i].search_for(query)
+            if hits:
+                self._search_hits[i] = hits
+                for j in range(len(hits)):
+                    self._search_matches.append((i, j))
+        if not self._search_matches:
+            self._search_label.set_label("0 / 0")
+            self._search_entry.add_css_class("error")
+            self.canvas.search_rects = []
+            self.canvas.search_current_rect = None
+            self.canvas.queue_draw()
+            return
+        self._search_entry.remove_css_class("error")
+        # Start from the first match on or after the current page
+        cur = self.canvas.current_page_idx
+        start = next((k for k, (pi, _) in enumerate(self._search_matches) if pi >= cur), 0)
+        self._go_to_match(start)
+
+    def _search_next(self):
+        if not self._search_matches:
+            return
+        self._go_to_match(self._search_current + 1)
+
+    def _search_prev(self):
+        if not self._search_matches:
+            return
+        self._go_to_match(self._search_current - 1)
+
+    def _go_to_match(self, idx):
+        n = len(self._search_matches)
+        if n == 0:
+            return
+        self._search_current = idx % n
+        page_idx, _ = self._search_matches[self._search_current]
+        if page_idx != self.canvas.current_page_idx:
+            self._commit_note()
+            self.canvas.go_to_page(page_idx)  # fires _on_page_changed → _update_search_canvas
+        else:
+            self._update_search_canvas()
+        self._search_label.set_label(f"{self._search_current + 1} / {n}")
+
+    def _update_search_canvas(self):
+        page_idx = self.canvas.current_page_idx
+        self.canvas.search_rects = list(self._search_hits.get(page_idx, []))
+        if (self._search_current >= 0 and self._search_matches
+                and self._search_matches[self._search_current][0] == page_idx):
+            pi, ri = self._search_matches[self._search_current]
+            self.canvas.search_current_rect = self._search_hits[pi][ri]
+        else:
+            self.canvas.search_current_rect = None
+        self.canvas.queue_draw()
 
 
 class PDFEditorApp(Adw.Application):
