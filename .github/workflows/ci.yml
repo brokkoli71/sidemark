@@ -102,8 +102,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install pygobject3 gtk4 libadwaita gtksourceview5
-          pip3 install pymupdf numpy
+          brew install pygobject3 gtk4 libadwaita gtksourceview5 python-numpy
+          pip3 install --break-system-packages pymupdf
 
       - name: Run tests
         run: python3 test_pdfeditor.py -v
