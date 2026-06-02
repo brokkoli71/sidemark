@@ -7,7 +7,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 ## Features
 
 - **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable by right-click-dragging
-- **Live markdown notes** linked to PDF pages
+- **Live markdown notes** linked to PDF pages, with anchor markers to pin notes to specific spots
 - **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
 - **Add and delete pages** — insert blank pages with same dimensions
 - **Text selection** — Alt+drag highlights words and copies them to the clipboard
@@ -99,6 +99,7 @@ pip install pymupdf
 | `Ctrl+I` | Italic selection |
 | `Ctrl+E` | Inline code selection |
 | `Ctrl+\` | Toggle notes panel |
+| `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
 
 ### File
 
@@ -108,4 +109,4 @@ pip install pymupdf
 
 ## Notes format
 
-Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault.
+Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault. Anchor markers (`<!-- anchor:X:Y -->`) are stored the same way — invisible in external viewers, but displayed as numbered circles on the PDF canvas inside Sidemark.

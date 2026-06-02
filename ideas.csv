@@ -13,3 +13,4 @@
 12,Unsaved changes dialog,Done,Done,Intercepts close-request and open-file when dirty; Save / Discard / Cancel.
 13,LaTeX formula rendering in notes,Hard,Open,Requires matplotlib mathtext → Cairo pixmap → TextBuffer child anchor; manageable but needs TextMark bookkeeping for cursor-show/hide like Typora.
 14,Multi-page PDF export / reorder pages,Easy,Open,PyMuPDF: doc.copy_page / doc.move_page. Drag-to-reorder would need a separate page-thumbnail sidebar widget.
+15,Anchor markers linking notes to PDF spots,Easy,Done,Ctrl+Alt+click inserts <!-- anchor:X:Y --> at notes cursor; numbered circles drawn on canvas. Stored invisibly in the sidecar .md file. Cursor line in notes highlights the corresponding marker on the PDF; clicking a marker jumps the notes cursor to its line.

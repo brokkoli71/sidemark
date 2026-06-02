@@ -74,9 +74,14 @@ class PDFCanvas(Gtk.DrawingArea):
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
-        self.on_page_changed = None  # callback(current_idx, n_pages)
-        self.on_nav_button = None    # callback(delta: int) for back/forward buttons
-        self.on_change = None        # callback() whenever strokes are modified
+        self.on_page_changed = None    # callback(current_idx, n_pages)
+        self.on_nav_button = None     # callback(delta: int) for back/forward buttons
+        self.on_change = None         # callback() whenever strokes are modified
+        self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
+        self.on_anchor_clicked = None  # callback(anchor_index)
+
+        self._anchors = {}         # {page_idx: [(x, y), ...]}
+        self._active_anchors = set()  # indices highlighted on current page
 
         # zoom-to-region state
         self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
@@ -138,6 +143,11 @@ class PDFCanvas(Gtk.DrawingArea):
         thumb.connect("begin", self._on_thumb_begin)
         thumb.connect("end", self._on_thumb_end)
         self.add_controller(thumb)
+
+        click = Gtk.GestureClick.new()
+        click.set_button(1)
+        click.connect("pressed", self._on_click_pressed)
+        self.add_controller(click)
 
 
     # ── page management ──────────────────────────────────────────────────────
@@ -304,6 +314,31 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
         ctx.restore()
 
+        # anchor markers
+        anchors = self._anchors.get(self.current_page_idx, [])
+        if anchors:
+            ctx.save()
+            ctx.translate(self.offset_x, self.offset_y)
+            ctx.scale(self.scale, self.scale)
+            r, g, b = self.zoom_accent
+            radius = 8.0 / self.scale
+            for i, (ax, ay) in enumerate(anchors):
+                if i in self._active_anchors:
+                    ctx.set_source_rgba(r, g, b, 0.3)
+                    ctx.arc(ax, ay, radius * 1.9, 0, 2 * math.pi)
+                    ctx.fill()
+                ctx.set_source_rgba(r, g, b, 0.88)
+                ctx.arc(ax, ay, radius, 0, 2 * math.pi)
+                ctx.fill()
+                ctx.set_source_rgb(1, 1, 1)
+                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(radius * 1.3)
+                label = str(i + 1)
+                ext = ctx.text_extents(label)
+                ctx.move_to(ax - ext.width / 2 - ext.x_bearing, ay - ext.height / 2 - ext.y_bearing)
+                ctx.show_text(label)
+            ctx.restore()
+
         # word-selection highlights
         if self._selected_words:
             ctx.save()
@@ -373,6 +408,24 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
         return True
 
+    def _anchor_hit_test(self, sx, sy):
+        """Return index of anchor circle under screen point, or None."""
+        anchors = self._anchors.get(self.current_page_idx, [])
+        for i, (ax, ay) in enumerate(anchors):
+            scx, scy = self._pdf_to_screen(ax, ay)
+            if math.hypot(sx - scx, sy - scy) <= 10.0:
+                return i
+        return None
+
+    def _on_click_pressed(self, gesture, n_press, x, y):
+        state = gesture.get_current_event_state()
+        if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
+            if self.page is None:
+                return
+            px, py = self._screen_to_pdf(x, y)
+            if self.on_anchor_placed:
+                self.on_anchor_placed(self.current_page_idx, round(px), round(py))
+
     def _on_drag_begin(self, gesture, start_x, start_y):
         if gesture.get_current_button() == 3:
             self._erasing = True
@@ -386,7 +439,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if btn in (8, 9):
             self._ignoring = True
             if self.on_nav_button:
-                self.on_nav_button(-1 if btn == 8 else 1)
+                self.on_nav_button(1 if btn == 8 else -1)
             return
         if btn == 10:
             self._ignoring = True  # GestureSingle owns this sequence
@@ -394,6 +447,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._ignoring = False
         self._erasing = False
         state = gesture.get_current_event_state()
+        if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
+            self._ignoring = True  # anchor placed by GestureClick, suppress drag
+            return
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
             self._pan_start_offset = (self.offset_x, self.offset_y)
@@ -414,6 +470,12 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_selecting = False
             self._text_selecting = False
             self._panning = False
+            hit = self._anchor_hit_test(start_x, start_y)
+            if hit is not None:
+                self._ignoring = True
+                if self.on_anchor_clicked:
+                    self.on_anchor_clicked(hit)
+                return
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
@@ -445,6 +507,7 @@ class PDFCanvas(Gtk.DrawingArea):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
         if self._ignoring:
             self._ignoring = False
+            self.queue_draw()
             return
         if self._erasing:
             self._erasing = False
@@ -1005,6 +1068,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._dirty = False
         self._suppress_dirty = False
         self.notes_model = NotesModel()
+        self._anchor_line_nos = []  # line number in buffer for each anchor on current page
 
         theme = _load_theme()
         bg = _hex_to_rgb(theme["background"])
@@ -1031,6 +1095,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.on_change = self._mark_dirty
         self.canvas.on_text_copied = self._on_text_copied
         self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
+        self.canvas.on_anchor_placed = self._on_anchor_placed
+        self.canvas.on_anchor_clicked = self._on_anchor_clicked
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -1236,6 +1302,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         notes_scroll.set_hexpand(True)
         self._notes_view = MarkdownNotesView(_src_scheme)
         self._notes_view.get_buffer().connect("changed", self._on_notes_changed)
+        self._notes_view.get_buffer().connect("notify::cursor-position", self._on_notes_cursor_moved)
         notes_scroll.set_child(self._notes_view)
         self._notes_box.append(notes_scroll)
 
@@ -1271,6 +1338,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
             ("Text",          None),
             ("Alt+Drag",      "Select & copy text (word-level)"),
+            ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
@@ -1359,6 +1427,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     def _on_notes_changed(self, _buf):
         self._mark_dirty()
+        self._update_canvas_anchors()
 
     def _clear_dirty(self):
         self._dirty = False
@@ -1413,6 +1482,40 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         text = self.notes_model.get(self.canvas.current_page_idx)
         self._notes_view.get_buffer().set_text(text)
         self._suppress_dirty = False
+        self._update_canvas_anchors()
+
+    def _update_canvas_anchors(self):
+        page_idx = self.canvas.current_page_idx
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        matches = list(re.finditer(r'<!--\s*anchor:(\d+):(\d+)\s*-->', text))
+        self.canvas._anchors[page_idx] = [(int(m.group(1)), int(m.group(2))) for m in matches]
+        self._anchor_line_nos = [text[:m.start()].count('\n') for m in matches]
+        self._on_notes_cursor_moved(buf, None)
+
+    def _on_notes_cursor_moved(self, buf, _param):
+        cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+        active = {i for i, ln in enumerate(self._anchor_line_nos) if ln == cursor_line}
+        if active != self.canvas._active_anchors:
+            self.canvas._active_anchors = active
+            self.canvas.queue_draw()
+
+    def _on_anchor_placed(self, page_idx, px, py):
+        buf = self._notes_view.get_buffer()
+        ins = buf.get_iter_at_mark(buf.get_insert())
+        buf.insert(ins, f"<!-- anchor:{px}:{py} -->\n")
+        self._notes_view.grab_focus()
+        self._mark_dirty()
+
+    def _on_anchor_clicked(self, idx):
+        if idx >= len(self._anchor_line_nos):
+            return
+        buf = self._notes_view.get_buffer()
+        _, it = buf.get_iter_at_line(self._anchor_line_nos[idx])
+        buf.place_cursor(it)
+        self._notes_view.scroll_to_mark(buf.get_insert(), 0.1, False, 0.0, 0.0)
+        self._notes_view.grab_focus()
+        self.canvas._active_anchors = {idx}
 
     def _on_notes_toggled(self, btn):
         if btn.get_active():
