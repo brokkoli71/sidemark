@@ -511,6 +511,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._panning = False
             self._text_selecting = False
             self._zoom_selecting = False
+            self._selected_words = []
             self._erase_at(start_x, start_y)
             return
         btn = gesture.get_current_button()
@@ -534,6 +535,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._pan_start_offset = (self.offset_x, self.offset_y)
             self._text_selecting = False
             self._zoom_selecting = False
+            self._selected_words = []
         elif state & Gdk.ModifierType.ALT_MASK:
             self._text_selecting = True
             self._alt_start = (start_x, start_y)
@@ -546,10 +548,12 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_end = (start_x, start_y)
             self._text_selecting = False
             self._panning = False
+            self._selected_words = []
         else:
             self._zoom_selecting = False
             self._text_selecting = False
             self._panning = False
+            self._selected_words = []
             hit = self._anchor_hit_test(start_x, start_y)
             if hit is not None:
                 self._ignoring = True
@@ -634,6 +638,9 @@ class PDFCanvas(Gtk.DrawingArea):
                 if w[0] < rx1 and w[2] > rx0 and w[1] < ry1 and w[3] > ry0]
 
     def _finish_text_selection(self):
+        self.queue_draw()   # highlight stays; copy on Ctrl+C
+
+    def copy_selection(self):
         text = self._words_to_text(self._selected_words)
         self._selected_words = []
         self.queue_draw()
@@ -1598,7 +1605,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Text",          None),
 
             ("Text",          None),
-            ("Alt+Drag",      "Select & copy text (word-level)"),
+            ("Alt+Drag",      "Select text (word-level)"),
+            ("Ctrl+C",        "Copy selected text"),
             ("Alt+Click",     "Open link under cursor"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Navigate",      None),
@@ -2048,6 +2056,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             if keyval == Gdk.KEY_s:
                 self._on_save()
                 return True
+            if keyval == Gdk.KEY_c:
+                if self.canvas._selected_words and not self._notes_view.has_focus():
+                    self.canvas.copy_selection()
+                    return True
             if keyval == Gdk.KEY_z:
                 self.canvas.undo_last()
                 return True
