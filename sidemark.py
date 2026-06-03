@@ -108,8 +108,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
-        # word-level text selection (Alt+drag)
+        # word-level text selection (Alt+drag) and link opening (Alt+click)
         self._text_selecting = False
+        self._alt_start = (0.0, 0.0)
         self._selected_words = []   # fitz word tuples currently highlighted
         self._page_words = []       # cached for current page
         self.on_text_copied = None  # callback(text_or_None)
@@ -473,6 +474,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_selecting = False
         elif state & Gdk.ModifierType.ALT_MASK:
             self._text_selecting = True
+            self._alt_start = (start_x, start_y)
             self._selected_words = []
             self._panning = False
             self._zoom_selecting = False
@@ -533,7 +535,11 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._text_selecting:
             self._text_selecting = False
-            self._finish_text_selection()
+            if abs(offset_x) < 8 and abs(offset_y) < 8:
+                sx, sy = self._alt_start
+                self._open_link_at(sx, sy)
+            else:
+                self._finish_text_selection()
             return
         if self._zoom_selecting:
             if self._zoom_start and self._zoom_end:
@@ -576,6 +582,27 @@ class PDFCanvas(Gtk.DrawingArea):
             Gdk.Display.get_default().get_clipboard().set_content(content)
         if self.on_text_copied:
             self.on_text_copied(text)
+
+    def _open_link_at(self, sx, sy):
+        if not self.page:
+            return
+        px, py = self._screen_to_pdf(sx, sy)
+        for link in self.page.get_links():
+            r = link["from"]
+            if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
+                kind = link.get("kind", 0)
+                if kind == fitz.LINK_URI:
+                    uri = link.get("uri", "")
+                    if uri:
+                        try:
+                            Gio.AppInfo.launch_default_for_uri(uri, None)
+                        except Exception:
+                            pass
+                elif kind == fitz.LINK_GOTO:
+                    page_no = link.get("page", -1)
+                    if page_no >= 0:
+                        self.go_to_page(page_no)
+                break
 
     @staticmethod
     def _words_to_text(words):
@@ -1510,6 +1537,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
             ("Text",          None),
             ("Alt+Drag",      "Select & copy text (word-level)"),
+            ("Alt+Click",     "Open link under cursor"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
