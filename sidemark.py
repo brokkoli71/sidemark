@@ -1178,7 +1178,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._dirty = False
         self._suppress_dirty = False
         self.notes_model = NotesModel()
-        self._anchor_line_nos = []  # line number in buffer for each anchor on current page
+        self._anchor_line_nos = []   # line number in buffer for each anchor on current page
+        self._anchor_para_ends = []  # last line of each anchor's paragraph (until next blank line)
         self._search_hits = {}      # {page_idx: [fitz.Rect, ...]}
         self._search_matches = []   # [(page_idx, rect_idx), ...] flat list
         self._search_current = -1   # index into _search_matches
@@ -1657,11 +1658,22 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         matches = list(re.finditer(r'<!--\s*anchor:(\d+):(\d+)\s*-->', text))
         self.canvas._anchors[page_idx] = [(int(m.group(1)), int(m.group(2))) for m in matches]
         self._anchor_line_nos = [text[:m.start()].count('\n') for m in matches]
+        lines = text.split('\n')
+        n_lines = len(lines)
+        self._anchor_para_ends = []
+        for ln in self._anchor_line_nos:
+            end = n_lines - 1
+            for j in range(ln + 1, n_lines):
+                if not lines[j].strip():
+                    end = j - 1
+                    break
+            self._anchor_para_ends.append(end)
         self._on_notes_cursor_moved(buf, None)
 
     def _on_notes_cursor_moved(self, buf, _param):
         cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
-        active = {i for i, ln in enumerate(self._anchor_line_nos) if ln == cursor_line}
+        active = {i for i, (ln, end) in enumerate(zip(self._anchor_line_nos, self._anchor_para_ends))
+                  if ln <= cursor_line <= end}
         if active != self.canvas._active_anchors:
             self.canvas._active_anchors = active
             self.canvas.queue_draw()
@@ -1669,7 +1681,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _on_anchor_placed(self, page_idx, px, py):
         buf = self._notes_view.get_buffer()
         ins = buf.get_iter_at_mark(buf.get_insert())
-        buf.insert(ins, f"<!-- anchor:{px}:{py} -->\n")
+        buf.insert(ins, f"\n<!-- anchor:{px}:{py} -->\n")
         self._notes_view.grab_focus()
         self._mark_dirty()
 
