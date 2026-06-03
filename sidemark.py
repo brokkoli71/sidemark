@@ -115,6 +115,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._page_words = []       # cached for current page
         self.on_text_copied = None  # callback(text_or_None)
 
+        # link hover hint
+        self._alt_held = False
+        self._hover_x = 0.0
+        self._hover_y = 0.0
+        self._hovered_link_rect = None
+
 
         self.set_draw_func(self._draw)
         self.set_focusable(True)
@@ -151,6 +157,16 @@ class PDFCanvas(Gtk.DrawingArea):
         click.set_button(1)
         click.connect("pressed", self._on_click_pressed)
         self.add_controller(click)
+
+        motion = Gtk.EventControllerMotion.new()
+        motion.connect("motion", self._on_motion)
+        motion.connect("leave",  self._on_motion_leave)
+        self.add_controller(motion)
+
+        key = Gtk.EventControllerKey.new()
+        key.connect("key-pressed",  self._on_alt_key, True)
+        key.connect("key-released", self._on_alt_key, False)
+        self.add_controller(key)
 
 
     # ── page management ──────────────────────────────────────────────────────
@@ -367,6 +383,22 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.fill()
             ctx.restore()
 
+        # hovered link highlight (Alt held)
+        if self._hovered_link_rect is not None:
+            ctx.save()
+            ctx.translate(self.offset_x, self.offset_y)
+            ctx.scale(self.scale, self.scale)
+            r = self._hovered_link_rect
+            ar, ag, ab = self.zoom_accent
+            ctx.set_source_rgba(ar, ag, ab, 0.15)
+            ctx.rectangle(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0)
+            ctx.fill()
+            ctx.set_source_rgba(ar, ag, ab, 0.7)
+            ctx.set_line_width(1.0 / self.scale)
+            ctx.rectangle(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0)
+            ctx.stroke()
+            ctx.restore()
+
         # zoom-selection rubber-band
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
             x1 = min(self._zoom_start[0], self._zoom_end[0])
@@ -433,6 +465,36 @@ class PDFCanvas(Gtk.DrawingArea):
             if math.hypot(sx - scx, sy - scy) <= 10.0:
                 return i
         return None
+
+    def _on_motion(self, _ctrl, x, y):
+        self._hover_x, self._hover_y = x, y
+        self._update_link_hover()
+
+    def _on_motion_leave(self, _ctrl):
+        if self._hovered_link_rect is not None:
+            self._hovered_link_rect = None
+            self.set_cursor(None)
+            self.queue_draw()
+
+    def _on_alt_key(self, _ctrl, keyval, _keycode, _state, pressed):
+        if keyval in (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R):
+            self._alt_held = pressed
+            self._update_link_hover()
+
+    def _update_link_hover(self):
+        new_rect = None
+        if self._alt_held and self.page:
+            px, py = self._screen_to_pdf(self._hover_x, self._hover_y)
+            for link in self.page.get_links():
+                r = link["from"]
+                if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
+                    new_rect = r
+                    break
+        if new_rect == self._hovered_link_rect:
+            return
+        self._hovered_link_rect = new_rect
+        self.set_cursor(Gdk.Cursor.new_from_name("pointer", None) if new_rect else None)
+        self.queue_draw()
 
     def _on_click_pressed(self, gesture, n_press, x, y):
         state = gesture.get_current_event_state()
