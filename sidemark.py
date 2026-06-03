@@ -2027,8 +2027,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _reload(self):
         if not self._path:
             return
+        page = self.canvas.current_page_idx
         def do_reload():
-            subprocess.Popen([sys.executable, os.path.abspath(__file__), self._path])
+            subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                              self._path, "--page", str(page)])
             self.destroy()
         if self._dirty:
             self._ask_save_then(do_reload)
@@ -2168,17 +2170,21 @@ class PDFEditorApp(Adw.Application):
             flags=Gio.ApplicationFlags.NON_UNIQUE,
         )
         self._initial_file = None
+        self._initial_page = 0
 
     def do_activate(self):
         win = PDFEditorWindow(self)
         win.present()
         if self._initial_file:
             win.open_file(self._initial_file)
+            if self._initial_page > 0:
+                win._go_to_page(self._initial_page)
         else:
             GLib.idle_add(win._open_scratchpad)
 
-    def run_with_file(self, path):
+    def run_with_file(self, path, page=0):
         self._initial_file = path
+        self._initial_page = page
         return self.run([])
 
 
@@ -2187,13 +2193,21 @@ def main():
     verbose = "--verbose" in args or "-v" in args
     args = [a for a in args if a not in ("--verbose", "-v")]
     _setup_logging(verbose=verbose)
+    initial_page = 0
+    if "--page" in args:
+        i = args.index("--page")
+        try:
+            initial_page = max(0, int(args[i + 1]))
+            args = args[:i] + args[i + 2:]
+        except (IndexError, ValueError):
+            args = args[:i] + args[i + 1:]
     app = PDFEditorApp()
     if args:
         path = args[0]
         if not os.path.isfile(path):
             print(f"File not found: {path}", file=sys.stderr)
             sys.exit(1)
-        sys.exit(app.run_with_file(path))
+        sys.exit(app.run_with_file(path, page=initial_page))
     else:
         sys.exit(app.run([]))
 
