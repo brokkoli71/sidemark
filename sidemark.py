@@ -1518,6 +1518,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("File",          None),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
+            ("Ctrl+Shift+S",  "Save as…"),
             ("Ctrl+R",        "Reload (new instance)"),
             ("Ctrl+\\",       "Toggle notes"),
         ]
@@ -1807,10 +1808,24 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.set_title("Sidemark — Untitled")
         self._clear_dirty()
 
+    def _open_scratchpad(self):
+        """Open (or create) the persistent scratchpad at ~/.local/share/sidemark/scratchpad.pdf."""
+        data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "scratchpad.pdf")
+        if not os.path.exists(path):
+            surf = cairo.PDFSurface(path, 595, 842)
+            cairo.Context(surf).show_page()
+            surf.finish()
+        self._do_open_file(path)
+        self.set_title("Sidemark — Scratchpad")
+        self._clear_dirty()
+
     def _on_save_as(self):
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Save PDF as…")
-        dialog.set_initial_name("notes.pdf")
+        default_name = os.path.basename(self._path) if self._path else "notes.pdf"
+        dialog.set_initial_name(default_name)
         f = Gtk.FileFilter()
         f.set_name("PDF files")
         f.add_pattern("*.pdf")
@@ -1949,6 +1964,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             if keyval == Gdk.KEY_backslash:
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
                 return True
+            if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_S:
+                self._on_save_as()
+                return True
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_N:
                 self._add_blank_page()
                 return True
@@ -2069,7 +2087,7 @@ class PDFEditorApp(Adw.Application):
         if self._initial_file:
             win.open_file(self._initial_file)
         else:
-            GLib.idle_add(win._create_blank)
+            GLib.idle_add(win._open_scratchpad)
 
     def run_with_file(self, path):
         self._initial_file = path
