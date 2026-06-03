@@ -8,7 +8,6 @@ import threading
 import tempfile
 import logging
 import atexit
-import urllib.parse
 
 LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
 _log_path = None
@@ -825,6 +824,7 @@ class NotesModel:
 
     def __init__(self):
         self._notes = {}
+        self.pdf_name = None  # written as ![[name.pdf]] at top of the file
 
     def get(self, idx):
         return self._notes.get(idx, "")
@@ -839,6 +839,8 @@ class NotesModel:
                 raw = f.read()
         except OSError:
             return
+        # Strip leading embed line (![[name.pdf]]) before parsing
+        raw = re.sub(r'^\s*!\[\[.*?\]\]\n+', '', raw)
         # Format: <!-- page:N --> delimiters (invisible in markdown viewers)
         parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
         for i in range(1, len(parts), 2):
@@ -852,10 +854,11 @@ class NotesModel:
             for idx in sorted(self._notes)
             if self._notes[idx].strip()
         ]
-        content = "\n\n".join(sections) + "\n" if sections else ""
+        body = "\n\n".join(sections) + "\n" if sections else ""
+        embed = f"![[{self.pdf_name}]]\n\n" if self.pdf_name else ""
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
+            f.write(embed + body)
         os.replace(tmp, path)
 
 
@@ -1397,14 +1400,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
         header.pack_end(self._notes_toggle)
 
-        # open notes in Obsidian
-        self._obsidian_btn = Gtk.Button()
-        self._obsidian_btn.set_icon_name("text-editor-symbolic")
-        self._obsidian_btn.set_tooltip_text("Open notes in Obsidian")
-        self._obsidian_btn.set_sensitive(False)
-        self._obsidian_btn.connect("clicked", self._on_open_obsidian)
-        header.pack_end(self._obsidian_btn)
-
         # shortcuts help
         help_btn = Gtk.MenuButton()
         help_btn.set_label("?")
@@ -1779,10 +1774,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._is_untitled = False
         self._set_file_title(os.path.basename(path), path)
         self.notes_model = NotesModel()
+        self.notes_model.pdf_name = os.path.basename(path)
         self.notes_model.load(notes_path_for(path))
         self._hide_search()
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
-        self._obsidian_btn.set_sensitive(True)
         self._clear_dirty()
 
     def _open_markdown(self, md_path):
@@ -1802,7 +1797,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.notes_model = NotesModel()
         self.notes_model.load(md_path)
         self._page_label.set_label("—")
-        self._obsidian_btn.set_sensitive(True)
         # Show page 0 notes; canvas stays in "no PDF" placeholder state.
         self._notes_view.get_buffer().set_text(self.notes_model.get(0))
 
@@ -1873,19 +1867,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                     pass
         except Exception as e:
             self._show_error("Could not save", str(e))
-
-    def _on_open_obsidian(self, _btn):
-        notes = notes_path_for(self._path) if self._path else self._notes_path
-        if not notes:
-            return
-        if not os.path.exists(notes):
-            self._commit_note()
-            self.notes_model.save(notes)
-        uri = "obsidian://open?path=" + urllib.parse.quote(os.path.abspath(notes))
-        try:
-            Gio.AppInfo.launch_default_for_uri(uri, None)
-        except Exception as e:
-            self._show_error("Could not open Obsidian", str(e))
 
     def _convert_pptx_then_open(self, pptx_path):
         toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
