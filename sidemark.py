@@ -542,6 +542,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._selected_words = []
             self._panning = False
             self._zoom_selecting = False
+            self.grab_focus()
         elif state & Gdk.ModifierType.SHIFT_MASK:
             self._zoom_selecting = True
             self._zoom_start = (start_x, start_y)
