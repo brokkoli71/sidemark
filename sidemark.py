@@ -1554,18 +1554,16 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     # ── page & notes handshake ────────────────────────────────────────────────
 
     def _on_realize(self, _widget):
-        self._pane_init_tries = 0
-        GLib.timeout_add(50, self._try_init_pane)
+        self._pane_sized = False
+        self.connect("size-allocate", self._on_size_allocate_init)
 
-    def _try_init_pane(self):
-        w = self.get_width()
-        self._pane_init_tries += 1
-        if w < 200 and self._pane_init_tries < 20:
-            return True  # retry until window has real width
-        pos = int(max(w, 1280) * 0.62)
+    def _on_size_allocate_init(self, _widget, width, _height, _baseline):
+        if self._pane_sized or width < 200:
+            return
+        self._pane_sized = True
+        pos = int(width * 0.62)
         self._saved_pane_pos = pos
         self._paned.set_position(pos)
-        return False
 
     def _add_blank_page(self):
         if not self.canvas.document:
