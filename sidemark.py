@@ -128,6 +128,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_motion)
+        motion.connect("leave",  self._on_motion_leave)
         self.add_controller(motion)
         self._mouse_x = 0.0
         self._mouse_y = 0.0
@@ -158,10 +159,7 @@ class PDFCanvas(Gtk.DrawingArea):
         click.connect("pressed", self._on_click_pressed)
         self.add_controller(click)
 
-        motion = Gtk.EventControllerMotion.new()
-        motion.connect("motion", self._on_motion)
-        motion.connect("leave",  self._on_motion_leave)
-        self.add_controller(motion)
+
 
         key = Gtk.EventControllerKey.new()
         key.connect("key-pressed",  self._on_alt_key, True)
@@ -431,13 +429,15 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_thumb_end(self, gesture, sequence):
         pass  # ignored — toggle mode, only begin matters
 
-    def _on_motion(self, ctrl, x, y):
+    def _on_motion(self, _ctrl, x, y):
         if self._thumb_panning:
             self.offset_x = self._thumb_start_offset[0] + (x - self._thumb_origin[0])
             self.offset_y = self._thumb_start_offset[1] + (y - self._thumb_origin[1])
             self.queue_draw()
         self._mouse_x = x
         self._mouse_y = y
+        self._hover_x, self._hover_y = x, y
+        self._update_link_hover()
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
@@ -465,10 +465,6 @@ class PDFCanvas(Gtk.DrawingArea):
             if math.hypot(sx - scx, sy - scy) <= 10.0:
                 return i
         return None
-
-    def _on_motion(self, _ctrl, x, y):
-        self._hover_x, self._hover_y = x, y
-        self._update_link_hover()
 
     def _on_motion_leave(self, _ctrl):
         if self._hovered_link_rect is not None:
