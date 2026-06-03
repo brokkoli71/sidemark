@@ -1518,6 +1518,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("File",          None),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
+            ("Ctrl+R",        "Reload (new instance)"),
             ("Ctrl+\\",       "Toggle notes"),
         ]
 
@@ -1920,8 +1921,22 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         except Exception as e:
             self._show_error("Save failed", str(e))
 
+    def _reload(self):
+        if not self._path:
+            return
+        def do_reload():
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), self._path])
+            self.destroy()
+        if self._dirty:
+            self._ask_save_then(do_reload)
+        else:
+            do_reload()
+
     def _on_key(self, ctrl, keyval, keycode, state):
         if state & Gdk.ModifierType.CONTROL_MASK:
+            if keyval == Gdk.KEY_r:
+                self._reload()
+                return True
             if keyval == Gdk.KEY_f:
                 self._show_search()
                 return True
