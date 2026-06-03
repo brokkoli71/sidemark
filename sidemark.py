@@ -45,7 +45,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource, Pango
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -1301,14 +1301,17 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         nav_box.append(add_page_btn)
         nav_box.append(del_page_btn)
 
-        self._win_title = Adw.WindowTitle()
-        self._win_title.set_title("Sidemark")
-        self._win_title.set_subtitle("")
+        self._file_label = Gtk.Label(label="")
+        self._file_label.add_css_class("dim-label")
+        self._file_label.add_css_class("caption")
+        self._file_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self._file_label.set_max_width_chars(28)
+        self._file_label.set_valign(Gtk.Align.CENTER)
 
         title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         title_box.set_valign(Gtk.Align.CENTER)
-        title_box.append(self._win_title)
         title_box.append(nav_box)
+        title_box.append(self._file_label)
         header.set_title_widget(title_box)
 
         undo_btn = Gtk.Button()
@@ -1565,9 +1568,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     # ── page & notes handshake ────────────────────────────────────────────────
 
     def _set_file_title(self, subtitle, full_path=None):
-        self._win_title.set_subtitle(subtitle)
+        self._file_label.set_label(subtitle)
+        self._file_label.set_tooltip_text(full_path or subtitle)
         self.set_title(f"Sidemark — {subtitle}")
-        self._win_title.set_tooltip_text(full_path or "")
 
     def _on_realize(self, _widget):
         self._pane_sized = False
