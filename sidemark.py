@@ -1300,7 +1300,16 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         nav_box.append(next_btn)
         nav_box.append(add_page_btn)
         nav_box.append(del_page_btn)
-        header.set_title_widget(nav_box)
+
+        self._win_title = Adw.WindowTitle()
+        self._win_title.set_title("Sidemark")
+        self._win_title.set_subtitle("")
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        title_box.set_valign(Gtk.Align.CENTER)
+        title_box.append(self._win_title)
+        title_box.append(nav_box)
+        header.set_title_widget(title_box)
 
         undo_btn = Gtk.Button()
         undo_btn.set_icon_name("edit-undo-symbolic")
@@ -1555,6 +1564,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     # ── page & notes handshake ────────────────────────────────────────────────
 
+    def _set_file_title(self, subtitle, full_path=None):
+        self._win_title.set_subtitle(subtitle)
+        self.set_title(f"Sidemark — {subtitle}")
+        self._win_title.set_tooltip_text(full_path or "")
+
     def _on_realize(self, _widget):
         self._pane_sized = False
         self.connect("size-allocate", self._on_size_allocate_init)
@@ -1760,7 +1774,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._path = path
         self._notes_path = None
         self._is_untitled = False
-        self.set_title(f"Sidemark — {os.path.basename(path)}")
+        self._set_file_title(os.path.basename(path), path)
         self.notes_model = NotesModel()
         self.notes_model.load(notes_path_for(path))
         self._hide_search()
@@ -1781,7 +1795,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         # Notes-only mode: no PDF, load markdown directly into notes panel.
         self._path = None
         self._notes_path = md_path
-        self.set_title(f"Sidemark — {os.path.basename(md_path)}")
+        self._set_file_title(os.path.basename(md_path), md_path)
         self.notes_model = NotesModel()
         self.notes_model.load(md_path)
         self._page_label.set_label("—")
@@ -1805,7 +1819,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._do_open_file(tmp)
         self._path = tmp           # track temp file so canvas.save() works
         self._is_untitled = True
-        self.set_title("Sidemark — Untitled")
+        self._set_file_title("Untitled")
         self._clear_dirty()
 
     def _open_scratchpad(self):
@@ -1818,7 +1832,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             cairo.Context(surf).show_page()
             surf.finish()
         self._do_open_file(path)
-        self.set_title("Sidemark — Scratchpad")
+        self._set_file_title("Scratchpad", path)
         self._clear_dirty()
 
     def _on_save_as(self):
@@ -1847,7 +1861,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             old_tmp = self._path if self._is_untitled else None
             self._path = path
             self._is_untitled = False
-            self.set_title(f"Sidemark — {os.path.basename(path)}")
+            self._set_file_title(os.path.basename(path), path)
             self._on_save()
             if old_tmp and os.path.exists(old_tmp):
                 try:
