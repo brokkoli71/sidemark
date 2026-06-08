@@ -8,6 +8,7 @@ import threading
 import tempfile
 import logging
 import atexit
+import traceback
 
 LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
 _log_path = None
@@ -968,7 +969,7 @@ def _render_export_notes(page, page_idx, notes_text, anchor_color):
     # Header
     page.draw_line((margin, 30), (w - margin, 30), color=(0.7, 0.7, 0.7))
     page.insert_text((margin, 24), f"Notes — Page {page_idx + 1}",
-                     fontsize=11, color=(0.3, 0.3, 0.3), fontname="helv-bo")
+                     fontsize=11, color=(0.3, 0.3, 0.3), fontname="hebo")
 
     # Process notes text: replace anchors, strip markdown
     counter = [0]
@@ -1746,16 +1747,15 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.set_title(f"Sidemark — {subtitle}")
 
     def _on_realize(self, _widget):
-        self._pane_sized = False
-        self._paned.connect("size-allocate", self._on_size_allocate_init)
+        GLib.idle_add(self._init_pane_position)
 
-    def _on_size_allocate_init(self, _widget, width, _height, _baseline):
-        if self._pane_sized or width < 200:
-            return
-        self._pane_sized = True
-        pos = int(width * 0.62)
-        self._saved_pane_pos = pos
-        self._paned.set_position(pos)
+    def _init_pane_position(self):
+        width = self.get_allocated_width()
+        if width < 200:
+            return GLib.SOURCE_CONTINUE
+        self._saved_pane_pos = int(width * 0.62)
+        self._paned.set_position(self._saved_pane_pos)
+        return GLib.SOURCE_REMOVE
 
     def _add_blank_page(self):
         if not self.canvas.document:
@@ -1903,7 +1903,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     # ── standard helpers ──────────────────────────────────────────────────────
 
-    def _show_error(self, title, detail):
+    def _show_error(self, title, detail, tb=None):
+        print(f"ERROR: {title}: {detail}", file=sys.stderr)
+        if tb:
+            print(tb, file=sys.stderr)
         dlg = Adw.AlertDialog.new(title, detail)
         dlg.add_response("close", "Close")
         dlg.add_response("copy", "Copy Error")
@@ -2116,9 +2119,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                     )) and None)
             except Exception as e:
                 msg = str(e)
+                tb = traceback.format_exc()
                 GLib.idle_add(lambda: (
                     toast.dismiss(),
-                    self._show_error("Export failed", msg)) and None)
+                    self._show_error("Export failed", msg, tb)) and None)
 
         threading.Thread(target=run, daemon=True).start()
 
