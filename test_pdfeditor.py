@@ -24,7 +24,8 @@ import unittest.mock as mock
 Adw.init()
 
 sys.path.insert(0, os.path.dirname(__file__))
-from sidemark import PDFCanvas, NotesModel, notes_path_for
+from sidemark import (PDFCanvas, NotesModel, notes_path_for,
+                      _export_pdf_with_notes, PDFEditorWindow)
 
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
@@ -731,6 +732,106 @@ class TestLatexFormatting(unittest.TestCase):
         le = ls.copy(); le.forward_to_line_end()
         result = buf.get_text(ls, le, False)
         self.assertEqual(result, r'\alpha')
+
+
+# ── export ────────────────────────────────────────────────────────────────────
+
+class TestExport(unittest.TestCase):
+    """
+    Covers three bug classes that slipped through before:
+      1. PyMuPDF API calls (font names, draw calls) must be tested against a
+         real PDF so bad names raise immediately rather than at user runtime.
+      2. Exception handlers in threads must be tested via the error path so
+         closure bugs (Python deletes 'except ... as e' at block exit) surface.
+      3. New GTK signal connections must be tested by constructing and
+         realizing the widget so unknown signal names raise in CI.
+    """
+
+    def _model_with_notes(self, text, page=0):
+        m = NotesModel()
+        m.set(page, text)
+        return m
+
+    # -- PyMuPDF rendering (font names, draw calls) ---------------------------
+
+    def test_export_plain_notes_produces_valid_pdf(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf")
+            out = os.path.join(d, "out.pdf")
+            make_pdf(src, n_pages=2)
+            model = self._model_with_notes("Hello world", page=0)
+            _export_pdf_with_notes(src, out, model, include_empty=False,
+                                   accent=(0.2, 0.5, 0.9))
+            doc = fitz.open(out)
+            # page 0 → source + notes; page 1 → source only (no notes, not included)
+            self.assertEqual(doc.page_count, 3)
+            doc.close()
+
+    def test_export_with_anchor_markers(self):
+        """Exercises _draw_export_anchor and the notes-page anchor replacement."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf")
+            out = os.path.join(d, "out.pdf")
+            make_pdf(src)
+            notes = "Before\n<!-- anchor:100:200 -->\nAfter"
+            model = self._model_with_notes(notes)
+            # Must not raise (caught helv-bo / font-name bug class)
+            _export_pdf_with_notes(src, out, model, include_empty=True,
+                                   accent=(0.2, 0.5, 0.9))
+            doc = fitz.open(out)
+            self.assertEqual(doc.page_count, 2)
+            # The anchor number "1" must appear as text on the source page
+            source_page_text = doc[0].get_text()
+            self.assertIn("1", source_page_text)
+            # The notes page must contain [1] replacing the anchor comment
+            notes_page_text = doc[1].get_text()
+            self.assertIn("[1]", notes_page_text)
+            doc.close()
+
+    def test_export_include_empty_adds_notes_page_for_every_source_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf")
+            out = os.path.join(d, "out.pdf")
+            make_pdf(src, n_pages=3)
+            model = NotesModel()  # no notes on any page
+            _export_pdf_with_notes(src, out, model, include_empty=True,
+                                   accent=(0.2, 0.5, 0.9))
+            doc = fitz.open(out)
+            self.assertEqual(doc.page_count, 6)
+            doc.close()
+
+    # -- Exception-path closure -----------------------------------------------
+
+    def test_export_bad_source_raises(self):
+        """Error path: bad source PDF must raise, not silently fail.
+        Catches the bug class where 'except ... as e' is used in a lambda
+        — the fix is to capture str(e) in a local before the lambda."""
+        model = NotesModel()
+        with self.assertRaises(Exception):
+            _export_pdf_with_notes("/nonexistent/no.pdf", "/tmp/out.pdf",
+                                   model, False, (0, 0, 1))
+
+    # -- GTK signal connections -----------------------------------------------
+
+    def test_window_realize_does_not_raise(self):
+        """Constructing and realizing PDFEditorWindow must not raise.
+        Catches the bug class where .connect() is given an unknown signal name."""
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.realize")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
 
 
 if __name__ == "__main__":

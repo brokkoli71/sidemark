@@ -956,9 +956,12 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accen
 def _draw_export_anchor(page, px, py, number, color):
     radius = 6
     page.draw_circle((px, py), radius, color=color, fill=color)
-    rect = fitz.Rect(px - radius, py - radius, px + radius, py + radius)
-    page.insert_textbox(rect, str(number), fontsize=radius * 1.4,
-                        color=(1, 1, 1), align=1, fontname="helv")
+    label = str(number)
+    fontsize = radius * 1.5
+    tw = fitz.Font("helv").text_length(label, fontsize)
+    # Center the text baseline visually inside the circle
+    page.insert_text((px - tw / 2, py + fontsize * 0.35),
+                     label, fontsize=fontsize, color=(1, 1, 1), fontname="helv")
 
 
 def _render_export_notes(page, page_idx, notes_text, anchor_color):
