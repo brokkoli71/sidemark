@@ -1747,7 +1747,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     def _on_realize(self, _widget):
         self._pane_sized = False
-        self.connect("size-allocate", self._on_size_allocate_init)
+        self._paned.connect("size-allocate", self._on_size_allocate_init)
 
     def _on_size_allocate_init(self, _widget, width, _height, _baseline):
         if self._pane_sized or width < 200:
@@ -2115,9 +2115,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                         Adw.Toast.new(f"Exported: {os.path.basename(path)}")
                     )) and None)
             except Exception as e:
+                msg = str(e)
                 GLib.idle_add(lambda: (
                     toast.dismiss(),
-                    self._show_error("Export failed", str(e))) and None)
+                    self._show_error("Export failed", msg)) and None)
 
         threading.Thread(target=run, daemon=True).start()
 
