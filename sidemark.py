@@ -912,6 +912,82 @@ def notes_path_for(pdf_path):
     return os.path.splitext(pdf_path)[0] + "-notes.md"
 
 
+_ANCHOR_RE = re.compile(r'<!--\s*anchor:(\d+):(\d+)\s*-->')
+_MD_STRIP = [
+    (re.compile(r'^#{1,6}\s+', re.MULTILINE), ''),
+    (re.compile(r'\*\*(.+?)\*\*'), r'\1'),
+    (re.compile(r'\*([^*\n]+?)\*'), r'\1'),
+    (re.compile(r'`([^`\n]+?)`'), r'\1'),
+]
+
+
+def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
+    src_doc = fitz.open(src_path)
+    out_doc = fitz.open()
+    r, g, b = accent
+    anchor_color = (r, g, b)
+
+    for page_idx in range(len(src_doc)):
+        notes_text = notes_model.get(page_idx)
+        anchor_matches = list(_ANCHOR_RE.finditer(notes_text))
+        anchors = [(int(m.group(1)), int(m.group(2))) for m in anchor_matches]
+        has_notes = bool(notes_text.strip())
+
+        # Copy source page
+        out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+        out_page = out_doc[-1]
+
+        # Draw numbered anchor markers on top of the page
+        for i, (px, py) in enumerate(anchors):
+            _draw_export_anchor(out_page, px, py, i + 1, anchor_color)
+
+        # Notes page
+        if has_notes or include_empty:
+            w, h = out_page.rect.width, out_page.rect.height
+            notes_page = out_doc.new_page(width=w, height=h)
+            _render_export_notes(notes_page, page_idx, notes_text, anchor_color)
+
+    out_doc.save(out_path, garbage=4, deflate=True)
+    out_doc.close()
+    src_doc.close()
+
+
+def _draw_export_anchor(page, px, py, number, color):
+    radius = 6
+    page.draw_circle((px, py), radius, color=color, fill=color)
+    rect = fitz.Rect(px - radius, py - radius, px + radius, py + radius)
+    page.insert_textbox(rect, str(number), fontsize=radius * 1.4,
+                        color=(1, 1, 1), align=1, fontname="helv")
+
+
+def _render_export_notes(page, page_idx, notes_text, anchor_color):
+    margin = 40
+    w, h = page.rect.width, page.rect.height
+    r, g, b = anchor_color
+
+    # Header
+    page.draw_line((margin, 30), (w - margin, 30), color=(0.7, 0.7, 0.7))
+    page.insert_text((margin, 24), f"Notes — Page {page_idx + 1}",
+                     fontsize=11, color=(0.3, 0.3, 0.3), fontname="helv-bo")
+
+    # Process notes text: replace anchors, strip markdown
+    counter = [0]
+
+    def _replace_anchor(m):
+        counter[0] += 1
+        return f"[{counter[0]}]"
+
+    text = _ANCHOR_RE.sub(_replace_anchor, notes_text)
+    for pattern, repl in _MD_STRIP:
+        text = pattern.sub(repl, text)
+    text = text.strip()
+
+    if text:
+        rect = fitz.Rect(margin, 45, w - margin, h - margin)
+        page.insert_textbox(rect, text, fontsize=10, color=(0, 0, 0),
+                            fontname="helv", align=0)
+
+
 class NotesModel:
     """Per-page markdown notes, backed by a sidecar .md file."""
 
@@ -1422,6 +1498,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         save_btn.connect("clicked", self._on_save)
         header.pack_end(save_btn)
 
+        export_btn = Gtk.Button()
+        export_btn.set_icon_name("document-send-symbolic")
+        export_btn.set_tooltip_text("Export with notes (Ctrl+E)")
+        export_btn.connect("clicked", lambda _: self._on_export())
+        header.pack_end(export_btn)
+
         # pen settings popover
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         popover_box.set_margin_start(16)
@@ -1621,6 +1703,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
+            ("Ctrl+E",        "Export PDF with notes"),
             ("Ctrl+R",        "Reload (new instance)"),
             ("Ctrl+\\",       "Toggle notes"),
         ]
@@ -1963,6 +2046,81 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         except Exception as e:
             self._show_error("Could not save", str(e))
 
+    # ── Export ────────────────────────────────────────────────────────────────
+
+    def _on_export(self):
+        if not self._path:
+            self._show_error("Export failed", "No PDF is open.")
+            return
+
+        check = Gtk.CheckButton(label="Include pages with no notes")
+        check.set_active(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(8)
+        box.append(check)
+
+        dlg = Adw.AlertDialog(
+            heading="Export with notes",
+            body="Each page will be followed by its notes page.",
+            extra_child=box,
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("export", "Choose file…")
+        dlg.set_response_appearance("export", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("export")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", self._export_options_response, check)
+        dlg.present(self)
+
+    def _export_options_response(self, dlg, response, check):
+        if response != "export":
+            return
+        include_empty = check.get_active()
+        file_dlg = Gtk.FileDialog.new()
+        file_dlg.set_title("Export PDF as…")
+        base = os.path.splitext(os.path.basename(self._path))[0]
+        file_dlg.set_initial_name(base + "-annotated.pdf")
+        f = Gtk.FileFilter()
+        f.set_name("PDF files")
+        f.add_pattern("*.pdf")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        file_dlg.set_filters(store)
+        file_dlg.save(self, None, lambda d, r: self._export_file_done(d, r, include_empty))
+
+    def _export_file_done(self, dialog, result, include_empty):
+        try:
+            gfile = dialog.save_finish(result)
+            if not gfile:
+                return
+            path = gfile.get_path()
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+        except Exception:
+            return
+
+        toast = Adw.Toast.new("Exporting…")
+        toast.set_timeout(0)
+        self.toast_overlay.add_toast(toast)
+
+        accent = self.canvas.zoom_accent
+
+        def run():
+            try:
+                _export_pdf_with_notes(self._path, path, self.notes_model,
+                                       include_empty, accent)
+                GLib.idle_add(lambda: (
+                    toast.dismiss(),
+                    self.toast_overlay.add_toast(
+                        Adw.Toast.new(f"Exported: {os.path.basename(path)}")
+                    )) and None)
+            except Exception as e:
+                GLib.idle_add(lambda: (
+                    toast.dismiss(),
+                    self._show_error("Export failed", str(e))) and None)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _convert_pptx_then_open(self, pptx_path):
         toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
         toast.set_timeout(0)
@@ -2049,6 +2207,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_f:
                 self._show_search()
+                return True
+            if keyval == Gdk.KEY_e:
+                self._on_export()
                 return True
             if keyval == Gdk.KEY_s:
                 self._on_save()
