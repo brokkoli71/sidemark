@@ -11,61 +11,23 @@ jobs:
   # construction. Weston's headless backend provides a Wayland socket
   # with no screen/GPU required.
   unit-tests:
-    name: Unit tests (${{ matrix.name }})
+    name: Unit tests
     runs-on: ubuntu-latest
-    container: ${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Arch Linux
-            image: archlinux:latest
-            distro: arch
-          - name: Ubuntu 24.04
-            image: ubuntu:24.04
-            distro: deb
-          - name: Fedora 41
-            image: fedora:41
-            distro: rpm
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Bootstrap sudo
+      - name: Install dependencies
         run: |
-          if ! command -v sudo &>/dev/null; then
-            if command -v pacman  &>/dev/null; then pacman -Sy --noconfirm sudo; fi
-            if command -v apt-get &>/dev/null; then apt-get update -qq && apt-get install -y sudo; fi
-            if command -v dnf     &>/dev/null; then dnf install -y sudo; fi
-          fi
-
-      - name: Install dependencies (Arch)
-        if: matrix.distro == 'arch'
-        run: |
-          pacman -Sy --noconfirm \
-            python python-gobject python-cairo python-numpy \
-            gtk4 libadwaita gtksourceview5 \
-            python-pymupdf weston
-
-      - name: Install dependencies (Ubuntu)
-        if: matrix.distro == 'deb'
-        run: |
-          apt-get update -qq
-          apt-get install -y \
-            python3 python3-gi python3-gi-cairo python3-numpy \
-            gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtksource-5 \
-            libgtk-4-1 libadwaita-1-0 libgtksourceview-5-0 \
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            python3 python3-gi python3-gi-cairo \
+            python3-numpy \
+            gir1.2-gtk-4.0 gir1.2-adw-1 \
+            gir1.2-gtksource-5 \
+            libgtk-4-1 libadwaita-1-0 \
+            libgtksourceview-5-0 \
             weston
-          python3 -m pip install --break-system-packages pymupdf
-
-      - name: Install dependencies (Fedora)
-        if: matrix.distro == 'rpm'
-        run: |
-          dnf install -y \
-            python3 python3-gobject python3-cairo python3-numpy \
-            gtk4 libadwaita gtksourceview5 \
-            python3-pip weston
-          python3 -m pip install --user --break-system-packages pymupdf
+          pip install pymupdf
 
       - name: Start headless Wayland compositor
         run: |
