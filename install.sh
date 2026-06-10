@@ -59,11 +59,12 @@ _MISS_ARCH=(); _MISS_DEB=(); _MISS_RPM=(); _MISS_PIP=()
 # _need ARCH_PKGS DEB_PKGS RPM_PKGS [pip=PKG]
 _need() {
     local arch="$1" deb="$2" rpm="$3" pip="${4:-}"
+    local display="${arch:-${pip}}"
     read -ra _a <<< "$arch"; _MISS_ARCH+=("${_a[@]}")
     read -ra _d <<< "$deb";  _MISS_DEB+=("${_d[@]}")
     read -ra _r <<< "$rpm";  _MISS_RPM+=("${_r[@]}")
     [[ -n "$pip" ]] && _MISS_PIP+=("$pip")
-    echo -e "  ${RED}✗${NC} Missing: $arch"
+    echo -e "  ${RED}✗${NC} Missing: $display"
 }
 
 # check_py TEST ARCH_PKGS DEB_PKGS RPM_PKGS [pip=PKG]
@@ -116,14 +117,14 @@ if _has_missing; then
                 ;;
             deb)
                 [[ ${#_MISS_DEB[@]} -gt 0 ]] && sudo apt-get install -y "${_MISS_DEB[@]}"
-                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user "${_MISS_PIP[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user --break-system-packages "${_MISS_PIP[@]}"
                 ;;
             rpm)
                 [[ ${#_MISS_RPM[@]} -gt 0 ]] && sudo dnf install -y "${_MISS_RPM[@]}"
-                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user "${_MISS_PIP[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user --break-system-packages "${_MISS_PIP[@]}"
                 ;;
             *)
-                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user "${_MISS_PIP[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user --break-system-packages "${_MISS_PIP[@]}"
                 ;;
         esac
         # Re-verify after install
