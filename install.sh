@@ -54,10 +54,21 @@ _hint() {
 # ── dependency check ───────────────────────────────────────────────────────────
 step "Checking dependencies…"
 
-# check_py TEST ARCH_PKG DEB_PKGS RPM_PKG
+_MISS_ARCH=(); _MISS_DEB=(); _MISS_RPM=(); _MISS_PIP=()
+
+# _need ARCH_PKGS DEB_PKGS RPM_PKGS [pip=PKG]
+_need() {
+    local arch="$1" deb="$2" rpm="$3" pip="${4:-}"
+    read -ra _a <<< "$arch"; _MISS_ARCH+=("${_a[@]}")
+    read -ra _d <<< "$deb";  _MISS_DEB+=("${_d[@]}")
+    read -ra _r <<< "$rpm";  _MISS_RPM+=("${_r[@]}")
+    [[ -n "$pip" ]] && _MISS_PIP+=("$pip")
+    echo -e "  ${RED}✗${NC} Missing: $arch"
+}
+
+# check_py TEST ARCH_PKGS DEB_PKGS RPM_PKGS [pip=PKG]
 check_py() {
-    /usr/bin/python3 -c "$1" 2>/dev/null || \
-        fail "Missing: $2  →  $(_hint "$2" "$3" "$4")"
+    /usr/bin/python3 -c "$1" 2>/dev/null || _need "$2" "$3" "$4" "${5:-}"
 }
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -65,39 +76,81 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 check_py "import gi" \
-    "python-gobject" \
-    "python3-gi python3-gi-cairo" \
-    "python3-gobject"
+    "python-gobject" "python3-gi python3-gi-cairo" "python3-gobject"
 check_py "import gi; gi.require_version('Gtk','4.0'); from gi.repository import Gtk" \
-    "gtk4" \
-    "gir1.2-gtk-4.0 libgtk-4-1" \
-    "gtk4"
+    "gtk4" "gir1.2-gtk-4.0 libgtk-4-1" "gtk4"
 check_py "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" \
-    "libadwaita" \
-    "gir1.2-adw-1 libadwaita-1-0" \
-    "libadwaita"
-# PyMuPDF: Arch has it in pacman; Debian/Ubuntu/Fedora need pip
+    "libadwaita" "gir1.2-adw-1 libadwaita-1-0" "libadwaita"
+# PyMuPDF: Arch = pacman, others = pip
 if ! /usr/bin/python3 -c "import fitz" 2>/dev/null; then
     case "$_DISTRO" in
-        arch) fail "Missing: python-pymupdf  →  sudo pacman -S python-pymupdf" ;;
-        *)    fail "Missing: pymupdf  →  pip install pymupdf" ;;
+        arch) _need "python-pymupdf" "" "" ;;
+        *)    _need "" "" "" "pymupdf" ;;
     esac
 fi
 check_py "import numpy" \
-    "python-numpy" \
-    "python3-numpy" \
-    "python3-numpy"
+    "python-numpy" "python3-numpy" "python3-numpy"
 check_py "import cairo" \
-    "python-cairo" \
-    "python3-gi-cairo" \
-    "python3-cairo"
+    "python-cairo" "python3-gi-cairo" "python3-cairo"
 check_py "import gi; gi.require_version('GtkSource','5'); from gi.repository import GtkSource" \
-    "gtksourceview5" \
-    "gir1.2-gtksource-5 libgtksourceview-5-0" \
-    "gtksourceview5"
+    "gtksourceview5" "gir1.2-gtksource-5 libgtksourceview-5-0" "gtksourceview5"
 
 if ! find /usr/share/icons/Adwaita -name "go-next-symbolic*" 2>/dev/null | grep -q .; then
-    warn "adwaita-icon-theme not found — icons may be missing.  →  $(_hint adwaita-icon-theme adwaita-icon-theme adwaita-icon-theme)"
+    warn "adwaita-icon-theme not found — icons may be missing."
+    _need "adwaita-icon-theme" "adwaita-icon-theme" "adwaita-icon-theme"
+fi
+
+# ── auto-install missing packages ─────────────────────────────────────────────
+_has_missing() {
+    [[ ${#_MISS_ARCH[@]} -gt 0 || ${#_MISS_DEB[@]} -gt 0 || \
+       ${#_MISS_RPM[@]} -gt 0  || ${#_MISS_PIP[@]} -gt 0 ]]
+}
+
+if _has_missing; then
+    echo ""
+    read -rp "  Install missing packages automatically? [Y/n] " _ans
+    if [[ "${_ans:-Y}" =~ ^[Yy]$ ]]; then
+        case "$_DISTRO" in
+            arch)
+                [[ ${#_MISS_ARCH[@]} -gt 0 ]] && sudo pacman -S --needed "${_MISS_ARCH[@]}"
+                ;;
+            deb)
+                [[ ${#_MISS_DEB[@]} -gt 0 ]] && sudo apt-get install -y "${_MISS_DEB[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user "${_MISS_PIP[@]}"
+                ;;
+            rpm)
+                [[ ${#_MISS_RPM[@]} -gt 0 ]] && sudo dnf install -y "${_MISS_RPM[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user "${_MISS_PIP[@]}"
+                ;;
+            *)
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user "${_MISS_PIP[@]}"
+                ;;
+        esac
+        # Re-verify after install
+        step "Re-checking dependencies…"
+        _MISS_ARCH=(); _MISS_DEB=(); _MISS_RPM=(); _MISS_PIP=()
+        check_py "import gi" \
+            "python-gobject" "python3-gi python3-gi-cairo" "python3-gobject"
+        check_py "import gi; gi.require_version('Gtk','4.0'); from gi.repository import Gtk" \
+            "gtk4" "gir1.2-gtk-4.0 libgtk-4-1" "gtk4"
+        check_py "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" \
+            "libadwaita" "gir1.2-adw-1 libadwaita-1-0" "libadwaita"
+        if ! /usr/bin/python3 -c "import fitz" 2>/dev/null; then
+            case "$_DISTRO" in
+                arch) _need "python-pymupdf" "" "" ;;
+                *)    _need "" "" "" "pymupdf" ;;
+            esac
+        fi
+        check_py "import numpy" \
+            "python-numpy" "python3-numpy" "python3-numpy"
+        check_py "import cairo" \
+            "python-cairo" "python3-gi-cairo" "python3-cairo"
+        check_py "import gi; gi.require_version('GtkSource','5'); from gi.repository import GtkSource" \
+            "gtksourceview5" "gir1.2-gtksource-5 libgtksourceview-5-0" "gtksourceview5"
+        _has_missing && fail "Some dependencies still missing after install."
+    else
+        fail "Aborted — install missing packages first."
+    fi
 fi
 
 ok "All required dependencies present."
