@@ -17,8 +17,6 @@ jobs:
         include:
           - name: Arch Linux
             image: archlinux:latest
-          - name: Ubuntu 24.04
-            image: ubuntu:24.04
           - name: Fedora 41
             image: fedora:41
 
