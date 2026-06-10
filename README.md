@@ -1,5 +1,8 @@
 # Sidemark
 
+[![AUR version](https://img.shields.io/aur/version/sidemark-git)](https://aur.archlinux.org/packages/sidemark-git)
+[![CI](https://github.com/brokkoli71/sidemark/actions/workflows/ci.yml/badge.svg)](https://github.com/brokkoli71/sidemark/actions/workflows/ci.yml)
+
 Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes panel. Open a PDF — lecture slides, papers, or any document — draw directly on it, and write structured notes beside it.
 
 ![Screenshot](screenshot.png)
@@ -131,6 +134,16 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 | Key | Action |
 |-----|--------|
 | `Ctrl+S` | Save (prompts for name if untitled) |
+
+## Tested distributions
+
+| Distro | Unit tests | Install |
+|--------|-----------|---------|
+| Arch Linux | ✓ | ✓ CI |
+| Ubuntu 24.04 | ✓ CI | ✓ CI |
+| Fedora 41 | | ✓ CI |
+
+"✓ CI" = verified on every push via GitHub Actions. Arch unit tests run locally (Omarchy is the primary development environment).
 
 ## Notes format
 
