@@ -125,7 +125,7 @@ if _has_missing; then
     if [[ "${_ans:-Y}" =~ ^[Yy]$ ]]; then
         case "$_DISTRO" in
             arch)
-                [[ ${#_MISS_ARCH[@]} -gt 0 ]] && sudo pacman -S --needed "${_MISS_ARCH[@]}"
+                [[ ${#_MISS_ARCH[@]} -gt 0 ]] && sudo pacman -S --needed --noconfirm "${_MISS_ARCH[@]}"
                 ;;
             deb)
                 [[ ${#_MISS_DEB[@]} -gt 0 ]] && sudo apt-get install -y "${_MISS_DEB[@]}"
