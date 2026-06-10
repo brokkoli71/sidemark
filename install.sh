@@ -1,8 +1,16 @@
 #!/bin/bash
 # install.sh — user-local install for Sidemark
 # Usage:  ./install.sh            install
+#         ./install.sh -y         install, auto-confirm dependency prompt
 #         ./install.sh --uninstall remove everything
 set -euo pipefail
+
+_YES=0
+for _arg in "$@"; do
+    case "$_arg" in
+        -y|--yes) _YES=1 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/.local/share/sidemark"
@@ -109,7 +117,11 @@ _has_missing() {
 
 if _has_missing; then
     echo ""
-    read -rp "  Install missing packages automatically? [Y/n] " _ans
+    if [[ $_YES -eq 1 ]]; then
+        _ans="Y"
+    else
+        read -rp "  Install missing packages automatically? [Y/n] " _ans
+    fi
     if [[ "${_ans:-Y}" =~ ^[Yy]$ ]]; then
         case "$_DISTRO" in
             arch)
