@@ -117,14 +117,14 @@ if _has_missing; then
                 ;;
             deb)
                 [[ ${#_MISS_DEB[@]} -gt 0 ]] && sudo apt-get install -y "${_MISS_DEB[@]}"
-                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user --break-system-packages "${_MISS_PIP[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && /usr/bin/python3 -m pip install --user --break-system-packages "${_MISS_PIP[@]}"
                 ;;
             rpm)
                 [[ ${#_MISS_RPM[@]} -gt 0 ]] && sudo dnf install -y "${_MISS_RPM[@]}"
-                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user --break-system-packages "${_MISS_PIP[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && /usr/bin/python3 -m pip install --user --break-system-packages "${_MISS_PIP[@]}"
                 ;;
             *)
-                [[ ${#_MISS_PIP[@]} -gt 0 ]] && pip install --user --break-system-packages "${_MISS_PIP[@]}"
+                [[ ${#_MISS_PIP[@]} -gt 0 ]] && /usr/bin/python3 -m pip install --user --break-system-packages "${_MISS_PIP[@]}"
                 ;;
         esac
         # Re-verify after install
