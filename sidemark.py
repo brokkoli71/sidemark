@@ -9,6 +9,10 @@ import tempfile
 import logging
 import atexit
 import traceback
+import hashlib
+import json
+import shutil
+import time
 
 LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
 _log_path = None
@@ -918,9 +922,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── save ──────────────────────────────────────────────────────────────────
 
-    def save(self, path):
-        """Save via self.document so structural changes (inserted pages) are preserved."""
-        tmp = path + ".tmp"
+    def _write_ink_annotations(self):
+        """Sync in-memory strokes into the document as ink annotations."""
         total_written = 0
         for i in range(self.n_pages):
             page = self.document[i]
@@ -937,11 +940,26 @@ class PDFCanvas(Gtk.DrawingArea):
                 annot.set_border(width=stroke["width"])
                 annot.update()
                 total_written += 1
+        return total_written
+
+    def save(self, path):
+        """Save via self.document so structural changes (inserted pages) are preserved."""
+        tmp = path + ".tmp"
+        total_written = self._write_ink_annotations()
         logger.info(f"save: {path} — wrote {total_written} ink annotation(s)")
         self.document.save(tmp, garbage=4, deflate=True)
         os.replace(tmp, path)
         # Reopen so self.document reflects the saved state cleanly
         self.document = fitz.open(path)
+
+    def save_copy(self, path):
+        """Write the current state (including unsaved strokes and structural
+        changes) to path without touching the original or rebinding the
+        document — used for autosave snapshots."""
+        self._write_ink_annotations()
+        tmp = path + ".tmp"
+        self.document.save(tmp)
+        os.replace(tmp, path)
 
     def add_blank_page(self):
         """Insert a blank page with the same dimensions as the current page, after it."""
@@ -1071,6 +1089,68 @@ def _hex_to_rgb(h):
 
 def notes_path_for(pdf_path):
     return os.path.splitext(pdf_path)[0] + "-notes.md"
+
+
+# ── autosave snapshots ────────────────────────────────────────────────────────
+# Unsaved changes are snapshotted here periodically; the original file is
+# never touched until an explicit save. XDG_STATE_HOME, not cache — cache
+# cleaners must not eat unsaved lecture notes.
+
+AUTOSAVE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "sidemark", "autosave")
+
+
+def _autosave_dir_for(path):
+    key = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:16]
+    return os.path.join(AUTOSAVE_DIR, key)
+
+
+def _find_autosave(path):
+    """Return (snapshot_pdf, snapshot_notes_or_None, saved_at) when a
+    recoverable snapshot newer than the file itself exists, else None."""
+    d = _autosave_dir_for(path)
+    snap_pdf = os.path.join(d, "doc.pdf")
+    meta_path = os.path.join(d, "meta.json")
+    if not (os.path.exists(snap_pdf) and os.path.exists(meta_path)):
+        return None
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if meta.get("path") != os.path.abspath(path):
+        return None   # hash collision or moved file — don't recover blindly
+    saved_at = meta.get("saved_at", 0)
+    try:
+        if os.path.getmtime(path) >= saved_at:
+            return None   # the file was saved/modified after the snapshot
+    except OSError:
+        pass
+    snap_notes = os.path.join(d, "notes.md")
+    return snap_pdf, (snap_notes if os.path.exists(snap_notes) else None), saved_at
+
+
+def _discard_autosave(path):
+    shutil.rmtree(_autosave_dir_for(path), ignore_errors=True)
+
+
+def _prune_autosaves(max_age_days=30):
+    """Drop snapshots nobody recovered for a month (e.g. of deleted temp files)."""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        entries = os.listdir(AUTOSAVE_DIR)
+    except OSError:
+        return
+    for name in entries:
+        d = os.path.join(AUTOSAVE_DIR, name)
+        try:
+            with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
+                saved_at = json.load(f).get("saved_at", 0)
+        except (OSError, ValueError):
+            saved_at = 0
+        if saved_at < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 _ANCHOR_RE = re.compile(r'<!--\s*anchor:(\d+):(\d+)\s*-->')
@@ -1563,6 +1643,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         # commit the current note before any canvas-initiated page change
         # (scroll flip, link jump, undo on another page)
         self.canvas.on_page_will_change = self._commit_note
+
+        GLib.timeout_add_seconds(60, self._autosave_tick)
         self.canvas.on_anchor_placed = self._on_anchor_placed
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
 
@@ -1973,6 +2055,61 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _clear_dirty(self):
         self._dirty = False
 
+    # ── autosave ──────────────────────────────────────────────────────────────
+
+    def _autosave_tick(self):
+        if self._dirty and self._path:
+            try:
+                self._write_autosave()
+            except Exception:
+                logger.error("autosave failed:\n" + traceback.format_exc())
+        return True   # keep the timer running
+
+    def _write_autosave(self):
+        d = _autosave_dir_for(self._path)
+        os.makedirs(d, exist_ok=True)
+        self.canvas.save_copy(os.path.join(d, "doc.pdf"))
+        self._commit_note()
+        self.notes_model.save(os.path.join(d, "notes.md"))
+        meta = {"path": os.path.abspath(self._path), "saved_at": time.time()}
+        tmp = os.path.join(d, "meta.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp, os.path.join(d, "meta.json"))
+        logger.info(f"autosave: snapshot written for {self._path}")
+
+    def _maybe_offer_recovery(self, path):
+        found = _find_autosave(path)
+        if not found:
+            return
+        snap_pdf, snap_notes, saved_at = found
+        when = time.strftime("%H:%M on %Y-%m-%d", time.localtime(saved_at))
+        dlg = Adw.AlertDialog.new(
+            "Recover unsaved changes?",
+            f"Sidemark closed with unsaved changes for this file "
+            f"(autosaved at {when}).",
+        )
+        dlg.add_response("later",   "Not now")
+        dlg.add_response("discard", "Discard them")
+        dlg.add_response("recover", "Recover")
+        dlg.set_response_appearance("recover", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("recover")
+        dlg.set_close_response("later")
+
+        def on_response(d, r):
+            if r == "recover":
+                if snap_notes:
+                    self.notes_model.load(snap_notes)
+                self.canvas.load(snap_pdf)   # _path stays the original file
+                self._mark_dirty()
+            elif r == "discard":
+                _discard_autosave(path)
+            # "later": keep the snapshot for the next open
+
+        dlg.connect("response", on_response)
+        dlg.present(self)
+
     # ── unsaved-changes dialog ────────────────────────────────────────────────
 
     def _on_close_request(self, _win):
@@ -1998,6 +2135,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 # save must not proceed (e.g. destroy the window).
                 self._on_save(after=callback)
             elif r == "discard":
+                if self._path:
+                    _discard_autosave(self._path)   # user chose to drop them
                 callback()
             # cancel: do nothing
         dlg.connect("response", on_response)
@@ -2149,6 +2288,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._hide_search()
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._clear_dirty()
+        self._maybe_offer_recovery(path)
 
     def _open_markdown(self, md_path):
         # If there's an associated PDF (e.g. lecture-notes.md → lecture.pdf), open it.
@@ -2414,6 +2554,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         except Exception as e:
             self._show_error("Save failed", str(e))
             return
+        if self._path:
+            _discard_autosave(self._path)   # changes are on disk now
         if after:
             after()
 
@@ -2593,6 +2735,10 @@ def main():
     verbose = "--verbose" in args or "-v" in args
     args = [a for a in args if a not in ("--verbose", "-v")]
     _setup_logging(verbose=verbose)
+    try:
+        _prune_autosaves()
+    except Exception:
+        logger.error("autosave pruning failed:\n" + traceback.format_exc())
     initial_page = 0
     if "--page" in args:
         i = args.index("--page")

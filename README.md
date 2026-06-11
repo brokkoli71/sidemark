@@ -146,6 +146,10 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 
 "✓ CI" = verified on every push via GitHub Actions. Arch unit tests run locally (Omarchy is the primary development environment).
 
+## Autosave
+
+While there are unsaved changes, Sidemark snapshots the document and notes every 60 seconds to `~/.local/state/sidemark/autosave/` — the original file is never modified until you explicitly save. If Sidemark closes uncleanly, reopening the file offers to recover the snapshot. Snapshots are removed on save or discard, and pruned after 30 days.
+
 ## Notes format
 
 Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault. Anchor markers (`<!-- anchor:X:Y -->`) are stored the same way — invisible in external viewers, but displayed as numbered circles on the PDF canvas inside Sidemark.

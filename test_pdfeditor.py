@@ -1206,6 +1206,137 @@ class TestExport(unittest.TestCase):
             raise errors[0]
 
 
+class TestAutosave(unittest.TestCase):
+    def setUp(self):
+        import sidemark as sm
+        self.sm = sm
+        self._dir = tempfile.mkdtemp(prefix="sidemark-test-autosave-")
+        self._patch = mock.patch.object(sm, "AUTOSAVE_DIR",
+                                        os.path.join(self._dir, "autosave"))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        import shutil
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _make_pdf(self, name="doc.pdf"):
+        path = os.path.join(self._dir, name)
+        make_pdf(path)
+        return path
+
+    def _write_snapshot(self, path, saved_at=None):
+        d = self.sm._autosave_dir_for(path)
+        os.makedirs(d, exist_ok=True)
+        make_pdf(os.path.join(d, "doc.pdf"))
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            import json
+            json.dump({"path": os.path.abspath(path),
+                       "saved_at": saved_at or (os.path.getmtime(path) + 100)}, f)
+        return d
+
+    def test_save_copy_keeps_original_untouched(self):
+        path = self._make_pdf()
+        original = open(path, "rb").read()
+        canvas = PDFCanvas()
+        canvas.load(path)
+        canvas.strokes.append({"pts": [(10, 10), (50, 50)], "color": (0, 0, 1), "width": 2})
+        out = os.path.join(self._dir, "snap.pdf")
+        canvas.save_copy(out)
+        doc = fitz.open(out)
+        self.assertEqual(len(list(doc[0].annots())), 1)   # stroke is in the copy
+        doc.close()
+        self.assertEqual(open(path, "rb").read(), original)   # original untouched
+
+    def test_save_still_works_after_save_copy(self):
+        path = self._make_pdf()
+        canvas = PDFCanvas()
+        canvas.load(path)
+        canvas.strokes.append({"pts": [(10, 10), (50, 50)], "color": (0, 0, 1), "width": 2})
+        canvas.save_copy(os.path.join(self._dir, "snap.pdf"))
+        canvas.save(path)
+        canvas2 = PDFCanvas()
+        canvas2.load(path)
+        self.assertEqual(len(canvas2.strokes), 1)
+
+    def test_find_autosave_returns_newer_snapshot(self):
+        path = self._make_pdf()
+        self._write_snapshot(path)
+        found = self.sm._find_autosave(path)
+        self.assertIsNotNone(found)
+        self.assertTrue(found[0].endswith("doc.pdf"))
+
+    def test_find_autosave_ignores_stale_snapshot(self):
+        path = self._make_pdf()
+        self._write_snapshot(path, saved_at=os.path.getmtime(path) - 100)
+        self.assertIsNone(self.sm._find_autosave(path))
+
+    def test_find_autosave_ignores_path_mismatch(self):
+        path = self._make_pdf()
+        d = self._write_snapshot(path)
+        import json
+        meta = json.load(open(os.path.join(d, "meta.json")))
+        meta["path"] = "/somewhere/else.pdf"
+        json.dump(meta, open(os.path.join(d, "meta.json"), "w"))
+        self.assertIsNone(self.sm._find_autosave(path))
+
+    def test_find_autosave_none_when_missing(self):
+        path = self._make_pdf()
+        self.assertIsNone(self.sm._find_autosave(path))
+
+    def test_discard_autosave_removes_snapshot(self):
+        path = self._make_pdf()
+        d = self._write_snapshot(path)
+        self.sm._discard_autosave(path)
+        self.assertFalse(os.path.exists(d))
+
+    def test_prune_removes_only_old_snapshots(self):
+        old_pdf = self._make_pdf("old.pdf")
+        new_pdf = self._make_pdf("new.pdf")
+        import time
+        old_dir = self._write_snapshot(old_pdf, saved_at=time.time() - 40 * 86400)
+        new_dir = self._write_snapshot(new_pdf, saved_at=time.time())
+        self.sm._prune_autosaves(max_age_days=30)
+        self.assertFalse(os.path.exists(old_dir))
+        self.assertTrue(os.path.exists(new_dir))
+
+    def test_window_autosave_tick_and_cleanup_on_save(self):
+        """Dirty window → tick writes a snapshot; explicit save removes it.
+        The recovery dialog construction must not raise either."""
+        errors = []
+        sm = self.sm
+        pdf = self._make_pdf()
+        app = Adw.Application(application_id="test.sidemark.autosave")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._do_open_file(pdf)
+                win.canvas.current_stroke = [(10, 10), (50, 50)]
+                win.canvas._on_drag_end(None, 0, 0)   # draws → marks dirty
+                if not win._dirty:
+                    raise AssertionError("drawing did not mark window dirty")
+                win._autosave_tick()
+                snap_dir = sm._autosave_dir_for(pdf)
+                for fn in ("doc.pdf", "notes.md", "meta.json"):
+                    if not os.path.exists(os.path.join(snap_dir, fn)):
+                        raise AssertionError(f"snapshot missing {fn}")
+                win._maybe_offer_recovery(pdf)   # dialog construction must not raise
+                win._on_save()
+                if os.path.exists(snap_dir):
+                    raise AssertionError("snapshot not cleaned up after save")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+
 class TestLogRetention(unittest.TestCase):
     """The session log must survive sessions that logged errors — atexit also
     runs after unhandled exceptions, which used to delete exactly the logs
