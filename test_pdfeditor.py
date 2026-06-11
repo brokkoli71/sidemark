@@ -1977,11 +1977,18 @@ class TestHighlighter(unittest.TestCase):
                     if win.canvas.pen_color != pen_color:
                         raise AssertionError("color button leaked into pen_color")
 
-                    win._hl_toggle.set_active(False)
+                    win._pen_seg.set_active(True)   # grouped pair: back to pen
                     if win.canvas.highlighter:
-                        raise AssertionError("toggle did not disable highlighter")
+                        raise AssertionError("pen segment did not disable highlighter")
                     if abs(win._width_scale.get_value() - pen_width) > 0.01:
                         raise AssertionError("scale did not return to pen width")
+                    # Ctrl+H helper flips the pair both ways
+                    win._toggle_highlighter()
+                    if not win.canvas.highlighter:
+                        raise AssertionError("Ctrl+H did not enable highlighter")
+                    win._toggle_highlighter()
+                    if win.canvas.highlighter:
+                        raise AssertionError("Ctrl+H did not return to pen")
                 except Exception as e:
                     errors.append(e)
                 finally:

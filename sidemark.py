@@ -2108,8 +2108,23 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         popover_box.set_margin_top(12)
         popover_box.set_margin_bottom(12)
 
+        # tool switcher — the width/color controls below edit the active tool
+        tool_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        tool_box.add_css_class("linked")
+        tool_box.set_homogeneous(True)
+        self._pen_seg = Gtk.ToggleButton(label="Pen")
+        self._pen_seg.set_active(True)
+        self._hl_toggle = Gtk.ToggleButton(label="Highlighter")
+        self._hl_toggle.set_tooltip_text("Wide translucent strokes (Ctrl+H)")
+        self._hl_toggle.set_group(self._pen_seg)
+        self._hl_toggle.connect("toggled", self._on_highlighter_toggled)
+        tool_box.append(self._pen_seg)
+        tool_box.append(self._hl_toggle)
+        popover_box.append(tool_box)
+
         width_label = Gtk.Label(label="Width", xalign=0)
         width_label.add_css_class("dim-label")
+        width_label.set_margin_top(6)
         popover_box.append(width_label)
 
         self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5.0, 0.1)
@@ -2158,15 +2173,15 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         popover = Gtk.Popover()
         popover.set_child(popover_box)
 
-        pen_btn = Gtk.MenuButton()
-        pen_btn.set_icon_name("document-edit-symbolic")
-        pen_btn.set_tooltip_text("Pen settings")
-        pen_btn.set_popover(popover)
-        header.pack_end(pen_btn)
+        self._pen_btn = Gtk.MenuButton()
+        self._pen_btn.set_icon_name("document-edit-symbolic")
+        self._pen_btn.set_tooltip_text("Pen settings")
+        self._pen_btn.set_popover(popover)
+        header.pack_end(self._pen_btn)
 
-        # highlighter toggle — no marker icon ships with Adwaita, so the icon
-        # is a mini preview of the actual highlight stroke (doubles as a
-        # color hint)
+        # While the highlighter is active the pen button shows a mini preview
+        # of the actual highlight stroke instead of the pencil icon — Adwaita
+        # ships no marker icon, and this doubles as a color hint.
         self._hl_icon = Gtk.DrawingArea()
         self._hl_icon.set_content_width(18)
         self._hl_icon.set_content_height(18)
@@ -2180,12 +2195,6 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ctx.line_to(w - 4, 5)
             ctx.stroke()
         self._hl_icon.set_draw_func(_draw_hl_icon)
-
-        self._hl_toggle = Gtk.ToggleButton()
-        self._hl_toggle.set_child(self._hl_icon)
-        self._hl_toggle.set_tooltip_text("Highlighter (Ctrl+H)")
-        self._hl_toggle.connect("toggled", self._on_highlighter_toggled)
-        header.pack_end(self._hl_toggle)
 
         # notes toggle
         self._notes_toggle = Gtk.ToggleButton()
@@ -2859,8 +2868,23 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         else:
             self.canvas.pen_color = rgb
 
+    def _toggle_highlighter(self):
+        """Ctrl+H: flip the Pen/Highlighter segment pair."""
+        if self._hl_toggle.get_active():
+            self._pen_seg.set_active(True)
+        else:
+            self._hl_toggle.set_active(True)
+
     def _on_highlighter_toggled(self, btn):
         self.canvas.highlighter = btn.get_active()
+        if self.canvas.highlighter:
+            self._pen_btn.set_child(self._hl_icon)
+            self._hl_icon.queue_draw()
+            self._pen_btn.set_tooltip_text("Pen settings — highlighter active (Ctrl+H)")
+        else:
+            self._pen_btn.set_child(None)
+            self._pen_btn.set_icon_name("document-edit-symbolic")
+            self._pen_btn.set_tooltip_text("Pen settings")
         self._sync_pen_popover()
 
     def _sync_pen_popover(self):
@@ -3275,7 +3299,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 self._show_search()
                 return True
             if keyval == Gdk.KEY_h:
-                self._hl_toggle.set_active(not self._hl_toggle.get_active())
+                self._toggle_highlighter()
                 return True
             if keyval == Gdk.KEY_e:
                 self._on_export()
