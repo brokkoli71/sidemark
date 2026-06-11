@@ -72,6 +72,8 @@ import numpy as np
 
 
 class PDFCanvas(Gtk.DrawingArea):
+    SCROLL_FLIP_THRESHOLD = 3.0   # scroll notches past the page edge before flipping
+
     def __init__(self):
         super().__init__()
         self.document = None
@@ -100,6 +102,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
         self.on_page_changed = None    # callback(current_idx, n_pages)
+        self.on_page_will_change = None  # callback() before leaving the page (commit notes)
         self.on_nav_button = None     # callback(delta: int) for back/forward buttons
         self.on_change = None         # callback() whenever strokes are modified
         self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
@@ -116,6 +119,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zoom_selecting = False
         self._zoom_start = None        # screen (x, y)
         self._zoom_end = None          # screen (x, y), constrained
+
+        # scroll-past-boundary page flip: signed accumulator of scroll notches
+        # while the page edge is already visible; flips after the threshold
+        self._scroll_past = 0.0
 
         # view-fit tracking: while the page is in "fitted" state, canvas
         # resizes (sidebar toggle, window resize) re-fit; after any manual
@@ -226,29 +233,35 @@ class PDFCanvas(Gtk.DrawingArea):
         logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
         self._load_page(0)
 
-    def _load_page(self, idx):
+    def _load_page(self, idx, keep_view=False):
         self.current_page_idx = idx
         self.page = self.document[idx]
         self.page_width  = self.page.rect.width
         self.page_height = self.page.rect.height
         self._page_surface = None
         self._surface_scale = 0.0
+        self._scroll_past = 0.0
         if self._rerender_id is not None:
             GLib.source_remove(self._rerender_id)
             self._rerender_id = None
-        self._needs_fit = True   # re-fit on first draw with real canvas dimensions
+        if keep_view:
+            self._needs_fit = False   # caller keeps zoom and positions the view
+        else:
+            self._needs_fit = True    # re-fit on first draw with real canvas dimensions
         self._page_words = self.page.get_text("words")   # cache for text selection
         self._selected_words = []
         self.queue_draw()
         if self.on_page_changed:
             self.on_page_changed(idx, self.n_pages)
 
-    def go_to_page(self, idx):
+    def go_to_page(self, idx, keep_view=False):
         if not self.document:
             return
         idx = max(0, min(self.n_pages - 1, idx))
         if idx != self.current_page_idx:
-            self._load_page(idx)
+            if self.on_page_will_change:
+                self.on_page_will_change()
+            self._load_page(idx, keep_view=keep_view)
 
     @property
     def strokes(self):
@@ -495,6 +508,9 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
         if not (state & Gdk.ModifierType.CONTROL_MASK):
+            if self._handle_boundary_flip(dx, dy):
+                return True
+            self._scroll_past = 0.0
             self.offset_x -= dx * 30
             self.offset_y -= dy * 30
             self._is_fitted = False
@@ -511,6 +527,47 @@ class PDFCanvas(Gtk.DrawingArea):
         self._schedule_rerender()
         self.queue_draw()
         return True
+
+    def _handle_boundary_flip(self, dx, dy):
+        """Scrolling further while the page edge is already visible flips the
+        page (after a small resistance threshold). Returns True when the
+        scroll was consumed (accumulating or flipping) instead of panning."""
+        if self.page is None or not dy or abs(dy) < abs(dx):
+            return False
+        ch = self.get_height() or 600
+        page_top = self.offset_y
+        page_bottom = self.offset_y + self.page_height * self.scale
+        at_bottom = dy > 0 and page_bottom <= ch + 1
+        at_top = dy < 0 and page_top >= -1
+        if not (at_bottom or at_top):
+            return False
+        if at_bottom and self.current_page_idx >= self.n_pages - 1:
+            return False
+        if at_top and self.current_page_idx <= 0:
+            return False
+        if self._scroll_past and (self._scroll_past > 0) != (dy > 0):
+            self._scroll_past = 0.0   # direction reversed — restart resistance
+        self._scroll_past += dy
+        if self._scroll_past >= self.SCROLL_FLIP_THRESHOLD:
+            self._flip_page(1)
+        elif self._scroll_past <= -self.SCROLL_FLIP_THRESHOLD:
+            self._flip_page(-1)
+        return True
+
+    def _flip_page(self, delta):
+        if self._is_fitted:
+            self.go_to_page(self.current_page_idx + delta)   # refit on the new page
+            return
+        # zoomed: keep zoom and horizontal position, align the new page so
+        # reading continues at its top (or bottom when flipping backwards)
+        ch = self.get_height() or 600
+        self.go_to_page(self.current_page_idx + delta, keep_view=True)
+        if delta > 0:
+            self.offset_y = 8.0
+        else:
+            self.offset_y = ch - self.page_height * self.scale - 8.0
+        self._schedule_rerender()
+        self.queue_draw()
 
     def _anchor_hit_test(self, sx, sy):
         """Return index of anchor circle under screen point, or None."""
@@ -1503,6 +1560,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.on_change = self._mark_dirty
         self.canvas.on_text_copied = self._on_text_copied
         self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
+        # commit the current note before any canvas-initiated page change
+        # (scroll flip, link jump, undo on another page)
+        self.canvas.on_page_will_change = self._commit_note
         self.canvas.on_anchor_placed = self._on_anchor_placed
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
 

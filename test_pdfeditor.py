@@ -425,6 +425,95 @@ class TestViewResize(unittest.TestCase):
         self.assertTrue(canvas._is_fitted)
 
 
+# ── scroll-past-boundary page flip ────────────────────────────────────────────
+
+class TestScrollFlip(unittest.TestCase):
+    def _canvas_with_pdf(self, n_pages=3):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=n_pages)
+        canvas.load(self._tmp)
+        canvas._fit_page(800, 600)   # whole page visible — both edges at boundary
+        return canvas
+
+    def tearDown(self):
+        if os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    @staticmethod
+    def _scroll(canvas, dy, times=1):
+        ctrl = mock.Mock()
+        ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
+        for _ in range(times):
+            canvas._on_scroll(ctrl, 0, dy)
+
+    def test_scrolling_past_bottom_flips_to_next_page(self):
+        canvas = self._canvas_with_pdf()
+        self._scroll(canvas, 1, times=3)
+        self.assertEqual(canvas.current_page_idx, 1)
+
+    def test_below_threshold_does_not_flip(self):
+        canvas = self._canvas_with_pdf()
+        self._scroll(canvas, 1, times=2)
+        self.assertEqual(canvas.current_page_idx, 0)
+
+    def test_scrolling_past_top_flips_to_previous_page(self):
+        canvas = self._canvas_with_pdf()
+        canvas.go_to_page(1)
+        canvas._fit_page(800, 600)
+        self._scroll(canvas, -1, times=3)
+        self.assertEqual(canvas.current_page_idx, 0)
+
+    def test_direction_reversal_resets_resistance(self):
+        canvas = self._canvas_with_pdf()
+        canvas.go_to_page(1)
+        canvas._fit_page(800, 600)
+        self._scroll(canvas, 1, times=2)    # 2 notches down …
+        self._scroll(canvas, -1, times=1)   # … reversal resets the accumulator
+        self._scroll(canvas, 1, times=2)    # 2 more down: still below threshold
+        self.assertEqual(canvas.current_page_idx, 1)
+        self._scroll(canvas, 1, times=1)
+        self.assertEqual(canvas.current_page_idx, 2)
+
+    def test_no_flip_past_last_page(self):
+        canvas = self._canvas_with_pdf()
+        canvas.go_to_page(2)
+        canvas._fit_page(800, 600)
+        self._scroll(canvas, 1, times=5)
+        self.assertEqual(canvas.current_page_idx, 2)
+
+    def test_zoomed_flip_keeps_zoom_and_aligns_top(self):
+        canvas = self._canvas_with_pdf()
+        canvas._is_fitted = False
+        canvas.scale = 2.0
+        canvas.offset_x = -100.0
+        canvas.offset_y = 600 - 842 * 2.0   # page bottom exactly at viewport bottom
+        self._scroll(canvas, 1, times=3)
+        self.assertEqual(canvas.current_page_idx, 1)
+        self.assertEqual(canvas.scale, 2.0)
+        self.assertEqual(canvas.offset_x, -100.0)
+        self.assertEqual(canvas.offset_y, 8.0)   # new page top in view
+
+    def test_mid_page_scroll_pans_normally(self):
+        canvas = self._canvas_with_pdf()
+        canvas._is_fitted = False
+        canvas.scale = 2.0
+        canvas.offset_y = -200.0   # neither edge visible
+        self._scroll(canvas, 1, times=1)
+        self.assertEqual(canvas.current_page_idx, 0)
+        self.assertEqual(canvas.offset_y, -230.0)   # panned by 30 px
+
+    def test_page_will_change_fires_before_change(self):
+        canvas = self._canvas_with_pdf()
+        seen = []
+        canvas.on_page_will_change = lambda: seen.append(canvas.current_page_idx)
+        canvas.go_to_page(1)
+        self.assertEqual(seen, [0])   # fired while the old page was current
+        canvas.go_to_page(1)          # no-op: same page
+        self.assertEqual(seen, [0])
+
+
 # ── undo for draw and erase ──────────────────────────────────────────────────
 
 class TestUndoEraser(unittest.TestCase):

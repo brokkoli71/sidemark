@@ -89,6 +89,7 @@ pip install pymupdf
 | Input | Action |
 |-------|--------|
 | Scroll | Pan |
+| Scroll past page edge | Flip to next / previous page (keeps zoom) |
 | `Ctrl+scroll` | Zoom in/out (cursor-anchored) |
 | `Ctrl+drag` | Pan |
 | `Shift+drag` | Zoom to region |
