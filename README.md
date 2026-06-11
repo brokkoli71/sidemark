@@ -10,6 +10,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 ## Features
 
 - **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable by right-click-dragging
+- **Highlighter mode** (`Ctrl+H`) — wide translucent strokes that survive save/reload like any other annotation
 - **Live markdown notes** linked to PDF pages, with anchor markers to pin notes to specific spots
 - **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
 - **Add and delete pages** — insert blank pages with same dimensions
@@ -73,6 +74,7 @@ pip install pymupdf
 |-------|--------|
 | Left-drag | Draw stroke |
 | Right-drag | Erase stroke (including from previous sessions) |
+| `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
 | `Ctrl+Z` | Undo the last action chronologically — a stroke, an erase drag, or a burst of notes typing — no matter where the cursor is |
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Redo the last undone action |
 | `Alt+drag` | Select & copy text (word-level highlight) |

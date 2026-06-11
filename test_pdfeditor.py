@@ -1908,6 +1908,90 @@ class TestGlobalRedo(TestGlobalUndo):
         self.assertEqual(canvas.all_strokes[0], [s1, s2])
 
 
+class TestHighlighter(unittest.TestCase):
+    def test_pen_attrs_switch(self):
+        canvas = PDFCanvas()
+        color, width, opacity = canvas._pen_attrs()
+        self.assertEqual((color, width, opacity),
+                         (canvas.pen_color, canvas.pen_width, 1.0))
+        canvas.highlighter = True
+        color, width, opacity = canvas._pen_attrs()
+        self.assertEqual((color, width, opacity),
+                         (canvas.hl_color, canvas.hl_width, canvas.hl_opacity))
+
+    def test_opacity_roundtrips_through_pdf(self):
+        """Highlight strokes keep their translucency across save/load (CA key
+        via annot.set_opacity); plain pen strokes stay fully opaque."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            canvas = PDFCanvas()
+            canvas.load(pdf)
+            canvas.all_strokes[0] = [
+                {"pts": [(10.0, 10.0), (60.0, 60.0)], "color": (1.0, 0.85, 0.0),
+                 "width": 12.0, "opacity": 0.4},
+                {"pts": [(10.0, 80.0), (60.0, 90.0)], "color": (0.0, 0.0, 1.0),
+                 "width": 2.0},   # pre-highlighter stroke without the key
+            ]
+            out = os.path.join(d, "saved.pdf")
+            canvas.save(out)
+
+            reloaded = PDFCanvas()
+            reloaded.load(out)
+            strokes = sorted(reloaded.all_strokes[0], key=lambda s: s["width"])
+            self.assertEqual(len(strokes), 2)
+            self.assertEqual(strokes[0]["opacity"], 1.0)
+            self.assertAlmostEqual(strokes[1]["opacity"], 0.4, places=2)
+            self.assertAlmostEqual(strokes[1]["width"], 12.0, places=1)
+            self.assertAlmostEqual(strokes[1]["color"][0], 1.0, places=2)
+
+    def test_toggle_routes_pen_popover_to_active_tool(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.highlighter")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    pen_width = win.canvas.pen_width
+                    pen_color = win.canvas.pen_color
+
+                    win._hl_toggle.set_active(True)
+                    if not win.canvas.highlighter:
+                        raise AssertionError("toggle did not enable highlighter")
+                    win._width_scale.set_value(18.0)
+                    if win.canvas.hl_width != 18.0:
+                        raise AssertionError("width scale did not set hl_width")
+                    if win.canvas.pen_width != pen_width:
+                        raise AssertionError("width scale leaked into pen_width")
+                    rgba = Gdk.RGBA()
+                    rgba.red, rgba.green, rgba.blue, rgba.alpha = 0.0, 1.0, 0.0, 1.0
+                    win._color_btn.set_rgba(rgba)
+                    if win.canvas.hl_color != (0.0, 1.0, 0.0):
+                        raise AssertionError("color button did not set hl_color")
+                    if win.canvas.pen_color != pen_color:
+                        raise AssertionError("color button leaked into pen_color")
+
+                    win._hl_toggle.set_active(False)
+                    if win.canvas.highlighter:
+                        raise AssertionError("toggle did not disable highlighter")
+                    if abs(win._width_scale.get_value() - pen_width) > 0.01:
+                        raise AssertionError("scale did not return to pen width")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
 class TestNotesSidebarAnimation(unittest.TestCase):
     def test_toggle_animates_hide_then_show(self):
         """Toggling the notes panel slides the paned position; the box is

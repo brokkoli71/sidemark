@@ -102,8 +102,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self._redo_stack = []
         self._erase_group = 0
 
-        self.pen_color = (0.05, 0.05, 0.8)   # RGB — PDF ink annotations have no alpha
+        self.pen_color = (0.05, 0.05, 0.8)   # RGB — stroke alpha lives in "opacity"
         self.pen_width = 2.0
+        # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
+        self.highlighter = False
+        self.hl_color = (1.0, 0.85, 0.0)
+        self.hl_width = 12.0
+        self.hl_opacity = 0.40
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
@@ -238,12 +243,15 @@ class PDFCanvas(Gtk.DrawingArea):
             for annot in page.annots(types=[fitz.PDF_ANNOT_INK]):
                 color = tuple(annot.colors.get("stroke", (0.05, 0.05, 0.8)))
                 width = annot.border.get("width", 2.0)
+                # fitz reports -1.0 (or 1.0) when the PDF CA key is unset
+                opacity = annot.opacity if 0 < annot.opacity < 1 else 1.0
                 for polyline in annot.vertices:
                     if polyline:
                         self.all_strokes.setdefault(i, []).append({
                             "pts":   [tuple(pt) for pt in polyline],
                             "color": color,
                             "width": width,
+                            "opacity": opacity,
                         })
                         total_annots += 1
         logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
@@ -282,6 +290,12 @@ class PDFCanvas(Gtk.DrawingArea):
     @property
     def strokes(self):
         return self.all_strokes.setdefault(self.current_page_idx, [])
+
+    def _pen_attrs(self):
+        """(color, width, opacity) of the active drawing tool."""
+        if self.highlighter:
+            return self.hl_color, self.hl_width, self.hl_opacity
+        return self.pen_color, self.pen_width, 1.0
 
     # ── layout ───────────────────────────────────────────────────────────────
 
@@ -389,9 +403,11 @@ class PDFCanvas(Gtk.DrawingArea):
 
         to_draw = self.strokes[:]
         if self.current_stroke:
+            color, width, opacity = self._pen_attrs()
             to_draw.append({"pts": self.current_stroke,
-                             "color": self.pen_color,
-                             "width": self.pen_width})
+                             "color": color,
+                             "width": width,
+                             "opacity": opacity})
 
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
@@ -399,7 +415,7 @@ class PDFCanvas(Gtk.DrawingArea):
         for stroke in to_draw:
             pts = stroke["pts"]
             r, g, b = stroke["color"]
-            ctx.set_source_rgb(r, g, b)
+            ctx.set_source_rgba(r, g, b, stroke.get("opacity", 1.0))
             ctx.set_line_width(stroke["width"])   # PDF units — scales with zoom
             if len(pts) < 2:
                 if pts:
@@ -837,10 +853,12 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_end = None
         else:
             if self.current_stroke:
+                color, width, opacity = self._pen_attrs()
                 stroke = {
                     "pts": self.current_stroke,
-                    "color": self.pen_color,
-                    "width": self.pen_width,
+                    "color": color,
+                    "width": width,
+                    "opacity": opacity,
                 }
                 self.strokes.append(stroke)
                 self._undo_stack.append(("draw", self.current_page_idx, stroke))
@@ -1070,6 +1088,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 annot = page.add_ink_annot([polyline])
                 annot.set_colors(stroke=(r, g, b))
                 annot.set_border(width=stroke["width"])
+                if stroke.get("opacity", 1.0) < 1.0:
+                    annot.set_opacity(stroke["opacity"])
                 annot.update()
                 total_written += 1
         return total_written
@@ -1850,6 +1870,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._is_untitled = False  # True when working on an auto-created blank (no saved path yet)
         self._dirty = False
         self._suppress_dirty = False
+        self._syncing_pen = False   # guard while pen popover mirrors tool state
         # global chronological undo: one entry per canvas gesture, one per
         # uninterrupted typing burst in the notes panel.
         # ("canvas",) | ("notes", page_idx, text_before_burst)
@@ -2082,8 +2103,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 def _on_click(_btn):
                     rgba = Gdk.RGBA()
                     rgba.red, rgba.green, rgba.blue, rgba.alpha = r, g, b, 1.0
+                    # routes through _on_color_changed → active tool
                     self._color_btn.set_rgba(rgba)
-                    self.canvas.pen_color = (r, g, b)
                 return _on_click
 
             swatch.connect("clicked", _make_handler(*rgb))
@@ -2098,6 +2119,29 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         pen_btn.set_tooltip_text("Pen settings")
         pen_btn.set_popover(popover)
         header.pack_end(pen_btn)
+
+        # highlighter toggle — no marker icon ships with Adwaita, so the icon
+        # is a mini preview of the actual highlight stroke (doubles as a
+        # color hint)
+        self._hl_icon = Gtk.DrawingArea()
+        self._hl_icon.set_content_width(18)
+        self._hl_icon.set_content_height(18)
+
+        def _draw_hl_icon(_area, ctx, w, h):
+            r, g, b = self.canvas.hl_color
+            ctx.set_source_rgba(r, g, b, max(self.canvas.hl_opacity, 0.55))
+            ctx.set_line_width(7)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.move_to(4, h - 5)
+            ctx.line_to(w - 4, 5)
+            ctx.stroke()
+        self._hl_icon.set_draw_func(_draw_hl_icon)
+
+        self._hl_toggle = Gtk.ToggleButton()
+        self._hl_toggle.set_child(self._hl_icon)
+        self._hl_toggle.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._hl_toggle.connect("toggled", self._on_highlighter_toggled)
+        header.pack_end(self._hl_toggle)
 
         # notes toggle
         self._notes_toggle = Gtk.ToggleButton()
@@ -2238,6 +2282,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Draw",          None),
             ("Left-drag",     "Draw stroke"),
             ("Right-drag",    "Erase stroke"),
+            ("Ctrl+H",        "Toggle highlighter"),
             ("Ctrl+Z",        "Undo last action (draw, erase, typing)"),
             ("Ctrl+Y",        "Redo (also Ctrl+Shift+Z)"),
             ("Text",          None),
@@ -2752,11 +2797,45 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.toast_overlay.add_toast(toast)
 
     def _on_width_changed(self, scale):
-        self.canvas.pen_width = scale.get_value()
+        if self._syncing_pen:
+            return
+        if self.canvas.highlighter:
+            self.canvas.hl_width = scale.get_value()
+        else:
+            self.canvas.pen_width = scale.get_value()
 
     def _on_color_changed(self, btn, _param=None):
+        if self._syncing_pen:
+            return
         rgba = btn.get_rgba()
-        self.canvas.pen_color = (rgba.red, rgba.green, rgba.blue)
+        rgb = (rgba.red, rgba.green, rgba.blue)
+        if self.canvas.highlighter:
+            self.canvas.hl_color = rgb
+            self._hl_icon.queue_draw()
+        else:
+            self.canvas.pen_color = rgb
+
+    def _on_highlighter_toggled(self, btn):
+        self.canvas.highlighter = btn.get_active()
+        self._sync_pen_popover()
+
+    def _sync_pen_popover(self):
+        """Point the width scale and color button at the active tool."""
+        self._syncing_pen = True
+        try:
+            if self.canvas.highlighter:
+                self._width_scale.set_range(4.0, 24.0)
+                self._width_scale.set_value(self.canvas.hl_width)
+                color = self.canvas.hl_color
+            else:
+                self._width_scale.set_range(0.3, 5.0)
+                self._width_scale.set_value(self.canvas.pen_width)
+                color = self.canvas.pen_color
+            rgba = Gdk.RGBA()
+            rgba.red, rgba.green, rgba.blue, rgba.alpha = *color, 1.0
+            self._color_btn.set_rgba(rgba)
+        finally:
+            self._syncing_pen = False
 
     def open_file(self, path):
         if self._dirty:
@@ -3083,6 +3162,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_f:
                 self._show_search()
+                return True
+            if keyval == Gdk.KEY_h:
+                self._hl_toggle.set_active(not self._hl_toggle.get_active())
                 return True
             if keyval == Gdk.KEY_e:
                 self._on_export()
