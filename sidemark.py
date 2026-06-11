@@ -14,6 +14,42 @@ import json
 import shutil
 import time
 
+RECENT_PATH = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+    "sidemark", "recent.json")
+RECENT_MAX = 15
+
+
+def _load_recent():
+    """Recent files, newest first; entries whose file vanished are dropped."""
+    try:
+        with open(RECENT_PATH, encoding="utf-8") as f:
+            items = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [it for it in items
+            if isinstance(it, dict) and os.path.isfile(it.get("path", ""))]
+
+
+def _add_recent(path):
+    path = os.path.abspath(path)
+    items = [it for it in _load_recent() if it.get("path") != path]
+    items.insert(0, {"path": path, "ts": time.time()})
+    del items[RECENT_MAX:]
+    os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
+    tmp = RECENT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f)
+    os.replace(tmp, RECENT_PATH)
+
+
+# Fast path for launcher integrations (walker/elephant menus, rofi, …):
+# print "name<TAB>path" lines and exit before any GTK import happens.
+if __name__ == "__main__" and "--list-recent" in sys.argv[1:]:
+    for _it in _load_recent():
+        print(f"{os.path.basename(_it['path'])}\t{_it['path']}")
+    sys.exit(0)
+
 LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
 _log_path = None
 _log_had_error = False
@@ -1975,6 +2011,14 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         open_btn.connect("clicked", self._on_open)
         header.pack_start(open_btn)
 
+        self._recent_popover = Gtk.Popover()
+        self._recent_popover.connect("show", self._rebuild_recent_menu)
+        recent_btn = Gtk.MenuButton()
+        recent_btn.set_icon_name("document-open-recent-symbolic")
+        recent_btn.set_tooltip_text("Open recent")
+        recent_btn.set_popover(self._recent_popover)
+        header.pack_start(recent_btn)
+
         new_btn = Gtk.Button(label="New")
         new_btn.set_tooltip_text("Create a new blank A4 PDF")
         new_btn.connect("clicked", self._on_new_pdf)
@@ -2837,6 +2881,70 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         finally:
             self._syncing_pen = False
 
+    # ── recent files ──────────────────────────────────────────────────────────
+
+    def _remember_recent(self, path):
+        path = os.path.abspath(path)
+        # the scratchpad and unsaved blanks are noise in a recents list
+        if path == os.path.join(os.path.expanduser("~"), ".local", "share",
+                                "sidemark", "scratchpad.pdf"):
+            return
+        if os.path.basename(path).startswith("sidemark_blank_"):
+            return
+        try:
+            _add_recent(path)
+        except OSError:
+            logger.error("recent list update failed:\n" + traceback.format_exc())
+        # also register with the XDG recent-files store (recently-used.xbel) —
+        # GTK/GNOME file dialogs and KDE's KRecentDocument/krunner read it.
+        # Skipped headless so tests don't pollute the user's real recents.
+        if os.environ.get("GDK_BACKEND") != "offscreen":
+            try:
+                Gtk.RecentManager.get_default().add_item(
+                    Gio.File.new_for_path(path).get_uri())
+            except Exception:
+                pass
+
+    def _rebuild_recent_menu(self, _popover=None):
+        items = _load_recent()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        if not items:
+            empty = Gtk.Label(label="No recent files")
+            empty.add_css_class("dim-label")
+            empty.set_margin_start(12)
+            empty.set_margin_end(12)
+            empty.set_margin_top(8)
+            empty.set_margin_bottom(8)
+            box.append(empty)
+        for it in items:
+            path = it["path"]
+            row = Gtk.Button()
+            row.add_css_class("flat")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            name = Gtk.Label(label=os.path.basename(path), xalign=0)
+            where = Gtk.Label(label=os.path.dirname(path), xalign=0)
+            where.add_css_class("dim-label")
+            where.set_ellipsize(Pango.EllipsizeMode.START)
+            where.set_max_width_chars(38)
+            inner.append(name)
+            inner.append(where)
+            row.set_child(inner)
+
+            def _make_open(p):
+                def _on_click(_btn):
+                    self._recent_popover.popdown()
+                    self.open_file(p)
+                return _on_click
+            row.connect("clicked", _make_open(path))
+            box.append(row)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_max_content_height(420)
+        scroller.set_propagate_natural_height(True)
+        scroller.set_propagate_natural_width(True)
+        scroller.set_child(box)
+        self._recent_popover.set_child(scroller)
+
     def open_file(self, path):
         if self._dirty:
             self._ask_save_then(lambda: self._do_open_file(path))
@@ -2864,6 +2972,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._undo_timeline.clear()
         self._redo_timeline.clear()
         self._notes_burst_open = False
+        self._remember_recent(path)
         self._maybe_offer_recovery(path)
 
     def _open_markdown(self, md_path):
@@ -2892,6 +3001,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._redo_timeline.clear()
         self._notes_burst_open = False
         self._burst_base = self.notes_model.get(0)
+        self._remember_recent(md_path)
 
     def _on_new_pdf(self, _btn):
         if self._dirty:
@@ -2955,6 +3065,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._path = path
             self._is_untitled = False
             self._set_file_title(os.path.basename(path), path)
+            self._remember_recent(path)
             self._on_save(after=after)
             if old_tmp and os.path.exists(old_tmp):
                 try:

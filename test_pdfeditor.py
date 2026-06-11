@@ -24,6 +24,7 @@ import unittest.mock as mock
 Adw.init()
 
 sys.path.insert(0, os.path.dirname(__file__))
+import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
                       _export_pdf_with_notes, _parse_anchors, PDFEditorWindow)
 
@@ -1988,6 +1989,123 @@ class TestHighlighter(unittest.TestCase):
 
             app.connect("activate", on_activate)
             app.run([])
+        if errors:
+            raise errors[0]
+
+
+class TestRecentFiles(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(
+            sidemark, "RECENT_PATH",
+            os.path.join(self._tmp.name, "recent.json"))
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _touch(self, name):
+        p = os.path.join(self._tmp.name, name)
+        open(p, "w").close()
+        return p
+
+    def test_add_dedupes_and_orders_newest_first(self):
+        a, b = self._touch("a.pdf"), self._touch("b.pdf")
+        sidemark._add_recent(a)
+        sidemark._add_recent(b)
+        sidemark._add_recent(a)   # re-open → moves to front, no duplicate
+        paths = [it["path"] for it in sidemark._load_recent()]
+        self.assertEqual(paths, [a, b])
+
+    def test_capped_at_max(self):
+        for i in range(sidemark.RECENT_MAX + 5):
+            sidemark._add_recent(self._touch(f"f{i}.pdf"))
+        self.assertEqual(len(sidemark._load_recent()), sidemark.RECENT_MAX)
+
+    def test_missing_files_dropped_and_corrupt_json_tolerated(self):
+        a = self._touch("a.pdf")
+        sidemark._add_recent(a)
+        os.unlink(a)
+        self.assertEqual(sidemark._load_recent(), [])
+        with open(sidemark.RECENT_PATH, "w") as f:
+            f.write("{not json")
+        self.assertEqual(sidemark._load_recent(), [])
+
+    def test_list_recent_cli_prints_without_gtk(self):
+        a = self._touch("doc.pdf")
+        sidemark._add_recent(a)
+        env = dict(os.environ, XDG_DATA_HOME=self._tmp.name)
+        # the CLI reads $XDG_DATA_HOME/sidemark/recent.json
+        os.makedirs(os.path.join(self._tmp.name, "sidemark"), exist_ok=True)
+        import shutil
+        shutil.copy(sidemark.RECENT_PATH,
+                    os.path.join(self._tmp.name, "sidemark", "recent.json"))
+        import subprocess
+        out = subprocess.run(
+            ["/usr/bin/python3", os.path.join(os.path.dirname(__file__), "sidemark.py"),
+             "--list-recent"],
+            env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(out.returncode, 0)
+        self.assertIn(f"doc.pdf\t{a}", out.stdout)
+
+    def test_open_file_records_recent_and_menu_lists_it(self):
+        errors = []
+        pdf = os.path.join(self._tmp.name, "doc.pdf")
+        make_pdf(pdf)
+        app = Adw.Application(application_id="test.sidemark.recent")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._do_open_file(pdf)
+                paths = [it["path"] for it in sidemark._load_recent()]
+                if paths != [pdf]:
+                    raise AssertionError(f"open did not record recent: {paths}")
+                win._rebuild_recent_menu()
+                scroller = win._recent_popover.get_child()
+                box = scroller.get_child().get_child()   # viewport → box
+                rows = []
+                child = box.get_first_child()
+                while child is not None:
+                    rows.append(child)
+                    child = child.get_next_sibling()
+                if len(rows) != 1:
+                    raise AssertionError(f"expected 1 menu row, got {len(rows)}")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_scratchpad_and_temp_blanks_not_recorded(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.recentskip")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                tmp_pdf = os.path.join(tempfile.gettempdir(), "sidemark_blank_test.pdf")
+                make_pdf(tmp_pdf)
+                try:
+                    win._do_open_file(tmp_pdf)
+                finally:
+                    os.unlink(tmp_pdf)
+                if sidemark._load_recent():
+                    raise AssertionError("temp blank ended up in recents")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
         if errors:
             raise errors[0]
 

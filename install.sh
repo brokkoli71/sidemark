@@ -31,6 +31,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -rf  "$INSTALL_DIR"
     rm -f   "$BIN_DIR/sidemark"
     rm -f   "$DESKTOP_DIR/$DESKTOP_ID.desktop"
+    rm -f   "$HOME/.config/elephant/menus/sidemark_recent.lua"
     rm -f   "$ICON_BASE/scalable/apps/$DESKTOP_ID.svg"
     for size in 16 32 48 64 128 256; do
         rm -f "$ICON_BASE/${size}x${size}/apps/$DESKTOP_ID.png"
@@ -223,6 +224,15 @@ if [[ $HAVE_RSVG -eq 1 ]]; then
     ok "icons (SVG + PNG)  →  $ICON_BASE/"
 else
     ok "icon (SVG only)    →  $ICON_BASE/"
+fi
+
+# Walker/elephant launcher menu (Omarchy): recent files in the launcher
+ELEPHANT_MENUS="$HOME/.config/elephant/menus"
+if [[ -d "$ELEPHANT_MENUS" ]] && command -v jq &>/dev/null; then
+    install -m 644 "$SCRIPT_DIR/extras/sidemark_recent.lua" \
+        "$ELEPHANT_MENUS/sidemark_recent.lua"
+    systemctl --user try-restart elephant 2>/dev/null || true
+    ok "walker menu    →  $ELEPHANT_MENUS/sidemark_recent.lua"
 fi
 
 # Refresh caches

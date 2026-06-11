@@ -18,6 +18,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 - **Text search** — Ctrl+F opens a search bar; highlights all matches across all pages, navigate with Enter / ↑↓
 - **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter
 - **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files
+- **Recent files** — header menu, XDG recent-files integration, and a walker (Omarchy) launcher menu
 - **Design Scheme** — Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
 
 ## Installation
@@ -157,6 +158,22 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 ## Autosave
 
 While there are unsaved changes, Sidemark snapshots the document and notes every 60 seconds to `~/.local/state/sidemark/autosave/` — the original file is never modified until you explicitly save. If Sidemark closes uncleanly, reopening the file offers to recover the snapshot. Snapshots are removed on save or discard, and pruned after 30 days.
+
+## Recent files
+
+Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (newest first, 15 entries) and exposed three ways:
+
+- **In-app** — the clock-arrow button next to *Open* lists them.
+- **XDG recent files** — opens are registered in `recently-used.xbel`, so GTK/GNOME file dialogs and KDE (KF6 `KRecentDocument`, hence krunner's recent-documents results) pick them up automatically.
+- **walker / Omarchy launcher** — `install.sh` drops `extras/sidemark_recent.lua` into `~/.config/elephant/menus/` (when that directory exists and `jq` is installed). Reach it via walker's provider list (`/` by default), or bind a prefix in `~/.config/walker/config.toml`:
+
+  ```toml
+  [[providers.prefixes]]
+  prefix = "p:"
+  provider = "menus:sidemarkrecent"
+  ```
+
+For other launchers (rofi, fuzzel, …) `sidemark --list-recent` prints `name<TAB>path` lines and exits without loading GTK.
 
 ## Notes format
 
