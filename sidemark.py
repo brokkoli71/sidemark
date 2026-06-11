@@ -2183,6 +2183,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Shift+Drag",    "Zoom to region"),
             ("Shift+Click",   "Fit page"),
             ("File",          None),
+            ("Ctrl+O",        "Open file…"),
+            ("Ctrl+N",        "New blank PDF"),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
@@ -2855,6 +2857,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_s:
                 self._on_save()
+                return True
+            if keyval == Gdk.KEY_o:
+                self._on_open(None)
+                return True
+            if keyval == Gdk.KEY_n and not (state & Gdk.ModifierType.SHIFT_MASK):
+                self._on_new_pdf(None)
                 return True
             if keyval == Gdk.KEY_c:
                 if self.canvas._selected_words and not self._notes_view.has_focus():

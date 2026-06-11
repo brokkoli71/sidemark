@@ -137,6 +137,8 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 
 | Key | Action |
 |-----|--------|
+| `Ctrl+O` | Open file |
+| `Ctrl+N` | New blank PDF |
 | `Ctrl+S` | Save (prompts for name if untitled) |
 
 ## Tested distributions
