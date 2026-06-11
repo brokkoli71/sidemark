@@ -344,6 +344,87 @@ class TestNotes(unittest.TestCase):
             os.unlink(path)
 
 
+# ── view adjustment on canvas resize (sidebar toggle, window resize) ─────────
+
+class TestViewResize(unittest.TestCase):
+    def _canvas_with_pdf(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)   # 595 x 842
+        canvas.load(self._tmp)
+        return canvas
+
+    def tearDown(self):
+        if os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def test_fitted_view_refits_on_resize(self):
+        canvas = self._canvas_with_pdf()
+        canvas._fit_page(800, 600)
+        canvas._last_size = (800, 600)
+        canvas._on_resize(None, 500, 600)
+        self.assertAlmostEqual(canvas.scale, min(500 / 595, 600 / 842) * 0.95)
+        self.assertAlmostEqual(canvas.offset_x, (500 - 595 * canvas.scale) / 2)
+        self.assertAlmostEqual(canvas.offset_y, (600 - 842 * canvas.scale) / 2)
+
+    def test_zoomed_view_keeps_center_anchored(self):
+        canvas = self._canvas_with_pdf()
+        canvas._is_fitted = False
+        canvas.scale = 2.0
+        canvas.offset_x = -200.0   # pdf point at old center (800/2, 600/2):
+        canvas.offset_y = -100.0   # ((400+200)/2, (300+100)/2) = (300, 200)
+        canvas._last_size = (800, 600)
+        canvas._on_resize(None, 600, 600)
+        cx_pdf = (600 / 2 - canvas.offset_x) / canvas.scale
+        cy_pdf = (600 / 2 - canvas.offset_y) / canvas.scale
+        self.assertAlmostEqual(cx_pdf, 300.0)
+        self.assertAlmostEqual(cy_pdf, 200.0)
+        self.assertAlmostEqual(canvas.scale, 2.0)   # zoom level untouched
+
+    def test_first_resize_only_records_size(self):
+        canvas = self._canvas_with_pdf()
+        scale, ox, oy = canvas.scale, canvas.offset_x, canvas.offset_y
+        canvas._on_resize(None, 800, 600)   # old size unknown (0, 0)
+        self.assertEqual(canvas._last_size, (800, 600))
+        self.assertEqual((canvas.scale, canvas.offset_x, canvas.offset_y),
+                         (scale, ox, oy))
+
+    def test_fit_page_sets_fitted_flag(self):
+        canvas = self._canvas_with_pdf()
+        canvas._is_fitted = False
+        canvas._fit_page(800, 600)
+        self.assertTrue(canvas._is_fitted)
+
+    def test_manual_zoom_clears_fitted_flag(self):
+        canvas = self._canvas_with_pdf()
+        canvas._fit_page(800, 600)
+        ctrl = mock.Mock()
+        ctrl.get_current_event_state.return_value = Gdk.ModifierType.CONTROL_MASK
+        canvas._on_scroll(ctrl, 0, 1)   # Ctrl+scroll zoom
+        self.assertFalse(canvas._is_fitted)
+
+    def test_scroll_pan_clears_fitted_flag(self):
+        canvas = self._canvas_with_pdf()
+        canvas._fit_page(800, 600)
+        ctrl = mock.Mock()
+        ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
+        canvas._on_scroll(ctrl, 0, 1)
+        self.assertFalse(canvas._is_fitted)
+
+    def test_zoom_to_rect_clears_fitted_flag(self):
+        canvas = self._canvas_with_pdf()
+        canvas._fit_page(800, 600)
+        canvas._execute_zoom_to_rect((10, 10), (200, 200))
+        self.assertFalse(canvas._is_fitted)
+
+    def test_zoom_to_fit_restores_fitted_flag(self):
+        canvas = self._canvas_with_pdf()
+        canvas._execute_zoom_to_rect((10, 10), (200, 200))
+        canvas.zoom_to_fit()
+        self.assertTrue(canvas._is_fitted)
+
+
 # ── undo for draw and erase ──────────────────────────────────────────────────
 
 class TestUndoEraser(unittest.TestCase):

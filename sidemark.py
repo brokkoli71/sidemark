@@ -117,6 +117,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zoom_start = None        # screen (x, y)
         self._zoom_end = None          # screen (x, y), constrained
 
+        # view-fit tracking: while the page is in "fitted" state, canvas
+        # resizes (sidebar toggle, window resize) re-fit; after any manual
+        # zoom/pan they keep the viewport center anchored instead
+        self._is_fitted = False
+        self._last_size = (0, 0)
+        self.connect("resize", self._on_resize)
+
         # cached page surface
         self._page_surface = None      # cairo.ImageSurface rendered at _surface_scale
         self._surface_scale = 0.0
@@ -249,13 +256,30 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── layout ───────────────────────────────────────────────────────────────
 
-    def _fit_page(self):
-        w = self.get_width() or 800
-        h = self.get_height() or 600
+    def _fit_page(self, w=None, h=None):
+        w = w or self.get_width() or 800
+        h = h or self.get_height() or 600
         if self.page_width and self.page_height:
             self.scale = min(w / self.page_width, h / self.page_height) * 0.95
             self.offset_x = (w - self.page_width * self.scale) / 2
             self.offset_y = (h - self.page_height * self.scale) / 2
+            self._is_fitted = True
+
+    def _on_resize(self, _area, width, height):
+        old_w, old_h = self._last_size
+        self._last_size = (width, height)
+        if not self.page or not old_w or not old_h or (width, height) == (old_w, old_h):
+            return
+        if self._is_fitted:
+            self._fit_page(width, height)
+            self._schedule_rerender()
+        else:
+            # keep the PDF point at the old viewport center centered
+            cx_pdf = (old_w / 2 - self.offset_x) / self.scale
+            cy_pdf = (old_h / 2 - self.offset_y) / self.scale
+            self.offset_x = width / 2 - cx_pdf * self.scale
+            self.offset_y = height / 2 - cy_pdf * self.scale
+        self.queue_draw()
 
     def _rerender_now(self):
         if not self.page:
@@ -451,6 +475,7 @@ class PDFCanvas(Gtk.DrawingArea):
         else:
             logger.debug(f"thumb pan start ({self._mouse_x:.0f},{self._mouse_y:.0f})")
             self._thumb_panning = True
+            self._is_fitted = False
             self._thumb_origin = (self._mouse_x, self._mouse_y)
             self._thumb_start_offset = (self.offset_x, self.offset_y)
 
@@ -472,6 +497,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if not (state & Gdk.ModifierType.CONTROL_MASK):
             self.offset_x -= dx * 30
             self.offset_y -= dy * 30
+            self._is_fitted = False
             self.queue_draw()
             return True
         factor = 0.9 if dy > 0 else 1.1
@@ -479,6 +505,7 @@ class PDFCanvas(Gtk.DrawingArea):
         pdf_x = (mx - self.offset_x) / self.scale
         pdf_y = (my - self.offset_y) / self.scale
         self.scale = max(0.1, min(20.0, self.scale * factor))
+        self._is_fitted = False
         self.offset_x = mx - pdf_x * self.scale
         self.offset_y = my - pdf_y * self.scale
         self._schedule_rerender()
@@ -557,6 +584,7 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
+            self._is_fitted = False
             self._pan_start_offset = (self.offset_x, self.offset_y)
             self._text_selecting = False
             self._zoom_selecting = False
@@ -787,6 +815,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zoom_stack.append((self.scale, self.offset_x, self.offset_y))
         new_scale = min(cw / pdf_w, ch / pdf_h) * 0.97
         self.scale = new_scale
+        self._is_fitted = False
         self.offset_x = (cw - pdf_w * new_scale) / 2 - px1 * new_scale
         self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
         self._schedule_rerender()
@@ -794,6 +823,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def zoom_back(self):
         if self._zoom_stack:
             self.scale, self.offset_x, self.offset_y = self._zoom_stack.pop()
+            self._is_fitted = False
             self._schedule_rerender()
             self.queue_draw()
 
