@@ -340,6 +340,85 @@ class TestNotes(unittest.TestCase):
             os.unlink(path)
 
 
+# ── page insert / delete keep notes, strokes and anchors aligned ─────────────
+
+class TestPageInsertDelete(unittest.TestCase):
+    """Inserting/deleting a page must re-key everything that is keyed by page
+    index: strokes, anchors (canvas) and notes (model). A desync here attaches
+    notes/ink to the wrong pages — silent data corruption."""
+
+    def _canvas_with_pdf(self, n_pages=3):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=n_pages)
+        canvas.load(self._tmp)
+        return canvas
+
+    def tearDown(self):
+        tmp = getattr(self, "_tmp", None)
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+    @staticmethod
+    def _stroke(tag):
+        return {"pts": [(tag, tag), (tag + 1, tag + 1)], "color": (0, 0, 1), "width": 2}
+
+    def test_insert_shifts_strokes_and_anchors(self):
+        canvas = self._canvas_with_pdf()
+        canvas.all_strokes = {0: [self._stroke(0)], 1: [self._stroke(1)], 2: [self._stroke(2)]}
+        canvas._anchors = {0: [(10, 10)], 1: [(11, 11)], 2: [(12, 12)]}
+        canvas.go_to_page(0)
+        canvas.add_blank_page()   # inserts at index 1
+        self.assertEqual(canvas.n_pages, 4)
+        self.assertEqual(canvas.all_strokes[0][0]["pts"][0], (0, 0))
+        self.assertNotIn(1, canvas.all_strokes)      # new blank page
+        self.assertEqual(canvas.all_strokes[2][0]["pts"][0], (1, 1))
+        self.assertEqual(canvas.all_strokes[3][0]["pts"][0], (2, 2))
+        self.assertEqual(canvas._anchors, {0: [(10, 10)], 2: [(11, 11)], 3: [(12, 12)]})
+
+    def test_delete_shifts_strokes_and_anchors(self):
+        canvas = self._canvas_with_pdf()
+        canvas.all_strokes = {0: [self._stroke(0)], 1: [self._stroke(1)], 2: [self._stroke(2)]}
+        canvas._anchors = {0: [(10, 10)], 1: [(11, 11)], 2: [(12, 12)]}
+        canvas.go_to_page(1)
+        self.assertTrue(canvas.delete_current_page())
+        self.assertEqual(canvas.n_pages, 2)
+        self.assertEqual(canvas.all_strokes[0][0]["pts"][0], (0, 0))
+        self.assertEqual(canvas.all_strokes[1][0]["pts"][0], (2, 2))
+        self.assertEqual(canvas._anchors, {0: [(10, 10)], 1: [(12, 12)]})
+
+    def test_notes_shift_for_insert(self):
+        m = NotesModel()
+        m.set(0, "zero")
+        m.set(1, "one")
+        m.set(2, "two")
+        m.shift_for_insert(1)
+        self.assertEqual(m.get(0), "zero")
+        self.assertEqual(m.get(1), "")      # the inserted page has no note
+        self.assertEqual(m.get(2), "one")
+        self.assertEqual(m.get(3), "two")
+
+    def test_notes_shift_for_delete(self):
+        m = NotesModel()
+        m.set(0, "zero")
+        m.set(1, "one")
+        m.set(2, "two")
+        m.shift_for_delete(1)
+        self.assertEqual(m.get(0), "zero")
+        self.assertEqual(m.get(1), "two")
+        self.assertEqual(m.get(2), "")
+
+    def test_insert_then_delete_roundtrip(self):
+        m = NotesModel()
+        m.set(0, "zero")
+        m.set(5, "five")
+        m.shift_for_insert(1)
+        m.shift_for_delete(1)
+        self.assertEqual(m.get(0), "zero")
+        self.assertEqual(m.get(5), "five")
+
+
 # ── eraser ───────────────────────────────────────────────────────────────────
 
 class TestEraser(unittest.TestCase):

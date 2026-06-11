@@ -806,10 +806,14 @@ class PDFCanvas(Gtk.DrawingArea):
         idx = self.current_page_idx + 1
         pw, ph = self.page_width, self.page_height
         self.document.insert_page(idx, width=pw, height=ph)
-        # Shift all stroke entries at or beyond the insertion point up by one
+        # Shift all stroke and anchor entries at or beyond the insertion point up by one
         self.all_strokes = {
             (k + 1 if k >= idx else k): v
             for k, v in self.all_strokes.items()
+        }
+        self._anchors = {
+            (k + 1 if k >= idx else k): v
+            for k, v in self._anchors.items()
         }
         self.n_pages = len(self.document)
         self._load_page(idx)   # navigate to the new blank page
@@ -820,10 +824,15 @@ class PDFCanvas(Gtk.DrawingArea):
             return False
         idx = self.current_page_idx
         self.document.delete_page(idx)
-        # Remove strokes for deleted page; shift later pages down by one
+        # Remove strokes/anchors for deleted page; shift later pages down by one
         self.all_strokes = {
             (k - 1 if k > idx else k): v
             for k, v in self.all_strokes.items()
+            if k != idx
+        }
+        self._anchors = {
+            (k - 1 if k > idx else k): v
+            for k, v in self._anchors.items()
             if k != idx
         }
         self.n_pages = len(self.document)
@@ -1020,6 +1029,21 @@ class NotesModel:
             content = parts[i + 1].strip() if i + 1 < len(parts) else ""
             if content:
                 self._notes[int(parts[i])] = content
+
+    def shift_for_insert(self, idx):
+        """Re-key notes after a page was inserted at idx."""
+        self._notes = {
+            (k + 1 if k >= idx else k): v
+            for k, v in self._notes.items()
+        }
+
+    def shift_for_delete(self, idx):
+        """Drop the note of deleted page idx; re-key later pages."""
+        self._notes = {
+            (k - 1 if k > idx else k): v
+            for k, v in self._notes.items()
+            if k != idx
+        }
 
     def save(self, path):
         sections = [
@@ -1763,6 +1787,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _add_blank_page(self):
         if not self.canvas.document:
             return
+        self._commit_note()
+        # Shift notes before the canvas inserts and navigates to the new page,
+        # so _restore_note already sees the re-keyed model.
+        self.notes_model.shift_for_insert(self.canvas.current_page_idx + 1)
         self.canvas.add_blank_page()
         self._mark_dirty()
 
@@ -1774,7 +1802,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
             return
-        self._commit_note()
+        self.notes_model.shift_for_delete(self.canvas.current_page_idx)
         self.canvas.delete_current_page()
         self._mark_dirty()
 
