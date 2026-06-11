@@ -1425,18 +1425,28 @@ class TestTocSidebar(unittest.TestCase):
                         child = child.get_next_sibling()
                     if len(rows) != 3:
                         raise AssertionError(f"expected 3 TOC rows, got {len(rows)}")
-                    if not win._toc_btn.get_sensitive():
-                        raise AssertionError("TOC button not enabled")
+                    if not win._has_toc:
+                        raise AssertionError("TOC not detected")
+                    if "Ctrl+T" not in (win._toc_btn.get_tooltip_text() or ""):
+                        raise AssertionError("tooltip not switched for TOC'd PDF")
+                    win._toc_btn.set_active(True)
+                    if not win._toc_revealer.get_reveal_child():
+                        raise AssertionError("revealer did not open")
                     win._on_toc_row_activated(win._toc_list, rows[1])
                     if win.canvas.current_page_idx != 1:
                         raise AssertionError(
                             f"row activation went to page {win.canvas.current_page_idx}")
-                    # a PDF without TOC disables the button and empties the list
+                    # a PDF without TOC: explanatory tooltip, toggle bounces
                     win._do_open_file(plain)
-                    if win._toc_btn.get_sensitive():
-                        raise AssertionError("TOC button still enabled for plain PDF")
+                    if win._has_toc:
+                        raise AssertionError("TOC wrongly detected for plain PDF")
+                    if "No outline" not in (win._toc_btn.get_tooltip_text() or ""):
+                        raise AssertionError("missing no-outline tooltip")
                     if win._toc_list.get_first_child() is not None:
                         raise AssertionError("TOC list not cleared for plain PDF")
+                    win._toc_btn.set_active(True)   # must bounce back
+                    if win._toc_btn.get_active() or win._toc_revealer.get_reveal_child():
+                        raise AssertionError("toggle did not bounce without TOC")
                 except Exception as e:
                     errors.append(e)
                 finally:

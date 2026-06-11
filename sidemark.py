@@ -1900,10 +1900,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         new_btn.connect("clicked", self._on_new_pdf)
         header.pack_start(new_btn)
 
+        # stays sensitive even without a TOC — insensitive widgets get no
+        # tooltip in GTK4, and the tooltip is how we explain the situation
+        self._has_toc = False
         self._toc_btn = Gtk.ToggleButton()
         self._toc_btn.set_icon_name("view-list-symbolic")
-        self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
-        self._toc_btn.set_sensitive(False)   # enabled when the PDF has a TOC
+        self._toc_btn.set_tooltip_text("No outline in this document")
         self._toc_btn.connect("toggled", self._on_toc_toggled)
         header.pack_start(self._toc_btn)
 
@@ -2455,6 +2457,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     # ── outline (TOC) sidebar ─────────────────────────────────────────────────
 
     def _on_toc_toggled(self, btn):
+        if btn.get_active() and not self._has_toc:
+            btn.set_active(False)   # bounce; re-fires toggled with False
+            toast = Adw.Toast.new("This document has no outline")
+            toast.set_timeout(2)
+            self.toast_overlay.add_toast(toast)
+            return
         self._toc_revealer.set_reveal_child(btn.get_active())
 
     def _on_toc_row_activated(self, _list, row):
@@ -2483,9 +2491,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             row.set_child(label)
             row.toc_page = page - 1   # get_toc() pages are 1-based
             self._toc_list.append(row)
+        self._has_toc = bool(toc)
         if not toc:
             self._toc_btn.set_active(False)   # also hides the revealer
-        self._toc_btn.set_sensitive(bool(toc))
+            self._toc_btn.set_tooltip_text("No outline in this document")
+        else:
+            self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
 
     def _on_notes_toggled(self, btn):
         if btn.get_active():
@@ -2883,8 +2894,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
                 return True
             if keyval == Gdk.KEY_t:
-                if self._toc_btn.get_sensitive():
-                    self._toc_btn.set_active(not self._toc_btn.get_active())
+                # without a TOC the toggle handler bounces and shows a toast
+                self._toc_btn.set_active(not self._toc_btn.get_active())
                 return True
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_S:
                 self._on_save_as()
