@@ -2393,7 +2393,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._suppress_dirty = True
         text = self.notes_model.get(self.canvas.current_page_idx)
         self._last_anchor_mark = None   # set_text would strand the mark at offset 0
-        self._notes_view.get_buffer().set_text(text)
+        buf = self._notes_view.get_buffer()
+        # Programmatic page loads must not enter the undo history — otherwise
+        # Ctrl+Z in the notes view could resurrect another page's text here
+        buf.begin_irreversible_action()
+        buf.set_text(text)
+        buf.end_irreversible_action()
         self._suppress_dirty = False
         self._update_canvas_anchors()
 
@@ -2580,7 +2585,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.notes_model.load(md_path)
         self._page_label.set_label("—")
         # Show page 0 notes; canvas stays in "no PDF" placeholder state.
-        self._notes_view.get_buffer().set_text(self.notes_model.get(0))
+        buf = self._notes_view.get_buffer()
+        buf.begin_irreversible_action()
+        buf.set_text(self.notes_model.get(0))
+        buf.end_irreversible_action()
 
     def _on_new_pdf(self, _btn):
         if self._dirty:

@@ -1349,6 +1349,52 @@ class TestCallouts(unittest.TestCase):
             raise errors[0]
 
 
+class TestNotesUndoIsolation(unittest.TestCase):
+    def test_undo_cannot_cross_page_boundary(self):
+        """Ctrl+Z in the notes view must only undo typing on the current
+        page — the programmatic set_text on page switches used to enter the
+        undo history, so undo could resurrect another page's text."""
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf, n_pages=2)
+            app = Adw.Application(application_id="test.sidemark.notesundo")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win.notes_model.set(0, "alpha")
+                    win.notes_model.set(1, "beta")
+                    win._restore_note()
+                    buf = win._notes_view.get_buffer()
+                    win._go_to_page(1)   # buffer now shows "beta"
+                    if buf.get_can_undo():
+                        raise AssertionError("undo history crossed page switch")
+                    buf.undo()   # must be a no-op
+                    text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    if text != "beta":
+                        raise AssertionError(f"undo corrupted page text: {text!r}")
+                    # typing on the current page stays undoable
+                    buf.insert(buf.get_end_iter(), "X")
+                    if not buf.get_can_undo():
+                        raise AssertionError("typing not undoable after restore")
+                    buf.undo()
+                    text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    if text != "beta":
+                        raise AssertionError(f"typing undo broken: {text!r}")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
 class TestTocSidebar(unittest.TestCase):
     def _pdf_with_toc(self, d):
         path = os.path.join(d, "toc.pdf")
