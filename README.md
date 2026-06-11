@@ -165,7 +165,7 @@ Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (new
 
 - **In-app** — the clock-arrow button next to *Open* lists them.
 - **XDG recent files** — opens are registered in `recently-used.xbel`, so GTK/GNOME file dialogs and KDE (KF6 `KRecentDocument`, hence krunner's recent-documents results) pick them up automatically.
-- **walker / Omarchy launcher** — `install.sh` drops `extras/sidemark_recent.lua` into `~/.config/elephant/menus/` (when that directory exists and `jq` is installed). Reach it via walker's provider list (`/` by default), or bind a prefix in `~/.config/walker/config.toml`:
+- **walker / Omarchy launcher** (opt-in) — `./install.sh --walker-menu` drops `extras/sidemark_recent.lua` into `~/.config/elephant/menus/` (needs `jq`). Reach it via walker's provider list (`/` by default), or bind a prefix in `~/.config/walker/config.toml`:
 
   ```toml
   [[providers.prefixes]]

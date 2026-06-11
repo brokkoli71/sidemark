@@ -1,14 +1,17 @@
 #!/bin/bash
 # install.sh — user-local install for Sidemark
-# Usage:  ./install.sh            install
-#         ./install.sh -y         install, auto-confirm dependency prompt
-#         ./install.sh --uninstall remove everything
+# Usage:  ./install.sh               install
+#         ./install.sh -y            install, auto-confirm dependency prompt
+#         ./install.sh --walker-menu also install the walker/elephant recent-files menu
+#         ./install.sh --uninstall   remove everything
 set -euo pipefail
 
 _YES=0
+_WALKER=0
 for _arg in "$@"; do
     case "$_arg" in
         -y|--yes) _YES=1 ;;
+        --walker-menu) _WALKER=1 ;;
     esac
 done
 
@@ -226,13 +229,18 @@ else
     ok "icon (SVG only)    →  $ICON_BASE/"
 fi
 
-# Walker/elephant launcher menu (Omarchy): recent files in the launcher
-ELEPHANT_MENUS="$HOME/.config/elephant/menus"
-if [[ -d "$ELEPHANT_MENUS" ]] && command -v jq &>/dev/null; then
-    install -m 644 "$SCRIPT_DIR/extras/sidemark_recent.lua" \
-        "$ELEPHANT_MENUS/sidemark_recent.lua"
-    systemctl --user try-restart elephant 2>/dev/null || true
-    ok "walker menu    →  $ELEPHANT_MENUS/sidemark_recent.lua"
+# Walker/elephant launcher menu (Omarchy): recent files in the launcher.
+# Opt-in via --walker-menu — not every user wants entries in their launcher.
+if [[ $_WALKER -eq 1 ]]; then
+    ELEPHANT_MENUS="$HOME/.config/elephant/menus"
+    if [[ -d "$ELEPHANT_MENUS" ]] && command -v jq &>/dev/null; then
+        install -m 644 "$SCRIPT_DIR/extras/sidemark_recent.lua" \
+            "$ELEPHANT_MENUS/sidemark_recent.lua"
+        systemctl --user try-restart elephant 2>/dev/null || true
+        ok "walker menu    →  $ELEPHANT_MENUS/sidemark_recent.lua"
+    else
+        warn "walker menu skipped: needs ~/.config/elephant/menus and jq"
+    fi
 fi
 
 # Refresh caches
