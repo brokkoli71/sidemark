@@ -1689,6 +1689,7 @@ class TestGlobalUndo(unittest.TestCase):
                   "color": (0, 0, 1), "width": 2.0}
         canvas.strokes.append(stroke)
         canvas._undo_stack.append(("draw", canvas.current_page_idx, stroke))
+        canvas._redo_stack.clear()
         if canvas.on_change:
             canvas.on_change()
         if canvas.on_user_action:
@@ -1844,6 +1845,67 @@ class TestGlobalUndo(unittest.TestCase):
         canvas._erase_group = 4
         canvas._on_drag_end(None, 0, 0)
         self.assertEqual(len(fired), 1)
+
+
+class TestGlobalRedo(TestGlobalUndo):
+    """Ctrl+Y / Ctrl+Shift+Z re-applies undone actions in reverse order.
+    Inherits the undo tests so redo plumbing cannot regress undo."""
+
+    def test_redo_canvas_and_notes_in_reverse_undo_order(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            s1 = self._simulate_draw(win)
+            buf.insert(buf.get_end_iter(), "hello")
+            win._global_undo()   # typing gone
+            win._global_undo()   # draw gone
+            if win.canvas.strokes or self._buf_text(win) != "":
+                raise AssertionError("undo precondition failed")
+            win._global_redo()   # draw back first (last undone)
+            if win.canvas.strokes != [s1]:
+                raise AssertionError("redo did not restore the stroke")
+            win._global_redo()   # typing back
+            if self._buf_text(win) != "hello":
+                raise AssertionError(f"redo did not restore typing: "
+                                     f"{self._buf_text(win)!r}")
+            if win.notes_model.get(0) != "hello":
+                raise AssertionError("redo did not update the notes model")
+            win._global_redo()   # empty redo stack must be a no-op
+            # the redone actions are undoable again
+            win._global_undo()
+            if self._buf_text(win) != "":
+                raise AssertionError("undo after redo broken")
+        self._run_in_window(1, body)
+
+    def test_new_action_clears_redo(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            self._simulate_draw(win)
+            win._global_undo()
+            if not win._redo_timeline:
+                raise AssertionError("undo did not fill the redo timeline")
+            buf.insert(buf.get_end_iter(), "x")   # new action
+            if win._redo_timeline:
+                raise AssertionError("typing did not clear the redo timeline")
+            win._global_redo()   # must be a no-op
+            if win.canvas.strokes:
+                raise AssertionError("stale redo re-applied a stroke")
+        self._run_in_window(1, body)
+
+    def test_canvas_erase_group_redo_roundtrip(self):
+        canvas = PDFCanvas()
+        s1 = {"pts": [(0.0, 0.0), (5.0, 5.0)], "color": (0, 0, 1), "width": 2.0}
+        s2 = {"pts": [(9.0, 9.0), (5.0, 5.0)], "color": (0, 0, 1), "width": 2.0}
+        canvas.all_strokes[0] = []
+        # one erase gesture removed both strokes (indices as _erase_at records them)
+        canvas._undo_stack.append(("erase", 0, 0, s1, 1))
+        canvas._undo_stack.append(("erase", 0, 0, s2, 1))
+        canvas.undo_last()
+        self.assertEqual(canvas.all_strokes[0], [s1, s2])
+        canvas.redo_last()
+        self.assertEqual(canvas.all_strokes[0], [])
+        self.assertEqual(len(canvas._undo_stack), 2)
+        canvas.undo_last()   # the round-tripped stack must still undo correctly
+        self.assertEqual(canvas.all_strokes[0], [s1, s2])
 
 
 class TestNotesSidebarAnimation(unittest.TestCase):

@@ -96,8 +96,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self.current_stroke = []
 
         # undo: ("draw", page, stroke) | ("erase", page, idx, stroke, group);
-        # erase ops of one drag gesture share a group and undo together
+        # erase ops of one drag gesture share a group and undo together.
+        # redo holds lists of ops exactly as undo_last popped them.
         self._undo_stack = []
+        self._redo_stack = []
         self._erase_group = 0
 
         self.pen_color = (0.05, 0.05, 0.8)   # RGB — PDF ink annotations have no alpha
@@ -228,6 +230,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.current_stroke = []
         self.all_strokes = {}
         self._undo_stack = []
+        self._redo_stack = []
         self._erase_group = 0
         total_annots = 0
         for i in range(self.n_pages):
@@ -841,6 +844,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 }
                 self.strokes.append(stroke)
                 self._undo_stack.append(("draw", self.current_page_idx, stroke))
+                self._redo_stack.clear()
                 if self.on_change:
                     self.on_change()
                 if self.on_user_action:
@@ -930,6 +934,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 kept.append(s)
         if removed:
             self.all_strokes[page] = kept
+            self._redo_stack.clear()
             if self.on_change:
                 self.on_change()
             self.queue_draw()
@@ -1001,6 +1006,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if not self._undo_stack:
             return
         op = self._undo_stack.pop()
+        popped = [op]
         page = op[1]
         strokes = self.all_strokes.setdefault(page, [])
         if op[0] == "draw":
@@ -1014,9 +1020,34 @@ class PDFCanvas(Gtk.DrawingArea):
             while (self._undo_stack and self._undo_stack[-1][0] == "erase"
                    and self._undo_stack[-1][4] == group):
                 op = self._undo_stack.pop()
+                popped.append(op)
                 strokes.insert(min(op[2], len(strokes)), op[3])
+        self._redo_stack.append(popped)
         if page != self.current_page_idx:
             self.go_to_page(page)   # show the user what was undone
+        if self.on_change:
+            self.on_change()
+        self.queue_draw()
+
+    def redo_last(self):
+        """Re-apply the most recently undone draw or erase gesture."""
+        if not self._redo_stack:
+            return
+        ops = self._redo_stack.pop()
+        page = ops[0][1]
+        strokes = self.all_strokes.setdefault(page, [])
+        if ops[0][0] == "draw":
+            strokes.append(ops[0][2])
+        else:
+            # re-remove in the gesture's chronological order (reverse of pop order)
+            for op in reversed(ops):
+                for i, s in enumerate(strokes):
+                    if s is op[3]:
+                        del strokes[i]
+                        break
+        self._undo_stack.extend(reversed(ops))
+        if page != self.current_page_idx:
+            self.go_to_page(page)
         if self.on_change:
             self.on_change()
         self.queue_draw()
@@ -1080,6 +1111,10 @@ class PDFCanvas(Gtk.DrawingArea):
             (op[0], op[1] + 1 if op[1] >= idx else op[1]) + op[2:]
             for op in self._undo_stack
         ]
+        self._redo_stack = [
+            [(op[0], op[1] + 1 if op[1] >= idx else op[1]) + op[2:] for op in ops]
+            for ops in self._redo_stack
+        ]
         self.n_pages = len(self.document)
         self._load_page(idx)   # navigate to the new blank page
 
@@ -1104,6 +1139,13 @@ class PDFCanvas(Gtk.DrawingArea):
             (op[0], op[1] - 1 if op[1] > idx else op[1]) + op[2:]
             for op in self._undo_stack
             if op[1] != idx
+        ]
+        self._redo_stack = [
+            shifted for shifted in (
+                [(op[0], op[1] - 1 if op[1] > idx else op[1]) + op[2:]
+                 for op in ops if op[1] != idx]
+                for ops in self._redo_stack
+            ) if shifted
         ]
         self.n_pages = len(self.document)
         new_idx = min(idx, self.n_pages - 1)
@@ -1812,6 +1854,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         # uninterrupted typing burst in the notes panel.
         # ("canvas",) | ("notes", page_idx, text_before_burst)
         self._undo_timeline = []
+        # redo: ("canvas",) | ("notes", page_idx, before, after)
+        self._redo_timeline = []
         self._notes_burst_open = False
         self._burst_base = ""   # buffer text at the last burst boundary
         self.notes_model = NotesModel()
@@ -1967,6 +2011,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         title_box.append(nav_box)
         title_box.append(self._file_label)
         header.set_title_widget(title_box)
+
+        redo_btn = Gtk.Button()
+        redo_btn.set_icon_name("edit-redo-symbolic")
+        redo_btn.set_tooltip_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+        redo_btn.connect("clicked", lambda _: self._global_redo())
+        header.pack_end(redo_btn)
 
         undo_btn = Gtk.Button()
         undo_btn.set_icon_name("edit-undo-symbolic")
@@ -2189,6 +2239,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Left-drag",     "Draw stroke"),
             ("Right-drag",    "Erase stroke"),
             ("Ctrl+Z",        "Undo last action (draw, erase, typing)"),
+            ("Ctrl+Y",        "Redo (also Ctrl+Shift+Z)"),
             ("Text",          None),
             ("Alt+Drag",      "Select text (word-level)"),
             ("Ctrl+C",        "Copy selected text"),
@@ -2286,6 +2337,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("notes", op[1] + 1, op[2]) if op[0] == "notes" and op[1] >= idx else op
             for op in self._undo_timeline
         ]
+        self._redo_timeline = [
+            ("notes", op[1] + 1) + op[2:] if op[0] == "notes" and op[1] >= idx else op
+            for op in self._redo_timeline
+        ]
         self.canvas.add_blank_page()
         self._mark_dirty()
 
@@ -2302,6 +2357,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._undo_timeline = [
             ("notes", op[1] - 1, op[2]) if op[0] == "notes" and op[1] > idx else op
             for op in self._undo_timeline
+            if not (op[0] == "notes" and op[1] == idx)
+        ]
+        self._redo_timeline = [
+            ("notes", op[1] - 1) + op[2:] if op[0] == "notes" and op[1] > idx else op
+            for op in self._redo_timeline
             if not (op[0] == "notes" and op[1] == idx)
         ]
         self.canvas.delete_current_page()
@@ -2322,6 +2382,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._undo_timeline.append(
                 ("notes", self.canvas.current_page_idx, self._burst_base))
             self._notes_burst_open = True
+            self._redo_timeline.clear()   # typing is a new action
         self._mark_dirty()
         self._update_canvas_anchors()
 
@@ -2457,17 +2518,42 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         buf = self._notes_view.get_buffer()
         self._burst_base = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
         self._undo_timeline.append(("canvas",))
+        self._redo_timeline.clear()   # canvas already cleared its own redo
 
     def _on_undo_key(self, ctrl, keyval, keycode, state):
-        if (keyval == Gdk.KEY_z and (state & Gdk.ModifierType.CONTROL_MASK)
-                and not (state & Gdk.ModifierType.SHIFT_MASK)):
-            # leave Ctrl+Z alone inside entries (search bar, dialogs)
-            focus = self.get_focus()
-            if isinstance(focus, Gtk.Editable):
-                return False
+        if not (state & Gdk.ModifierType.CONTROL_MASK):
+            return False
+        is_z = keyval in (Gdk.KEY_z, Gdk.KEY_Z)
+        is_y = keyval in (Gdk.KEY_y, Gdk.KEY_Y)
+        if not is_z and not is_y:
+            return False
+        # leave undo/redo alone inside entries (search bar, dialogs)
+        focus = self.get_focus()
+        if isinstance(focus, Gtk.Editable):
+            return False
+        if is_y or (state & Gdk.ModifierType.SHIFT_MASK):
+            self._global_redo()   # Ctrl+Y or Ctrl+Shift+Z
+        else:
             self._global_undo()
-            return True
-        return False
+        return True
+
+    def _set_notes_text(self, page, text):
+        """Put text into the notes buffer and model without touching the
+        timeline — shared by global undo and redo."""
+        if page != self.canvas.current_page_idx:
+            self._go_to_page(page)   # show the user what is being changed
+        buf = self._notes_view.get_buffer()
+        self._suppress_dirty = True
+        self._last_anchor_mark = None
+        buf.begin_irreversible_action()
+        buf.set_text(text)
+        buf.end_irreversible_action()
+        self._suppress_dirty = False
+        self._notes_burst_open = False
+        self._burst_base = text
+        self.notes_model.set(page, text)
+        self._mark_dirty()
+        self._update_canvas_anchors()
 
     def _global_undo(self):
         """Undo the most recent user action — a stroke, an erase gesture, or a
@@ -2477,22 +2563,28 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         op = self._undo_timeline.pop()
         if op[0] == "canvas":
             self.canvas.undo_last()
+            self._redo_timeline.append(("canvas",))
             return
         _, page, before = op
         if page != self.canvas.current_page_idx:
-            self._go_to_page(page)   # show the user what is being undone
+            self._go_to_page(page)
         buf = self._notes_view.get_buffer()
-        self._suppress_dirty = True
-        self._last_anchor_mark = None
-        buf.begin_irreversible_action()
-        buf.set_text(before)
-        buf.end_irreversible_action()
-        self._suppress_dirty = False
-        self._notes_burst_open = False
-        self._burst_base = before
-        self.notes_model.set(page, before)
-        self._mark_dirty()
-        self._update_canvas_anchors()
+        after = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        self._redo_timeline.append(("notes", page, before, after))
+        self._set_notes_text(page, before)
+
+    def _global_redo(self):
+        """Re-apply the most recently undone action (Ctrl+Y / Ctrl+Shift+Z)."""
+        if not self._redo_timeline:
+            return
+        op = self._redo_timeline.pop()
+        if op[0] == "canvas":
+            self.canvas.redo_last()
+            self._undo_timeline.append(("canvas",))
+            return
+        _, page, before, after = op
+        self._set_notes_text(page, after)
+        self._undo_timeline.append(("notes", page, before))
 
     def _update_canvas_anchors(self):
         page_idx = self.canvas.current_page_idx
@@ -2691,6 +2783,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._populate_toc()
         self._clear_dirty()
         self._undo_timeline.clear()
+        self._redo_timeline.clear()
         self._notes_burst_open = False
         self._maybe_offer_recovery(path)
 
@@ -2717,6 +2810,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         buf.set_text(self.notes_model.get(0))
         buf.end_irreversible_action()
         self._undo_timeline.clear()
+        self._redo_timeline.clear()
         self._notes_burst_open = False
         self._burst_base = self.notes_model.get(0)
 
