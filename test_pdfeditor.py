@@ -913,5 +913,43 @@ class TestExport(unittest.TestCase):
             raise errors[0]
 
 
+class TestSaveCallback(unittest.TestCase):
+    def test_after_callback_only_on_successful_save(self):
+        """_on_save(after=...) must run the callback exactly once on success
+        and not at all when the save fails (the unsaved-changes dialog relies
+        on this to not destroy the window before/despite a failed save)."""
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.savecb")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+
+                    called = []
+                    win._on_save(after=lambda: called.append(True))
+                    if called != [True]:
+                        raise AssertionError(f"after not run on success: {called}")
+
+                    win._path = os.path.join(d, "missing-dir", "doc.pdf")
+                    called_on_failure = []
+                    win._on_save(after=lambda: called_on_failure.append(True))
+                    if called_on_failure:
+                        raise AssertionError("after ran despite failed save")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

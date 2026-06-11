@@ -1839,8 +1839,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         dlg.set_close_response("cancel")
         def on_response(d, r):
             if r == "save":
-                self._on_save()
-                callback()
+                # Run callback only once the save actually succeeded — the
+                # untitled path opens an async save-as dialog, and a failed
+                # save must not proceed (e.g. destroy the window).
+                self._on_save(after=callback)
             elif r == "discard":
                 callback()
             # cancel: do nothing
@@ -2044,7 +2046,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._set_file_title("Scratchpad", path)
         self._clear_dirty()
 
-    def _on_save_as(self):
+    def _on_save_as(self, after=None):
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Save PDF as…")
         default_name = os.path.basename(self._path) if self._path else "notes.pdf"
@@ -2055,13 +2057,16 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         store = Gio.ListStore.new(Gtk.FileFilter)
         store.append(f)
         dialog.set_filters(store)
-        dialog.save(self, None, self._save_as_done)
+        dialog.save(self, None, lambda d, r: self._save_as_done(d, r, after))
 
-    def _save_as_done(self, dialog, result):
+    def _save_as_done(self, dialog, result, after=None):
         try:
             file = dialog.save_finish(result)
-            if not file:
-                return
+        except GLib.Error:
+            return   # dialog dismissed by user
+        if not file:
+            return
+        try:
             path = file.get_path()
             if not path.lower().endswith(".pdf"):
                 path += ".pdf"
@@ -2071,7 +2076,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._path = path
             self._is_untitled = False
             self._set_file_title(os.path.basename(path), path)
-            self._on_save()
+            self._on_save(after=after)
             if old_tmp and os.path.exists(old_tmp):
                 try:
                     os.unlink(old_tmp)
@@ -2203,9 +2208,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         except Exception as e:
             self._show_error("Could not open file", str(e))
 
-    def _on_save(self, _btn=None):
+    def _on_save(self, _btn=None, after=None):
+        """Save; if `after` is given it runs only on a successful save
+        (for untitled files that means after the save-as dialog completed)."""
         if self._is_untitled:
-            self._on_save_as()
+            self._on_save_as(after=after)
             return
         notes_file = notes_path_for(self._path) if self._path else self._notes_path
         if not self._path and not notes_file:
@@ -2222,6 +2229,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self.toast_overlay.add_toast(toast)
         except Exception as e:
             self._show_error("Save failed", str(e))
+            return
+        if after:
+            after()
 
     def _reload(self):
         if not self._path:
