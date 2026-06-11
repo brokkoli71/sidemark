@@ -25,7 +25,7 @@ Adw.init()
 
 sys.path.insert(0, os.path.dirname(__file__))
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
-                      _export_pdf_with_notes, PDFEditorWindow)
+                      _export_pdf_with_notes, _parse_anchors, PDFEditorWindow)
 
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
@@ -1195,6 +1195,149 @@ class TestExport(unittest.TestCase):
                     win._on_export()   # dirty → save prompt
                     win._clear_dirty()
                     win._on_export()   # clean → export options
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
+class TestCallouts(unittest.TestCase):
+    # -- parser ---------------------------------------------------------------
+
+    def test_anchor_without_callout(self):
+        parsed = _parse_anchors("Heading\n<!-- anchor:10:20 -->\nBody text")
+        self.assertEqual(len(parsed), 1)
+        a = parsed[0]
+        self.assertEqual((a["x"], a["y"]), (10, 20))
+        self.assertIsNone(a["callout"])
+        self.assertEqual(a["text"], "Body text")
+        self.assertEqual(a["line"], 1)
+
+    def test_anchor_with_callout(self):
+        parsed = _parse_anchors("<!-- anchor:10:20 --> <!-- callout:30:40 -->\nBody")
+        self.assertEqual(parsed[0]["callout"], (30, 40))
+        self.assertEqual(parsed[0]["text"], "Body")
+
+    def test_callout_in_next_paragraph_not_paired(self):
+        parsed = _parse_anchors("<!-- anchor:10:20 -->\nBody\n\n<!-- callout:30:40 -->")
+        self.assertIsNone(parsed[0]["callout"])
+
+    def test_callout_belongs_to_nearest_preceding_anchor(self):
+        text = ("<!-- anchor:1:1 -->\n"
+                "<!-- anchor:2:2 --> <!-- callout:5:5 -->\nB")
+        parsed = _parse_anchors(text)
+        self.assertIsNone(parsed[0]["callout"])
+        self.assertEqual(parsed[1]["callout"], (5, 5))
+
+    def test_text_strips_markers_and_markdown(self):
+        parsed = _parse_anchors("<!-- anchor:1:1 --> <!-- callout:2:2 -->\n**bold** and `code`")
+        self.assertEqual(parsed[0]["text"], "bold and code")
+
+    # -- export rendering (real PDF, content asserted) -------------------------
+
+    def test_export_callout_renders_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf")
+            out = os.path.join(d, "out.pdf")
+            make_pdf(src)
+            model = NotesModel()
+            model.set(0, "<!-- anchor:100:200 --> <!-- callout:300:400 -->\n"
+                         "Important callout fact")
+            _export_pdf_with_notes(src, out, model, include_empty=False,
+                                   accent=(0.2, 0.5, 0.9))
+            doc = fitz.open(out)
+            source_text = doc[0].get_text()
+            self.assertIn("Important callout fact", source_text)   # box on the page
+            self.assertIn("1", source_text)                        # anchor number
+            notes_text = doc[1].get_text()
+            self.assertNotIn("callout:", notes_text)   # marker stripped from notes page
+            doc.close()
+
+    def test_export_callout_near_page_edge_is_clamped(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf")
+            out = os.path.join(d, "out.pdf")
+            make_pdf(src)
+            model = NotesModel()
+            model.set(0, "<!-- anchor:10:10 --> <!-- callout:590:838 -->\nEdge note")
+            _export_pdf_with_notes(src, out, model, include_empty=False,
+                                   accent=(0.2, 0.5, 0.9))
+            doc = fitz.open(out)
+            self.assertIn("Edge note", doc[0].get_text())
+            doc.close()
+
+    # -- canvas rendering -----------------------------------------------------
+
+    def test_canvas_draw_with_callout_does_not_raise(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        try:
+            make_pdf(path)
+            canvas.load(path)
+            canvas._fit_page(800, 600)
+            canvas._anchors[0] = _parse_anchors(
+                "<!-- anchor:100:100 --> <!-- callout:300:300 -->\nCanvas note")
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+            canvas._draw(canvas, cairo.Context(surf), 800, 600)   # must not raise
+        finally:
+            os.unlink(path)
+
+    # -- gesture: Ctrl+Alt+drag places a callout --------------------------------
+
+    def _drag_gesture(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = (
+            Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK)
+        return g
+
+    def test_long_drag_fires_callout_callback(self):
+        canvas = PDFCanvas()
+        canvas.scale, canvas.offset_x, canvas.offset_y = 1.0, 0.0, 0.0
+        placed = []
+        canvas.on_callout_placed = lambda x, y: placed.append((x, y))
+        canvas._on_drag_begin(self._drag_gesture(), 100, 100)
+        self.assertTrue(canvas._callout_dragging)
+        canvas._on_drag_end(None, 50, 30)
+        self.assertEqual(placed, [(150, 130)])
+
+    def test_short_drag_stays_anchor_only(self):
+        canvas = PDFCanvas()
+        placed = []
+        canvas.on_callout_placed = lambda x, y: placed.append((x, y))
+        canvas._on_drag_begin(self._drag_gesture(), 100, 100)
+        canvas._on_drag_end(None, 3, 3)
+        self.assertEqual(placed, [])
+
+    # -- window round-trip ----------------------------------------------------
+
+    def test_window_anchor_then_callout_in_buffer(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.callout")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._on_anchor_placed(0, 50, 60)
+                    win._on_callout_placed(80, 90)
+                    buf = win._notes_view.get_buffer()
+                    text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    if "<!-- anchor:50:60 --> <!-- callout:80:90 -->" not in text:
+                        raise AssertionError(f"markers not adjacent: {text!r}")
+                    parsed = win.canvas._anchors[0]
+                    if parsed[0]["callout"] != (80, 90):
+                        raise AssertionError(f"canvas missed callout: {parsed}")
                 except Exception as e:
                     errors.append(e)
                 finally:

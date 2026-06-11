@@ -104,6 +104,7 @@ pip install pymupdf
 | `Ctrl+E` | Inline code selection |
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
+| `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
 
 ### Inline math (notes)
 
@@ -152,4 +153,4 @@ While there are unsaved changes, Sidemark snapshots the document and notes every
 
 ## Notes format
 
-Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault. Anchor markers (`<!-- anchor:X:Y -->`) are stored the same way — invisible in external viewers, but displayed as numbered circles on the PDF canvas inside Sidemark.
+Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault. Anchor markers (`<!-- anchor:X:Y -->`) and callout markers (`<!-- callout:X:Y -->`) are stored the same way — invisible in external viewers. Inside Sidemark, anchors appear as numbered circles on the PDF canvas; a callout additionally renders its anchor's note paragraph in a box at the callout position, with an arrow from the anchor. Callouts are included in Ctrl+E exports.

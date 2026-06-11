@@ -69,7 +69,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource, Pango
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource, Pango, PangoCairo
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -111,9 +111,17 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_change = None         # callback() whenever strokes are modified
         self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
         self.on_anchor_clicked = None  # callback(anchor_index)
+        self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
 
-        self._anchors = {}         # {page_idx: [(x, y), ...]}
+        # {page_idx: [anchor dict from _parse_anchors, ...]}
+        self._anchors = {}
         self._active_anchors = set()  # indices highlighted on current page
+
+        # Ctrl+Alt+drag: anchor placed at press (GestureClick), callout box
+        # placed at release when the drag travelled far enough
+        self._callout_dragging = False
+        self._callout_start = None    # screen (x, y)
+        self._callout_cur = None
 
         self.search_rects = []          # fitz.Rect hits for current page
         self.search_current_rect = None # the active match rect
@@ -403,12 +411,17 @@ class PDFCanvas(Gtk.DrawingArea):
         # anchor markers
         anchors = self._anchors.get(self.current_page_idx, [])
         if anchors:
+            # callout boxes go under the circles so an anchor inside a box stays visible
+            for a in anchors:
+                if a.get("callout") and a.get("text"):
+                    self._draw_callout(ctx, a)
             ctx.save()
             ctx.translate(self.offset_x, self.offset_y)
             ctx.scale(self.scale, self.scale)
             r, g, b = self.zoom_accent
             radius = 8.0 / self.scale
-            for i, (ax, ay) in enumerate(anchors):
+            for i, a in enumerate(anchors):
+                ax, ay = a["x"], a["y"]
                 if i in self._active_anchors:
                     ctx.set_source_rgba(r, g, b, 0.3)
                     ctx.arc(ax, ay, radius * 1.9, 0, 2 * math.pi)
@@ -424,6 +437,17 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.move_to(ax - ext.width / 2 - ext.x_bearing, ay - ext.height / 2 - ext.y_bearing)
                 ctx.show_text(label)
             ctx.restore()
+
+        # callout placement preview (Ctrl+Alt+drag in progress)
+        if self._callout_dragging and self._callout_start and self._callout_cur:
+            ar, ag, ab = self.zoom_accent
+            ctx.set_source_rgba(ar, ag, ab, 0.8)
+            ctx.set_line_width(1.5)
+            ctx.set_dash([5.0, 3.0])
+            ctx.move_to(*self._callout_start)
+            ctx.line_to(*self._callout_cur)
+            ctx.stroke()
+            ctx.set_dash([])
 
         # search highlights
         if self.search_rects:
@@ -482,6 +506,57 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.rectangle(x1, y1, rw, rh)
             ctx.stroke()
             ctx.set_dash([])
+
+    def _draw_callout(self, ctx, a):
+        """Wrapped note text in a box at the callout position, with an arrow
+        from the anchor circle to the box. Drawn in screen space for crisp
+        text; all dimensions scale with zoom."""
+        ax, ay = self._pdf_to_screen(a["x"], a["y"])
+        cx, cy = self._pdf_to_screen(*a["callout"])
+        pad = max(3.0, 5.0 * self.scale)
+
+        layout = PangoCairo.create_layout(ctx)
+        desc = Pango.FontDescription("Sans")
+        desc.set_absolute_size(max(6.0, 8.5 * self.scale) * Pango.SCALE)
+        layout.set_font_description(desc)
+        layout.set_width(int(170 * self.scale * Pango.SCALE))
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        layout.set_text(a["text"])
+        tw, th = layout.get_pixel_size()
+        bx, by = cx, cy
+        bw, bh = tw + 2 * pad, th + 2 * pad
+
+        # arrow from anchor to the nearest point on the box edge
+        attach_x = min(max(ax, bx), bx + bw)
+        attach_y = min(max(ay, by), by + bh)
+        ar, ag, ab = self.zoom_accent
+        dxv, dyv = attach_x - ax, attach_y - ay
+        dist = math.hypot(dxv, dyv)
+        if dist > 1.0:
+            ctx.set_source_rgba(ar, ag, ab, 0.85)
+            ctx.set_line_width(max(1.0, 1.5 * self.scale))
+            ctx.move_to(ax, ay)
+            ctx.line_to(attach_x, attach_y)
+            ctx.stroke()
+            ux, uy = dxv / dist, dyv / dist
+            head = max(4.0, 6.0 * self.scale)
+            base_x, base_y = attach_x - ux * head, attach_y - uy * head
+            ctx.move_to(attach_x, attach_y)
+            ctx.line_to(base_x - uy * head * 0.5, base_y + ux * head * 0.5)
+            ctx.line_to(base_x + uy * head * 0.5, base_y - ux * head * 0.5)
+            ctx.close_path()
+            ctx.fill()
+
+        ctx.set_source_rgba(1, 1, 1, 0.95)
+        ctx.rectangle(bx, by, bw, bh)
+        ctx.fill()
+        ctx.set_source_rgba(ar, ag, ab, 0.9)
+        ctx.set_line_width(max(1.0, 1.2 * self.scale))
+        ctx.rectangle(bx, by, bw, bh)
+        ctx.stroke()
+        ctx.set_source_rgb(0.1, 0.1, 0.1)
+        ctx.move_to(bx + pad, by + pad)
+        PangoCairo.show_layout(ctx, layout)
 
     # ── input handlers ────────────────────────────────────────────────────────
 
@@ -576,8 +651,8 @@ class PDFCanvas(Gtk.DrawingArea):
     def _anchor_hit_test(self, sx, sy):
         """Return index of anchor circle under screen point, or None."""
         anchors = self._anchors.get(self.current_page_idx, [])
-        for i, (ax, ay) in enumerate(anchors):
-            scx, scy = self._pdf_to_screen(ax, ay)
+        for i, a in enumerate(anchors):
+            scx, scy = self._pdf_to_screen(a["x"], a["y"])
             if math.hypot(sx - scx, sy - scy) <= 10.0:
                 return i
         return None
@@ -641,7 +716,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self._erasing = False
         state = gesture.get_current_event_state()
         if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
-            self._ignoring = True  # anchor placed by GestureClick, suppress drag
+            # anchor already placed at press by GestureClick; dragging on
+            # places a callout box at the release point
+            self._callout_dragging = True
+            self._callout_start = (start_x, start_y)
+            self._callout_cur = None
             return
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
@@ -682,6 +761,10 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         logger.debug(f"drag update offset=({offset_x:.0f},{offset_y:.0f})")
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
+        if self._callout_dragging:
+            self._callout_cur = (sx + offset_x, sy + offset_y)
+            self.queue_draw()
+            return
         if self._erasing:
             self._erase_at(sx + offset_x, sy + offset_y)
             return
@@ -706,6 +789,16 @@ class PDFCanvas(Gtk.DrawingArea):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
         if self._ignoring:
             self._ignoring = False
+            self.queue_draw()
+            return
+        if self._callout_dragging:
+            self._callout_dragging = False
+            sx, sy = self._callout_start
+            self._callout_start = None
+            self._callout_cur = None
+            if math.hypot(offset_x, offset_y) >= 12 and self.on_callout_placed:
+                px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+                self.on_callout_placed(round(px), round(py))
             self.queue_draw()
             return
         if self._erasing:
@@ -1154,12 +1247,58 @@ def _prune_autosaves(max_age_days=30):
 
 
 _ANCHOR_RE = re.compile(r'<!--\s*anchor:(\d+):(\d+)\s*-->')
+_CALLOUT_RE = re.compile(r'<!--\s*callout:(\d+):(\d+)\s*-->')
 _MD_STRIP = [
     (re.compile(r'^#{1,6}\s+', re.MULTILINE), ''),
     (re.compile(r'\*\*(.+?)\*\*'), r'\1'),
     (re.compile(r'\*([^*\n]+?)\*'), r'\1'),
     (re.compile(r'`([^`\n]+?)`'), r'\1'),
 ]
+
+
+def _strip_markers(text):
+    text = _ANCHOR_RE.sub('', text)
+    text = _CALLOUT_RE.sub('', text)
+    for pattern, repl in _MD_STRIP:
+        text = pattern.sub(repl, text)
+    return text.strip()
+
+
+def _parse_anchors(text):
+    """Parse anchor markers (and their optional callout companions) from notes
+    text. Returns one dict per anchor:
+      {x, y, callout: (cx, cy) | None, text: cleaned paragraph text,
+       line: anchor line number, para_end: last line of its paragraph}
+    A callout marker belongs to the nearest anchor before it, within the same
+    paragraph (paragraphs end at the first blank line)."""
+    lines = text.split('\n')
+    n_lines = len(lines)
+    line_starts = []
+    off = 0
+    for l in lines:
+        line_starts.append(off)
+        off += len(l) + 1
+    result = []
+    matches = list(_ANCHOR_RE.finditer(text))
+    for i, m in enumerate(matches):
+        ln = text[:m.start()].count('\n')
+        para_end = n_lines - 1
+        for j in range(ln + 1, n_lines):
+            if not lines[j].strip():
+                para_end = j - 1
+                break
+        para_end_off = line_starts[para_end] + len(lines[para_end])
+        region_end = para_end_off
+        if i + 1 < len(matches):
+            region_end = min(region_end, matches[i + 1].start())
+        cm = _CALLOUT_RE.search(text, m.end(), region_end) if region_end > m.end() else None
+        result.append({
+            "x": int(m.group(1)), "y": int(m.group(2)),
+            "callout": (int(cm.group(1)), int(cm.group(2))) if cm else None,
+            "text": _strip_markers('\n'.join(lines[ln:para_end + 1])),
+            "line": ln, "para_end": para_end,
+        })
+    return result
 
 
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
@@ -1170,17 +1309,20 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accen
 
     for page_idx in range(len(src_doc)):
         notes_text = notes_model.get(page_idx)
-        anchor_matches = list(_ANCHOR_RE.finditer(notes_text))
-        anchors = [(int(m.group(1)), int(m.group(2))) for m in anchor_matches]
+        anchors = _parse_anchors(notes_text)
         has_notes = bool(notes_text.strip())
 
         # Copy source page
         out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
         out_page = out_doc[-1]
 
+        # Callout boxes under the anchor circles
+        for a in anchors:
+            if a["callout"] and a["text"]:
+                _draw_export_callout(out_page, a, anchor_color)
         # Draw numbered anchor markers on top of the page
-        for i, (px, py) in enumerate(anchors):
-            _draw_export_anchor(out_page, px, py, i + 1, anchor_color)
+        for i, a in enumerate(anchors):
+            _draw_export_anchor(out_page, a["x"], a["y"], i + 1, anchor_color)
 
         # Notes page
         if has_notes or include_empty:
@@ -1204,6 +1346,55 @@ def _draw_export_anchor(page, px, py, number, color):
                      label, fontsize=fontsize, color=(1, 1, 1), fontname="helv")
 
 
+def _draw_export_callout(page, a, color):
+    """Callout box with the anchor's paragraph text plus an arrow from the
+    anchor — same layout as the canvas rendering."""
+    fontsize = 8.5
+    pad = 5.0
+    box_w = 170.0
+    page_rect = page.rect
+    # Measure the exact height fitz's own wrapping needs on a scratch page —
+    # estimating it ourselves risks a too-small rect, and insert_textbox
+    # silently renders nothing when the text does not fit.
+    text = a["text"]
+    measure_doc = fitz.open()
+    measure_page = measure_doc.new_page(width=page_rect.width, height=page_rect.height)
+    measure_rect = fitz.Rect(0, 0, box_w - 2 * pad, page_rect.height)
+    spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
+                                        fontname="helv", align=0)
+    while spare < 0 and len(text) > 8:   # taller than a page: truncate
+        text = text[:int(len(text) * 0.8)].rstrip() + "…"
+        spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
+                                            fontname="helv", align=0)
+    measure_doc.close()
+    box_h = (measure_rect.height - max(spare, 0)) + 2 * pad + 2
+
+    cx, cy = a["callout"]
+    cx = min(max(cx, 0), page_rect.width - box_w)
+    cy = min(max(cy, 0), page_rect.height - box_h)
+    box = fitz.Rect(cx, cy, cx + box_w, cy + box_h)
+
+    # arrow from anchor to nearest box-edge point
+    ax, ay = a["x"], a["y"]
+    attach = (min(max(ax, box.x0), box.x1), min(max(ay, box.y0), box.y1))
+    dxv, dyv = attach[0] - ax, attach[1] - ay
+    dist = math.hypot(dxv, dyv)
+    if dist > 1.0:
+        page.draw_line((ax, ay), attach, color=color, width=1.2)
+        ux, uy = dxv / dist, dyv / dist
+        head = 6.0
+        base = (attach[0] - ux * head, attach[1] - uy * head)
+        left = (base[0] - uy * head * 0.5, base[1] + ux * head * 0.5)
+        right = (base[0] + uy * head * 0.5, base[1] - ux * head * 0.5)
+        page.draw_line(attach, left, color=color, width=1.2)
+        page.draw_line(attach, right, color=color, width=1.2)
+
+    page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
+    text_rect = fitz.Rect(box.x0 + pad, box.y0 + pad, box.x1 - pad, box.y1 - pad)
+    page.insert_textbox(text_rect, text, fontsize=fontsize,
+                        color=(0.1, 0.1, 0.1), fontname="helv", align=0)
+
+
 def _render_export_notes(page, page_idx, notes_text, anchor_color):
     margin = 40
     w, h = page.rect.width, page.rect.height
@@ -1222,6 +1413,7 @@ def _render_export_notes(page, page_idx, notes_text, anchor_color):
         return f"[{counter[0]}]"
 
     text = _ANCHOR_RE.sub(_replace_anchor, notes_text)
+    text = _CALLOUT_RE.sub('', text)
     for pattern, repl in _MD_STRIP:
         text = pattern.sub(repl, text)
     text = text.strip()
@@ -1647,6 +1839,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(60, self._autosave_tick)
         self.canvas.on_anchor_placed = self._on_anchor_placed
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
+        self.canvas.on_callout_placed = self._on_callout_placed
+        self._last_anchor_mark = None   # TextMark right after the last placed anchor
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -1952,6 +2146,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Ctrl+C",        "Copy selected text"),
             ("Alt+Click",     "Open link under cursor"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
+            ("Ctrl+Alt+Drag","Place anchor + callout box at drag end"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
@@ -2163,6 +2358,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _restore_note(self):
         self._suppress_dirty = True
         text = self.notes_model.get(self.canvas.current_page_idx)
+        self._last_anchor_mark = None   # set_text would strand the mark at offset 0
         self._notes_view.get_buffer().set_text(text)
         self._suppress_dirty = False
         self._update_canvas_anchors()
@@ -2171,19 +2367,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         page_idx = self.canvas.current_page_idx
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
-        matches = list(re.finditer(r'<!--\s*anchor:(\d+):(\d+)\s*-->', text))
-        self.canvas._anchors[page_idx] = [(int(m.group(1)), int(m.group(2))) for m in matches]
-        self._anchor_line_nos = [text[:m.start()].count('\n') for m in matches]
-        lines = text.split('\n')
-        n_lines = len(lines)
-        self._anchor_para_ends = []
-        for ln in self._anchor_line_nos:
-            end = n_lines - 1
-            for j in range(ln + 1, n_lines):
-                if not lines[j].strip():
-                    end = j - 1
-                    break
-            self._anchor_para_ends.append(end)
+        parsed = _parse_anchors(text)
+        self.canvas._anchors[page_idx] = parsed
+        self._anchor_line_nos = [a["line"] for a in parsed]
+        self._anchor_para_ends = [a["para_end"] for a in parsed]
         self._on_notes_cursor_moved(buf, None)
 
     def _on_notes_cursor_moved(self, buf, _param):
@@ -2198,7 +2385,22 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         buf = self._notes_view.get_buffer()
         ins = buf.get_iter_at_mark(buf.get_insert())
         buf.insert(ins, f"\n<!-- anchor:{px}:{py} -->\n")
+        # remember the spot right after the anchor comment so a callout
+        # marker from the same gesture can be appended next to it
+        after = buf.get_iter_at_mark(buf.get_insert())
+        after.backward_char()   # before the trailing newline
+        if self._last_anchor_mark is not None:
+            buf.delete_mark(self._last_anchor_mark)
+        self._last_anchor_mark = buf.create_mark(None, after, True)
         self._notes_view.grab_focus()
+        self._mark_dirty()
+
+    def _on_callout_placed(self, px, py):
+        if self._last_anchor_mark is None:
+            return
+        buf = self._notes_view.get_buffer()
+        it = buf.get_iter_at_mark(self._last_anchor_mark)
+        buf.insert(it, f" <!-- callout:{px}:{py} -->")
         self._mark_dirty()
 
     def _on_anchor_clicked(self, idx):
