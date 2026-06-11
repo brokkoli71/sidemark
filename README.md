@@ -15,6 +15,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 - **Add and delete pages** — insert blank pages with same dimensions
 - **Text selection** — Alt+drag highlights words and copies them to the clipboard
 - **Text search** — Ctrl+F opens a search bar; highlights all matches across all pages, navigate with Enter / ↑↓
+- **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter
 - **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files
 - **Design Scheme** — Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
 
@@ -83,6 +84,7 @@ pip install pymupdf
 | `PageUp` | Previous page |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
+| `Ctrl+T` | Toggle outline (TOC) sidebar |
 
 ### Zoom & pan
 

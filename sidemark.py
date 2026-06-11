@@ -1900,6 +1900,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         new_btn.connect("clicked", self._on_new_pdf)
         header.pack_start(new_btn)
 
+        self._toc_btn = Gtk.ToggleButton()
+        self._toc_btn.set_icon_name("view-list-symbolic")
+        self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
+        self._toc_btn.set_sensitive(False)   # enabled when the PDF has a TOC
+        self._toc_btn.connect("toggled", self._on_toc_toggled)
+        header.pack_start(self._toc_btn)
+
         prev_btn = Gtk.Button()
         prev_btn.set_icon_name("go-previous-symbolic")
         prev_btn.set_tooltip_text("Previous page (PageUp)")
@@ -2120,11 +2127,29 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._paned.set_end_child(self._notes_box)
         self._paned.set_resize_end_child(True)
         self._paned.set_shrink_end_child(True)
+        self._paned.set_hexpand(True)
         self.connect("realize", self._on_realize)
         self.connect("close-request", self._on_close_request)
 
+        # ── outline (TOC) sidebar ─────────────────────────────────────────────
+        self._toc_list = Gtk.ListBox()
+        self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._toc_list.connect("row-activated", self._on_toc_row_activated)
+        toc_scroll = Gtk.ScrolledWindow()
+        toc_scroll.set_child(self._toc_list)
+        toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toc_scroll.set_size_request(230, -1)
+        self._toc_revealer = Gtk.Revealer()
+        self._toc_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self._toc_revealer.set_child(toc_scroll)
+        self._toc_revealer.set_reveal_child(False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content.append(self._toc_revealer)
+        content.append(self._paned)
+
         self.toast_overlay = Adw.ToastOverlay()
-        self.toast_overlay.set_child(self._paned)
+        self.toast_overlay.set_child(content)
         self.set_child(self.toast_overlay)
 
         key_ctrl = Gtk.EventControllerKey()
@@ -2147,6 +2172,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Alt+Click",     "Open link under cursor"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Ctrl+Alt+Drag","Place anchor + callout box at drag end"),
+            ("Ctrl+T",       "Toggle outline (TOC) sidebar"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
@@ -2413,6 +2439,41 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._notes_view.grab_focus()
         self.canvas._active_anchors = {idx}
 
+    # ── outline (TOC) sidebar ─────────────────────────────────────────────────
+
+    def _on_toc_toggled(self, btn):
+        self._toc_revealer.set_reveal_child(btn.get_active())
+
+    def _on_toc_row_activated(self, _list, row):
+        page = getattr(row, "toc_page", None)
+        if page is not None:
+            self._go_to_page(page)
+            self.canvas.grab_focus()
+
+    def _populate_toc(self):
+        while (child := self._toc_list.get_first_child()) is not None:
+            self._toc_list.remove(child)
+        toc = []
+        if self.canvas.document:
+            try:
+                toc = self.canvas.document.get_toc(simple=True)
+            except Exception:
+                toc = []
+        for level, title, page in toc:
+            label = Gtk.Label(label=title.strip() or "—", xalign=0)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_margin_start(8 + 14 * max(0, level - 1))
+            label.set_margin_end(8)
+            label.set_margin_top(4)
+            label.set_margin_bottom(4)
+            row = Gtk.ListBoxRow()
+            row.set_child(label)
+            row.toc_page = page - 1   # get_toc() pages are 1-based
+            self._toc_list.append(row)
+        if not toc:
+            self._toc_btn.set_active(False)   # also hides the revealer
+        self._toc_btn.set_sensitive(bool(toc))
+
     def _on_notes_toggled(self, btn):
         if btn.get_active():
             self._notes_box.set_visible(True)
@@ -2489,6 +2550,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.notes_model.load(notes_path_for(path))
         self._hide_search()
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
+        self._populate_toc()
         self._clear_dirty()
         self._maybe_offer_recovery(path)
 
@@ -2797,6 +2859,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_backslash:
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
+                return True
+            if keyval == Gdk.KEY_t:
+                if self._toc_btn.get_sensitive():
+                    self._toc_btn.set_active(not self._toc_btn.get_active())
                 return True
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_S:
                 self._on_save_as()

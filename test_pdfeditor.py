@@ -1349,6 +1349,59 @@ class TestCallouts(unittest.TestCase):
             raise errors[0]
 
 
+class TestTocSidebar(unittest.TestCase):
+    def _pdf_with_toc(self, d):
+        path = os.path.join(d, "toc.pdf")
+        make_pdf(path, n_pages=3)
+        doc = fitz.open(path)
+        doc.set_toc([[1, "Chapter One", 1], [1, "Chapter Two", 2], [2, "Section 2.1", 3]])
+        doc.saveIncr()
+        doc.close()
+        return path
+
+    def test_toc_populated_and_navigates(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = self._pdf_with_toc(d)
+            plain = os.path.join(d, "plain.pdf")
+            make_pdf(plain)
+            app = Adw.Application(application_id="test.sidemark.toc")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    rows = []
+                    child = win._toc_list.get_first_child()
+                    while child is not None:
+                        rows.append(child)
+                        child = child.get_next_sibling()
+                    if len(rows) != 3:
+                        raise AssertionError(f"expected 3 TOC rows, got {len(rows)}")
+                    if not win._toc_btn.get_sensitive():
+                        raise AssertionError("TOC button not enabled")
+                    win._on_toc_row_activated(win._toc_list, rows[1])
+                    if win.canvas.current_page_idx != 1:
+                        raise AssertionError(
+                            f"row activation went to page {win.canvas.current_page_idx}")
+                    # a PDF without TOC disables the button and empties the list
+                    win._do_open_file(plain)
+                    if win._toc_btn.get_sensitive():
+                        raise AssertionError("TOC button still enabled for plain PDF")
+                    if win._toc_list.get_first_child() is not None:
+                        raise AssertionError("TOC list not cleared for plain PDF")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
 class TestAutosave(unittest.TestCase):
     def setUp(self):
         import sidemark as sm
