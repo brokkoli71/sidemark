@@ -2163,9 +2163,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Draw",          None),
             ("Left-drag",     "Draw stroke"),
             ("Right-drag",    "Erase stroke"),
-            ("Ctrl+Z",        "Undo last stroke"),
-            ("Text",          None),
-
+            ("Ctrl+Z",        "Undo draw / erase"),
             ("Text",          None),
             ("Alt+Drag",      "Select text (word-level)"),
             ("Ctrl+C",        "Copy selected text"),
@@ -2219,8 +2217,16 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 grid.attach(desc_lbl, 1, row, 1, 1)
             row += 1
 
+        # The list is taller than small windows — without a height-capped
+        # scroller GTK refuses to map a popover that does not fit.
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_child(grid)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_propagate_natural_width(True)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_max_content_height(480)
         popover = Gtk.Popover()
-        popover.set_child(grid)
+        popover.set_child(scroll)
         return popover
 
     # ── page & notes handshake ────────────────────────────────────────────────
