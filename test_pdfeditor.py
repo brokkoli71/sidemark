@@ -912,6 +912,35 @@ class TestExport(unittest.TestCase):
         if errors:
             raise errors[0]
 
+    def test_export_save_prompt_does_not_raise(self):
+        """Ctrl+E with unsaved changes presents the 'Save before exporting?'
+        dialog; without changes it goes straight to the options dialog.
+        Both construct widgets and connect signals — must not raise."""
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.exportprompt")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._mark_dirty()
+                    win._on_export()   # dirty → save prompt
+                    win._clear_dirty()
+                    win._on_export()   # clean → export options
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
 
 class TestSaveCallback(unittest.TestCase):
     def test_after_callback_only_on_successful_save(self):

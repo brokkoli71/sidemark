@@ -2091,7 +2091,35 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         if not self._path:
             self._show_error("Export failed", "No PDF is open.")
             return
+        # The export reads the PDF from disk and the notes from the model:
+        # commit the current page's note and offer to save unsaved changes
+        # first, otherwise they would silently be missing from the export.
+        self._commit_note()
+        if self._dirty:
+            dlg = Adw.AlertDialog.new(
+                "Save before exporting?",
+                "The export is created from the last saved version. "
+                "Unsaved changes will not be included.",
+            )
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("export", "Export without saving")
+            dlg.add_response("save",   "Save and export")
+            dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+            dlg.set_default_response("save")
+            dlg.set_close_response("cancel")
 
+            def on_response(d, r):
+                if r == "save":
+                    self._on_save(after=self._show_export_options)
+                elif r == "export":
+                    self._show_export_options()
+
+            dlg.connect("response", on_response)
+            dlg.present(self)
+            return
+        self._show_export_options()
+
+    def _show_export_options(self):
         check = Gtk.CheckButton(label="Include pages with no notes")
         check.set_active(False)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
