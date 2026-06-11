@@ -1846,5 +1846,54 @@ class TestGlobalUndo(unittest.TestCase):
         self.assertEqual(len(fired), 1)
 
 
+class TestNotesSidebarAnimation(unittest.TestCase):
+    def test_toggle_animates_hide_then_show(self):
+        """Toggling the notes panel slides the paned position; the box is
+        hidden only once the collapse animation finished."""
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.notesanim")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._notes_toggle.set_active(False)
+                    if win._pane_anim is None:
+                        raise AssertionError("toggle did not start an animation")
+                    state = {"ticks": 0}
+
+                    def poll():
+                        state["ticks"] += 1
+                        try:
+                            if not win._notes_box.get_visible():
+                                # hide completed → re-show must be immediate
+                                win._notes_toggle.set_active(True)
+                                if not win._notes_box.get_visible():
+                                    raise AssertionError("notes box not shown on toggle on")
+                                a.quit()
+                                return False
+                            if state["ticks"] > 40:   # 2 s
+                                raise AssertionError("notes box never hidden")
+                        except Exception as e:
+                            errors.append(e)
+                            a.quit()
+                            return False
+                        return True
+
+                    GLib.timeout_add(50, poll)
+                except Exception as e:
+                    errors.append(e)
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

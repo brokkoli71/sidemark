@@ -2137,6 +2137,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
         # ── split pane ────────────────────────────────────────────────────────
         self._saved_pane_pos = 800
+        self._pane_anim = None   # running notes show/hide animation
         self._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self._paned.set_start_child(canvas_box)
         self._paned.set_resize_start_child(True)
@@ -2588,20 +2589,44 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
 
     def _on_notes_toggled(self, btn):
+        w = self.get_width() or 1280
         if btn.get_active():
             self._notes_box.set_visible(True)
-            w = self.get_width() or 1280
             pos = self._saved_pane_pos
             if pos > w - 150 or pos < 100:
                 pos = int(w * 0.62)
                 self._saved_pane_pos = pos
-            self._paned.set_position(pos)
+            # slide in from the right edge, like the outline revealer
+            self._paned.set_position(w)
+            self._animate_pane(w, pos)
         else:
             pos = self._paned.get_position()
-            w = self.get_width() or 1280
             if 100 < pos < w - 50:
                 self._saved_pane_pos = pos
-            self._notes_box.set_visible(False)
+            self._animate_pane(pos, w, hide_after=True)
+
+    def _animate_pane(self, frm, to, hide_after=False):
+        if self._pane_anim is not None:
+            self._pane_anim.pause()
+        target = Adw.CallbackAnimationTarget.new(
+            lambda v: self._paned.set_position(int(v)))
+        anim = Adw.TimedAnimation.new(self._paned, frm, to, 250, target)
+        anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        if hide_after:
+            # only hide if the user didn't re-toggle during the animation
+            anim.connect("done", lambda *_: self._notes_box.set_visible(False)
+                         if not self._notes_toggle.get_active() else None)
+        anim.play()
+        self._pane_anim = anim
+
+        # If no frames arrive (headless/offscreen, hidden window) the
+        # animation never finishes — jump to the end so the panel state
+        # stays correct.
+        def force_finish():
+            if self._pane_anim is anim and anim.get_state() == Adw.AnimationState.PLAYING:
+                anim.skip()
+            return False
+        GLib.timeout_add(600, force_finish)
 
     # ── standard helpers ──────────────────────────────────────────────────────
 
