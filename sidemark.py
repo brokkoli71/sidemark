@@ -89,6 +89,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self.all_strokes = {}
         self.current_stroke = []
 
+        # undo: ("draw", page, stroke) | ("erase", page, idx, stroke, group);
+        # erase ops of one drag gesture share a group and undo together
+        self._undo_stack = []
+        self._erase_group = 0
+
         self.pen_color = (0.05, 0.05, 0.8)   # RGB — PDF ink annotations have no alpha
         self.pen_width = 2.0
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
@@ -195,6 +200,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self.n_pages = len(self.document)
         self.current_stroke = []
         self.all_strokes = {}
+        self._undo_stack = []
+        self._erase_group = 0
         total_annots = 0
         for i in range(self.n_pages):
             page = self.document[i]   # keep reference alive while reading annotations
@@ -525,6 +532,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_drag_begin(self, gesture, start_x, start_y):
         if gesture.get_current_button() == 3:
             self._erasing = True
+            self._erase_group += 1
             self._panning = False
             self._text_selecting = False
             self._zoom_selecting = False
@@ -638,11 +646,13 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_end = None
         else:
             if self.current_stroke:
-                self.strokes.append({
+                stroke = {
                     "pts": self.current_stroke,
                     "color": self.pen_color,
                     "width": self.pen_width,
-                })
+                }
+                self.strokes.append(stroke)
+                self._undo_stack.append(("draw", self.current_page_idx, stroke))
                 if self.on_change:
                     self.on_change()
             self.current_stroke = []
@@ -716,13 +726,20 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
-        before = len(self.strokes)
-        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) strokes={before}")
-        self.all_strokes[self.current_page_idx] = [
-            s for s in self.strokes
-            if not self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0)
-        ]
-        if len(self.strokes) != before:
+        page = self.current_page_idx
+        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) strokes={len(self.strokes)}")
+        kept = []
+        removed = 0
+        for i, s in enumerate(self.strokes):
+            if self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0):
+                # record the index as if strokes were removed one at a time,
+                # so undo can reinsert by popping ops in reverse order
+                self._undo_stack.append(("erase", page, i - removed, s, self._erase_group))
+                removed += 1
+            else:
+                kept.append(s)
+        if removed:
+            self.all_strokes[page] = kept
             if self.on_change:
                 self.on_change()
             self.queue_draw()
@@ -788,11 +805,29 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def undo_last(self):
-        if self.strokes:
-            self.strokes.pop()
-            if self.on_change:
-                self.on_change()
-            self.queue_draw()
+        """Undo the last draw or erase operation (an erase drag counts as one)."""
+        if not self._undo_stack:
+            return
+        op = self._undo_stack.pop()
+        page = op[1]
+        strokes = self.all_strokes.setdefault(page, [])
+        if op[0] == "draw":
+            for i, s in enumerate(strokes):
+                if s is op[2]:
+                    del strokes[i]
+                    break
+        else:
+            strokes.insert(min(op[2], len(strokes)), op[3])
+            group = op[4]
+            while (self._undo_stack and self._undo_stack[-1][0] == "erase"
+                   and self._undo_stack[-1][4] == group):
+                op = self._undo_stack.pop()
+                strokes.insert(min(op[2], len(strokes)), op[3])
+        if page != self.current_page_idx:
+            self.go_to_page(page)   # show the user what was undone
+        if self.on_change:
+            self.on_change()
+        self.queue_draw()
 
     # ── save ──────────────────────────────────────────────────────────────────
 
@@ -835,6 +870,10 @@ class PDFCanvas(Gtk.DrawingArea):
             (k + 1 if k >= idx else k): v
             for k, v in self._anchors.items()
         }
+        self._undo_stack = [
+            (op[0], op[1] + 1 if op[1] >= idx else op[1]) + op[2:]
+            for op in self._undo_stack
+        ]
         self.n_pages = len(self.document)
         self._load_page(idx)   # navigate to the new blank page
 
@@ -855,6 +894,11 @@ class PDFCanvas(Gtk.DrawingArea):
             for k, v in self._anchors.items()
             if k != idx
         }
+        self._undo_stack = [
+            (op[0], op[1] - 1 if op[1] > idx else op[1]) + op[2:]
+            for op in self._undo_stack
+            if op[1] != idx
+        ]
         self.n_pages = len(self.document)
         new_idx = min(idx, self.n_pages - 1)
         self._load_page(new_idx)

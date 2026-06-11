@@ -168,8 +168,12 @@ class TestStrokes(unittest.TestCase):
 
     def test_undo_removes_last_stroke(self):
         canvas = self._canvas_with_pdf()
-        canvas.strokes.append({"pts": [(0, 0)], "color": (0, 0, 1, 1), "width": 2})
-        canvas.strokes.append({"pts": [(1, 1)], "color": (1, 0, 0, 1), "width": 3})
+        canvas.pen_color = (0, 0, 1, 1)
+        canvas.current_stroke = [(0, 0)]
+        canvas._on_drag_end(None, 0, 0)
+        canvas.pen_color = (1, 0, 0, 1)
+        canvas.current_stroke = [(1, 1)]
+        canvas._on_drag_end(None, 0, 0)
         canvas.undo_last()
         self.assertEqual(len(canvas.strokes), 1)
         self.assertEqual(canvas.strokes[0]["color"], (0, 0, 1, 1))
@@ -338,6 +342,96 @@ class TestNotes(unittest.TestCase):
             self.assertFalse(os.path.exists(path + ".tmp"))
         finally:
             os.unlink(path)
+
+
+# ── undo for draw and erase ──────────────────────────────────────────────────
+
+class TestUndoEraser(unittest.TestCase):
+    """Ctrl+Z must also undo erasing — erased strokes (including ones loaded
+    from a saved file) used to be gone for good."""
+
+    def _canvas_with_pdf(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)
+        canvas.load(self._tmp)
+        canvas.scale = 1.0
+        canvas.offset_x = 0.0
+        canvas.offset_y = 0.0
+        return canvas
+
+    def tearDown(self):
+        if os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def _draw(self, canvas, pts):
+        canvas.current_stroke = list(pts)
+        canvas._on_drag_end(None, 0, 0)
+
+    def test_undo_restores_erased_stroke(self):
+        canvas = self._canvas_with_pdf()
+        self._draw(canvas, [(10, 10), (50, 10)])
+        canvas._erase_group += 1   # as set by _on_drag_begin for button 3
+        canvas._erase_at(30, 10)
+        self.assertEqual(len(canvas.strokes), 0)
+        canvas.undo_last()
+        self.assertEqual(len(canvas.strokes), 1)
+        self.assertEqual(canvas.strokes[0]["pts"], [(10, 10), (50, 10)])
+
+    def test_erase_drag_undoes_as_one_group(self):
+        canvas = self._canvas_with_pdf()
+        self._draw(canvas, [(10, 10), (50, 10)])
+        self._draw(canvas, [(10, 40), (50, 40)])
+        canvas._erase_group += 1
+        canvas._erase_at(30, 10)   # one drag gesture hits both strokes …
+        canvas._erase_at(30, 40)   # … across two motion events
+        self.assertEqual(len(canvas.strokes), 0)
+        canvas.undo_last()         # a single undo restores the whole drag
+        self.assertEqual(len(canvas.strokes), 2)
+
+    def test_separate_erase_drags_undo_separately(self):
+        canvas = self._canvas_with_pdf()
+        self._draw(canvas, [(10, 10), (50, 10)])
+        self._draw(canvas, [(10, 40), (50, 40)])
+        canvas._erase_group += 1
+        canvas._erase_at(30, 10)
+        canvas._erase_group += 1
+        canvas._erase_at(30, 40)
+        canvas.undo_last()
+        self.assertEqual(len(canvas.strokes), 1)
+        canvas.undo_last()
+        self.assertEqual(len(canvas.strokes), 2)
+
+    def test_erased_stroke_restored_at_original_position(self):
+        canvas = self._canvas_with_pdf()
+        self._draw(canvas, [(10, 10), (50, 10)])
+        self._draw(canvas, [(10, 40), (50, 40)])
+        self._draw(canvas, [(10, 70), (50, 70)])
+        canvas._erase_group += 1
+        canvas._erase_at(30, 40)   # erase the middle stroke
+        canvas.undo_last()
+        self.assertEqual([s["pts"][0] for s in canvas.strokes],
+                         [(10, 10), (10, 40), (10, 70)])
+
+    def test_undo_order_interleaves_draw_and_erase(self):
+        canvas = self._canvas_with_pdf()
+        self._draw(canvas, [(10, 10), (50, 10)])
+        canvas._erase_group += 1
+        canvas._erase_at(30, 10)
+        self._draw(canvas, [(10, 40), (50, 40)])
+        canvas.undo_last()   # removes the second draw
+        self.assertEqual(len(canvas.strokes), 0)
+        canvas.undo_last()   # restores the erased first stroke
+        self.assertEqual(len(canvas.strokes), 1)
+        self.assertEqual(canvas.strokes[0]["pts"][0], (10, 10))
+
+    def test_load_clears_undo_stack(self):
+        canvas = self._canvas_with_pdf()
+        self._draw(canvas, [(10, 10), (50, 10)])
+        canvas.load(self._tmp)
+        self.assertEqual(canvas._undo_stack, [])
+        canvas.undo_last()   # must not raise or remove loaded strokes
 
 
 # ── page insert / delete keep notes, strokes and anchors aligned ─────────────

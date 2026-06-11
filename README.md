@@ -72,7 +72,7 @@ pip install pymupdf
 |-------|--------|
 | Left-drag | Draw stroke |
 | Right-drag | Erase stroke (including from previous sessions) |
-| `Ctrl+Z` | Undo last stroke |
+| `Ctrl+Z` | Undo last draw or erase (an erase drag undoes as one) |
 | `Alt+drag` | Select & copy text (word-level highlight) |
 
 ### Pages
