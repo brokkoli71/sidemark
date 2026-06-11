@@ -1676,5 +1676,175 @@ class TestSaveCallback(unittest.TestCase):
             raise errors[0]
 
 
+class TestGlobalUndo(unittest.TestCase):
+    """Ctrl+Z undoes the last user action chronologically across canvas and
+    notes: each draw/erase gesture is one entry, each uninterrupted typing
+    burst between two canvas actions is one entry."""
+
+    @staticmethod
+    def _simulate_draw(win):
+        """Mimic the stroke-commit branch of PDFCanvas._on_drag_end."""
+        canvas = win.canvas
+        stroke = {"pts": [(10.0, 10.0), (40.0, 40.0)],
+                  "color": (0, 0, 1), "width": 2.0}
+        canvas.strokes.append(stroke)
+        canvas._undo_stack.append(("draw", canvas.current_page_idx, stroke))
+        if canvas.on_change:
+            canvas.on_change()
+        if canvas.on_user_action:
+            canvas.on_user_action()
+        return stroke
+
+    @staticmethod
+    def _buf_text(win):
+        buf = win._notes_view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+
+    def _run_in_window(self, n_pages, body):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf, n_pages=n_pages)
+            app = Adw.Application(application_id="test.sidemark.globalundo")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_draw_type_draw_undo_order(self):
+        """The reported bug: draw1 → type → draw2 must undo as
+        draw2 → typing → draw1, regardless of keyboard focus."""
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            s1 = self._simulate_draw(win)
+            buf.insert(buf.get_end_iter(), "hello")
+            s2 = self._simulate_draw(win)
+
+            win._global_undo()   # undoes draw2
+            if win.canvas.strokes != [s1]:
+                raise AssertionError("first undo did not remove draw2")
+            if self._buf_text(win) != "hello":
+                raise AssertionError("first undo touched the notes")
+
+            win._global_undo()   # undoes the typing burst
+            if self._buf_text(win) != "":
+                raise AssertionError(f"second undo did not clear typing: "
+                                     f"{self._buf_text(win)!r}")
+            if win.canvas.strokes != [s1]:
+                raise AssertionError("second undo touched the canvas")
+
+            win._global_undo()   # undoes draw1
+            if win.canvas.strokes:
+                raise AssertionError("third undo did not remove draw1")
+            win._global_undo()   # empty timeline must be a no-op
+        self._run_in_window(1, body)
+
+    def test_typing_burst_undone_as_one(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            buf.insert(buf.get_end_iter(), "first ")
+            buf.insert(buf.get_end_iter(), "second")
+            if len(win._undo_timeline) != 1:
+                raise AssertionError(f"expected one burst entry, got "
+                                     f"{win._undo_timeline!r}")
+            win._global_undo()
+            if self._buf_text(win) != "":
+                raise AssertionError("burst undo did not clear all typing")
+        self._run_in_window(1, body)
+
+    def test_canvas_action_splits_bursts(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            buf.insert(buf.get_end_iter(), "abc")
+            self._simulate_draw(win)
+            buf.insert(buf.get_end_iter(), "def")
+            win._global_undo()   # second burst
+            if self._buf_text(win) != "abc":
+                raise AssertionError(f"expected 'abc', got {self._buf_text(win)!r}")
+            win._global_undo()   # the stroke
+            if win.canvas.strokes:
+                raise AssertionError("stroke not undone")
+            win._global_undo()   # first burst
+            if self._buf_text(win) != "":
+                raise AssertionError("first burst not undone")
+        self._run_in_window(1, body)
+
+    def test_undo_jumps_to_notes_page(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            buf.insert(buf.get_end_iter(), "page0 note")
+            win._go_to_page(1)            # commits note, closes burst
+            s = self._simulate_draw(win)  # stroke on page 1
+            win._global_undo()
+            if win.canvas.strokes:
+                raise AssertionError("stroke on page 1 not undone")
+            win._global_undo()            # typing was on page 0 → must jump back
+            if win.canvas.current_page_idx != 0:
+                raise AssertionError("undo did not navigate to the notes page")
+            if self._buf_text(win) != "":
+                raise AssertionError("page 0 typing not undone")
+            if win.notes_model.get(0) != "":
+                raise AssertionError("notes model kept the undone text")
+        self._run_in_window(2, body)
+
+    def test_page_restore_does_not_open_burst(self):
+        def body(win):
+            win.notes_model.set(0, "alpha")
+            win.notes_model.set(1, "beta")
+            win._restore_note()
+            win._go_to_page(1)
+            win._go_to_page(0)
+            if win._undo_timeline:
+                raise AssertionError("page switches polluted the undo timeline")
+        self._run_in_window(2, body)
+
+    def test_timeline_rekeyed_on_page_insert_delete(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            buf.insert(buf.get_end_iter(), "note on page 0")
+            win._go_to_page(1)
+            buf.insert(buf.get_end_iter(), "note on page 1")
+            win._go_to_page(0)
+            win._add_blank_page()    # insert at index 1 → old page 1 becomes 2
+            pages = [op[1] for op in win._undo_timeline if op[0] == "notes"]
+            if pages != [0, 2]:
+                raise AssertionError(f"insert re-key wrong: {pages}")
+            win._go_to_page(2)
+            win._delete_current_page()   # drops page-2 token
+            pages = [op[1] for op in win._undo_timeline if op[0] == "notes"]
+            if pages != [0]:
+                raise AssertionError(f"delete re-key wrong: {pages}")
+        self._run_in_window(2, body)
+
+    def test_erase_gesture_fires_user_action(self):
+        canvas = PDFCanvas()
+        fired = []
+        canvas.on_user_action = lambda: fired.append(1)
+        stroke = {"pts": [(0.0, 0.0), (5.0, 5.0)], "color": (0, 0, 1), "width": 2.0}
+        # erase drag that removed a stroke
+        canvas._erasing = True
+        canvas._erase_group = 3
+        canvas._undo_stack.append(("erase", 0, 0, stroke, 3))
+        canvas._on_drag_end(None, 0, 0)
+        self.assertEqual(len(fired), 1)
+        # erase drag that removed nothing must not fire
+        canvas._erasing = True
+        canvas._erase_group = 4
+        canvas._on_drag_end(None, 0, 0)
+        self.assertEqual(len(fired), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -112,6 +112,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
         self.on_anchor_clicked = None  # callback(anchor_index)
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
+        self.on_user_action = None     # callback() once per completed draw/erase gesture
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
         self._anchors = {}
@@ -803,6 +804,11 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._erasing:
             self._erasing = False
+            # one timeline entry per erase gesture that actually removed something
+            if (self._undo_stack and self._undo_stack[-1][0] == "erase"
+                    and self._undo_stack[-1][4] == self._erase_group
+                    and self.on_user_action):
+                self.on_user_action()
             return
         if self._panning:
             self._panning = False
@@ -837,6 +843,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._undo_stack.append(("draw", self.current_page_idx, stroke))
                 if self.on_change:
                     self.on_change()
+                if self.on_user_action:
+                    self.on_user_action()
             self.current_stroke = []
         self.queue_draw()
 
@@ -1800,6 +1808,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._is_untitled = False  # True when working on an auto-created blank (no saved path yet)
         self._dirty = False
         self._suppress_dirty = False
+        # global chronological undo: one entry per canvas gesture, one per
+        # uninterrupted typing burst in the notes panel.
+        # ("canvas",) | ("notes", page_idx, text_before_burst)
+        self._undo_timeline = []
+        self._notes_burst_open = False
+        self._burst_base = ""   # buffer text at the last burst boundary
         self.notes_model = NotesModel()
         self._anchor_line_nos = []   # line number in buffer for each anchor on current page
         self._anchor_para_ends = []  # last line of each anchor's paragraph (until next blank line)
@@ -1840,6 +1854,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.on_anchor_placed = self._on_anchor_placed
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
         self.canvas.on_callout_placed = self._on_callout_placed
+        self.canvas.on_user_action = self._on_canvas_action
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
 
         # ── CSS ───────────────────────────────────────────────────────────────
@@ -1956,7 +1971,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         undo_btn = Gtk.Button()
         undo_btn.set_icon_name("edit-undo-symbolic")
         undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
-        undo_btn.connect("clicked", lambda _: self.canvas.undo_last())
+        undo_btn.connect("clicked", lambda _: self._global_undo())
         header.pack_end(undo_btn)
 
         save_btn = Gtk.Button(label="Save")
@@ -2158,6 +2173,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         key_ctrl.connect("key-pressed", self._on_key)
         self.add_controller(key_ctrl)
 
+        # Ctrl+Z must work globally; the notes TextView consumes it before the
+        # bubble-phase controller above, so intercept it in the capture phase.
+        undo_ctrl = Gtk.EventControllerKey()
+        undo_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        undo_ctrl.connect("key-pressed", self._on_undo_key)
+        self.add_controller(undo_ctrl)
+
     # ── shortcuts popover ─────────────────────────────────────────────────────
 
     def _build_shortcuts_popover(self):
@@ -2165,7 +2187,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Draw",          None),
             ("Left-drag",     "Draw stroke"),
             ("Right-drag",    "Erase stroke"),
-            ("Ctrl+Z",        "Undo draw / erase"),
+            ("Ctrl+Z",        "Undo last action (draw, erase, typing)"),
             ("Text",          None),
             ("Alt+Drag",      "Select text (word-level)"),
             ("Ctrl+C",        "Copy selected text"),
@@ -2257,7 +2279,12 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._commit_note()
         # Shift notes before the canvas inserts and navigates to the new page,
         # so _restore_note already sees the re-keyed model.
-        self.notes_model.shift_for_insert(self.canvas.current_page_idx + 1)
+        idx = self.canvas.current_page_idx + 1
+        self.notes_model.shift_for_insert(idx)
+        self._undo_timeline = [
+            ("notes", op[1] + 1, op[2]) if op[0] == "notes" and op[1] >= idx else op
+            for op in self._undo_timeline
+        ]
         self.canvas.add_blank_page()
         self._mark_dirty()
 
@@ -2269,7 +2296,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
             return
-        self.notes_model.shift_for_delete(self.canvas.current_page_idx)
+        idx = self.canvas.current_page_idx
+        self.notes_model.shift_for_delete(idx)
+        self._undo_timeline = [
+            ("notes", op[1] - 1, op[2]) if op[0] == "notes" and op[1] > idx else op
+            for op in self._undo_timeline
+            if not (op[0] == "notes" and op[1] == idx)
+        ]
         self.canvas.delete_current_page()
         self._mark_dirty()
 
@@ -2280,6 +2313,14 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self._dirty = True
 
     def _on_notes_changed(self, _buf):
+        # A real user edit (not a page restore, not the symbol-substitution
+        # machinery) opens a typing burst: one timeline entry that covers all
+        # typing until the next canvas action or page switch.
+        if (not self._suppress_dirty and not self._notes_view._in_highlight
+                and not self._notes_burst_open):
+            self._undo_timeline.append(
+                ("notes", self.canvas.current_page_idx, self._burst_base))
+            self._notes_burst_open = True
         self._mark_dirty()
         self._update_canvas_anchors()
 
@@ -2402,6 +2443,54 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         buf.set_text(text)
         buf.end_irreversible_action()
         self._suppress_dirty = False
+        # a page switch ends any typing burst; future bursts diff against this text
+        self._notes_burst_open = False
+        self._burst_base = text
+        self._update_canvas_anchors()
+
+    # ── global undo ───────────────────────────────────────────────────────────
+
+    def _on_canvas_action(self):
+        """A draw/erase gesture finished: record it and end any typing burst."""
+        self._notes_burst_open = False
+        buf = self._notes_view.get_buffer()
+        self._burst_base = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        self._undo_timeline.append(("canvas",))
+
+    def _on_undo_key(self, ctrl, keyval, keycode, state):
+        if (keyval == Gdk.KEY_z and (state & Gdk.ModifierType.CONTROL_MASK)
+                and not (state & Gdk.ModifierType.SHIFT_MASK)):
+            # leave Ctrl+Z alone inside entries (search bar, dialogs)
+            focus = self.get_focus()
+            if isinstance(focus, Gtk.Editable):
+                return False
+            self._global_undo()
+            return True
+        return False
+
+    def _global_undo(self):
+        """Undo the most recent user action — a stroke, an erase gesture, or a
+        typing burst — in chronological order across canvas and notes."""
+        if not self._undo_timeline:
+            return
+        op = self._undo_timeline.pop()
+        if op[0] == "canvas":
+            self.canvas.undo_last()
+            return
+        _, page, before = op
+        if page != self.canvas.current_page_idx:
+            self._go_to_page(page)   # show the user what is being undone
+        buf = self._notes_view.get_buffer()
+        self._suppress_dirty = True
+        self._last_anchor_mark = None
+        buf.begin_irreversible_action()
+        buf.set_text(before)
+        buf.end_irreversible_action()
+        self._suppress_dirty = False
+        self._notes_burst_open = False
+        self._burst_base = before
+        self.notes_model.set(page, before)
+        self._mark_dirty()
         self._update_canvas_anchors()
 
     def _update_canvas_anchors(self):
@@ -2576,6 +2665,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._populate_toc()
         self._clear_dirty()
+        self._undo_timeline.clear()
+        self._notes_burst_open = False
         self._maybe_offer_recovery(path)
 
     def _open_markdown(self, md_path):
@@ -2600,6 +2691,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         buf.begin_irreversible_action()
         buf.set_text(self.notes_model.get(0))
         buf.end_irreversible_action()
+        self._undo_timeline.clear()
+        self._notes_burst_open = False
+        self._burst_base = self.notes_model.get(0)
 
     def _on_new_pdf(self, _btn):
         if self._dirty:
@@ -2888,7 +2982,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                     self.canvas.copy_selection()
                     return True
             if keyval == Gdk.KEY_z:
-                self.canvas.undo_last()
+                self._global_undo()
                 return True
             if keyval == Gdk.KEY_backslash:
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
