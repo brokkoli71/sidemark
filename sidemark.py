@@ -12,7 +12,15 @@ import traceback
 
 LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
 _log_path = None
+_log_had_error = False
 logger = logging.getLogger(__name__)
+
+
+def _flag_errors(record):
+    global _log_had_error
+    if record.levelno >= logging.ERROR:
+        _log_had_error = True
+    return True
 
 
 def _setup_logging(verbose=False):
@@ -26,17 +34,29 @@ def _setup_logging(verbose=False):
     file_handler = logging.FileHandler(_log_path)
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
+    logger.addFilter(_flag_errors)
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.info("session started" + (" (verbose)" if verbose else ""))
+
+    def _excepthook(exc_type, exc, tb):
+        logger.error("uncaught exception", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = _excepthook
+
     atexit.register(_cleanup_log)
 
 
 def _cleanup_log():
     logger.info("session ended cleanly")
     logging.shutdown()
+    if not _log_path:
+        return
+    if _log_had_error:
+        # Keep the log — it is the only record of what went wrong.
+        print(f"Errors were logged this session — log kept at {_log_path}", file=sys.stderr)
+        return
     try:
-        if _log_path:
-            os.remove(_log_path)
+        os.remove(_log_path)
     except OSError:
         pass
 
@@ -1937,9 +1957,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     # ── standard helpers ──────────────────────────────────────────────────────
 
     def _show_error(self, title, detail, tb=None):
-        print(f"ERROR: {title}: {detail}", file=sys.stderr)
+        # logger reaches stderr via its stream handler and flags the session
+        # log for retention, so crashes stay diagnosable after exit.
+        logger.error(f"{title}: {detail}")
         if tb:
-            print(tb, file=sys.stderr)
+            logger.error(tb)
         dlg = Adw.AlertDialog.new(title, detail)
         dlg.add_response("close", "Close")
         dlg.add_response("copy", "Copy Error")

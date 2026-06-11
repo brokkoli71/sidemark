@@ -942,6 +942,55 @@ class TestExport(unittest.TestCase):
             raise errors[0]
 
 
+class TestLogRetention(unittest.TestCase):
+    """The session log must survive sessions that logged errors — atexit also
+    runs after unhandled exceptions, which used to delete exactly the logs
+    needed for debugging."""
+
+    def setUp(self):
+        import logging
+        import sidemark as sm
+        self._logging = logging
+        self._sm = sm
+        self._orig = (sm._log_path, sm._log_had_error)
+
+    def tearDown(self):
+        self._sm._log_path, self._sm._log_had_error = self._orig
+
+    def _make_log(self):
+        fd, path = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+        return path
+
+    def test_clean_session_log_removed(self):
+        path = self._make_log()
+        self._sm._log_path = path
+        self._sm._log_had_error = False
+        self._sm._cleanup_log()
+        self.assertFalse(os.path.exists(path))
+
+    def test_log_kept_after_error(self):
+        path = self._make_log()
+        try:
+            self._sm._log_path = path
+            self._sm._log_had_error = True
+            self._sm._cleanup_log()
+            self.assertTrue(os.path.exists(path))
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_filter_flags_only_error_records(self):
+        logging = self._logging
+        self._sm._log_had_error = False
+        info = logging.LogRecord("x", logging.INFO, "f", 1, "msg", None, None)
+        self.assertTrue(self._sm._flag_errors(info))   # filter must not drop records
+        self.assertFalse(self._sm._log_had_error)
+        err = logging.LogRecord("x", logging.ERROR, "f", 1, "boom", None, None)
+        self.assertTrue(self._sm._flag_errors(err))
+        self.assertTrue(self._sm._log_had_error)
+
+
 class TestSaveCallback(unittest.TestCase):
     def test_after_callback_only_on_successful_save(self):
         """_on_save(after=...) must run the callback exactly once on success
