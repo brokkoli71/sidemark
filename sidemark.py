@@ -2027,9 +2027,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         # stays sensitive even without a TOC — insensitive widgets get no
         # tooltip in GTK4, and the tooltip is how we explain the situation
         self._has_toc = False
+        self._toc_thumbs = False
+        self._thumb_idle_id = None
         self._toc_btn = Gtk.ToggleButton()
         self._toc_btn.set_icon_name("view-list-symbolic")
-        self._toc_btn.set_tooltip_text("No outline in this document")
+        self._toc_btn.set_tooltip_text("No document open")
         self._toc_btn.connect("toggled", self._on_toc_toggled)
         header.pack_start(self._toc_btn)
 
@@ -2300,13 +2302,13 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._toc_list = Gtk.ListBox()
         self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self._toc_list.connect("row-activated", self._on_toc_row_activated)
-        toc_scroll = Gtk.ScrolledWindow()
-        toc_scroll.set_child(self._toc_list)
-        toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toc_scroll.set_size_request(230, -1)
+        self._toc_scroll = Gtk.ScrolledWindow()
+        self._toc_scroll.set_child(self._toc_list)
+        self._toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._toc_scroll.set_size_request(230, -1)
         self._toc_revealer = Gtk.Revealer()
         self._toc_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
-        self._toc_revealer.set_child(toc_scroll)
+        self._toc_revealer.set_child(self._toc_scroll)
         self._toc_revealer.set_reveal_child(False)
 
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -2344,7 +2346,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             ("Alt+Click",     "Open link under cursor"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Ctrl+Alt+Drag","Place anchor + callout box at drag end"),
-            ("Ctrl+T",       "Toggle outline (TOC) sidebar"),
+            ("Ctrl+T",       "Toggle outline / page-thumbnail sidebar"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
             ("PageUp",        "Previous page"),
@@ -2440,6 +2442,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             for op in self._redo_timeline
         ]
         self.canvas.add_blank_page()
+        self._populate_toc()
         self._mark_dirty()
 
     def _delete_current_page(self):
@@ -2463,6 +2466,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             if not (op[0] == "notes" and op[1] == idx)
         ]
         self.canvas.delete_current_page()
+        self._populate_toc()
         self._mark_dirty()
 
     # ── dirty tracking ────────────────────────────────────────────────────────
@@ -2534,6 +2538,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 if snap_notes:
                     self.notes_model.load(snap_notes)
                 self.canvas.load(snap_pdf)   # _path stays the original file
+                self._populate_toc()
                 self._mark_dirty()
             elif r == "discard":
                 _discard_autosave(path)
@@ -2580,6 +2585,8 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._page_label.set_label(f"{idx + 1} / {n}")
         self._restore_note()
         self._update_search_canvas()
+        if self._toc_thumbs and self._toc_revealer.get_reveal_child():
+            self._select_thumb(idx)
 
     def _go_to_page(self, idx):
         self._commit_note()
@@ -2737,13 +2744,15 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     # ── outline (TOC) sidebar ─────────────────────────────────────────────────
 
     def _on_toc_toggled(self, btn):
-        if btn.get_active() and not self._has_toc:
+        if btn.get_active() and not self.canvas.document:
             btn.set_active(False)   # bounce; re-fires toggled with False
-            toast = Adw.Toast.new("This document has no outline")
+            toast = Adw.Toast.new("No document open")
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
             return
         self._toc_revealer.set_reveal_child(btn.get_active())
+        if btn.get_active() and self._toc_thumbs:
+            self._select_thumb(self.canvas.current_page_idx)
 
     def _on_toc_row_activated(self, _list, row):
         page = getattr(row, "toc_page", None)
@@ -2752,6 +2761,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             self.canvas.grab_focus()
 
     def _populate_toc(self):
+        if self._thumb_idle_id is not None:
+            GLib.source_remove(self._thumb_idle_id)
+            self._thumb_idle_id = None
         while (child := self._toc_list.get_first_child()) is not None:
             self._toc_list.remove(child)
         toc = []
@@ -2760,23 +2772,98 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 toc = self.canvas.document.get_toc(simple=True)
             except Exception:
                 toc = []
-        for level, title, page in toc:
-            label = Gtk.Label(label=title.strip() or "—", xalign=0)
-            label.set_ellipsize(Pango.EllipsizeMode.END)
-            label.set_margin_start(8 + 14 * max(0, level - 1))
-            label.set_margin_end(8)
-            label.set_margin_top(4)
-            label.set_margin_bottom(4)
-            row = Gtk.ListBoxRow()
-            row.set_child(label)
-            row.toc_page = page - 1   # get_toc() pages are 1-based
-            self._toc_list.append(row)
         self._has_toc = bool(toc)
-        if not toc:
-            self._toc_btn.set_active(False)   # also hides the revealer
-            self._toc_btn.set_tooltip_text("No outline in this document")
-        else:
+        self._toc_thumbs = not toc and self.canvas.document is not None
+        if toc:
+            self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
+            for level, title, page in toc:
+                label = Gtk.Label(label=title.strip() or "—", xalign=0)
+                label.set_ellipsize(Pango.EllipsizeMode.END)
+                label.set_margin_start(8 + 14 * max(0, level - 1))
+                label.set_margin_end(8)
+                label.set_margin_top(4)
+                label.set_margin_bottom(4)
+                row = Gtk.ListBoxRow()
+                row.set_child(label)
+                row.toc_page = page - 1   # get_toc() pages are 1-based
+                self._toc_list.append(row)
             self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
+        elif self._toc_thumbs:
+            self._populate_thumbnails()
+            if self._toc_revealer.get_reveal_child():
+                self._select_thumb(self.canvas.current_page_idx)
+            self._toc_btn.set_tooltip_text(
+                "Toggle page thumbnails (Ctrl+T) — no outline in this document")
+        else:
+            self._toc_btn.set_active(False)   # also hides the revealer
+            self._toc_btn.set_tooltip_text("No document open")
+
+    # ── page thumbnails (outline fallback) ────────────────────────────────────
+
+    THUMB_WIDTH = 160
+
+    def _populate_thumbnails(self):
+        """Fill the outline sidebar with page thumbnails, rendered lazily so
+        opening a large document stays instant."""
+        doc = self.canvas.document
+        self._toc_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        pictures = []
+        for i in range(len(doc)):
+            rect = doc[i].rect
+            pic = Gtk.Picture()
+            scale = self.THUMB_WIDTH / rect.width if rect.width else 0.2
+            pic.set_size_request(self.THUMB_WIDTH, int(rect.height * scale))
+            num = Gtk.Label(label=str(i + 1))
+            num.add_css_class("dim-label")
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_margin_top(6)
+            box.set_margin_bottom(2)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            box.append(pic)
+            box.append(num)
+            row = Gtk.ListBoxRow()
+            row.set_child(box)
+            row.toc_page = i
+            self._toc_list.append(row)
+            pictures.append(pic)
+
+        queue = list(enumerate(pictures))
+
+        def render_next():
+            # a new document invalidates the queue
+            if not queue or self.canvas.document is not doc:
+                self._thumb_idle_id = None
+                return False
+            i, pic = queue.pop(0)
+            try:
+                page = doc[i]
+                s = self.THUMB_WIDTH / page.rect.width
+                pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
+                tex = Gdk.MemoryTexture.new(
+                    pix.width, pix.height, Gdk.MemoryFormat.R8G8B8,
+                    GLib.Bytes.new(pix.samples), pix.stride)
+                pic.set_paintable(tex)
+            except Exception:
+                logger.error("thumbnail render failed:\n" + traceback.format_exc())
+            if not queue:
+                self._thumb_idle_id = None
+                return False
+            return True
+
+        self._thumb_idle_id = GLib.idle_add(render_next)
+
+    def _select_thumb(self, idx):
+        """Highlight the current page's thumbnail and scroll it into view."""
+        row = self._toc_list.get_row_at_index(idx)
+        if row is None:
+            return
+        self._toc_list.select_row(row)
+        ok, bounds = row.compute_bounds(self._toc_list)
+        if ok:
+            adj = self._toc_scroll.get_vadjustment()
+            target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
+            adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
     def _on_notes_toggled(self, btn):
         w = self.get_width() or 1280

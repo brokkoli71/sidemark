@@ -1444,17 +1444,18 @@ class TestTocSidebar(unittest.TestCase):
                     if win.canvas.current_page_idx != 1:
                         raise AssertionError(
                             f"row activation went to page {win.canvas.current_page_idx}")
-                    # a PDF without TOC: explanatory tooltip, toggle bounces
+                    # a PDF without TOC: falls back to page thumbnails
                     win._do_open_file(plain)
                     if win._has_toc:
                         raise AssertionError("TOC wrongly detected for plain PDF")
-                    if "No outline" not in (win._toc_btn.get_tooltip_text() or ""):
-                        raise AssertionError("missing no-outline tooltip")
-                    if win._toc_list.get_first_child() is not None:
-                        raise AssertionError("TOC list not cleared for plain PDF")
-                    win._toc_btn.set_active(True)   # must bounce back
-                    if win._toc_btn.get_active() or win._toc_revealer.get_reveal_child():
-                        raise AssertionError("toggle did not bounce without TOC")
+                    if not win._toc_thumbs:
+                        raise AssertionError("thumbnail mode not active for plain PDF")
+                    if "thumbnails" not in (win._toc_btn.get_tooltip_text() or ""):
+                        raise AssertionError("missing thumbnails tooltip")
+                    win._toc_btn.set_active(False)
+                    win._toc_btn.set_active(True)   # must NOT bounce
+                    if not win._toc_btn.get_active() or not win._toc_revealer.get_reveal_child():
+                        raise AssertionError("toggle bounced despite thumbnail fallback")
                 except Exception as e:
                     errors.append(e)
                 finally:
@@ -1464,6 +1465,122 @@ class TestTocSidebar(unittest.TestCase):
             app.run([])
         if errors:
             raise errors[0]
+
+
+class TestThumbnailSidebar(unittest.TestCase):
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.thumbs")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _rows(win):
+        rows = []
+        child = win._toc_list.get_first_child()
+        while child is not None:
+            rows.append(child)
+            child = child.get_next_sibling()
+        return rows
+
+    @staticmethod
+    def _pump_thumbs(win):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + 5
+        while win._thumb_idle_id is not None:
+            ctx.iteration(False)
+            if time.time() > deadline:
+                raise AssertionError("thumbnail render queue never drained")
+
+    def test_no_document_bounces(self):
+        def body(win):
+            self.assertIn("No document", win._toc_btn.get_tooltip_text() or "")
+            win._toc_btn.set_active(True)
+            self.assertFalse(win._toc_btn.get_active())
+            self.assertFalse(win._toc_revealer.get_reveal_child())
+
+        self._run_in_window(body)
+
+    def test_thumbnails_rendered_and_navigate(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "plain.pdf")
+            make_pdf(pdf, n_pages=3)
+
+            def body(win):
+                win._do_open_file(pdf)
+                rows = self._rows(win)
+                self.assertEqual(len(rows), 3)
+                self._pump_thumbs(win)
+                for row in rows:
+                    pic = row.get_child().get_first_child()
+                    self.assertIsInstance(pic, Gtk.Picture)
+                    tex = pic.get_paintable()
+                    self.assertIsNotNone(tex, "thumbnail not rendered")
+                    self.assertEqual(tex.get_width(), win.THUMB_WIDTH)
+                # clicking a thumbnail navigates
+                win._toc_btn.set_active(True)
+                win._on_toc_row_activated(win._toc_list, rows[2])
+                self.assertEqual(win.canvas.current_page_idx, 2)
+                # page change moves the selection
+                win.canvas.go_to_page(0)
+                self.assertIs(win._toc_list.get_selected_row(), rows[0])
+
+            self._run_in_window(body)
+
+    def test_rows_follow_page_insert_and_delete(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "plain.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._toc_btn.set_active(True)
+                win._add_blank_page()
+                self.assertEqual(len(self._rows(win)), 3)
+                # selection tracks the newly inserted current page
+                sel = win._toc_list.get_selected_row()
+                self.assertIsNotNone(sel)
+                self.assertEqual(sel.toc_page, win.canvas.current_page_idx)
+                win._delete_current_page()
+                self.assertEqual(len(self._rows(win)), 2)
+                self._pump_thumbs(win)
+
+            self._run_in_window(body)
+
+    def test_toc_takes_precedence_over_thumbnails(self):
+        with tempfile.TemporaryDirectory() as d:
+            plain = os.path.join(d, "plain.pdf")
+            make_pdf(plain, n_pages=2)
+            toc_pdf = os.path.join(d, "toc.pdf")
+            make_pdf(toc_pdf, n_pages=2)
+            doc = fitz.open(toc_pdf)
+            doc.set_toc([[1, "One", 1], [1, "Two", 2]])
+            doc.saveIncr()
+            doc.close()
+
+            def body(win):
+                win._do_open_file(plain)
+                self.assertTrue(win._toc_thumbs)
+                win._do_open_file(toc_pdf)   # switching docs must leave thumbs mode
+                self.assertFalse(win._toc_thumbs)
+                rows = self._rows(win)
+                self.assertEqual(len(rows), 2)
+                self.assertIsInstance(rows[0].get_child(), Gtk.Label)
+
+            self._run_in_window(body)
 
 
 class TestAutosave(unittest.TestCase):
