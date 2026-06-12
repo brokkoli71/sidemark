@@ -4,3 +4,7 @@ __pycache__
 logs/
 publish.sh
 .claude
+demo.pdf
+demo-notes.md
+sample.pdf
+sample-notes.md
