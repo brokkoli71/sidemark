@@ -2306,9 +2306,29 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self._toc_scroll.set_child(self._toc_list)
         self._toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self._toc_scroll.set_size_request(230, -1)
+        self._toc_scroll.set_vexpand(True)
+        # Outline ⇄ Pages view switcher, shown only when the PDF has a TOC
+        self._toc_seg_outline = Gtk.ToggleButton(label="Outline")
+        self._toc_seg_outline.set_active(True)
+        self._toc_seg_pages = Gtk.ToggleButton(label="Pages")
+        self._toc_seg_pages.set_group(self._toc_seg_outline)
+        self._toc_seg_pages.connect("toggled", self._on_toc_view_toggled)
+        self._toc_switch = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self._toc_switch.add_css_class("linked")
+        self._toc_switch.set_homogeneous(True)
+        self._toc_switch.set_margin_top(8)
+        self._toc_switch.set_margin_bottom(4)
+        self._toc_switch.set_margin_start(8)
+        self._toc_switch.set_margin_end(8)
+        self._toc_switch.append(self._toc_seg_outline)
+        self._toc_switch.append(self._toc_seg_pages)
+        self._toc_switch.set_visible(False)
+        toc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        toc_box.append(self._toc_switch)
+        toc_box.append(self._toc_scroll)
         self._toc_revealer = Gtk.Revealer()
         self._toc_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
-        self._toc_revealer.set_child(self._toc_scroll)
+        self._toc_revealer.set_child(toc_box)
         self._toc_revealer.set_reveal_child(False)
 
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -2773,9 +2793,28 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             except Exception:
                 toc = []
         self._has_toc = bool(toc)
-        self._toc_thumbs = not toc and self.canvas.document is not None
-        if toc:
+        if self.canvas.document is None:
+            self._toc_thumbs = False
+            self._toc_switch.set_visible(False)
+            self._toc_btn.set_active(False)   # also hides the revealer
+            self._toc_btn.set_tooltip_text("No document open")
+            return
+        # with a TOC the user can flip between outline and thumbnails;
+        # without one, thumbnails are the only view
+        self._toc_switch.set_visible(self._has_toc)
+        self._toc_thumbs = not self._has_toc or self._toc_seg_pages.get_active()
+        if self._toc_thumbs:
+            self._populate_thumbnails()
+            # sidebar hugs the thumbnails (margins + row padding)
+            self._toc_scroll.set_size_request(self.THUMB_WIDTH + 32, -1)
+            if self._toc_revealer.get_reveal_child():
+                self._select_thumb(self.canvas.current_page_idx)
+            self._toc_btn.set_tooltip_text(
+                "Toggle outline (Ctrl+T)" if self._has_toc else
+                "Toggle page thumbnails (Ctrl+T) — no outline in this document")
+        else:
             self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
+            self._toc_scroll.set_size_request(230, -1)
             for level, title, page in toc:
                 label = Gtk.Label(label=title.strip() or "—", xalign=0)
                 label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -2788,15 +2827,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 row.toc_page = page - 1   # get_toc() pages are 1-based
                 self._toc_list.append(row)
             self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
-        elif self._toc_thumbs:
-            self._populate_thumbnails()
-            if self._toc_revealer.get_reveal_child():
-                self._select_thumb(self.canvas.current_page_idx)
-            self._toc_btn.set_tooltip_text(
-                "Toggle page thumbnails (Ctrl+T) — no outline in this document")
-        else:
-            self._toc_btn.set_active(False)   # also hides the revealer
-            self._toc_btn.set_tooltip_text("No document open")
+
+    def _on_toc_view_toggled(self, _btn):
+        if self.canvas.document:
+            self._populate_toc()
 
     # ── page thumbnails (outline fallback) ────────────────────────────────────
 

@@ -1560,6 +1560,49 @@ class TestThumbnailSidebar(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_switcher_flips_between_outline_and_thumbnails(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "toc.pdf")
+            make_pdf(pdf, n_pages=3)
+            doc = fitz.open(pdf)
+            doc.set_toc([[1, "One", 1], [1, "Two", 2], [1, "Three", 3]])
+            doc.saveIncr()
+            doc.close()
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertTrue(win._has_toc)
+                self.assertFalse(win._toc_thumbs)
+                self.assertTrue(win._toc_switch.get_visible())
+                self.assertEqual(win._toc_scroll.get_size_request()[0], 230)
+                win._toc_seg_pages.set_active(True)
+                self.assertTrue(win._toc_thumbs)
+                rows = self._rows(win)
+                self.assertEqual(len(rows), 3)
+                self.assertIsInstance(rows[0].get_child(), Gtk.Box)
+                self.assertEqual(win._toc_scroll.get_size_request()[0],
+                                 win.THUMB_WIDTH + 32)
+                self._pump_thumbs(win)
+                win._toc_seg_outline.set_active(True)
+                self.assertFalse(win._toc_thumbs)
+                self.assertEqual(win._toc_scroll.get_size_request()[0], 230)
+                self.assertIsInstance(self._rows(win)[0].get_child(), Gtk.Label)
+
+            self._run_in_window(body)
+
+    def test_switcher_hidden_without_toc(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "plain.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertFalse(win._toc_switch.get_visible())
+                self.assertEqual(win._toc_scroll.get_size_request()[0],
+                                 win.THUMB_WIDTH + 32)
+
+            self._run_in_window(body)
+
     def test_toc_takes_precedence_over_thumbnails(self):
         with tempfile.TemporaryDirectory() as d:
             plain = os.path.join(d, "plain.pdf")
