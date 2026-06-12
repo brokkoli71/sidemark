@@ -2800,7 +2800,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
     # ── page thumbnails (outline fallback) ────────────────────────────────────
 
-    THUMB_WIDTH = 160
+    THUMB_WIDTH = 96
 
     def _populate_thumbnails(self):
         """Fill the outline sidebar with page thumbnails, rendered lazily so
