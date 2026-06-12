@@ -2921,8 +2921,9 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
             logger.error("recent list update failed:\n" + traceback.format_exc())
         # also register with the XDG recent-files store (recently-used.xbel) —
         # GTK/GNOME file dialogs and KDE's KRecentDocument/krunner read it.
-        # Skipped headless so tests don't pollute the user's real recents.
-        if os.environ.get("GDK_BACKEND") != "offscreen":
+        # Skipped under test so the user's real recents aren't polluted (tests
+        # run on the live Wayland session; GTK4 has no offscreen backend).
+        if not os.environ.get("SIDEMARK_TEST"):
             try:
                 Gtk.RecentManager.get_default().add_item(
                     Gio.File.new_for_path(path).get_uri())

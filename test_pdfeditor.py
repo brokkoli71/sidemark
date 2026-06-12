@@ -7,10 +7,12 @@ import os
 import sys
 import math
 import tempfile
+import time
 import unittest
 
-# Prevent GTK from trying to connect to a display
-os.environ.setdefault("GDK_BACKEND", "offscreen")
+# Keep tests from writing the user's real recently-used.xbel — they run on the
+# live session backend (GTK4 dropped the offscreen backend).
+os.environ["SIDEMARK_TEST"] = "1"
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -27,6 +29,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
                       _export_pdf_with_notes, _parse_anchors, PDFEditorWindow)
+
+# window tests open files, which records recents — keep that out of the user's
+# real ~/.local/share/sidemark/recent.json (TestRecentFiles patches its own)
+sidemark.RECENT_PATH = os.path.join(
+    tempfile.mkdtemp(prefix="sidemark-test-recents-"), "recent.json")
 
 
 # ── helper: create a minimal single-page PDF in memory ───────────────────────
