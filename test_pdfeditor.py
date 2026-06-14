@@ -1731,6 +1731,64 @@ class TestSelectMode(unittest.TestCase):
         self.assertFalse(self.canvas._text_selecting)
 
 
+class TestDragAndDrop(unittest.TestCase):
+    """#39: dropping a supported file onto the window opens it."""
+
+    def _drop_value(self, paths):
+        files = []
+        for p in paths:
+            gf = mock.Mock()
+            gf.get_path.return_value = p
+            files.append(gf)
+        value = mock.Mock()
+        value.get_files.return_value = files
+        return value
+
+    def _drop(self, make_target, app_id):
+        errors, result = [], {}
+        with tempfile.TemporaryDirectory() as d:
+            target = make_target(d)
+            app = Adw.Application(application_id=app_id)
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._dirty = False   # open directly, no save prompt
+                    result["handled"] = win._on_file_drop(
+                        None, self._drop_value([target]), 0, 0)
+                    result["path"] = win._path
+                    result["target"] = target
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+        return result
+
+    def test_drop_pdf_opens_it(self):
+        def make(d):
+            pdf = os.path.join(d, "dropped.pdf")
+            make_pdf(pdf)
+            return pdf
+        r = self._drop(make, "test.sidemark.dnd.pdf")
+        self.assertTrue(r["handled"])
+        self.assertEqual(r["path"], r["target"])
+
+    def test_drop_unsupported_is_ignored(self):
+        def make(d):
+            txt = os.path.join(d, "notes.txt")
+            open(txt, "w").close()
+            return txt
+        r = self._drop(make, "test.sidemark.dnd.txt")
+        self.assertFalse(r["handled"])
+        self.assertIsNone(r["path"])
+
+
 class TestThumbHoldPan(unittest.TestCase):
     def _canvas(self, n_pages=2):
         canvas = PDFCanvas()

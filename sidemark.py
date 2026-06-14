@@ -2389,6 +2389,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         key_ctrl.connect("key-pressed", self._on_key)
         self.add_controller(key_ctrl)
 
+        # drag a file from the file manager onto the window to open it
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_file_drop)
+        self.add_controller(drop)
+
         # Ctrl+Z must work globally; the notes TextView consumes it before the
         # bubble-phase controller above, so intercept it in the capture phase.
         undo_ctrl = Gtk.EventControllerKey()
@@ -3161,6 +3166,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         scroller.set_propagate_natural_width(True)
         scroller.set_child(box)
         self._recent_popover.set_child(scroller)
+
+    SUPPORTED_DND = (".pdf", ".pptx", ".md")
+
+    def _on_file_drop(self, _target, value, _x, _y):
+        """Open the first supported file dropped onto the window."""
+        try:
+            files = value.get_files()
+        except AttributeError:
+            return False
+        for gfile in files:
+            path = gfile.get_path()
+            if path and path.lower().endswith(self.SUPPORTED_DND):
+                self.open_file(path)
+                return True
+        self.toast_overlay.add_toast(
+            Adw.Toast.new("Drop a PDF, PPTX, or Markdown file"))
+        return False
 
     def open_file(self, path):
         if self._dirty:
