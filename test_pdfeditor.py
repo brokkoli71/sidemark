@@ -1184,6 +1184,44 @@ class TestExport(unittest.TestCase):
         if errors:
             raise errors[0]
 
+    def test_header_stays_visible_in_fullscreen(self):
+        """Regression for #40: the header must live in an Adw.ToolbarView top
+        bar, not the titlebar slot — GTK4 hides the titlebar in fullscreen.
+        Asserts the structure and that the header stays mapped after
+        fullscreen()."""
+        errors = []
+        results = {}
+        app = Adw.Application(application_id="test.sidemark.fullscreen")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                # the header must be inside the ToolbarView that fills the
+                # window, not the titlebar slot GTK4 hides in fullscreen
+                results["content_is_toolbarview"] = isinstance(
+                    win.get_content(), Adw.ToolbarView)
+                results["header_in_toolbarview"] = (
+                    win._header.get_ancestor(Adw.ToolbarView) is not None)
+                win.fullscreen()
+                ctx = GLib.MainContext.default()
+                for _ in range(200):
+                    ctx.iteration(False)
+                results["header_mapped"] = win._header.get_mapped()
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+        self.assertTrue(results["content_is_toolbarview"])
+        self.assertTrue(results["header_in_toolbarview"])
+        self.assertTrue(results["header_mapped"],
+                        "header must stay mapped in fullscreen")
+
     def test_export_save_prompt_does_not_raise(self):
         """Ctrl+E with unsaved changes presents the 'Save before exporting?'
         dialog; without changes it goes straight to the options dialog.

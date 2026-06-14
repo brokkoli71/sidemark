@@ -1917,7 +1917,7 @@ class MarkdownNotesView(GtkSource.View):
                     apply(tag_name, a + 1, b)
 
 
-class PDFEditorWindow(Gtk.ApplicationWindow):
+class PDFEditorWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Sidemark")
         self.set_default_size(1280, 800)
@@ -2024,8 +2024,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         )
 
         # ── header bar ────────────────────────────────────────────────────────
+        # Adw.ApplicationWindow has no titlebar slot; the header goes in an
+        # Adw.ToolbarView top bar, which (unlike set_titlebar) stays visible in
+        # fullscreen.
         header = Gtk.HeaderBar()
-        self.set_titlebar(header)
+        self._header = header
 
         open_btn = Gtk.Button(label="Open")
         open_btn.connect("clicked", self._on_open)
@@ -2357,7 +2360,11 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
 
         self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(content)
-        self.set_child(self.toast_overlay)
+
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(self.toast_overlay)
+        self.set_content(toolbar_view)
 
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self._on_key)
