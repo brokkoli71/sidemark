@@ -1626,6 +1626,34 @@ class TestThumbnailSidebar(unittest.TestCase):
             self._run_in_window(body)
 
 
+class TestMiddleMousePan(unittest.TestCase):
+    def setUp(self):
+        self.canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)
+        self.canvas.load(self._tmp)
+        self.canvas._fit_page(800, 600)
+
+    def tearDown(self):
+        os.unlink(self._tmp)
+
+    def test_middle_drag_pans_like_ctrl_drag(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 2
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._panning)
+        self.assertFalse(self.canvas._is_fitted)
+        ox, oy = self.canvas._pan_start_offset
+        g.get_start_point.return_value = (True, 100, 100)
+        self.canvas._on_drag_update(g, 30, -20)
+        self.assertEqual((self.canvas.offset_x, self.canvas.offset_y),
+                         (ox + 30, oy - 20))
+        self.canvas._on_drag_end(g, 30, -20)
+        self.assertFalse(self.canvas._panning)
+        self.assertEqual(len(self.canvas.strokes), 0)   # no stroke committed
+
+
 class TestThumbHoldPan(unittest.TestCase):
     def _canvas(self, n_pages=2):
         canvas = PDFCanvas()

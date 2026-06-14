@@ -775,10 +775,21 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.on_nav_button(1 if btn == 8 else -1)
             return
         if btn == 10:
-            self._ignoring = True  # GestureSingle owns this sequence
+            # thumb-button pan is driven by _on_motion while held; ignore the
+            # drag gesture so it doesn't draw or pan on top of it
+            self._ignoring = True
             return
         self._ignoring = False
         self._erasing = False
+        if btn == 2:
+            # middle-mouse drag pans, same as Ctrl+drag
+            self._panning = True
+            self._is_fitted = False
+            self._pan_start_offset = (self.offset_x, self.offset_y)
+            self._text_selecting = False
+            self._zoom_selecting = False
+            self._selected_words = []
+            return
         state = gesture.get_current_event_state()
         if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
             # anchor already placed at press by GestureClick; dragging on
