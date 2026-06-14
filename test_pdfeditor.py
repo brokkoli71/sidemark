@@ -1749,8 +1749,8 @@ class TestDragAndDrop(unittest.TestCase):
                     win = PDFEditorWindow(a)
                     win.present()
                     win._dirty = False   # open directly, no save prompt
-                    result["handled"] = win._on_file_drop(
-                        None, self._drop_value([target]), 0, 0)
+                    paths = win._dnd_paths(self._drop_value([target]))
+                    result["handled"] = win._open_dropped(paths)
                     result["path"] = win._path
                     result["target"] = target
                 except Exception as e:

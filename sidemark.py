@@ -105,7 +105,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GObject, GtkSource, Pango, PangoCairo
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource, Pango, PangoCairo
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -2411,14 +2411,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.add_controller(key_ctrl)
 
         # drag a file from the file manager onto the window to open it.
-        # Accept several types: file managers vary in what they offer over
-        # Wayland — Gdk.FileList, a single Gio.File, or a text/uri-list string.
-        drop = Gtk.DropTarget()
-        drop.set_gtypes([Gdk.FileList, Gio.File, GObject.TYPE_STRING])
-        drop.set_actions(Gdk.DragAction.COPY)
+        # Use the *async* target: Wayland file managers transfer files through
+        # the desktop portal (application/vnd.portal.filetransfer), which the
+        # synchronous Gtk.DropTarget can't read inline at drop time, so its
+        # "drop" never fires. DropTargetAsync reads the value asynchronously.
+        drop = Gtk.DropTargetAsync.new(
+            Gdk.ContentFormats.new_for_gtype(Gdk.FileList), Gdk.DragAction.COPY)
         drop.connect("accept", self._on_drop_accept)
-        drop.connect("enter", self._on_drop_enter)
-        drop.connect("drop", self._on_file_drop)
+        drop.connect("drop", self._on_drop_async)
         self.add_controller(drop)
 
         # Ctrl+Z must work globally; the notes TextView consumes it before the
@@ -3203,38 +3203,46 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     fmts.to_string() if fmts else None)
         return True
 
-    def _on_drop_enter(self, _target, x, y):
-        logger.info("DnD enter at (%.0f, %.0f)", x, y)
-        return Gdk.DragAction.COPY
+    def _on_drop_async(self, _target, gdk_drop, x, y):
+        """Read the dropped file list asynchronously (portal-safe)."""
+        logger.info("DnD drop at (%.0f, %.0f) — reading FileList async", x, y)
+        gdk_drop.read_value_async(
+            Gdk.FileList, GLib.PRIORITY_DEFAULT, None,
+            self._on_drop_read, gdk_drop)
+        return True
+
+    def _on_drop_read(self, gdk_drop, result, _user_data):
+        try:
+            value = gdk_drop.read_value_finish(result)
+            logger.info("DnD read value = %r (type %s)", value, type(value))
+            paths = self._dnd_paths(value)
+        except Exception as e:
+            logger.warning("DnD read_value failed: %s", e)
+            paths = []
+        opened = self._open_dropped(paths)
+        gdk_drop.finish(Gdk.DragAction.COPY if opened else 0)
 
     def _dnd_paths(self, value):
         """Extract filesystem paths from whatever the drop delivered."""
-        logger.info("DnD drop: value type = %s, repr = %r", type(value), value)
         paths = []
         if isinstance(value, Gdk.FileList):
             paths = [f.get_path() for f in value.get_files()]
         elif isinstance(value, Gio.File):
             paths = [value.get_path()]
         elif isinstance(value, str):
-            # text/uri-list or a bare path
             for line in value.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                if line.startswith("file://"):
-                    paths.append(Gio.File.new_for_uri(line).get_path())
-                else:
-                    paths.append(line)
+                paths.append(Gio.File.new_for_uri(line).get_path()
+                             if line.startswith("file://") else line)
         else:
-            # last-ditch: some bindings hand back an object with get_files()
-            getter = getattr(value, "get_files", None) or getattr(value, "get_path", None)
-            logger.warning("DnD: unhandled value type, getter = %s", getter)
-        logger.info("DnD drop: extracted paths = %s", paths)
+            logger.warning("DnD: unhandled value type %s", type(value))
         return [p for p in paths if p]
 
-    def _on_file_drop(self, _target, value, _x, _y):
-        """Open the first supported file dropped onto the window."""
-        paths = self._dnd_paths(value)
+    def _open_dropped(self, paths):
+        """Open the first supported path; toast and return False otherwise."""
+        logger.info("DnD: candidate paths = %s", paths)
         for path in paths:
             if path.lower().endswith(self.SUPPORTED_DND):
                 logger.info("DnD: opening %s", path)
