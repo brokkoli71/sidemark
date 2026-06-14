@@ -2418,6 +2418,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         drop = Gtk.DropTargetAsync.new(
             Gdk.ContentFormats.new_for_gtype(Gdk.FileList), Gdk.DragAction.COPY)
         drop.connect("accept", self._on_drop_accept)
+        # drag-enter / drag-motion MUST return the action, or the negotiated
+        # action stays none and the compositor rejects the drop on release.
+        drop.connect("drag-enter", self._on_drop_motion)
+        drop.connect("drag-motion", self._on_drop_motion)
         drop.connect("drop", self._on_drop_async)
         self.add_controller(drop)
 
@@ -3197,11 +3201,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     SUPPORTED_DND = (".pdf", ".pptx", ".md")
 
     def _on_drop_accept(self, _target, gdk_drop):
-        """Diagnostic: log what MIME types the drag source is offering."""
+        # fires repeatedly during hover; keep at debug to avoid log spam
         fmts = gdk_drop.get_formats()
-        logger.info("DnD accept: offered formats = %s",
-                    fmts.to_string() if fmts else None)
+        logger.debug("DnD accept: offered formats = %s",
+                     fmts.to_string() if fmts else None)
         return True
+
+    def _on_drop_motion(self, _target, _drop, _x, _y):
+        # advertise COPY so the drop is permitted on release
+        return Gdk.DragAction.COPY
 
     def _on_drop_async(self, _target, gdk_drop, x, y):
         """Read the dropped file list asynchronously (portal-safe)."""
