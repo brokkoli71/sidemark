@@ -1692,6 +1692,45 @@ class TestMiddleMousePan(unittest.TestCase):
         self.assertEqual(len(self.canvas.strokes), 0)   # no stroke committed
 
 
+class TestSelectMode(unittest.TestCase):
+    """#41: in select-text mode a plain drag selects text instead of drawing."""
+
+    def setUp(self):
+        self.canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)
+        self.canvas.load(self._tmp)
+        self.canvas._fit_page(800, 600)
+
+    def tearDown(self):
+        os.unlink(self._tmp)
+
+    def _plain_drag(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        return g
+
+    def test_draw_mode_starts_a_stroke(self):
+        self.canvas.select_mode = False
+        g = self._plain_drag()
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertFalse(self.canvas._text_selecting)
+        self.assertEqual(len(self.canvas.current_stroke), 1)
+
+    def test_select_mode_selects_text_and_draws_nothing(self):
+        self.canvas.select_mode = True
+        g = self._plain_drag()
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._text_selecting)
+        g.get_start_point.return_value = (True, 100, 100)
+        self.canvas._on_drag_update(g, 60, 8)
+        self.canvas._on_drag_end(g, 60, 8)
+        self.assertEqual(len(self.canvas.strokes), 0)
+        self.assertFalse(self.canvas._text_selecting)
+
+
 class TestThumbHoldPan(unittest.TestCase):
     def _canvas(self, n_pages=2):
         canvas = PDFCanvas()

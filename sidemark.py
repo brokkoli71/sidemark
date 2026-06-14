@@ -204,6 +204,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
+        # tool mode: in "select" mode a plain drag selects text instead of
+        # drawing (Alt+drag still selects in either mode). Toggled from the
+        # header / Ctrl+R.
+        self.select_mode = False
+
         # word-level text selection (Alt+drag) and link opening (Alt+click)
         self._text_selecting = False
         self._alt_start = (0.0, 0.0)
@@ -829,6 +834,12 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._ignoring = True
                 if self.on_anchor_clicked:
                     self.on_anchor_clicked(hit)
+                return
+            if self.select_mode:
+                # plain drag selects text instead of drawing
+                self._text_selecting = True
+                self._alt_start = (start_x, start_y)
+                self.grab_focus()
                 return
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
@@ -2204,6 +2215,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pen_btn.set_popover(popover)
         header.pack_end(self._pen_btn)
 
+        # draw ↔ select-text mode toggle (Ctrl+M). Active = a plain drag
+        # selects text instead of drawing; Alt+drag still selects in either.
+        self._select_toggle = Gtk.ToggleButton()
+        self._select_toggle.set_icon_name("edit-select-all-symbolic")
+        self._select_toggle.set_tooltip_text("Select-text mode (Ctrl+M)")
+        self._select_toggle.connect("toggled", self._on_select_mode_toggled)
+        header.pack_end(self._select_toggle)
+
         # While the highlighter is active the pen button shows a mini preview
         # of the actual highlight stroke instead of the pencil icon — Adwaita
         # ships no marker icon, and this doubles as a color hint.
@@ -2388,7 +2407,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+Z",        "Undo last action (draw, erase, typing)"),
             ("Ctrl+Y",        "Redo (also Ctrl+Shift+Z)"),
             ("Text",          None),
+            ("Ctrl+M",        "Toggle draw / select-text mode"),
             ("Alt+Drag",      "Select text (word-level)"),
+            ("Left-drag",     "Select text (in select-text mode)"),
             ("Ctrl+C",        "Copy selected text"),
             ("Alt+Click",     "Open link under cursor"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
@@ -2939,6 +2960,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
+    def _on_select_mode_toggled(self, btn):
+        select = btn.get_active()
+        self.canvas.select_mode = select
+        # cursor doubles as the mode indicator
+        self.canvas.set_cursor(
+            Gdk.Cursor.new_from_name("text", None) if select else None)
+
+    def _toggle_select_mode(self):
+        self._select_toggle.set_active(not self._select_toggle.get_active())
+
     def _on_notes_toggled(self, btn):
         w = self.get_width() or 1280
         if btn.get_active():
@@ -3462,6 +3493,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_h:
                 self._toggle_highlighter()
+                return True
+            if keyval == Gdk.KEY_m:
+                self._toggle_select_mode()
                 return True
             if keyval == Gdk.KEY_e:
                 self._on_export()

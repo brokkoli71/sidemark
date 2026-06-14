@@ -14,7 +14,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 - **Live markdown notes** linked to PDF pages, with anchor markers to pin notes to specific spots
 - **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
 - **Add and delete pages** — insert blank pages with same dimensions
-- **Text selection** — Alt+drag highlights words and copies them to the clipboard
+- **Text selection** — Alt+drag highlights words and copies them to the clipboard, or switch to select-text mode (Ctrl+M) so a plain drag selects instead of drawing
 - **Text search** — Ctrl+F opens a search bar; highlights all matches across all pages, navigate with Enter / ↑↓
 - **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter. A switcher flips between the outline and page thumbnails; PDFs without an outline show thumbnails directly
 - **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files
@@ -78,7 +78,8 @@ pip install pymupdf
 | `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
 | `Ctrl+Z` | Undo the last action chronologically — a stroke, an erase drag, or a burst of notes typing — no matter where the cursor is |
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Redo the last undone action |
-| `Alt+drag` | Select & copy text (word-level highlight) |
+| `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (text cursor shows the mode) |
+| `Alt+drag` | Select & copy text (word-level highlight) — works in either mode |
 
 ### Pages
 
