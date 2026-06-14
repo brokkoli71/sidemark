@@ -105,7 +105,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource, Pango, PangoCairo
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GObject, GtkSource, Pango, PangoCairo
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -2410,8 +2410,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         key_ctrl.connect("key-pressed", self._on_key)
         self.add_controller(key_ctrl)
 
-        # drag a file from the file manager onto the window to open it
-        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        # drag a file from the file manager onto the window to open it.
+        # Accept several types: file managers vary in what they offer over
+        # Wayland — Gdk.FileList, a single Gio.File, or a text/uri-list string.
+        drop = Gtk.DropTarget()
+        drop.set_gtypes([Gdk.FileList, Gio.File, GObject.TYPE_STRING])
+        drop.set_actions(Gdk.DragAction.COPY)
+        drop.connect("accept", self._on_drop_accept)
+        drop.connect("enter", self._on_drop_enter)
         drop.connect("drop", self._on_file_drop)
         self.add_controller(drop)
 
@@ -3190,17 +3196,51 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     SUPPORTED_DND = (".pdf", ".pptx", ".md")
 
+    def _on_drop_accept(self, _target, gdk_drop):
+        """Diagnostic: log what MIME types the drag source is offering."""
+        fmts = gdk_drop.get_formats()
+        logger.info("DnD accept: offered formats = %s",
+                    fmts.to_string() if fmts else None)
+        return True
+
+    def _on_drop_enter(self, _target, x, y):
+        logger.info("DnD enter at (%.0f, %.0f)", x, y)
+        return Gdk.DragAction.COPY
+
+    def _dnd_paths(self, value):
+        """Extract filesystem paths from whatever the drop delivered."""
+        logger.info("DnD drop: value type = %s, repr = %r", type(value), value)
+        paths = []
+        if isinstance(value, Gdk.FileList):
+            paths = [f.get_path() for f in value.get_files()]
+        elif isinstance(value, Gio.File):
+            paths = [value.get_path()]
+        elif isinstance(value, str):
+            # text/uri-list or a bare path
+            for line in value.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("file://"):
+                    paths.append(Gio.File.new_for_uri(line).get_path())
+                else:
+                    paths.append(line)
+        else:
+            # last-ditch: some bindings hand back an object with get_files()
+            getter = getattr(value, "get_files", None) or getattr(value, "get_path", None)
+            logger.warning("DnD: unhandled value type, getter = %s", getter)
+        logger.info("DnD drop: extracted paths = %s", paths)
+        return [p for p in paths if p]
+
     def _on_file_drop(self, _target, value, _x, _y):
         """Open the first supported file dropped onto the window."""
-        try:
-            files = value.get_files()
-        except AttributeError:
-            return False
-        for gfile in files:
-            path = gfile.get_path()
-            if path and path.lower().endswith(self.SUPPORTED_DND):
+        paths = self._dnd_paths(value)
+        for path in paths:
+            if path.lower().endswith(self.SUPPORTED_DND):
+                logger.info("DnD: opening %s", path)
                 self.open_file(path)
                 return True
+        logger.info("DnD: no supported file among %s", paths)
         self.toast_overlay.add_toast(
             Adw.Toast.new("Drop a PDF, PPTX, or Markdown file"))
         return False

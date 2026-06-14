@@ -17,7 +17,7 @@ os.environ["SIDEMARK_TEST"] = "1"
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib, Gdk
+from gi.repository import Gtk, Adw, GLib, Gdk, Gio
 import cairo
 import fitz
 import unittest.mock as mock
@@ -1735,14 +1735,8 @@ class TestDragAndDrop(unittest.TestCase):
     """#39: dropping a supported file onto the window opens it."""
 
     def _drop_value(self, paths):
-        files = []
-        for p in paths:
-            gf = mock.Mock()
-            gf.get_path.return_value = p
-            files.append(gf)
-        value = mock.Mock()
-        value.get_files.return_value = files
-        return value
+        # mimic what a Wayland file manager delivers: a text/uri-list string
+        return "\r\n".join(Gio.File.new_for_path(p).get_uri() for p in paths)
 
     def _drop(self, make_target, app_id):
         errors, result = [], {}
