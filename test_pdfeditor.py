@@ -1735,6 +1735,56 @@ class TestThumbScrollZoom(unittest.TestCase):
             os.unlink(tmp)
 
 
+class TestNavKeepsZoom(unittest.TestCase):
+    def test_page_keys_keep_zoom_when_zoomed(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf, n_pages=3)
+            app = Adw.Application(application_id="test.sidemark.navzoom")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    c = win.canvas
+                    c.scale = 2.0
+                    c._is_fitted = False
+                    win._nav_page(1)
+                    if c.current_page_idx != 1:
+                        raise AssertionError("PageDown did not navigate")
+                    if c.scale != 2.0 or c._needs_fit:
+                        raise AssertionError("zoom not preserved on PageDown")
+                    if c.offset_y != 8.0:
+                        raise AssertionError("new page not aligned to top")
+                    win._nav_page(-1)
+                    if c.current_page_idx != 0 or c.scale != 2.0:
+                        raise AssertionError("zoom not preserved on PageUp")
+                    # fitted views keep re-fitting
+                    c._is_fitted = True
+                    win._nav_page(1)
+                    if c.current_page_idx != 1 or not c._needs_fit:
+                        raise AssertionError("fitted view did not re-fit")
+                    # bounds are a no-op
+                    c._is_fitted = True
+                    win._nav_page(5)
+                    if c.current_page_idx != 2:
+                        raise AssertionError("clamped nav failed")
+                    win._nav_page(1)
+                    if c.current_page_idx != 2:
+                        raise AssertionError("nav past last page not a no-op")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+
 class TestAutosave(unittest.TestCase):
     def setUp(self):
         import sidemark as sm

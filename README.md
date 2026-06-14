@@ -84,8 +84,8 @@ pip install pymupdf
 
 | Key | Action |
 |-----|--------|
-| `PageDown` | Next page |
-| `PageUp` | Previous page |
+| `PageDown` | Next page (keeps zoom when zoomed, like mouse buttons 8/9) |
+| `PageUp` | Previous page (keeps zoom when zoomed) |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |

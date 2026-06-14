@@ -1966,7 +1966,7 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
         self.canvas.on_page_changed = self._on_page_changed
         self.canvas.on_change = self._mark_dirty
         self.canvas.on_text_copied = self._on_text_copied
-        self.canvas.on_nav_button = lambda d: self._go_to_page(self.canvas.current_page_idx + d)
+        self.canvas.on_nav_button = lambda d: self._nav_page(d)
         # commit the current note before any canvas-initiated page change
         # (scroll flip, link jump, undo on another page)
         self.canvas.on_page_will_change = self._commit_note
@@ -2631,6 +2631,19 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
     def _go_to_page(self, idx):
         self._commit_note()
         self.canvas.go_to_page(idx)
+
+    def _nav_page(self, delta):
+        """Relative page navigation (PageUp/Down, mouse back/forward): zoomed
+        views keep their zoom and align to the new page's top/bottom, fitted
+        views re-fit — same behavior as scroll-past-edge flips."""
+        c = self.canvas
+        if not c.document:
+            return
+        target = max(0, min(c.n_pages - 1, c.current_page_idx + delta))
+        if target == c.current_page_idx:
+            return
+        self._commit_note()
+        c._flip_page(target - c.current_page_idx)
 
     def _commit_note(self):
         if not self._path and not self._notes_path and not self._is_untitled:
@@ -3479,10 +3492,10 @@ class PDFEditorWindow(Gtk.ApplicationWindow):
                 self._delete_current_page()
                 return True
         if keyval == Gdk.KEY_Page_Down:
-            self._go_to_page(self.canvas.current_page_idx + 1)
+            self._nav_page(1)
             return True
         if keyval == Gdk.KEY_Page_Up:
-            self._go_to_page(self.canvas.current_page_idx - 1)
+            self._nav_page(-1)
             return True
         return False
 
