@@ -2217,9 +2217,30 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         # draw ↔ select-text mode toggle (Ctrl+M). Active = a plain drag
         # selects text instead of drawing; Alt+drag still selects in either.
+        # Custom icon: a glyph with a selection highlight behind it (Adwaita
+        # has no clear "select text" icon), mirroring the highlighter preview.
         self._select_toggle = Gtk.ToggleButton()
-        self._select_toggle.set_icon_name("edit-select-all-symbolic")
         self._select_toggle.set_tooltip_text("Select-text mode (Ctrl+M)")
+        sel_icon = Gtk.DrawingArea()
+        sel_icon.set_content_width(16)
+        sel_icon.set_content_height(16)
+
+        def _draw_sel_icon(_area, ctx, w, h):
+            # selection highlight box behind the glyph
+            ctx.set_source_rgba(*acc, 0.40)
+            ctx.rectangle(1.5, 3, w - 3, h - 6)
+            ctx.fill()
+            # the glyph
+            ctx.set_source_rgb(*fg)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                                 cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(11)
+            ext = ctx.text_extents("A")
+            ctx.move_to((w - ext.width) / 2 - ext.x_bearing,
+                        (h - ext.height) / 2 - ext.y_bearing)
+            ctx.show_text("A")
+        sel_icon.set_draw_func(_draw_sel_icon)
+        self._select_toggle.set_child(sel_icon)
         self._select_toggle.connect("toggled", self._on_select_mode_toggled)
         header.pack_end(self._select_toggle)
 
