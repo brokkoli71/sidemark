@@ -1626,6 +1626,87 @@ class TestThumbnailSidebar(unittest.TestCase):
             self._run_in_window(body)
 
 
+class TestThumbHoldPan(unittest.TestCase):
+    def _canvas(self, n_pages=2):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=n_pages)
+        canvas.load(self._tmp)
+        canvas._fit_page(800, 600)
+        return canvas
+
+    def tearDown(self):
+        if os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    @staticmethod
+    def _event(kind, button):
+        e = mock.Mock()
+        e.get_event_type.return_value = kind
+        e.get_button.return_value = button
+        return e
+
+    def test_press_starts_pan_release_ends_it(self):
+        canvas = self._canvas()
+        canvas._mouse_x, canvas._mouse_y = 200, 150
+        ctrl = mock.Mock()
+        canvas._on_thumb_event(ctrl, self._event(Gdk.EventType.BUTTON_PRESS, 10))
+        self.assertTrue(canvas._thumb_panning)
+        self.assertFalse(canvas._is_fitted)
+        self.assertEqual(canvas._thumb_origin, (200, 150))
+        ox, oy = canvas._thumb_start_offset
+        # motion while held pans relative to the press origin
+        canvas._on_motion(None, 250, 130)
+        self.assertEqual((canvas.offset_x, canvas.offset_y), (ox + 50, oy - 20))
+        canvas._on_thumb_event(ctrl, self._event(Gdk.EventType.BUTTON_RELEASE, 10))
+        self.assertFalse(canvas._thumb_panning)
+        # motion after release no longer pans
+        canvas._on_motion(None, 400, 400)
+        self.assertEqual((canvas.offset_x, canvas.offset_y), (ox + 50, oy - 20))
+
+    def test_other_buttons_ignored(self):
+        canvas = self._canvas()
+        ctrl = mock.Mock()
+        canvas._on_thumb_event(ctrl, self._event(Gdk.EventType.BUTTON_PRESS, 1))
+        self.assertFalse(canvas._thumb_panning)
+
+    def test_marshals_event_from_controller_when_arg_none(self):
+        canvas = self._canvas()
+        ctrl = mock.Mock()
+        ctrl.get_current_event.return_value = self._event(
+            Gdk.EventType.BUTTON_PRESS, 10)
+        canvas._on_thumb_event(ctrl, None)   # PyGObject quirk: arg is None
+        self.assertTrue(canvas._thumb_panning)
+
+
+class TestThumbScrollZoom(unittest.TestCase):
+    def test_scroll_zooms_while_thumb_pan_latched(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            tmp = f.name
+        try:
+            make_pdf(tmp, n_pages=2)
+            canvas.load(tmp)
+            canvas._fit_page(800, 600)
+            canvas._thumb_panning = True
+            canvas._mouse_x = canvas._mouse_y = 300
+            ctrl = mock.Mock()
+            ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
+            scale = canvas.scale
+            canvas._on_scroll(ctrl, 0, -1)
+            self.assertAlmostEqual(canvas.scale, scale * 1.1)
+            # pan origin rebased so the next motion event doesn't jump
+            self.assertEqual(canvas._thumb_origin, (300, 300))
+            self.assertEqual(canvas._thumb_start_offset,
+                             (canvas.offset_x, canvas.offset_y))
+            canvas._on_scroll(ctrl, 0, 1)   # zoom back out, no page flip
+            self.assertAlmostEqual(canvas.scale, scale * 1.1 * 0.9)
+            self.assertEqual(canvas.current_page_idx, 0)
+        finally:
+            os.unlink(tmp)
+
+
 class TestAutosave(unittest.TestCase):
     def setUp(self):
         import sidemark as sm

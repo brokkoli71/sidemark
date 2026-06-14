@@ -243,11 +243,12 @@ class PDFCanvas(Gtk.DrawingArea):
         drag.connect("drag-end", self._on_drag_end)
         self.add_controller(drag)
 
-        thumb = Gtk.GestureSingle()
-        thumb.set_button(10)
-        thumb.set_exclusive(True)
-        thumb.connect("begin", self._on_thumb_begin)
-        thumb.connect("end", self._on_thumb_end)
+        # MX Master thumb button (btn 10): hold to pan, scroll-while-held to
+        # zoom. EventControllerLegacy is the only layer that reliably reports
+        # button-10 press AND release through pointer movement — every gesture
+        # API cancels the sequence once a drag claims it (extras/probe_thumb.py).
+        thumb = Gtk.EventControllerLegacy()
+        thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
 
         click = Gtk.GestureClick.new()
@@ -616,19 +617,22 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── input handlers ────────────────────────────────────────────────────────
 
-    def _on_thumb_begin(self, gesture, sequence):
-        if self._thumb_panning:
-            pass
-            self._thumb_panning = False
-        else:
+    def _on_thumb_event(self, ctrl, event):
+        if event is None:   # PyGObject sometimes fails to marshal the arg
+            event = ctrl.get_current_event()
+        if event is None:
+            return False
+        t = event.get_event_type()
+        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
             logger.debug(f"thumb pan start ({self._mouse_x:.0f},{self._mouse_y:.0f})")
             self._thumb_panning = True
             self._is_fitted = False
             self._thumb_origin = (self._mouse_x, self._mouse_y)
             self._thumb_start_offset = (self.offset_x, self.offset_y)
-
-    def _on_thumb_end(self, gesture, sequence):
-        pass  # ignored — toggle mode, only begin matters
+        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
+            logger.debug("thumb pan end")
+            self._thumb_panning = False
+        return False
 
     def _on_motion(self, _ctrl, x, y):
         if self._thumb_panning:
@@ -642,7 +646,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
-        if not (state & Gdk.ModifierType.CONTROL_MASK):
+        # zoom on Ctrl+scroll, or plain scroll while thumb pan mode is latched
+        if not (state & Gdk.ModifierType.CONTROL_MASK) and not self._thumb_panning:
             if self._handle_boundary_flip(dx, dy):
                 return True
             self._scroll_past = 0.0
@@ -659,6 +664,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._is_fitted = False
         self.offset_x = mx - pdf_x * self.scale
         self.offset_y = my - pdf_y * self.scale
+        if self._thumb_panning:
+            # rebase the pan origin so the next motion event doesn't jump
+            self._thumb_origin = (mx, my)
+            self._thumb_start_offset = (self.offset_x, self.offset_y)
         self._schedule_rerender()
         self.queue_draw()
         return True
