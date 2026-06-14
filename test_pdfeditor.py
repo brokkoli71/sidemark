@@ -993,6 +993,106 @@ class TestMarkdownFormatting(unittest.TestCase):
         self.assertEqual(buf.get_text(s, e, False), "world")
 
 
+class TestMarkdownLineOps(unittest.TestCase):
+
+    def _view(self):
+        from sidemark import MarkdownNotesView
+        return MarkdownNotesView()
+
+    def _text(self, buf):
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def _cursor(self, buf):
+        it = buf.get_iter_at_mark(buf.get_insert())
+        return it.get_line(), it.get_line_offset()
+
+    def _put_cursor(self, buf, line, col):
+        it = buf.get_iter_at_line(line)[1]
+        it.forward_chars(col)
+        buf.place_cursor(it)
+
+    def _select(self, buf, l0, c0, l1, c1):
+        a = buf.get_iter_at_line(l0)[1]; a.forward_chars(c0)
+        b = buf.get_iter_at_line(l1)[1]; b.forward_chars(c1)
+        buf.select_range(a, b)
+
+    # ── duplicate (Ctrl+D) ──
+    def test_duplicate_single_line(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("one\ntwo\nthree")
+        self._put_cursor(buf, 1, 2)
+        v._duplicate_lines()
+        self.assertEqual(self._text(buf), "one\ntwo\ntwo\nthree")
+        self.assertEqual(self._cursor(buf), (2, 2))   # cursor lands on the copy
+
+    def test_duplicate_final_line_without_newline(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("a\nb")
+        self._put_cursor(buf, 1, 1)
+        v._duplicate_lines()
+        self.assertEqual(self._text(buf), "a\nb\nb")
+
+    def test_duplicate_multiline_selection(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("a\nb\nc\nd")
+        self._select(buf, 1, 0, 2, 1)
+        v._duplicate_lines()
+        self.assertEqual(self._text(buf), "a\nb\nc\nb\nc\nd")
+
+    def test_duplicate_selection_ending_at_col0_excludes_trailing_line(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("a\nb\nc")
+        self._select(buf, 0, 0, 1, 0)   # visually just line "a"
+        v._duplicate_lines()
+        self.assertEqual(self._text(buf), "a\na\nb\nc")
+
+    # ── move (Alt+↑/↓) ──
+    def test_move_line_down(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("one\ntwo\nthree")
+        self._put_cursor(buf, 0, 1)
+        v._move_lines(1)
+        self.assertEqual(self._text(buf), "two\none\nthree")
+        self.assertEqual(self._cursor(buf), (1, 1))   # cursor follows the line
+
+    def test_move_line_up(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("one\ntwo\nthree")
+        self._put_cursor(buf, 2, 3)
+        v._move_lines(-1)
+        self.assertEqual(self._text(buf), "one\nthree\ntwo")
+        self.assertEqual(self._cursor(buf), (1, 3))
+
+    def test_move_up_at_top_is_noop(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("one\ntwo")
+        self._put_cursor(buf, 0, 0)
+        v._move_lines(-1)
+        self.assertEqual(self._text(buf), "one\ntwo")
+
+    def test_move_down_at_bottom_is_noop(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("one\ntwo")
+        self._put_cursor(buf, 1, 0)
+        v._move_lines(1)
+        self.assertEqual(self._text(buf), "one\ntwo")
+
+    def test_move_final_line_up_keeps_no_trailing_newline(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("a\nb\nc")
+        self._put_cursor(buf, 2, 0)
+        v._move_lines(-1)
+        self.assertEqual(self._text(buf), "a\nc\nb")
+
+    def test_move_selection_down_keeps_selection(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("a\nb\nc\nd")
+        self._select(buf, 0, 0, 1, 1)
+        v._move_lines(1)
+        self.assertEqual(self._text(buf), "c\na\nb\nd")
+        self.assertTrue(buf.get_has_selection())
+
+
 class TestLatexFormatting(unittest.TestCase):
 
     def _view(self):
@@ -1781,6 +1881,80 @@ class TestDragAndDrop(unittest.TestCase):
         r = self._drop(make, "test.sidemark.dnd.txt")
         self.assertFalse(r["handled"])
         self.assertIsNone(r["path"])
+
+
+class TestReorderPages(unittest.TestCase):
+    """#14: drag-to-reorder moves a page and re-keys strokes / notes."""
+
+    def _make_text_pdf(self, path, n):
+        doc = fitz.open()
+        for i in range(n):
+            p = doc.new_page(width=300, height=400)
+            p.insert_text((50, 50), f"PAGE{i}")
+        doc.save(path)
+        doc.close()
+
+    def test_move_order_permutation(self):
+        self.assertEqual(PDFCanvas._move_order(3, 0, 2), [1, 2, 0])
+        self.assertEqual(PDFCanvas._move_order(3, 2, 0), [2, 0, 1])
+
+    def test_move_page_reorders_document_and_strokes(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            tmp = f.name
+        try:
+            self._make_text_pdf(tmp, 3)
+            canvas.load(tmp)
+            s0, s2 = [{"pts": [(1, 1)]}], [{"pts": [(2, 2)]}]
+            canvas.all_strokes = {0: s0, 2: s2}
+            old_to_new = canvas.move_page(0, 2)
+            self.assertEqual(old_to_new, {1: 0, 2: 1, 0: 2})
+            texts = [canvas.document[i].get_text().strip() for i in range(3)]
+            self.assertEqual(texts, ["PAGE1", "PAGE2", "PAGE0"])
+            self.assertEqual(canvas.all_strokes[2], s0)  # page 0 -> 2
+            self.assertEqual(canvas.all_strokes[1], s2)  # page 2 -> 1
+        finally:
+            os.unlink(tmp)
+
+    def test_notes_model_reorder(self):
+        nm = NotesModel()
+        nm.set(0, "zero")
+        nm.set(2, "two")
+        nm.reorder({1: 0, 2: 1, 0: 2})
+        self.assertEqual(nm.get(2), "zero")
+        self.assertEqual(nm.get(1), "two")
+        self.assertEqual(nm.get(0), "")
+
+    def test_window_move_page_reorders_notes(self):
+        errors, result = [], {}
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._make_text_pdf(pdf, 3)
+            app = Adw.Application(application_id="test.sidemark.reorder")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    # notes on pages 1 and 2; stay on page 0 so _commit_note
+                    # (empty buffer) doesn't clobber them
+                    win.notes_model.set(1, "note one")
+                    win.notes_model.set(2, "note two")
+                    win._move_page(1, 2)   # order -> [0, 2, 1]
+                    result["n1"] = win.notes_model.get(1)
+                    result["n2"] = win.notes_model.get(2)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+        self.assertEqual(result["n2"], "note one")  # page 1 -> 2
+        self.assertEqual(result["n1"], "note two")  # page 2 -> 1
 
 
 class TestThumbHoldPan(unittest.TestCase):

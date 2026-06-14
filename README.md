@@ -16,7 +16,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 - **Add and delete pages** — insert blank pages with same dimensions
 - **Text selection** — Alt+drag highlights words and copies them to the clipboard, or switch to select-text mode (Ctrl+M) so a plain drag selects instead of drawing
 - **Text search** — Ctrl+F opens a search bar; highlights all matches across all pages, navigate with Enter / ↑↓
-- **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter. A switcher flips between the outline and page thumbnails; PDFs without an outline show thumbnails directly
+- **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter. A switcher flips between the outline and page thumbnails; PDFs without an outline show thumbnails directly. Drag a thumbnail onto another to reorder pages
 - **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files; drag a file from your file manager onto the window to open it
 - **Recent files** — header menu, XDG recent-files integration, and a walker (Omarchy) launcher menu
 - **Design Scheme** — Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
@@ -90,6 +90,7 @@ pip install pymupdf
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |
+| Drag thumbnail → thumbnail | Reorder pages (in the page-thumbnail sidebar) |
 
 ### Zoom & pan
 
@@ -110,6 +111,8 @@ pip install pymupdf
 | `Ctrl+B` | Bold selection |
 | `Ctrl+I` | Italic selection |
 | `Ctrl+E` | Inline code selection |
+| `Ctrl+D` | Duplicate the current line (or every line the selection spans) |
+| `Alt+↑` / `Alt+↓` | Move the current line (or selected lines) up / down |
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
 | `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |

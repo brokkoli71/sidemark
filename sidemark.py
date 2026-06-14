@@ -105,7 +105,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GtkSource, Pango, PangoCairo
+from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GObject, GtkSource, Pango, PangoCairo
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -1239,6 +1239,36 @@ class PDFCanvas(Gtk.DrawingArea):
         self._load_page(new_idx)
         return True
 
+    @staticmethod
+    def _move_order(n, src, dst):
+        """Permutation (list of old indices in new order) for moving the page
+        at src so it lands at index dst."""
+        order = list(range(n))
+        order.insert(dst, order.pop(src))
+        return order
+
+    def move_page(self, src, dst):
+        """Move the page at index src to index dst, re-keying strokes/anchors
+        and the undo/redo stacks. Returns the old→new index map (or None)."""
+        if not self.document or src == dst:
+            return None
+        n = self.n_pages
+        if not (0 <= src < n and 0 <= dst < n):
+            return None
+        order = self._move_order(n, src, dst)
+        self.document.select(order)        # reorder underlying pages
+        old_to_new = {old: new for new, old in enumerate(order)}
+        self.all_strokes = {old_to_new[k]: v for k, v in self.all_strokes.items()}
+        self._anchors = {old_to_new[k]: v for k, v in self._anchors.items()}
+        self._undo_stack = [
+            (op[0], old_to_new[op[1]]) + op[2:] for op in self._undo_stack]
+        self._redo_stack = [
+            [(op[0], old_to_new[op[1]]) + op[2:] for op in ops]
+            for ops in self._redo_stack]
+        self.n_pages = len(self.document)
+        self._load_page(old_to_new[self.current_page_idx])
+        return old_to_new
+
 
 def _load_theme():
     """Read background/foreground/accent — tries Omarchy, then GNOME, then KDE."""
@@ -1605,6 +1635,14 @@ class NotesModel:
             if k != idx
         }
 
+    def reorder(self, old_to_new):
+        """Re-key notes after pages were reordered. old_to_new maps each old
+        page index to its new index."""
+        self._notes = {
+            old_to_new.get(k, k): v
+            for k, v in self._notes.items()
+        }
+
     def save(self, path):
         sections = [
             f"<!-- page:{idx} -->\n\n{self._notes[idx].strip()}"
@@ -1707,18 +1745,115 @@ class MarkdownNotesView(GtkSource.View):
     # ── formatting shortcuts ──────────────────────────────────────────────────
 
     def _on_key(self, ctrl, keyval, keycode, state):
-        if not (state & Gdk.ModifierType.CONTROL_MASK):
+        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        alt_held = bool(state & Gdk.ModifierType.ALT_MASK)
+        if ctrl_held and not alt_held:
+            if keyval == Gdk.KEY_b:
+                self._wrap_selection("**")
+                return True
+            if keyval == Gdk.KEY_i:
+                self._wrap_selection("*")
+                return True
+            if keyval == Gdk.KEY_e:
+                self._wrap_selection("`")
+                return True
+            if keyval == Gdk.KEY_d:
+                self._duplicate_lines()
+                return True
             return False
-        if keyval == Gdk.KEY_b:
-            self._wrap_selection("**")
-            return True
-        if keyval == Gdk.KEY_i:
-            self._wrap_selection("*")
-            return True
-        if keyval == Gdk.KEY_e:
-            self._wrap_selection("`")
-            return True
+        if alt_held and not ctrl_held:
+            if keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+                self._move_lines(-1)
+                return True
+            if keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+                self._move_lines(1)
+                return True
+            return False
         return False
+
+    # ── line operations (Ctrl+D duplicate, Alt+↑/↓ move) ──────────────────────
+
+    def _line_range(self):
+        """The line span the cursor or selection covers, as
+        (buf, ins, bound, first, last). A selection that ends at column 0
+        doesn't include that trailing line (matches common editors)."""
+        buf = self.get_buffer()
+        ins = buf.get_iter_at_mark(buf.get_insert())
+        bound = buf.get_iter_at_mark(buf.get_selection_bound())
+        first = min(ins.get_line(), bound.get_line())
+        last = max(ins.get_line(), bound.get_line())
+        if buf.get_has_selection() and last > first:
+            lower = ins if ins.get_line() == last else bound
+            if lower.get_line_offset() == 0:
+                last -= 1
+        return buf, ins, bound, first, last
+
+    @staticmethod
+    def _iter_at(buf, line, col):
+        """Iter at line/col, clamping col to the line length and line to the buffer."""
+        ok, it = buf.get_iter_at_line(line)
+        if not ok:
+            return buf.get_end_iter()
+        end = it.copy()
+        if not end.ends_line():
+            end.forward_to_line_end()
+        it.forward_chars(min(col, end.get_line_offset()))
+        return it
+
+    def _duplicate_lines(self):
+        """Ctrl+D — duplicate the current line, or every line the selection spans."""
+        buf, ins, bound, first, last = self._line_range()
+        start = buf.get_iter_at_line(first)[1]
+        ok, end = buf.get_iter_at_line(last + 1)
+        if not ok:
+            end = buf.get_end_iter()
+        block = buf.get_text(start, end, True)
+        ins_line, ins_col = ins.get_line(), ins.get_line_offset()
+        bnd_line, bnd_col = bound.get_line(), bound.get_line_offset()
+        n = last - first + 1
+        buf.begin_user_action()
+        try:
+            # a final line without a trailing newline needs one before the copy
+            buf.insert(end, block if block.endswith("\n") else "\n" + block)
+            buf.select_range(self._iter_at(buf, ins_line + n, ins_col),
+                             self._iter_at(buf, bnd_line + n, bnd_col))
+        finally:
+            buf.end_user_action()
+
+    def _move_lines(self, direction):
+        """Alt+↑/↓ — move the current line (or selected lines) up or down."""
+        buf, ins, bound, first, last = self._line_range()
+        if direction < 0 and first == 0:
+            return
+        if direction > 0 and last >= buf.get_line_count() - 1:
+            return
+        lo, hi = (first - 1, last) if direction < 0 else (first, last + 1)
+        start = buf.get_iter_at_line(lo)[1]
+        ok, end = buf.get_iter_at_line(hi + 1)
+        trailing = ok
+        if not ok:
+            end = buf.get_end_iter()
+        region = buf.get_text(start, end, True)
+        parts = region.split("\n")
+        if trailing:
+            parts = parts[:-1]              # drop the empty tail after the last newline
+        if direction < 0:
+            parts = parts[1:] + parts[:1]   # first line rotates to the bottom
+        else:
+            parts = parts[-1:] + parts[:-1] # last line rotates to the top
+        new_region = "\n".join(parts) + ("\n" if trailing else "")
+        ins_line, ins_col = ins.get_line(), ins.get_line_offset()
+        bnd_line, bnd_col = bound.get_line(), bound.get_line_offset()
+        buf.begin_user_action()
+        try:
+            mark = buf.create_mark(None, start, True)   # left gravity: insertion point
+            buf.delete(start, end)
+            buf.insert(buf.get_iter_at_mark(mark), new_region)
+            buf.delete_mark(mark)
+            buf.select_range(self._iter_at(buf, ins_line + direction, ins_col),
+                             self._iter_at(buf, bnd_line + direction, bnd_col))
+        finally:
+            buf.end_user_action()
 
     def _wrap_selection(self, marker):
         """Wrap selection in marker, or unwrap if already wrapped. Selection is preserved.
@@ -2573,6 +2708,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._populate_toc()
         self._mark_dirty()
 
+    def _move_page(self, src, dst):
+        """Reorder pages: move page src to index dst, re-keying notes too."""
+        if not self.canvas.document or src == dst:
+            return
+        n = self.canvas.n_pages
+        if not (0 <= src < n and 0 <= dst < n):
+            return
+        self._commit_note()
+        order = PDFCanvas._move_order(n, src, dst)
+        old_to_new = {old: new for new, old in enumerate(order)}
+        self.notes_model.reorder(old_to_new)
+        self._undo_timeline = [
+            ("notes", old_to_new[op[1]], op[2]) if op[0] == "notes" else op
+            for op in self._undo_timeline
+        ]
+        self._redo_timeline = [
+            ("notes", old_to_new[op[1]]) + op[2:] if op[0] == "notes" else op
+            for op in self._redo_timeline
+        ]
+        self.canvas.move_page(src, dst)
+        self._populate_toc()
+        self._mark_dirty()
+
     # ── dirty tracking ────────────────────────────────────────────────────────
 
     def _mark_dirty(self, *_):
@@ -2956,6 +3114,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.set_child(box)
             row.toc_page = i
+            self._add_thumb_dnd(row, i)
             self._toc_list.append(row)
             pictures.append(pic)
 
@@ -2983,6 +3142,27 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return True
 
         self._thumb_idle_id = GLib.idle_add(render_next)
+
+    def _add_thumb_dnd(self, row, idx):
+        """Make a thumbnail row draggable and a drop target so dragging one
+        thumbnail onto another reorders the pages. Intra-app DnD, so it uses
+        the synchronous controllers (no portal involved)."""
+        src = Gtk.DragSource()
+        src.set_actions(Gdk.DragAction.MOVE)
+        src.connect("prepare", lambda _s, _x, _y, i=idx:
+                    Gdk.ContentProvider.new_for_value(GObject.Value(int, i)))
+        row.add_controller(src)
+
+        target = Gtk.DropTarget.new(int, Gdk.DragAction.MOVE)
+        target.connect("drop", lambda _t, value, _x, _y, dst=idx:
+                       self._on_thumb_drop(value, dst))
+        row.add_controller(target)
+
+    def _on_thumb_drop(self, src, dst):
+        if isinstance(src, int) and src != dst:
+            logger.info("reorder: move page %d -> %d", src, dst)
+            self._move_page(src, dst)
+        return True
 
     def _select_thumb(self, idx):
         """Highlight the current page's thumbnail and scroll it into view."""
