@@ -37,7 +37,7 @@ cd sidemark
 ./install.sh
 ```
 
-Installs the app, creates a launcher entry, and registers it as the default handler for PDF and Markdown files.
+Installs the app, creates a launcher entry, and registers it as the default handler for PDF and Markdown files. Optional flags: `--walker-menu` (launcher recent-files menu, see below) and `--register-pptx` (also become the default handler for PowerPoint files, which open via LibreOffice conversion).
 
 ```bash
 ./install.sh --uninstall

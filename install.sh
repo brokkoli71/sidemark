@@ -1,17 +1,20 @@
 #!/bin/bash
 # install.sh — user-local install for Sidemark
-# Usage:  ./install.sh               install
-#         ./install.sh -y            install, auto-confirm dependency prompt
-#         ./install.sh --walker-menu also install the walker/elephant recent-files menu
-#         ./install.sh --uninstall   remove everything
+# Usage:  ./install.sh                 install
+#         ./install.sh -y              install, auto-confirm dependency prompt
+#         ./install.sh --walker-menu   also install the walker/elephant recent-files menu
+#         ./install.sh --register-pptx also register as default handler for PowerPoint files
+#         ./install.sh --uninstall     remove everything
 set -euo pipefail
 
 _YES=0
 _WALKER=0
+_PPTX=0
 for _arg in "$@"; do
     case "$_arg" in
         -y|--yes) _YES=1 ;;
         --walker-menu) _WALKER=1 ;;
+        --register-pptx) _PPTX=1 ;;
     esac
 done
 
@@ -215,6 +218,15 @@ xdg-mime default "$DESKTOP_ID.desktop" application/pdf          2>/dev/null || t
 xdg-mime default "$DESKTOP_ID.desktop" text/markdown            2>/dev/null || true
 xdg-mime default "$DESKTOP_ID.desktop" text/x-markdown          2>/dev/null || true
 ok "registered as default for PDF and Markdown."
+
+# PowerPoint opens via LibreOffice conversion — opt-in, since most users want
+# an office suite as their .pptx default.
+if [[ $_PPTX -eq 1 ]]; then
+    xdg-mime default "$DESKTOP_ID.desktop" application/vnd.ms-powerpoint 2>/dev/null || true
+    xdg-mime default "$DESKTOP_ID.desktop" \
+        application/vnd.openxmlformats-officedocument.presentationml.presentation 2>/dev/null || true
+    ok "registered as default for PowerPoint."
+fi
 
 # Icons
 install -m 644 "$SCRIPT_DIR/icon.svg" \
