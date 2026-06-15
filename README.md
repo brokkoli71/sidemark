@@ -15,7 +15,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 - **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
 - **Add and delete pages** — insert blank pages with same dimensions
 - **Text selection** — Alt+drag highlights words and copies them to the clipboard, or switch to select-text mode (Ctrl+M) so a plain drag selects instead of drawing
-- **Text search** — Ctrl+F opens a search bar; highlights all matches across all pages, navigate with Enter / ↑↓
+- **Text search** — Ctrl+F opens a search bar that spans both the PDF and your Markdown notes; matches highlight across all pages, and Enter / ↑↓ cycle through them (starting at the current page and wrapping around)
 - **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter. A switcher flips between the outline and page thumbnails; PDFs without an outline show thumbnails directly. Drag a thumbnail onto another to reorder pages
 - **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files; drag a file from your file manager onto the window to open it
 - **Recent files** — header menu, XDG recent-files integration, and a walker (Omarchy) launcher menu
@@ -139,7 +139,7 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+F` | Open search bar |
+| `Ctrl+F` | Open search bar (searches the PDF text **and** the Markdown notes) |
 | `Enter` / `↓` | Next match |
 | `↑` | Previous match |
 | `Escape` | Close search |

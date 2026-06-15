@@ -1876,6 +1876,115 @@ class TestThumbnailSidebar(unittest.TestCase):
             self._run_in_window(body)
 
 
+class TestNotesSearch(unittest.TestCase):
+    """#43: Ctrl+F also searches the Markdown notes, unified with PDF hits."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.notesearch")
+
+        def on_activate(a):
+            try:
+                body(a)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def _text_pdf(self, path, page_texts):
+        doc = fitz.open()
+        for txt in page_texts:
+            p = doc.new_page(width=300, height=400)
+            p.insert_text((50, 50), txt)
+        doc.save(path)
+        doc.close()
+
+    def _sel(self, win):
+        buf = win._notes_view.get_buffer()
+        a = buf.get_iter_at_mark(buf.get_insert())
+        b = buf.get_iter_at_mark(buf.get_selection_bound())
+        if a.compare(b) > 0:
+            a, b = b, a
+        return buf.get_text(a, b, False)
+
+    def test_find_note_matches_offsets(self):
+        def body(a):
+            win = PDFEditorWindow(a); win.present()
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "t.pdf")
+                self._text_pdf(pdf, ["x", "y"])
+                win._do_open_file(pdf)
+                win.notes_model.set(0, "a needle and a needle")
+                hits = win._find_note_matches("needle")
+                self.assertEqual(hits, {0: [(2, 8), (15, 21)]})
+                # case-insensitive
+                self.assertEqual(win._find_note_matches("NEEDLE"), {0: [(2, 8), (15, 21)]})
+        self._run_in_window(body)
+
+    def test_unified_search_cycles_pdf_and_notes(self):
+        def body(a):
+            win = PDFEditorWindow(a); win.present()
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "t.pdf")
+                # PDF: needle only on page 1
+                self._text_pdf(pdf, ["zzz", "needle here", "zzz"])
+                win._do_open_file(pdf)
+                win.notes_model.set(0, "a needle in notes")
+                win.notes_model.set(2, "second needle\nmore")
+                win._restore_note()                 # sync page-0 buffer so commit won't clobber
+
+                win._search_entry.set_text("needle")
+                win._on_search_changed(win._search_entry)
+
+                # ordered by page: note(0), pdf(1), note(2)
+                kinds = [m[0] for m in win._search_matches]
+                pages = [m[1] for m in win._search_matches]
+                self.assertEqual(kinds, ["note", "pdf", "note"])
+                self.assertEqual(pages, [0, 1, 2])
+
+                # starts on the current page's first match (the page-0 note)
+                self.assertEqual(win._search_current, 0)
+                self.assertEqual(win.canvas.current_page_idx, 0)
+                self.assertEqual(self._sel(win).lower(), "needle")
+                self.assertEqual(win._search_label.get_label(), "1 / 3")
+
+                # next → PDF hit on page 1, canvas highlights it
+                win._search_next()
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                self.assertIsNotNone(win.canvas.search_current_rect)
+
+                # next → note hit on page 2, notes selection lands on it
+                win._search_next()
+                self.assertEqual(win.canvas.current_page_idx, 2)
+                self.assertEqual(self._sel(win).lower(), "needle")
+                self.assertIsNone(win.canvas.search_current_rect)
+
+                # wraps back to the page-0 note
+                win._search_next()
+                self.assertEqual(win._search_current, 0)
+                self.assertEqual(win.canvas.current_page_idx, 0)
+        self._run_in_window(body)
+
+    def test_no_matches_marks_error(self):
+        def body(a):
+            win = PDFEditorWindow(a); win.present()
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "t.pdf")
+                self._text_pdf(pdf, ["nothing"])
+                win._do_open_file(pdf)
+                win._search_entry.set_text("absent")
+                win._on_search_changed(win._search_entry)
+                self.assertEqual(win._search_matches, [])
+                self.assertEqual(win._search_label.get_label(), "0 / 0")
+                self.assertTrue(win._search_entry.has_css_class("error"))
+        self._run_in_window(body)
+
+
 class TestMiddleMousePan(unittest.TestCase):
     def setUp(self):
         self.canvas = PDFCanvas()

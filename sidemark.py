@@ -2161,8 +2161,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.notes_model = NotesModel()
         self._anchor_line_nos = []   # line number in buffer for each anchor on current page
         self._anchor_para_ends = []  # last line of each anchor's paragraph (until next blank line)
-        self._search_hits = {}      # {page_idx: [fitz.Rect, ...]}
-        self._search_matches = []   # [(page_idx, rect_idx), ...] flat list
+        self._search_hits = {}      # {page_idx: [fitz.Rect, ...]} — PDF hits
+        self._note_hits = {}        # {page_idx: [(start, end), ...]} — notes hits
+        # unified flat list, ordered by page: ("pdf", page, rect_idx) or
+        # ("note", page, start_offset, end_offset)
+        self._search_matches = []
         self._search_current = -1   # index into _search_matches
 
         theme = _load_theme()
@@ -2517,7 +2520,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         self._search_entry = Gtk.SearchEntry()
         self._search_entry.set_hexpand(True)
-        self._search_entry.set_placeholder_text("Search in PDF…")
+        self._search_entry.set_placeholder_text("Search PDF & notes…")
         self._search_entry.connect("search-changed", self._on_search_changed)
         self._search_entry.connect("stop-search", lambda _: self._hide_search())
         self._search_entry.connect("activate", lambda _: self._search_next())
@@ -3907,6 +3910,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._search_revealer.set_reveal_child(False)
         self._search_entry.set_text("")
         self._search_hits = {}
+        self._note_hits = {}
         self._search_matches = []
         self._search_current = -1
         self._search_label.set_label("")
@@ -3926,20 +3930,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_search_changed(self, entry):
         query = entry.get_text()
         self._search_hits = {}
+        self._note_hits = {}
         self._search_matches = []
         self._search_current = -1
-        if not query or not self.canvas.document:
+        if not query:
             self._search_label.set_label("")
             self.canvas.search_rects = []
             self.canvas.search_current_rect = None
             self.canvas.queue_draw()
             return
-        for i in range(self.canvas.n_pages):
-            hits = self.canvas.document[i].search_for(query)
-            if hits:
-                self._search_hits[i] = hits
-                for j in range(len(hits)):
-                    self._search_matches.append((i, j))
+        # Flush the open page's edits so the notes search sees current text.
+        self._commit_note()
+        # PDF hits per page
+        if self.canvas.document:
+            for i in range(self.canvas.n_pages):
+                hits = self.canvas.document[i].search_for(query)
+                if hits:
+                    self._search_hits[i] = hits
+        # Notes hits per page (case-insensitive substring on the stored text)
+        self._note_hits = self._find_note_matches(query)
+        # Unified list, ordered by page; within a page PDF hits then note hits
+        for i in sorted(set(self._search_hits) | set(self._note_hits)):
+            for j in range(len(self._search_hits.get(i, []))):
+                self._search_matches.append(("pdf", i, j))
+            for (s, e) in self._note_hits.get(i, []):
+                self._search_matches.append(("note", i, s, e))
         if not self._search_matches:
             self._search_label.set_label("0 / 0")
             self._search_entry.add_css_class("error")
@@ -3948,10 +3963,25 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self.canvas.queue_draw()
             return
         self._search_entry.remove_css_class("error")
-        # Start from the first match on or after the current page
+        # Start from the first match on or after the current page (wraps after)
         cur = self.canvas.current_page_idx
-        start = next((k for k, (pi, _) in enumerate(self._search_matches) if pi >= cur), 0)
+        start = next((k for k, m in enumerate(self._search_matches) if m[1] >= cur), 0)
         self._go_to_match(start)
+
+    def _find_note_matches(self, query):
+        """{page_idx: [(start, end), ...]} of query occurrences in the stored
+        per-page notes text (case-insensitive)."""
+        q = query.lower()
+        out = {}
+        for page, text in self.notes_model._notes.items():
+            low = text.lower()
+            spans, pos = [], low.find(q)
+            while pos != -1:
+                spans.append((pos, pos + len(query)))
+                pos = low.find(q, pos + 1)
+            if spans:
+                out[page] = spans
+        return out
 
     def _search_next(self):
         if not self._search_matches:
@@ -3968,20 +3998,35 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if n == 0:
             return
         self._search_current = idx % n
-        page_idx, _ = self._search_matches[self._search_current]
-        if page_idx != self.canvas.current_page_idx:
+        match = self._search_matches[self._search_current]
+        page_idx = match[1]
+        if page_idx != self.canvas.current_page_idx and self.canvas.document:
             self._commit_note()
             self.canvas.go_to_page(page_idx)  # fires _on_page_changed → _update_search_canvas
         else:
             self._update_search_canvas()
+        if match[0] == "note":
+            self._select_note_match(match[2], match[3])
         self._search_label.set_label(f"{self._search_current + 1} / {n}")
+
+    def _select_note_match(self, start, end):
+        """Select a notes hit. _restore_note loads the raw stored text into the
+        buffer synchronously (before rehighlight substitutes \\alpha→α on
+        non-cursor lines), so the model offsets map exactly."""
+        self._restore_note()
+        buf = self._notes_view.get_buffer()
+        s = buf.get_iter_at_offset(start)
+        e = buf.get_iter_at_offset(end)
+        buf.select_range(s, e)   # insert at start → that line becomes the cursor line
+        self._notes_view.scroll_to_iter(s, 0.1, False, 0.0, 0.5)
 
     def _update_search_canvas(self):
         page_idx = self.canvas.current_page_idx
         self.canvas.search_rects = list(self._search_hits.get(page_idx, []))
-        if (self._search_current >= 0 and self._search_matches
-                and self._search_matches[self._search_current][0] == page_idx):
-            pi, ri = self._search_matches[self._search_current]
+        cur = (self._search_matches[self._search_current]
+               if self._search_current >= 0 and self._search_matches else None)
+        if cur and cur[0] == "pdf" and cur[1] == page_idx:
+            _, pi, ri = cur
             self.canvas.search_current_rect = self._search_hits[pi][ri]
         else:
             self.canvas.search_current_rect = None
