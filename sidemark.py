@@ -201,6 +201,13 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self._ignoring = False  # True while a button-8/9 drag sequence is active
 
+        # after a pinch, the finger left on the screen pans the page (never
+        # draws) until it too is lifted. _post_pinch_anchor latches the drag
+        # offset at the moment the pinch ended so panning has no jump.
+        self._post_pinch = False
+        self._post_pinch_anchor = None
+        self._post_pinch_base = (0.0, 0.0)
+
         self._thumb_panning = False
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
@@ -735,6 +742,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._pinch_start_scale = None
         self._pinch_anchor_pdf = None
         self._ignoring = False
+        # a finger may still be on the screen (the user lifted one before the
+        # other) — its still-live drag should pan, not draw, until it lifts too
+        self._post_pinch = True
+        self._post_pinch_anchor = None
 
     def _handle_boundary_flip(self, dx, dy):
         """Scrolling further while the page edge is already visible flips the
@@ -822,6 +833,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.on_anchor_placed(self.current_page_idx, round(px), round(py))
 
     def _on_drag_begin(self, gesture, start_x, start_y):
+        self._post_pinch = False   # a fresh press starts a normal interaction
         if gesture.get_current_button() == 3:
             self._erasing = True
             self._erase_group += 1
@@ -903,6 +915,18 @@ class PDFCanvas(Gtk.DrawingArea):
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
+        if self._post_pinch:
+            # the finger left over from a pinch pans the page (never draws);
+            # latch the offset at hand-off so the page doesn't jump
+            if self._post_pinch_anchor is None:
+                self._post_pinch_anchor = (offset_x, offset_y)
+                self._post_pinch_base = (self.offset_x, self.offset_y)
+                self._is_fitted = False
+            ax, ay = self._post_pinch_anchor
+            self.offset_x = self._post_pinch_base[0] + (offset_x - ax)
+            self.offset_y = self._post_pinch_base[1] + (offset_y - ay)
+            self.queue_draw()
+            return
         if self._ignoring:
             return
         logger.debug(f"drag update offset=({offset_x:.0f},{offset_y:.0f})")
@@ -933,6 +957,12 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
+        if self._post_pinch:
+            self._post_pinch = False
+            self._post_pinch_anchor = None
+            self._schedule_rerender()
+            self.queue_draw()
+            return
         if self._ignoring:
             self._ignoring = False
             self.queue_draw()

@@ -225,6 +225,43 @@ class TestPinchZoom(unittest.TestCase):
         self.assertFalse(c._ignoring)
         self.assertIsNone(c._pinch_start_scale)
 
+    def test_leftover_finger_pans_after_pinch_no_dot(self):
+        # release one finger before the other: the remaining finger's live drag
+        # must pan the page, not draw a stroke
+        c = self._canvas()
+        c.page = object()
+        c.scale = 2.0
+        c.offset_x, c.offset_y = 0.0, 0.0
+        zoom = mock.Mock()
+        zoom.get_bounding_box_center.return_value = (True, 100.0, 100.0)
+        c._on_pinch_begin(zoom, None)
+        c._on_pinch_end(zoom, None)         # one finger lifted
+        self.assertTrue(c._post_pinch)
+        drag = mock.Mock()
+        drag.get_start_point.return_value = (True, 100.0, 100.0)
+        c._on_drag_update(drag, 30.0, 20.0)  # leftover finger moves
+        # first post-pinch update latches the anchor → no movement yet
+        self.assertEqual((c.offset_x, c.offset_y), (0.0, 0.0))
+        c._on_drag_update(drag, 50.0, 35.0)  # 20px right, 15px down from anchor
+        self.assertAlmostEqual(c.offset_x, 20.0)
+        self.assertAlmostEqual(c.offset_y, 15.0)
+        self.assertEqual(c.current_stroke, [])  # nothing drawn
+        c._on_drag_end(drag, 50.0, 35.0)
+        self.assertFalse(c._post_pinch)
+        self.assertEqual(c.current_stroke, [])
+
+    def test_drag_begin_clears_post_pinch(self):
+        c = self._canvas()
+        c.page = object()
+        c._post_pinch = True
+        gesture = mock.Mock()
+        gesture.get_current_button.return_value = 1
+        gesture.get_current_event_state.return_value = Gdk.ModifierType(0)
+        c.select_mode = False
+        c._anchor_hit_test = lambda *a: None
+        c._on_drag_begin(gesture, 10.0, 10.0)
+        self.assertFalse(c._post_pinch)
+
     def test_pinch_without_page_is_noop(self):
         c = self._canvas()
         c.page = None
