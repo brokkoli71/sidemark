@@ -1078,6 +1078,26 @@ class TestTheme(unittest.TestCase):
             os.unlink(tmp)
 
 
+class TestThemedIcon(unittest.TestCase):
+    def test_falls_back_when_first_missing(self):
+        from sidemark import _themed_icon
+        # A bogus first name forces a fall-through to a real freedesktop icon
+        # that every icon theme ships, so the button is never left blank.
+        name = _themed_icon("definitely-not-a-real-icon-symbolic",
+                            "go-next-symbolic")
+        self.assertEqual(name, "go-next-symbolic")
+
+    def test_returns_first_when_all_missing(self):
+        from sidemark import _themed_icon
+        name = _themed_icon("no-such-icon-aaa-symbolic", "no-such-icon-bbb")
+        self.assertEqual(name, "no-such-icon-aaa-symbolic")
+
+    def test_prefers_first_available(self):
+        from sidemark import _themed_icon
+        name = _themed_icon("go-next-symbolic", "go-previous-symbolic")
+        self.assertEqual(name, "go-next-symbolic")
+
+
 # ── deferred fit (needs_fit flag) ─────────────────────────────────────────────
 
 class TestNeedsFit(unittest.TestCase):

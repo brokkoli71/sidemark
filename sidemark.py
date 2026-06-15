@@ -1548,6 +1548,23 @@ def _hex_to_rgb(h):
     return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
 
 
+def _themed_icon(*candidates):
+    """First candidate icon the active theme actually has, else the first.
+
+    Symbolic icon names are not portable: e.g. ``view-sidebar-symbolic`` and
+    ``view-list-symbolic`` exist in Adwaita/GNOME but not in KDE's Breeze, so a
+    hard-coded name shows a blank button under Plasma. Falling back keeps the
+    button labelled on every desktop.
+    """
+    display = Gdk.Display.get_default()
+    if display is not None:
+        theme = Gtk.IconTheme.get_for_display(display)
+        for name in candidates:
+            if theme.has_icon(name):
+                return name
+    return candidates[0]
+
+
 def notes_path_for(pdf_path):
     return os.path.splitext(pdf_path)[0] + "-notes.md"
 
@@ -2446,7 +2463,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._toc_thumbs = False
         self._thumb_idle_id = None
         self._toc_btn = Gtk.ToggleButton()
-        self._toc_btn.set_icon_name("view-list-symbolic")
+        self._toc_btn.set_icon_name(
+            _themed_icon("view-list-symbolic", "view-list-text-symbolic",
+                         "format-justify-fill-symbolic"))
         self._toc_btn.set_tooltip_text("No document open")
         self._toc_btn.connect("toggled", self._on_toc_toggled)
         header.pack_start(self._toc_btn)
@@ -2659,7 +2678,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         # notes toggle
         self._notes_toggle = Gtk.ToggleButton()
-        self._notes_toggle.set_icon_name("view-sidebar-symbolic")
+        self._notes_toggle.set_icon_name(
+            _themed_icon("view-sidebar-symbolic", "sidebar-show-symbolic"))
         self._notes_toggle.set_tooltip_text("Toggle notes (Ctrl+\\)")
         self._notes_toggle.set_active(True)
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
@@ -2918,7 +2938,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._init_pane_position)
 
     def _init_pane_position(self):
-        width = self.get_allocated_width()
+        width = self.get_width()
         if width < 200:
             return GLib.SOURCE_CONTINUE
         self._saved_pane_pos = int(width * 0.62)
