@@ -248,6 +248,15 @@ class PDFCanvas(Gtk.DrawingArea):
         drag.connect("drag-end", self._on_drag_end)
         self.add_controller(drag)
 
+        # Two-finger pinch zoom (touchpad/touchscreen). GestureZoom reports a
+        # cumulative scale-delta since the pinch began; we apply it relative to
+        # the scale at begin, anchored on the pinch centroid.
+        zoom = Gtk.GestureZoom.new()
+        zoom.connect("begin", self._on_pinch_begin)
+        zoom.connect("scale-changed", self._on_pinch_scale)
+        self.add_controller(zoom)
+        self._pinch_start_scale = None
+
         # MX Master thumb button (btn 10): hold to pan, scroll-while-held to
         # zoom. EventControllerLegacy is the only layer that reliably reports
         # button-10 press AND release through pointer movement — every gesture
@@ -662,20 +671,45 @@ class PDFCanvas(Gtk.DrawingArea):
             self.queue_draw()
             return True
         factor = 0.9 if dy > 0 else 1.1
-        mx, my = self._mouse_x, self._mouse_y
-        pdf_x = (mx - self.offset_x) / self.scale
-        pdf_y = (my - self.offset_y) / self.scale
-        self.scale = max(0.1, min(20.0, self.scale * factor))
+        self._zoom_at(factor, self._mouse_x, self._mouse_y)
+        return True
+
+    def _zoom_at(self, factor, cx, cy):
+        """Multiply the zoom by ``factor`` keeping the document point under
+        (cx, cy) fixed on screen. Shared by Ctrl+scroll, thumb-scroll zoom and
+        the pinch gesture."""
+        old_scale = self.scale
+        new_scale = max(0.1, min(20.0, old_scale * factor))
+        if new_scale == old_scale:
+            return
+        pdf_x = (cx - self.offset_x) / old_scale
+        pdf_y = (cy - self.offset_y) / old_scale
+        self.scale = new_scale
         self._is_fitted = False
-        self.offset_x = mx - pdf_x * self.scale
-        self.offset_y = my - pdf_y * self.scale
+        self.offset_x = cx - pdf_x * self.scale
+        self.offset_y = cy - pdf_y * self.scale
         if self._thumb_panning:
             # rebase the pan origin so the next motion event doesn't jump
-            self._thumb_origin = (mx, my)
+            self._thumb_origin = (cx, cy)
             self._thumb_start_offset = (self.offset_x, self.offset_y)
         self._schedule_rerender()
         self.queue_draw()
-        return True
+
+    def _on_pinch_begin(self, gesture, _seq):
+        if self.page is None:
+            return
+        self._pinch_start_scale = self.scale
+
+    def _on_pinch_scale(self, gesture, delta):
+        if self._pinch_start_scale is None or self.page is None:
+            return
+        ok, cx, cy = gesture.get_bounding_box_center()
+        if not ok:
+            cx, cy = self._mouse_x, self._mouse_y
+        target = self._pinch_start_scale * delta
+        if self.scale == 0:
+            return
+        self._zoom_at(target / self.scale, cx, cy)
 
     def _handle_boundary_flip(self, dx, dy):
         """Scrolling further while the page edge is already visible flips the

@@ -145,6 +145,63 @@ class TestZoomToRegion(unittest.TestCase):
         self.assertAlmostEqual(c.scale, 1.0)
 
 
+# ── pinch zoom ────────────────────────────────────────────────────────────────
+
+class TestPinchZoom(unittest.TestCase):
+    def _canvas(self):
+        c = PDFCanvas()
+        c.scale = 1.0
+        c.offset_x = 0.0
+        c.offset_y = 0.0
+        c._pinch_start_scale = None
+        return c
+
+    def test_zoom_at_keeps_anchor_fixed(self):
+        c = self._canvas()
+        c.scale = 2.0
+        c.offset_x, c.offset_y = 40.0, 25.0
+        cx, cy = 150.0, 110.0
+        pdf_before = ((cx - c.offset_x) / c.scale, (cy - c.offset_y) / c.scale)
+        c._zoom_at(1.5, cx, cy)
+        pdf_after = ((cx - c.offset_x) / c.scale, (cy - c.offset_y) / c.scale)
+        self.assertAlmostEqual(c.scale, 3.0)
+        self.assertAlmostEqual(pdf_before[0], pdf_after[0], places=10)
+        self.assertAlmostEqual(pdf_before[1], pdf_after[1], places=10)
+
+    def test_zoom_at_clamps(self):
+        c = self._canvas()
+        c.scale = 19.0
+        c._zoom_at(5.0, 100, 100)
+        self.assertLessEqual(c.scale, 20.0)
+        c.scale = 0.2
+        c._zoom_at(0.01, 100, 100)
+        self.assertGreaterEqual(c.scale, 0.1)
+
+    def test_pinch_scales_relative_to_begin(self):
+        c = self._canvas()
+        c.page = object()  # non-None so handlers run
+        c.scale = 2.0
+        gesture = mock.Mock()
+        gesture.get_bounding_box_center.return_value = (True, 100.0, 100.0)
+        c._on_pinch_begin(gesture, None)
+        self.assertEqual(c._pinch_start_scale, 2.0)
+        # a cumulative delta of 1.5 → target scale 3.0
+        c._on_pinch_scale(gesture, 1.5)
+        self.assertAlmostEqual(c.scale, 3.0)
+        # a later delta of 0.5 → target scale 1.0 (relative to begin, not current)
+        c._on_pinch_scale(gesture, 0.5)
+        self.assertAlmostEqual(c.scale, 1.0)
+
+    def test_pinch_without_page_is_noop(self):
+        c = self._canvas()
+        c.page = None
+        gesture = mock.Mock()
+        c._on_pinch_begin(gesture, None)
+        self.assertIsNone(c._pinch_start_scale)
+        c._on_pinch_scale(gesture, 2.0)  # must not raise
+        self.assertEqual(c.scale, 1.0)
+
+
 # ── stroke storage ────────────────────────────────────────────────────────────
 
 class TestStrokes(unittest.TestCase):
