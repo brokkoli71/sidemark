@@ -384,6 +384,62 @@ class TestStraightLineSnap(unittest.TestCase):
         self.assertIsNone(c._straight_timer)
 
 
+# ── stroke smoothing ───────────────────────────────────────────────────────────
+
+class TestStrokeSmoothing(unittest.TestCase):
+    def test_zero_strength_is_identity(self):
+        pts = [(0, 0), (1, 5), (2, 0), (3, 5)]
+        self.assertEqual(PDFCanvas._smooth_points(pts, 0.0), pts)
+
+    def test_too_few_points_unchanged(self):
+        self.assertEqual(PDFCanvas._smooth_points([(0, 0), (4, 4)], 1.0),
+                         [(0, 0), (4, 4)])
+
+    def test_endpoints_preserved(self):
+        pts = [(0, 0), (1, 9), (2, 0), (3, 9), (4, 0)]
+        out = PDFCanvas._smooth_points(pts, 1.0)
+        self.assertEqual(out[0], (0.0, 0.0))
+        self.assertEqual(out[-1], (4.0, 0.0))
+        self.assertEqual(len(out), len(pts))
+
+    def test_smoothing_reduces_jitter(self):
+        # a zigzag: interior points should move toward their neighbours' mean,
+        # so total deviation from the straight baseline shrinks
+        pts = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        out = PDFCanvas._smooth_points(pts, 1.0)
+        raw_dev = sum(abs(y) for _, y in pts)
+        new_dev = sum(abs(y) for _, y in out)
+        self.assertLess(new_dev, raw_dev)
+
+    def test_commit_smooths_freehand_stroke(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.smoothing = 1.0
+        c.current_stroke = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        raw = list(c.current_stroke)
+        c._on_drag_end(None, 0, 0)
+        committed = c.strokes[-1]["pts"]
+        self.assertNotEqual(committed, raw)          # was smoothed
+        self.assertEqual(committed[0], (0.0, 0.0))   # endpoints kept
+
+    def test_commit_does_not_smooth_when_disabled(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.smoothing = 0.0
+        c.current_stroke = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        c._on_drag_end(None, 0, 0)
+        self.assertEqual(c.strokes[-1]["pts"], [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)])
+
+    def test_snapped_line_is_not_smoothed(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.smoothing = 1.0
+        c._straight_mode = True
+        c.current_stroke = [(0, 0), (10, 4)]
+        c._on_drag_end(None, 0, 0)
+        self.assertEqual(c.strokes[-1]["pts"], [(0, 0), (10, 4)])
+
+
 # ── save round-trip ───────────────────────────────────────────────────────────
 
 class TestSave(unittest.TestCase):

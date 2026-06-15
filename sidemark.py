@@ -146,6 +146,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self.pen_color = (0.05, 0.05, 0.8)   # RGB — stroke alpha lives in "opacity"
         self.pen_width = 2.0
+        # freehand smoothing strength 0..1 (Laplacian passes applied on commit)
+        self.smoothing = 0.5
         # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
         self.highlighter = False
         self.hl_color = (1.0, 0.85, 0.0)
@@ -1006,6 +1008,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
         self._cancel_straight_timer()
+        was_straight = self._straight_mode
         self._straight_mode = False
         if self._post_pinch:
             self._post_pinch = False
@@ -1073,9 +1076,14 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_end = None
         else:
             if self.current_stroke:
+                pts = self.current_stroke
+                # smooth freehand ink on commit; a snapped straight line and
+                # tiny strokes (dots) are left exactly as drawn
+                if not was_straight and len(pts) > 2:
+                    pts = self._smooth_points(pts, self.smoothing)
                 color, width, opacity = self._pen_attrs()
                 stroke = {
-                    "pts": self.current_stroke,
+                    "pts": pts,
                     "color": color,
                     "width": width,
                     "opacity": opacity,
@@ -1099,6 +1107,26 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._straight_timer is not None:
             GLib.source_remove(self._straight_timer)
             self._straight_timer = None
+
+    @staticmethod
+    def _smooth_points(pts, strength, passes=4):
+        """Clean up a freehand polyline with Laplacian (moving-average)
+        smoothing. ``strength`` 0..1 scales how far each interior point is
+        pulled toward the midpoint of its neighbours; endpoints stay fixed so
+        the stroke keeps its start and end. Returns a new list of (x, y)."""
+        if strength <= 0 or len(pts) < 3:
+            return list(pts)
+        factor = 0.5 * min(strength, 1.0)
+        cur = [(float(x), float(y)) for x, y in pts]
+        for _ in range(passes):
+            nxt = [cur[0]]
+            for i in range(1, len(cur) - 1):
+                x = cur[i][0] + factor * (cur[i - 1][0] + cur[i + 1][0] - 2 * cur[i][0])
+                y = cur[i][1] + factor * (cur[i - 1][1] + cur[i + 1][1] - 2 * cur[i][1])
+                nxt.append((x, y))
+            nxt.append(cur[-1])
+            cur = nxt
+        return cur
 
     def _snap_to_straight(self):
         """Fired when the cursor has rested mid-stroke: collapse the in-progress
@@ -2560,6 +2588,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             swatches_box.append(swatch)
         popover_box.append(swatches_box)
 
+        smooth_label = Gtk.Label(label="Smoothing", xalign=0)
+        smooth_label.add_css_class("dim-label")
+        smooth_label.set_margin_top(6)
+        popover_box.append(smooth_label)
+
+        self._smooth_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        self._smooth_scale.set_value(self.canvas.smoothing * 100)
+        self._smooth_scale.set_draw_value(True)
+        self._smooth_scale.set_size_request(200, -1)
+        self._smooth_scale.set_tooltip_text(
+            "How much freehand strokes are smoothed when you lift the pen")
+        self._smooth_scale.connect("value-changed", self._on_smoothing_changed)
+        popover_box.append(self._smooth_scale)
+
         popover = Gtk.Popover()
         popover.set_child(popover_box)
 
@@ -3498,6 +3540,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self.canvas.hl_width = scale.get_value()
         else:
             self.canvas.pen_width = scale.get_value()
+
+    def _on_smoothing_changed(self, scale):
+        self.canvas.smoothing = scale.get_value() / 100.0
 
     def _on_color_changed(self, btn, _param=None):
         if self._syncing_pen:

@@ -9,7 +9,7 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 
 ## Features
 
-- **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable by right-click-dragging
+- **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable by right-click-dragging. Freehand ink is smoothed on release (adjustable in pen settings), and holding still mid-stroke snaps it to a straight line
 - **Highlighter mode** (`Ctrl+H`) — wide translucent strokes that survive save/reload like any other annotation
 - **Live markdown notes** linked to PDF pages, with anchor markers to pin notes to specific spots
 - **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
