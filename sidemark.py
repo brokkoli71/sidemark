@@ -2452,10 +2452,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         recent_btn.set_popover(self._recent_popover)
         header.pack_start(recent_btn)
 
-        new_btn = Gtk.Button(label="New")
-        new_btn.set_tooltip_text("Create a new blank A4 PDF")
-        new_btn.connect("clicked", self._on_new_pdf)
-        header.pack_start(new_btn)
+        self._new_btn = Gtk.Button(label="New")
+        self._new_btn.set_tooltip_text("Create a new blank A4 PDF")
+        self._new_btn.connect("clicked", self._on_new_pdf)
+        header.pack_start(self._new_btn)
 
         # stays sensitive even without a TOC — insensitive widgets get no
         # tooltip in GTK4, and the tooltip is how we explain the situation
@@ -2483,23 +2483,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         next_btn.set_tooltip_text("Next page (PageDown)")
         next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
 
-        add_page_btn = Gtk.Button()
-        add_page_btn.set_icon_name("list-add-symbolic")
-        add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
-        add_page_btn.connect("clicked", lambda _: self._add_blank_page())
+        self._add_page_btn = Gtk.Button()
+        self._add_page_btn.set_icon_name("list-add-symbolic")
+        self._add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
+        self._add_page_btn.connect("clicked", lambda _: self._add_blank_page())
 
-        del_page_btn = Gtk.Button()
-        del_page_btn.set_icon_name("list-remove-symbolic")
-        del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
-        del_page_btn.connect("clicked", lambda _: self._delete_current_page())
+        self._del_page_btn = Gtk.Button()
+        self._del_page_btn.set_icon_name("list-remove-symbolic")
+        self._del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
+        self._del_page_btn.connect("clicked", lambda _: self._delete_current_page())
 
         nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
         nav_box.append(prev_btn)
         nav_box.append(self._page_label)
         nav_box.append(next_btn)
-        nav_box.append(add_page_btn)
-        nav_box.append(del_page_btn)
+        nav_box.append(self._add_page_btn)
+        nav_box.append(self._del_page_btn)
 
         self._file_label = Gtk.Label(label="")
         self._file_label.add_css_class("dim-label")
@@ -2513,6 +2513,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         title_box.append(nav_box)
         title_box.append(self._file_label)
         header.set_title_widget(title_box)
+
+        # Overflow menu: holds the controls that collapse out of the bar when
+        # the window is too narrow (wired up by the Adw.Breakpoint below). Far
+        # right, hidden until the breakpoint reveals it.
+        self._overflow_btn = Gtk.MenuButton()
+        self._overflow_btn.set_icon_name(
+            _themed_icon("view-more-symbolic", "open-menu-symbolic"))
+        self._overflow_btn.set_tooltip_text("More actions")
+        self._overflow_btn.set_visible(False)
+        overflow_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        overflow_box.set_margin_top(4)
+        overflow_box.set_margin_bottom(4)
+        overflow_box.set_margin_start(4)
+        overflow_box.set_margin_end(4)
+
+        def _overflow_item(label, callback):
+            item = Gtk.Button()
+            item.add_css_class("flat")
+            item.set_child(Gtk.Label(label=label, xalign=0))
+            item.connect("clicked",
+                         lambda _b: (self._overflow_btn.popdown(), callback()))
+            overflow_box.append(item)
+            return item
+
+        _overflow_item("New PDF", lambda: self._on_new_pdf(None))
+        _overflow_item("Add page after this", self._add_blank_page)
+        _overflow_item("Delete this page", self._delete_current_page)
+        _overflow_item("Export with notes…", self._on_export)
+        overflow_pop = Gtk.Popover()
+        overflow_pop.set_child(overflow_box)
+        self._overflow_btn.set_popover(overflow_pop)
+        header.pack_end(self._overflow_btn)
 
         redo_btn = Gtk.Button()
         redo_btn.set_icon_name("edit-redo-symbolic")
@@ -2532,11 +2564,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         save_btn.connect("clicked", self._on_save)
         header.pack_end(save_btn)
 
-        export_btn = Gtk.Button()
-        export_btn.set_icon_name("document-send-symbolic")
-        export_btn.set_tooltip_text("Export with notes (Ctrl+E)")
-        export_btn.connect("clicked", lambda _: self._on_export())
-        header.pack_end(export_btn)
+        self._export_btn = Gtk.Button()
+        self._export_btn.set_icon_name("document-send-symbolic")
+        self._export_btn.set_tooltip_text("Export with notes (Ctrl+E)")
+        self._export_btn.connect("clicked", lambda _: self._on_export())
+        header.pack_end(self._export_btn)
 
         # pen settings popover
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -2821,6 +2853,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         toolbar_view.add_top_bar(header)
         toolbar_view.set_content(self.toast_overlay)
         self.set_content(toolbar_view)
+
+        # Responsive header: below this width the bar gets cramped, so the
+        # secondary actions collapse into the ⋮ overflow menu. Open, Recent,
+        # navigation, undo/redo, pen, select, notes and Save stay put.
+        self._header_breakpoint = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse("max-width: 820px"))
+        for w in (self._new_btn, self._export_btn,
+                  self._add_page_btn, self._del_page_btn):
+            self._header_breakpoint.add_setter(w, "visible", False)
+        self._header_breakpoint.add_setter(self._overflow_btn, "visible", True)
+        self.add_breakpoint(self._header_breakpoint)
 
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self._on_key)

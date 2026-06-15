@@ -1992,6 +1992,76 @@ class TestTocSidebar(unittest.TestCase):
             raise errors[0]
 
 
+class TestResponsiveHeader(unittest.TestCase):
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.header")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _overflow_items(win):
+        box = win._overflow_btn.get_popover().get_child()
+        items = {}
+        c = box.get_first_child()
+        while c is not None:
+            items[c.get_child().get_text()] = c
+            c = c.get_next_sibling()
+        return items
+
+    def test_overflow_hidden_by_default(self):
+        def body(win):
+            if win._overflow_btn.get_visible():
+                raise AssertionError("overflow should be hidden at full width")
+            for name in ("_new_btn", "_export_btn", "_add_page_btn", "_del_page_btn"):
+                if not getattr(win, name).get_visible():
+                    raise AssertionError(f"{name} should be visible at full width")
+        self._run_in_window(body)
+
+    def test_breakpoint_registered(self):
+        def body(win):
+            cond = win._header_breakpoint.get_condition()
+            if cond is None or "max-width" not in cond.to_string():
+                raise AssertionError("header breakpoint condition missing")
+        self._run_in_window(body)
+
+    def test_overflow_menu_mirrors_secondary_actions(self):
+        def body(win):
+            items = self._overflow_items(win)
+            for label in ("New PDF", "Add page after this",
+                          "Delete this page", "Export with notes…"):
+                if label not in items:
+                    raise AssertionError(f"overflow missing {label!r}")
+        self._run_in_window(body)
+
+    def test_overflow_add_page_adds_a_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "p.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                before = win.canvas.document.page_count
+                self._overflow_items(win)["Add page after this"].emit("clicked")
+                after = win.canvas.document.page_count
+                if after != before + 1:
+                    raise AssertionError(f"page count {before} -> {after}")
+            self._run_in_window(body)
+
+
 class TestThumbnailSidebar(unittest.TestCase):
     def _run_in_window(self, body):
         errors = []
