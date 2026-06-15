@@ -15,9 +15,51 @@ import shutil
 import time
 import datetime
 
-RECENT_PATH = os.path.join(
-    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
-    "sidemark", "recent.json")
+
+# ── platform-specific base directories ──────────────────────────────────────
+# On Linux we follow the XDG Base Directory spec; on Windows we map to the
+# conventional %APPDATA% / %LOCALAPPDATA% roots. Everything else (incl. a
+# Python-on-Android runtime) falls back to the XDG layout under ~.
+
+def _data_home():
+    if sys.platform == "win32":
+        return os.environ.get(
+            "APPDATA", os.path.expanduser(r"~\AppData\Roaming"))
+    return os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+
+
+def _cache_home():
+    if sys.platform == "win32":
+        return os.environ.get(
+            "LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
+    return os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+
+
+def _state_home():
+    # State is unsaved-work territory; on Windows it lives under LOCALAPPDATA
+    # too, just in a separate "state" subtree so cache cleaners leave it alone.
+    if sys.platform == "win32":
+        return os.path.join(_cache_home(), "state")
+    return os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+
+
+def _find_libreoffice():
+    """Locate the LibreOffice binary across platforms; None if not found."""
+    for name in ("libreoffice", "soffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    if sys.platform == "win32":
+        # On Windows soffice.exe is rarely on PATH; probe the usual installs.
+        for root in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            cand = os.path.join(root, "LibreOffice", "program", "soffice.exe")
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+RECENT_PATH = os.path.join(_data_home(), "sidemark", "recent.json")
 RECENT_MAX = 15
 
 
@@ -51,7 +93,7 @@ if __name__ == "__main__" and "--list-recent" in sys.argv[1:]:
         print(f"{os.path.basename(_it['path'])}\t{_it['path']}")
     sys.exit(0)
 
-LOG_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sidemark", "logs")
+LOG_DIR = os.path.join(_cache_home(), "sidemark", "logs")
 _log_path = None
 _log_had_error = False
 logger = logging.getLogger(__name__)
@@ -1060,7 +1102,10 @@ class PDFCanvas(Gtk.DrawingArea):
                     uri = link.get("uri", "")
                     if uri:
                         try:
-                            Gio.AppInfo.launch_default_for_uri(uri, None)
+                            if sys.platform == "win32":
+                                os.startfile(uri)  # noqa: S606
+                            else:
+                                Gio.AppInfo.launch_default_for_uri(uri, None)
                         except Exception:
                             pass
                 elif kind == fitz.LINK_GOTO:
@@ -1381,6 +1426,22 @@ def _load_theme():
     except OSError:
         pass
 
+    # ── Windows (registry) ────────────────────────────────────────────────────
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key:
+                light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                if light == 0:
+                    defaults["background"] = "#242424"
+                    defaults["foreground"] = "#e5e5e5"
+        except Exception:
+            pass
+        return defaults
+
     # ── GNOME (gsettings) ─────────────────────────────────────────────────────
     try:
         import subprocess
@@ -1445,9 +1506,7 @@ def notes_path_for(pdf_path):
 # never touched until an explicit save. XDG_STATE_HOME, not cache — cache
 # cleaners must not eat unsaved lecture notes.
 
-AUTOSAVE_DIR = os.path.join(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
-    "sidemark", "autosave")
+AUTOSAVE_DIR = os.path.join(_state_home(), "sidemark", "autosave")
 
 
 def _autosave_dir_for(path):
@@ -3653,8 +3712,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._clear_dirty()
 
     def _open_scratchpad(self):
-        """Open (or create) the persistent scratchpad at ~/.local/share/sidemark/scratchpad.pdf."""
-        data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
+        """Open (or create) the persistent scratchpad in the per-user data dir."""
+        data_dir = os.path.join(_data_home(), "sidemark")
         os.makedirs(data_dir, exist_ok=True)
         path = os.path.join(data_dir, "scratchpad.pdf")
         if not os.path.exists(path):
@@ -3817,10 +3876,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         out_dir = tempfile.mkdtemp(prefix="sidemark-")
         base = os.path.splitext(os.path.basename(pptx_path))[0]
 
+        soffice = _find_libreoffice()
+        if not soffice:
+            hint = ("LibreOffice not found. Install it from "
+                    "https://www.libreoffice.org/download/"
+                    if sys.platform == "win32"
+                    else "LibreOffice not found. Install it with:\n  pacman -S libreoffice-still")
+            GLib.idle_add(lambda: (toast.dismiss(),
+                self._show_error("Conversion failed", hint)) and None)
+            return
+
         def run():
             try:
                 subprocess.run(
-                    ["libreoffice", "--headless", "--convert-to", "pdf",
+                    [soffice, "--headless", "--convert-to", "pdf",
                      "--outdir", out_dir, pptx_path],
                     check=True, capture_output=True,
                 )
@@ -3829,7 +3898,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             except FileNotFoundError:
                 GLib.idle_add(lambda: (toast.dismiss(),
                     self._show_error("Conversion failed",
-                        "LibreOffice not found. Install it with:\n  pacman -S libreoffice-still")) and None)
+                        "LibreOffice could not be launched.")) and None)
             except subprocess.CalledProcessError as e:
                 msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
                 GLib.idle_add(lambda: (toast.dismiss(),
