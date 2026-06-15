@@ -255,8 +255,11 @@ class PDFCanvas(Gtk.DrawingArea):
         zoom = Gtk.GestureZoom.new()
         zoom.connect("begin", self._on_pinch_begin)
         zoom.connect("scale-changed", self._on_pinch_scale)
+        zoom.connect("end", self._on_pinch_end)
+        zoom.connect("cancel", lambda g, seq: self._on_pinch_end(g, seq))
         self.add_controller(zoom)
         self._pinch_start_scale = None
+        self._pinch_anchor_pdf = None
 
         # MX Master thumb button (btn 10): hold to pan, scroll-while-held to
         # zoom. EventControllerLegacy is the only layer that reliably reports
@@ -699,18 +702,39 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_pinch_begin(self, gesture, _seq):
         if self.page is None:
             return
+        ok, cx, cy = gesture.get_bounding_box_center()
+        if not ok:
+            cx, cy = self._mouse_x, self._mouse_y
         self._pinch_start_scale = self.scale
+        # document point under the pinch centroid — kept under the (moving)
+        # centroid for the rest of the gesture, so fingers stay anchored to the
+        # page and pinch zooms *and* pans at once
+        self._pinch_anchor_pdf = ((cx - self.offset_x) / self.scale,
+                                  (cy - self.offset_y) / self.scale)
+        # a single-finger drag may have already begun a stroke (a dot) before
+        # the second finger landed — discard it and stop the drag from drawing
+        self.current_stroke = []
+        self._ignoring = True
 
     def _on_pinch_scale(self, gesture, delta):
         if self._pinch_start_scale is None or self.page is None:
             return
         ok, cx, cy = gesture.get_bounding_box_center()
         if not ok:
-            cx, cy = self._mouse_x, self._mouse_y
-        target = self._pinch_start_scale * delta
-        if self.scale == 0:
             return
-        self._zoom_at(target / self.scale, cx, cy)
+        new_scale = max(0.1, min(20.0, self._pinch_start_scale * delta))
+        pdf_x, pdf_y = self._pinch_anchor_pdf
+        self.scale = new_scale
+        self._is_fitted = False
+        self.offset_x = cx - pdf_x * new_scale
+        self.offset_y = cy - pdf_y * new_scale
+        self._schedule_rerender()
+        self.queue_draw()
+
+    def _on_pinch_end(self, _gesture, _seq):
+        self._pinch_start_scale = None
+        self._pinch_anchor_pdf = None
+        self._ignoring = False
 
     def _handle_boundary_flip(self, dx, dy):
         """Scrolling further while the page edge is already visible flips the

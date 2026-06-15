@@ -192,6 +192,39 @@ class TestPinchZoom(unittest.TestCase):
         c._on_pinch_scale(gesture, 0.5)
         self.assertAlmostEqual(c.scale, 1.0)
 
+    def test_pinch_anchor_point_follows_centroid(self):
+        # both fingers stay anchored: the document point under the centroid at
+        # begin must remain under the centroid even as the centroid moves
+        c = self._canvas()
+        c.page = object()
+        c.scale = 2.0
+        c.offset_x, c.offset_y = 10.0, 5.0
+        begin = mock.Mock()
+        begin.get_bounding_box_center.return_value = (True, 100.0, 80.0)
+        c._on_pinch_begin(begin, None)
+        anchor_pdf = ((100 - 10) / 2.0, (80 - 5) / 2.0)
+        # centroid moves to (160,140) while pinching out 1.5×
+        move = mock.Mock()
+        move.get_bounding_box_center.return_value = (True, 160.0, 140.0)
+        c._on_pinch_scale(move, 1.5)
+        self.assertAlmostEqual(c.scale, 3.0)
+        # the anchored document point now sits under the new centroid
+        self.assertAlmostEqual((160 - c.offset_x) / c.scale, anchor_pdf[0])
+        self.assertAlmostEqual((140 - c.offset_y) / c.scale, anchor_pdf[1])
+
+    def test_pinch_begin_discards_in_progress_stroke(self):
+        c = self._canvas()
+        c.page = object()
+        c.current_stroke = [(10, 10), (11, 12)]  # a dot/stroke from finger 1
+        gesture = mock.Mock()
+        gesture.get_bounding_box_center.return_value = (True, 50.0, 50.0)
+        c._on_pinch_begin(gesture, None)
+        self.assertEqual(c.current_stroke, [])
+        self.assertTrue(c._ignoring)
+        c._on_pinch_end(gesture, None)
+        self.assertFalse(c._ignoring)
+        self.assertIsNone(c._pinch_start_scale)
+
     def test_pinch_without_page_is_noop(self):
         c = self._canvas()
         c.page = None
