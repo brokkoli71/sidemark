@@ -7,19 +7,43 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 
 ![Screenshot](screenshot.png)
 
+## Why Sidemark
+
+Most PDF tools treat notes as an afterthought. Sidemark is built around them:
+
+- **Page-linked Markdown notes** — a full Markdown editor sits beside the PDF; notes are automatically scoped to whichever page you're on and scroll with it
+- **Anchor markers & callouts** — pin a note to a precise spot on the page; callouts render the note text directly on the PDF with an arrow, so context stays visible even without the notes panel open
+- **Portable plain-text notes** — notes are saved as a standard `.md` sidecar file, Obsidian-compatible and readable anywhere, with no proprietary format
+- **Unified search** — `Ctrl+F` searches the PDF text and your Markdown notes in one pass
+
 ## Features
 
-- **Draw annotations** with a configurable pen — strokes are saved as PDF ink annotations and remain individually erasable by right-click-dragging
-- **Highlighter mode** (`Ctrl+H`) — wide translucent strokes that survive save/reload like any other annotation
-- **Live markdown notes** linked to PDF pages, with anchor markers to pin notes to specific spots
-- **Quick page navigation** via drag to pan, Shift+drag to easily Zoom to region and Shift+click to zoom back
-- **Add and delete pages** — insert blank pages with same dimensions
-- **Text selection** — Alt+drag highlights words and copies them to the clipboard, or switch to select-text mode (Ctrl+M) so a plain drag selects instead of drawing
-- **Text search** — Ctrl+F opens a search bar that spans both the PDF and your Markdown notes; matches highlight across all pages, and Enter / ↑↓ cycle through them (starting at the current page and wrapping around)
-- **Outline sidebar** — Ctrl+T shows the PDF's table of contents; click to jump to a chapter. A switcher flips between the outline and page thumbnails; PDFs without an outline show thumbnails directly. Drag a thumbnail onto another to reorder pages
-- **Formats** — Opens `.pdf`, `.pptx` (auto-converts via LibreOffice), and `.md` files; drag a file from your file manager onto the window to open it
-- **Recent files** — header menu, XDG recent-files integration, and a walker (Omarchy) launcher menu
-- **Design Scheme** — Picks up accent color and dark/light mode from Omarchy, GNOME, or KDE automatically
+### Annotations
+
+- **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
+- **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — chronological across strokes, erases, and notes edits regardless of where the cursor is
+
+### Notes
+
+- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`)
+- **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
+- **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; included in exports
+- **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
+
+### Navigation
+
+- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (cursor-anchored), `Shift+drag` to zoom to region, `Shift+click` to fit page
+- **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
+- **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages
+- **Add / delete pages** — insert blank pages with the same dimensions as the current page
+
+### Files & integration
+
+- **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice), and `.md` files; drag a file from your file manager onto the window
+- **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
+- **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode
+- **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
 
 ## Installation
 
