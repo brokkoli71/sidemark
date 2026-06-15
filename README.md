@@ -117,6 +117,7 @@ pip install pymupdf
 | `/date` `/time` `/now` | Type the snippet then Space/Enter — expands to today's date, the time, or both |
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
+| Drag an anchor | Move a placed anchor to a new spot (a click without dragging still jumps to its note) |
 | `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
 
 ### Inline math (notes)

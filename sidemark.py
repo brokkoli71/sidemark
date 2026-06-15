@@ -155,12 +155,18 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_change = None         # callback() whenever strokes are modified
         self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
         self.on_anchor_clicked = None  # callback(anchor_index)
+        self.on_anchor_moved = None    # callback(anchor_index, pdf_x, pdf_y)
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
         self.on_user_action = None     # callback() once per completed draw/erase gesture
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
         self._anchors = {}
         self._active_anchors = set()  # indices highlighted on current page
+        # drag-to-reposition: index of the anchor being dragged, and whether the
+        # drag moved far enough to count as a move (vs. a click that jumps notes)
+        self._anchor_dragging = None
+        self._anchor_drag_moved = False
+        self._hovering_anchor = False
 
         # Ctrl+Alt+drag: anchor placed at press (GestureClick), callout box
         # placed at release when the drag travelled far enough
@@ -668,6 +674,22 @@ class PDFCanvas(Gtk.DrawingArea):
         self._mouse_y = y
         self._hover_x, self._hover_y = x, y
         self._update_link_hover()
+        self._update_anchor_hover(x, y)
+
+    def _update_anchor_hover(self, x, y):
+        """Show a grab cursor over anchor circles so it's clear they can be
+        dragged. Yields to link-hover (Alt) and stays out of its way."""
+        over = (self._hovered_link_rect is None and not self._alt_held
+                and self.page is not None
+                and self._anchor_hit_test(x, y) is not None)
+        if over == self._hovering_anchor:
+            return
+        self._hovering_anchor = over
+        if over:
+            self.set_cursor(Gdk.Cursor.new_from_name("grab", None))
+        elif self._hovered_link_rect is None:
+            self.set_cursor(Gdk.Cursor.new_from_name("text", None)
+                            if self.select_mode else None)
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
@@ -902,9 +924,11 @@ class PDFCanvas(Gtk.DrawingArea):
             self._selected_words = []
             hit = self._anchor_hit_test(start_x, start_y)
             if hit is not None:
-                self._ignoring = True
-                if self.on_anchor_clicked:
-                    self.on_anchor_clicked(hit)
+                # begin dragging the anchor; a release with no real movement is
+                # treated as a click that jumps the notes cursor (see drag-end)
+                self._anchor_dragging = hit
+                self._anchor_drag_moved = False
+                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
                 return
             if self.select_mode:
                 # plain drag selects text instead of drawing
@@ -931,6 +955,16 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         logger.debug(f"drag update offset=({offset_x:.0f},{offset_y:.0f})")
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
+        if self._anchor_dragging is not None:
+            if math.hypot(offset_x, offset_y) >= 4:
+                self._anchor_drag_moved = True
+            anchors = self._anchors.get(self.current_page_idx, [])
+            if 0 <= self._anchor_dragging < len(anchors):
+                px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+                anchors[self._anchor_dragging]["x"] = round(px)
+                anchors[self._anchor_dragging]["y"] = round(py)
+                self.queue_draw()
+            return
         if self._callout_dragging:
             self._callout_cur = (sx + offset_x, sy + offset_y)
             self.queue_draw()
@@ -961,6 +995,20 @@ class PDFCanvas(Gtk.DrawingArea):
             self._post_pinch = False
             self._post_pinch_anchor = None
             self._schedule_rerender()
+            self.queue_draw()
+            return
+        if self._anchor_dragging is not None:
+            idx = self._anchor_dragging
+            self._anchor_dragging = None
+            self.set_cursor(None)
+            self._hovering_anchor = False
+            anchors = self._anchors.get(self.current_page_idx, [])
+            if self._anchor_drag_moved and 0 <= idx < len(anchors):
+                a = anchors[idx]
+                if self.on_anchor_moved:
+                    self.on_anchor_moved(idx, a["x"], a["y"])
+            elif not self._anchor_drag_moved and self.on_anchor_clicked:
+                self.on_anchor_clicked(idx)
             self.queue_draw()
             return
         if self._ignoring:
@@ -2254,6 +2302,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         GLib.timeout_add_seconds(60, self._autosave_tick)
         self.canvas.on_anchor_placed = self._on_anchor_placed
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
+        self.canvas.on_anchor_moved = self._on_anchor_moved
         self.canvas.on_callout_placed = self._on_callout_placed
         self.canvas.on_user_action = self._on_canvas_action
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
@@ -3138,6 +3187,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf = self._notes_view.get_buffer()
         it = buf.get_iter_at_mark(self._last_anchor_mark)
         buf.insert(it, f" <!-- callout:{px}:{py} -->")
+        self._mark_dirty()
+
+    def _on_anchor_moved(self, idx, px, py):
+        """Rewrite the idx-th anchor marker in the notes with its new
+        position. The buffer's changed handler refreshes the canvas anchors."""
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        matches = list(_ANCHOR_RE.finditer(text))
+        if idx >= len(matches):
+            return
+        m = matches[idx]
+        start = buf.get_iter_at_offset(m.start())
+        end = buf.get_iter_at_offset(m.end())
+        buf.delete(start, end)
+        buf.insert(start, f"<!-- anchor:{px}:{py} -->")
         self._mark_dirty()
 
     def _on_anchor_clicked(self, idx):

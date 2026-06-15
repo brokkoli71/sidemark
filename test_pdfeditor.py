@@ -1643,7 +1643,81 @@ class TestCallouts(unittest.TestCase):
         canvas._on_drag_end(None, 3, 3)
         self.assertEqual(placed, [])
 
+    # -- gesture: drag an anchor to reposition it -------------------------------
+
+    def _plain_drag_gesture(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, 100.0, 100.0)
+        return g
+
+    def _canvas_with_anchor(self):
+        canvas = PDFCanvas()
+        canvas.scale, canvas.offset_x, canvas.offset_y = 1.0, 0.0, 0.0
+        canvas.page = object()
+        canvas.select_mode = False
+        canvas._anchors[canvas.current_page_idx] = _parse_anchors(
+            "<!-- anchor:100:100 -->\nNote")
+        return canvas
+
+    def test_drag_moves_anchor_and_fires_callback(self):
+        canvas = self._canvas_with_anchor()
+        moved = []
+        canvas.on_anchor_moved = lambda i, x, y: moved.append((i, x, y))
+        canvas.on_anchor_clicked = lambda i: moved.append(("click", i))
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        self.assertEqual(canvas._anchor_dragging, 0)
+        canvas._on_drag_update(self._plain_drag_gesture(), 40, 25)
+        a = canvas._anchors[canvas.current_page_idx][0]
+        self.assertEqual((a["x"], a["y"]), (140, 125))  # follows the cursor
+        canvas._on_drag_end(self._plain_drag_gesture(), 40, 25)
+        self.assertEqual(moved, [(0, 140, 125)])
+        self.assertIsNone(canvas._anchor_dragging)
+
+    def test_click_on_anchor_jumps_not_moves(self):
+        canvas = self._canvas_with_anchor()
+        events = []
+        canvas.on_anchor_moved = lambda i, x, y: events.append(("move", i))
+        canvas.on_anchor_clicked = lambda i: events.append(("click", i))
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        canvas._on_drag_update(self._plain_drag_gesture(), 2, 1)  # below threshold
+        canvas._on_drag_end(self._plain_drag_gesture(), 2, 1)
+        self.assertEqual(events, [("click", 0)])
+
     # -- window round-trip ----------------------------------------------------
+
+    def test_window_anchor_move_rewrites_marker(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.anchormove")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._on_anchor_placed(0, 50, 60)
+                    win._on_anchor_moved(0, 120, 200)
+                    buf = win._notes_view.get_buffer()
+                    text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    if "<!-- anchor:120:200 -->" not in text:
+                        raise AssertionError(f"marker not rewritten: {text!r}")
+                    if "<!-- anchor:50:60 -->" in text:
+                        raise AssertionError(f"old marker remained: {text!r}")
+                    if win.canvas._anchors[0][0]["x"] != 120:
+                        raise AssertionError(f"canvas not refreshed: {win.canvas._anchors[0]}")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
 
     def test_window_anchor_then_callout_in_buffer(self):
         errors = []
