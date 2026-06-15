@@ -1150,6 +1150,61 @@ class TestMarkdownLineOps(unittest.TestCase):
         self.assertTrue(buf.get_has_selection())
 
 
+class TestMarkdownSnippets(unittest.TestCase):
+
+    def _view(self):
+        from sidemark import MarkdownNotesView
+        return MarkdownNotesView()
+
+    def _text(self, buf):
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def _put_cursor(self, buf, line, col):
+        it = buf.get_iter_at_line(line)[1]
+        it.forward_chars(col)
+        buf.place_cursor(it)
+
+    def test_date_token_expands(self):
+        import datetime
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("/date")
+        self._put_cursor(buf, 0, 5)        # cursor right after the token
+        self.assertTrue(v._expand_snippet())
+        self.assertEqual(self._text(buf), datetime.date.today().isoformat())
+
+    def test_date_token_mid_line_expands_only_the_token(self):
+        import datetime
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("on /date")
+        self._put_cursor(buf, 0, 8)
+        self.assertTrue(v._expand_snippet())
+        self.assertEqual(self._text(buf), "on " + datetime.date.today().isoformat())
+
+    def test_unknown_token_is_left_alone(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("/nope")
+        self._put_cursor(buf, 0, 5)
+        self.assertFalse(v._expand_snippet())
+        self.assertEqual(self._text(buf), "/nope")
+
+    def test_token_glued_to_word_is_not_a_snippet(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("foo/date")
+        self._put_cursor(buf, 0, 8)
+        self.assertFalse(v._expand_snippet())
+        self.assertEqual(self._text(buf), "foo/date")
+
+    def test_now_token_expands_with_time(self):
+        import datetime
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("/now")
+        self._put_cursor(buf, 0, 4)
+        self.assertTrue(v._expand_snippet())
+        # starts with today's date, plus a time component
+        self.assertTrue(self._text(buf).startswith(datetime.date.today().isoformat()))
+        self.assertRegex(self._text(buf), r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+
+
 class TestLatexFormatting(unittest.TestCase):
 
     def _view(self):

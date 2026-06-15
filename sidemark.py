@@ -13,6 +13,7 @@ import hashlib
 import json
 import shutil
 import time
+import datetime
 
 RECENT_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -1803,7 +1804,49 @@ class MarkdownNotesView(GtkSource.View):
                 self._move_lines(1)
                 return True
             return False
+        if not ctrl_held and not alt_held:
+            # Slash snippets (/date, /time, /now) expand on the trigger key;
+            # return False so the space/newline still gets inserted afterwards.
+            if keyval in (Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self._expand_snippet()
         return False
+
+    # ── slash snippets (/date → today's date) ─────────────────────────────────
+
+    @staticmethod
+    def _snippet_value(token):
+        """The replacement text for a slash snippet token, or None."""
+        if token == "/date":
+            return datetime.date.today().isoformat()           # 2026-06-15
+        if token == "/time":
+            return datetime.datetime.now().strftime("%H:%M")   # 14:09
+        if token == "/now":
+            return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        return None
+
+    def _expand_snippet(self):
+        """Replace the slash token just before the cursor with its value."""
+        buf = self.get_buffer()
+        if buf.get_has_selection():
+            return False
+        ins = buf.get_iter_at_mark(buf.get_insert())
+        start = ins.copy()
+        while not start.starts_line():                 # back up to the token start
+            prev = start.copy()
+            prev.backward_char()
+            if prev.get_char().isspace():
+                break
+            start = prev
+        value = self._snippet_value(buf.get_text(start, ins, False))
+        if value is None:
+            return False
+        buf.begin_user_action()
+        try:
+            buf.delete(start, ins)
+            buf.insert(buf.get_iter_at_mark(buf.get_insert()), value)
+        finally:
+            buf.end_user_action()
+        return True
 
     # ── line operations (Ctrl+D duplicate, Alt+↑/↓ move) ──────────────────────
 

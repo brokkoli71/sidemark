@@ -114,6 +114,7 @@ pip install pymupdf
 | `Ctrl+E` | Inline code selection |
 | `Ctrl+D` | Duplicate the current line (or every line the selection spans) |
 | `Alt+↑` / `Alt+↓` | Move the current line (or selected lines) up / down |
+| `/date` `/time` `/now` | Type the snippet then Space/Enter — expands to today's date, the time, or both |
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
 | `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
