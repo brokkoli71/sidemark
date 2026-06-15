@@ -329,6 +329,61 @@ class TestStrokes(unittest.TestCase):
         self.assertEqual(stroke["width"], 5.0)
 
 
+# ── straight-line snap (GoodNotes-style hold) ──────────────────────────────────
+
+class TestStraightLineSnap(unittest.TestCase):
+    def _drag(self, sx=0.0, sy=0.0):
+        g = mock.Mock()
+        g.get_start_point.return_value = (True, sx, sy)
+        return g
+
+    def _canvas(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        return c
+
+    def test_snap_collapses_squiggle_to_line(self):
+        c = self._canvas()
+        c.current_stroke = [(0, 0), (5, 3), (8, 1), (12, 9)]
+        c._snap_to_straight()
+        self.assertTrue(c._straight_mode)
+        self.assertEqual(c.current_stroke, [(0, 0), (12, 9)])
+
+    def test_snap_noop_for_single_point(self):
+        c = self._canvas()
+        c.current_stroke = [(2, 2)]
+        c._snap_to_straight()
+        self.assertFalse(c._straight_mode)
+        self.assertEqual(c.current_stroke, [(2, 2)])
+
+    def test_endpoint_follows_cursor_in_straight_mode(self):
+        c = self._canvas()
+        c.current_stroke = [(0, 0), (10, 10)]
+        c._straight_mode = True
+        c._on_drag_update(self._drag(0, 0), 30, 5)
+        self.assertEqual(len(c.current_stroke), 2)   # stays a line
+        self.assertEqual(tuple(c.current_stroke[0]), (0, 0))
+        self.assertEqual(tuple(c.current_stroke[1]), (30, 5))
+
+    def test_free_motion_appends_and_arms_timer(self):
+        c = self._canvas()
+        c.current_stroke = [(0, 0)]
+        c._on_drag_update(self._drag(0, 0), 5, 5)
+        self.assertEqual(len(c.current_stroke), 2)
+        self.assertIsNotNone(c._straight_timer)
+        c._cancel_straight_timer()
+        self.assertIsNone(c._straight_timer)
+
+    def test_drag_end_resets_straight_state(self):
+        c = self._canvas()
+        c._straight_mode = True
+        c._arm_straight_timer()
+        c.current_stroke = [(0, 0), (5, 5)]
+        c._on_drag_end(None, 5, 5)
+        self.assertFalse(c._straight_mode)
+        self.assertIsNone(c._straight_timer)
+
+
 # ── save round-trip ───────────────────────────────────────────────────────────
 
 class TestSave(unittest.TestCase):

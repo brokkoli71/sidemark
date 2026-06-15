@@ -74,6 +74,7 @@ pip install pymupdf
 | Input | Action |
 |-------|--------|
 | Left-drag | Draw stroke |
+| Hold still mid-stroke | Snaps the stroke to a straight line (GoodNotes-style) — keep holding and move to aim it, release to commit |
 | Right-drag | Erase stroke (including from previous sessions) |
 | `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
 | `Ctrl+Z` | Undo the last action chronologically — a stroke, an erase drag, or a burst of notes typing — no matter where the cursor is |

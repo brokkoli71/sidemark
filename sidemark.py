@@ -114,6 +114,7 @@ import numpy as np
 
 class PDFCanvas(Gtk.DrawingArea):
     SCROLL_FLIP_THRESHOLD = 3.0   # scroll notches past the page edge before flipping
+    STRAIGHT_HOLD_MS = 500        # hold still this long mid-stroke to snap to a line
 
     def __init__(self):
         super().__init__()
@@ -131,6 +132,10 @@ class PDFCanvas(Gtk.DrawingArea):
         # {page_idx: [{"pts": [...], "color": (r,g,b,a), "width": float}]}
         self.all_strokes = {}
         self.current_stroke = []
+        # GoodNotes-style straight-line snap: holding still mid-stroke collapses
+        # the in-progress stroke to a line from its start to the cursor
+        self._straight_mode = False
+        self._straight_timer = None
 
         # undo: ("draw", page, stroke) | ("erase", page, idx, stroke, group);
         # erase ops of one drag gesture share a group and undo together.
@@ -936,6 +941,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._alt_start = (start_x, start_y)
                 self.grab_focus()
                 return
+            self._cancel_straight_timer()
+            self._straight_mode = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
@@ -986,11 +993,20 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._zoom_selecting:
             self._zoom_end = self._constrain_zoom_end(sx, sy, sx + offset_x, sy + offset_y)
         else:
-            self.current_stroke.append(self._screen_to_pdf(sx + offset_x, sy + offset_y))
+            pt = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            if self._straight_mode:
+                # locked to a line: only the endpoint follows the cursor
+                self.current_stroke = [self.current_stroke[0], pt]
+            else:
+                self.current_stroke.append(pt)
+                # re-arm on every motion → the snap fires once the cursor rests
+                self._arm_straight_timer()
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
+        self._cancel_straight_timer()
+        self._straight_mode = False
         if self._post_pinch:
             self._post_pinch = False
             self._post_pinch_anchor = None
@@ -1073,6 +1089,26 @@ class PDFCanvas(Gtk.DrawingArea):
                     self.on_user_action()
             self.current_stroke = []
         self.queue_draw()
+
+    def _arm_straight_timer(self):
+        self._cancel_straight_timer()
+        self._straight_timer = GLib.timeout_add(
+            self.STRAIGHT_HOLD_MS, self._snap_to_straight)
+
+    def _cancel_straight_timer(self):
+        if self._straight_timer is not None:
+            GLib.source_remove(self._straight_timer)
+            self._straight_timer = None
+
+    def _snap_to_straight(self):
+        """Fired when the cursor has rested mid-stroke: collapse the in-progress
+        free stroke into a straight line from its start to the current point."""
+        self._straight_timer = None
+        if len(self.current_stroke) >= 2:
+            self._straight_mode = True
+            self.current_stroke = [self.current_stroke[0], self.current_stroke[-1]]
+            self.queue_draw()
+        return False   # one-shot
 
     def _words_in_rect(self, px0, py0, px1, py1):
         """Return fitz word tuples whose bounding boxes overlap the given PDF rect."""
