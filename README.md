@@ -22,7 +22,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
 - **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation
-- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — chronological across strokes, erases, and notes edits regardless of where the cursor is
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
 ### Notes
 
@@ -33,7 +33,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 ### Navigation
 
-- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (cursor-anchored), `Shift+drag` to zoom to region, `Shift+click` to fit page
+- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` to zoom to region, `Shift+click` to fit page
 - **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
@@ -100,17 +100,17 @@ pip install pymupdf
 | Left-drag | Draw stroke |
 | Right-drag | Erase stroke (including from previous sessions) |
 | `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
-| `Ctrl+Z` | Undo the last action chronologically — a stroke, an erase drag, or a burst of notes typing — no matter where the cursor is |
+| `Ctrl+Z` | Undo the last action — a stroke, an erase, or a burst of typing — works across drawing and notes regardless of where the cursor is |
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Redo the last undone action |
-| `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (text cursor shows the mode) |
-| `Alt+drag` | Select & copy text (word-level highlight) — works in either mode |
+| `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (the cursor changes to indicate the active mode) |
+| `Alt+drag` | Select & copy text (snaps to whole words) — works in either mode |
 
 ### Pages
 
 | Key | Action |
 |-----|--------|
-| `PageDown` | Next page (keeps zoom when zoomed, like mouse buttons 8/9) |
-| `PageUp` | Previous page (keeps zoom when zoomed) |
+| `PageDown` | Next page (keeps current zoom) |
+| `PageUp` | Previous page (keeps current zoom) |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |
@@ -122,8 +122,8 @@ pip install pymupdf
 |-------|--------|
 | Scroll | Pan |
 | Scroll past page edge | Flip to next / previous page (keeps zoom) |
-| `Ctrl+scroll` | Zoom in/out (cursor-anchored) |
-| Pinch (two-finger) | Zoom and pan together — both fingers stay anchored to the page |
+| `Ctrl+scroll` | Zoom in/out (centered on the cursor) |
+| Pinch (two-finger) | Zoom and pan together — the points under your fingers stay fixed on the page |
 | `Ctrl+drag` / Middle-drag | Pan |
 | Mouse thumb button (hold) | Pan by moving the mouse; scroll while holding to zoom |
 | `Shift+drag` | Zoom to region |
@@ -140,12 +140,12 @@ pip install pymupdf
 | `Alt+↑` / `Alt+↓` | Move the current line (or selected lines) up / down |
 | `/date` `/time` `/now` | Type the snippet then Space/Enter — expands to today's date, the time, or both |
 | `Ctrl+\` | Toggle notes panel |
-| `Ctrl+Alt+click` | Place a numbered anchor marker on the PDF at the cursor position in notes |
+| `Ctrl+Alt+click` | Place a numbered anchor on the PDF, linked to the note paragraph at the current cursor position |
 | `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
 
 ### Inline math (notes)
 
-Rendered on non-cursor lines; raw syntax restored when you move the cursor back to edit.
+Renders automatically on lines where the cursor isn't; move the cursor to a line to edit the raw syntax.
 
 | Syntax | Renders as |
 |--------|-----------|
@@ -192,10 +192,10 @@ While there are unsaved changes, Sidemark snapshots the document and notes every
 
 ## Recent files
 
-Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (newest first, 15 entries) and exposed three ways:
+Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (newest first, 15 entries) and accessible three ways:
 
 - **In-app** — the clock-arrow button next to *Open* lists them.
-- **XDG recent files** — opens are registered in `recently-used.xbel`, so GTK/GNOME file dialogs and KDE (KF6 `KRecentDocument`, hence krunner's recent-documents results) pick them up automatically.
+- **XDG recent files** — opens are registered in `recently-used.xbel`, so GTK/GNOME file dialogs and KDE (including krunner's recent-documents results) pick them up automatically.
 - **walker / Omarchy launcher** (opt-in) — `./install.sh --walker-menu` drops `extras/sidemark_recent.lua` into `~/.config/elephant/menus/` (needs `jq`). Reach it via walker's provider list (`/` by default), or bind a prefix in `~/.config/walker/config.toml`:
 
   ```toml
@@ -204,7 +204,7 @@ Opened and saved files are tracked in `~/.local/share/sidemark/recent.json` (new
   provider = "menus:sidemarkrecent"
   ```
 
-For other launchers (rofi, fuzzel, …) `sidemark --list-recent` prints `name<TAB>path` lines and exits without loading GTK.
+For other launchers (rofi, fuzzel, …) `sidemark --list-recent` prints `name<TAB>path` lines and exits — useful for scripting or building your own menu.
 
 ## Notes format
 
