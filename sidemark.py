@@ -1,6 +1,7 @@
 #!/usr/bin/env /usr/bin/python3
 import sys
 import os
+import signal
 import math
 import re
 import subprocess
@@ -4179,8 +4180,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _open_done(self, dialog, result):
         try:
             file = dialog.open_finish(result)
-            if file:
-                self.open_file(file.get_path())
+        except GLib.Error as e:
+            # Escape / cancel raises gtk-dialog-error-quark DISMISSED — not an error
+            if not e.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
+                self._show_error("Could not open file", e.message)
+            return
+        if not file:
+            return
+        try:
+            self.open_file(file.get_path())
         except Exception as e:
             self._show_error("Could not open file", str(e))
 
@@ -4423,6 +4431,29 @@ class PDFEditorApp(Adw.Application):
         )
         self._initial_file = None
         self._initial_page = 0
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        # Ctrl+C from the launching terminal should stop the app cleanly rather
+        # than surface a KeyboardInterrupt traceback through the GLib main loop.
+        # GLibUnix.signal_add is the current API; fall back to the (deprecated)
+        # GLib.unix_signal_add on older PyGObject (Ubuntu/Fedora CI runners).
+        try:
+            gi.require_version("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+            add_signal = GLibUnix.signal_add
+        except (ValueError, ImportError):
+            add_signal = GLib.unix_signal_add
+        add_signal(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._on_sigint)
+
+    def _on_sigint(self):
+        logger.info("Interrupted (Ctrl+C) — shutting down")
+        # destroy() tears windows down without firing close-request, so we don't
+        # block on a save prompt — the periodic autosave already covers the work.
+        for win in list(self.get_windows()):
+            win.destroy()
+        self.quit()
+        return GLib.SOURCE_REMOVE
 
     def do_activate(self):
         win = PDFEditorWindow(self)

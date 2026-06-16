@@ -1664,6 +1664,51 @@ class TestExport(unittest.TestCase):
         if errors:
             raise errors[0]
 
+    def test_open_dialog_dismiss_shows_no_error(self):
+        """Escaping the Open dialog raises gtk-dialog-error DISMISSED — that is a
+        normal cancel, not an error, so no error window must appear. A genuine
+        GLib error code still surfaces."""
+        errors = []
+        results = {}
+        app = Adw.Application(application_id="test.sidemark.opendismiss")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                shown = []
+                win._show_error = lambda title, msg: shown.append((title, msg))
+
+                def finish_raising(err):
+                    d = mock.Mock()
+                    d.open_finish.side_effect = err
+                    return d
+
+                dismissed = GLib.Error.new_literal(
+                    Gtk.DialogError.quark(), "Dismissed by user",
+                    Gtk.DialogError.DISMISSED)
+                win._open_done(finish_raising(dismissed), mock.Mock())
+                results["dismiss_shown"] = list(shown)
+
+                shown.clear()
+                failed = GLib.Error.new_literal(
+                    Gtk.DialogError.quark(), "boom", Gtk.DialogError.FAILED)
+                win._open_done(finish_raising(failed), mock.Mock())
+                results["failed_shown"] = list(shown)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+        self.assertEqual(results["dismiss_shown"], [],
+                         "dismissing the dialog must not show an error")
+        self.assertEqual(len(results["failed_shown"]), 1,
+                         "a real open failure must still surface")
+
 
 class TestCallouts(unittest.TestCase):
     # -- parser ---------------------------------------------------------------
