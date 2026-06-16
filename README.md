@@ -123,7 +123,7 @@ pip install pymupdf
 
 | Input | Action |
 |-------|--------|
-| Scroll | Pan |
+| Two-finger drag (touchpad) / scroll wheel | Pan — a touchpad pans smoothly in any direction (no axis lock) |
 | Scroll past page edge | Flip to next / previous page (keeps zoom) |
 | `Ctrl+scroll` | Zoom in/out (centered on the cursor) |
 | Pinch (two-finger) | Zoom and pan together — the points under your fingers stay fixed on the page |

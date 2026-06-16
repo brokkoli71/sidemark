@@ -114,7 +114,9 @@ import numpy as np
 
 
 class PDFCanvas(Gtk.DrawingArea):
-    SCROLL_FLIP_THRESHOLD = 3.0   # scroll notches past the page edge before flipping
+    SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
+    TOUCHPAD_FLIP_THRESHOLD = 180.0   # px of touchpad scroll past the edge before flipping
+    WHEEL_PAN_STEP = 30.0         # px panned per mouse-wheel notch
     STRAIGHT_HOLD_MS = 500        # hold still this long mid-stroke to snap to a line
 
     def __init__(self):
@@ -256,9 +258,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._mouse_x = 0.0
         self._mouse_y = 0.0
 
+        # No DISCRETE flag: it quantises touchpad two-finger scroll into wheel
+        # notches, which axis-locks to horizontal *or* vertical. Smooth deltas
+        # let a two-finger drag pan diagonally; we tell touchpad (SURFACE) from
+        # mouse-wheel (WHEEL) input per-event via get_unit().
         scroll = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.BOTH_AXES |
-            Gtk.EventControllerScrollFlags.DISCRETE
+            Gtk.EventControllerScrollFlags.BOTH_AXES
         )
         scroll.connect("scroll", self._on_scroll)
         self.add_controller(scroll)
@@ -701,17 +706,27 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
+        # Touchpad two-finger scroll arrives as smooth SURFACE-unit deltas (~1px
+        # each, both axes at once); a mouse wheel as ±1 WHEEL notches. Pan speed
+        # and the page-flip resistance differ per source so both feel natural.
+        smooth = ctrl.get_unit() == Gdk.ScrollUnit.SURFACE
         # zoom on Ctrl+scroll, or plain scroll while thumb pan mode is latched
         if not (state & Gdk.ModifierType.CONTROL_MASK) and not self._thumb_panning:
-            if self._handle_boundary_flip(dx, dy):
+            flip_threshold = (self.TOUCHPAD_FLIP_THRESHOLD if smooth
+                              else self.SCROLL_FLIP_THRESHOLD)
+            if self._handle_boundary_flip(dx, dy, flip_threshold):
                 return True
             self._scroll_past = 0.0
-            self.offset_x -= dx * 30
-            self.offset_y -= dy * 30
+            step = 1.0 if smooth else self.WHEEL_PAN_STEP
+            self.offset_x -= dx * step
+            self.offset_y -= dy * step
             self._is_fitted = False
             self.queue_draw()
             return True
-        factor = 0.9 if dy > 0 else 1.1
+        if smooth:
+            factor = max(0.5, min(2.0, 1.0 - dy * 0.02))
+        else:
+            factor = 0.9 if dy > 0 else 1.1
         self._zoom_at(factor, self._mouse_x, self._mouse_y)
         return True
 
@@ -777,9 +792,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._post_pinch = True
         self._post_pinch_anchor = None
 
-    def _handle_boundary_flip(self, dx, dy):
+    def _handle_boundary_flip(self, dx, dy, threshold):
         """Scrolling further while the page edge is already visible flips the
-        page (after a small resistance threshold). Returns True when the
+        page (after a resistance ``threshold``). Returns True when the
         scroll was consumed (accumulating or flipping) instead of panning."""
         if self.page is None or not dy or abs(dy) < abs(dx):
             return False
@@ -797,9 +812,9 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._scroll_past and (self._scroll_past > 0) != (dy > 0):
             self._scroll_past = 0.0   # direction reversed — restart resistance
         self._scroll_past += dy
-        if self._scroll_past >= self.SCROLL_FLIP_THRESHOLD:
+        if self._scroll_past >= threshold:
             self._flip_page(1)
-        elif self._scroll_past <= -self.SCROLL_FLIP_THRESHOLD:
+        elif self._scroll_past <= -threshold:
             self._flip_page(-1)
         return True
 

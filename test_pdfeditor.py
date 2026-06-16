@@ -760,6 +760,56 @@ class TestScrollFlip(unittest.TestCase):
         self.assertEqual(seen, [0])
 
 
+# ── touchpad (smooth two-finger) scrolling ─────────────────────────────────────
+
+class TestTouchpadScroll(unittest.TestCase):
+    def _canvas_with_pdf(self, n_pages=3):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=n_pages)
+        canvas.load(self._tmp)
+        canvas._fit_page(800, 600)
+        return canvas
+
+    def tearDown(self):
+        if os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    @staticmethod
+    def _ctrl():
+        ctrl = mock.Mock()
+        ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
+        ctrl.get_unit.return_value = Gdk.ScrollUnit.SURFACE
+        return ctrl
+
+    def test_smooth_scroll_pans_both_axes_at_pixel_scale(self):
+        canvas = self._canvas_with_pdf()
+        canvas._is_fitted = False
+        canvas.scale = 2.0
+        canvas.offset_x, canvas.offset_y = -200.0, -200.0   # neither edge visible
+        canvas._on_scroll(self._ctrl(), 12.0, 7.0)
+        # 1:1 with the surface delta, both axes at once (no axis lock)
+        self.assertAlmostEqual(canvas.offset_x, -212.0)
+        self.assertAlmostEqual(canvas.offset_y, -207.0)
+
+    def test_small_smooth_scroll_does_not_flip(self):
+        # a gentle two-finger drag past the edge (well under the px threshold)
+        # pans/accumulates but must not flip like a few wheel notches would
+        canvas = self._canvas_with_pdf()
+        ctrl = self._ctrl()
+        for _ in range(5):
+            canvas._on_scroll(ctrl, 0.0, 10.0)   # 50 px < 180 px threshold
+        self.assertEqual(canvas.current_page_idx, 0)
+
+    def test_sustained_smooth_scroll_eventually_flips(self):
+        canvas = self._canvas_with_pdf()
+        ctrl = self._ctrl()
+        for _ in range(20):
+            canvas._on_scroll(ctrl, 0.0, 10.0)   # 200 px > 180 px threshold
+        self.assertEqual(canvas.current_page_idx, 1)
+
+
 # ── undo for draw and erase ──────────────────────────────────────────────────
 
 class TestUndoEraser(unittest.TestCase):
