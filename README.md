@@ -21,6 +21,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 ### Annotations
 
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
+- **Straight-line snap** — hold still mid-stroke to lock to a straight line; move while holding to aim, release to commit
 - **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
@@ -44,6 +45,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
+- **Responsive header** — a compact single-row toolbar (file actions live in the ☰ menu); as the window narrows it measures itself and folds progressively — first the pen / highlighter / select switch tucks into the pen-settings popover, then undo / redo / find drop away — so the core controls stay reachable at any width
 
 ## Installation
 
@@ -98,6 +100,7 @@ pip install pymupdf
 | Input | Action |
 |-------|--------|
 | Left-drag | Draw stroke |
+| Hold still mid-stroke | Snaps the stroke to a straight line (GoodNotes-style) — keep holding and move to aim it, release to commit |
 | Right-drag | Erase stroke (including from previous sessions) |
 | `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
 | `Ctrl+Z` | Undo the last action — a stroke, an erase, or a burst of typing — works across drawing and notes regardless of where the cursor is |
@@ -141,6 +144,7 @@ pip install pymupdf
 | `/date` `/time` `/now` | Type the snippet then Space/Enter — expands to today's date, the time, or both |
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor on the PDF, linked to the note paragraph at the current cursor position |
+| Drag an anchor | Move a placed anchor to a new spot (a click without dragging still jumps to its note) |
 | `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
 
 ### Inline math (notes)

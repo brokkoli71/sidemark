@@ -329,6 +329,117 @@ class TestStrokes(unittest.TestCase):
         self.assertEqual(stroke["width"], 5.0)
 
 
+# ── straight-line snap (GoodNotes-style hold) ──────────────────────────────────
+
+class TestStraightLineSnap(unittest.TestCase):
+    def _drag(self, sx=0.0, sy=0.0):
+        g = mock.Mock()
+        g.get_start_point.return_value = (True, sx, sy)
+        return g
+
+    def _canvas(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        return c
+
+    def test_snap_collapses_squiggle_to_line(self):
+        c = self._canvas()
+        c.current_stroke = [(0, 0), (5, 3), (8, 1), (12, 9)]
+        c._snap_to_straight()
+        self.assertTrue(c._straight_mode)
+        self.assertEqual(c.current_stroke, [(0, 0), (12, 9)])
+
+    def test_snap_noop_for_single_point(self):
+        c = self._canvas()
+        c.current_stroke = [(2, 2)]
+        c._snap_to_straight()
+        self.assertFalse(c._straight_mode)
+        self.assertEqual(c.current_stroke, [(2, 2)])
+
+    def test_endpoint_follows_cursor_in_straight_mode(self):
+        c = self._canvas()
+        c.current_stroke = [(0, 0), (10, 10)]
+        c._straight_mode = True
+        c._on_drag_update(self._drag(0, 0), 30, 5)
+        self.assertEqual(len(c.current_stroke), 2)   # stays a line
+        self.assertEqual(tuple(c.current_stroke[0]), (0, 0))
+        self.assertEqual(tuple(c.current_stroke[1]), (30, 5))
+
+    def test_free_motion_appends_and_arms_timer(self):
+        c = self._canvas()
+        c.current_stroke = [(0, 0)]
+        c._on_drag_update(self._drag(0, 0), 5, 5)
+        self.assertEqual(len(c.current_stroke), 2)
+        self.assertIsNotNone(c._straight_timer)
+        c._cancel_straight_timer()
+        self.assertIsNone(c._straight_timer)
+
+    def test_drag_end_resets_straight_state(self):
+        c = self._canvas()
+        c._straight_mode = True
+        c._arm_straight_timer()
+        c.current_stroke = [(0, 0), (5, 5)]
+        c._on_drag_end(None, 5, 5)
+        self.assertFalse(c._straight_mode)
+        self.assertIsNone(c._straight_timer)
+
+
+# ── stroke smoothing ───────────────────────────────────────────────────────────
+
+class TestStrokeSmoothing(unittest.TestCase):
+    def test_zero_strength_is_identity(self):
+        pts = [(0, 0), (1, 5), (2, 0), (3, 5)]
+        self.assertEqual(PDFCanvas._smooth_points(pts, 0.0), pts)
+
+    def test_too_few_points_unchanged(self):
+        self.assertEqual(PDFCanvas._smooth_points([(0, 0), (4, 4)], 1.0),
+                         [(0, 0), (4, 4)])
+
+    def test_endpoints_preserved(self):
+        pts = [(0, 0), (1, 9), (2, 0), (3, 9), (4, 0)]
+        out = PDFCanvas._smooth_points(pts, 1.0)
+        self.assertEqual(out[0], (0.0, 0.0))
+        self.assertEqual(out[-1], (4.0, 0.0))
+        self.assertEqual(len(out), len(pts))
+
+    def test_smoothing_reduces_jitter(self):
+        # a zigzag: interior points should move toward their neighbours' mean,
+        # so total deviation from the straight baseline shrinks
+        pts = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        out = PDFCanvas._smooth_points(pts, 1.0)
+        raw_dev = sum(abs(y) for _, y in pts)
+        new_dev = sum(abs(y) for _, y in out)
+        self.assertLess(new_dev, raw_dev)
+
+    def test_commit_smooths_freehand_stroke(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.smoothing = 1.0
+        c.current_stroke = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        raw = list(c.current_stroke)
+        c._on_drag_end(None, 0, 0)
+        committed = c.strokes[-1]["pts"]
+        self.assertNotEqual(committed, raw)          # was smoothed
+        self.assertEqual(committed[0], (0.0, 0.0))   # endpoints kept
+
+    def test_commit_does_not_smooth_when_disabled(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.smoothing = 0.0
+        c.current_stroke = [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)]
+        c._on_drag_end(None, 0, 0)
+        self.assertEqual(c.strokes[-1]["pts"], [(0, 0), (1, 10), (2, -10), (3, 10), (4, 0)])
+
+    def test_snapped_line_is_not_smoothed(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.smoothing = 1.0
+        c._straight_mode = True
+        c.current_stroke = [(0, 0), (10, 4)]
+        c._on_drag_end(None, 0, 0)
+        self.assertEqual(c.strokes[-1]["pts"], [(0, 0), (10, 4)])
+
+
 # ── save round-trip ───────────────────────────────────────────────────────────
 
 class TestSave(unittest.TestCase):
@@ -965,6 +1076,26 @@ class TestTheme(unittest.TestCase):
             self.assertEqual(theme["accent"], "#445566")
         finally:
             os.unlink(tmp)
+
+
+class TestThemedIcon(unittest.TestCase):
+    def test_falls_back_when_first_missing(self):
+        from sidemark import _themed_icon
+        # A bogus first name forces a fall-through to a real freedesktop icon
+        # that every icon theme ships, so the button is never left blank.
+        name = _themed_icon("definitely-not-a-real-icon-symbolic",
+                            "go-next-symbolic")
+        self.assertEqual(name, "go-next-symbolic")
+
+    def test_returns_first_when_all_missing(self):
+        from sidemark import _themed_icon
+        name = _themed_icon("no-such-icon-aaa-symbolic", "no-such-icon-bbb")
+        self.assertEqual(name, "no-such-icon-aaa-symbolic")
+
+    def test_prefers_first_available(self):
+        from sidemark import _themed_icon
+        name = _themed_icon("go-next-symbolic", "go-previous-symbolic")
+        self.assertEqual(name, "go-next-symbolic")
 
 
 # ── deferred fit (needs_fit flag) ─────────────────────────────────────────────
@@ -1643,7 +1774,81 @@ class TestCallouts(unittest.TestCase):
         canvas._on_drag_end(None, 3, 3)
         self.assertEqual(placed, [])
 
+    # -- gesture: drag an anchor to reposition it -------------------------------
+
+    def _plain_drag_gesture(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, 100.0, 100.0)
+        return g
+
+    def _canvas_with_anchor(self):
+        canvas = PDFCanvas()
+        canvas.scale, canvas.offset_x, canvas.offset_y = 1.0, 0.0, 0.0
+        canvas.page = object()
+        canvas.select_mode = False
+        canvas._anchors[canvas.current_page_idx] = _parse_anchors(
+            "<!-- anchor:100:100 -->\nNote")
+        return canvas
+
+    def test_drag_moves_anchor_and_fires_callback(self):
+        canvas = self._canvas_with_anchor()
+        moved = []
+        canvas.on_anchor_moved = lambda i, x, y: moved.append((i, x, y))
+        canvas.on_anchor_clicked = lambda i: moved.append(("click", i))
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        self.assertEqual(canvas._anchor_dragging, 0)
+        canvas._on_drag_update(self._plain_drag_gesture(), 40, 25)
+        a = canvas._anchors[canvas.current_page_idx][0]
+        self.assertEqual((a["x"], a["y"]), (140, 125))  # follows the cursor
+        canvas._on_drag_end(self._plain_drag_gesture(), 40, 25)
+        self.assertEqual(moved, [(0, 140, 125)])
+        self.assertIsNone(canvas._anchor_dragging)
+
+    def test_click_on_anchor_jumps_not_moves(self):
+        canvas = self._canvas_with_anchor()
+        events = []
+        canvas.on_anchor_moved = lambda i, x, y: events.append(("move", i))
+        canvas.on_anchor_clicked = lambda i: events.append(("click", i))
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        canvas._on_drag_update(self._plain_drag_gesture(), 2, 1)  # below threshold
+        canvas._on_drag_end(self._plain_drag_gesture(), 2, 1)
+        self.assertEqual(events, [("click", 0)])
+
     # -- window round-trip ----------------------------------------------------
+
+    def test_window_anchor_move_rewrites_marker(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.anchormove")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._on_anchor_placed(0, 50, 60)
+                    win._on_anchor_moved(0, 120, 200)
+                    buf = win._notes_view.get_buffer()
+                    text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    if "<!-- anchor:120:200 -->" not in text:
+                        raise AssertionError(f"marker not rewritten: {text!r}")
+                    if "<!-- anchor:50:60 -->" in text:
+                        raise AssertionError(f"old marker remained: {text!r}")
+                    if win.canvas._anchors[0][0]["x"] != 120:
+                        raise AssertionError(f"canvas not refreshed: {win.canvas._anchors[0]}")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
 
     def test_window_anchor_then_callout_in_buffer(self):
         errors = []
@@ -1785,6 +1990,133 @@ class TestTocSidebar(unittest.TestCase):
             app.run([])
         if errors:
             raise errors[0]
+
+
+class TestResponsiveHeader(unittest.TestCase):
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.header")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_default_level_is_fully_expanded(self):
+        def body(win):
+            # at full width nothing is folded: the segmented tool switch is on
+            # the bar, the popover's mirror modes are hidden, undo/redo/find show
+            win._apply_collapse_level(0)
+            if not win._tools_box.get_visible():
+                raise AssertionError("tool switch should be on the bar at level 0")
+            if win._pen_modes_section.get_visible():
+                raise AssertionError("popover modes should be hidden at level 0")
+            for b in (win._undo_btn, win._redo_btn, win._search_btn):
+                if not b.get_visible():
+                    raise AssertionError("undo/redo/find should show at level 0")
+        self._run_in_window(body)
+
+    def test_level1_folds_pen_modes_into_popover(self):
+        def body(win):
+            win._apply_collapse_level(1)
+            # the segmented switch leaves the bar; its mirror appears in the
+            # pen-settings popover; secondary actions are still present
+            if win._tools_box.get_visible():
+                raise AssertionError("tool switch should leave the bar at level 1")
+            if not win._pen_modes_section.get_visible():
+                raise AssertionError("popover modes should appear at level 1")
+            if not win._undo_btn.get_visible():
+                raise AssertionError("undo should still show at level 1")
+        self._run_in_window(body)
+
+    def test_level2_hides_secondary_actions(self):
+        def body(win):
+            win._apply_collapse_level(2)
+            for b in (win._undo_btn, win._redo_btn, win._search_btn, win._undo_sep):
+                if b.get_visible():
+                    raise AssertionError("undo/redo/find should hide at level 2")
+            # the tool switch stays folded into the popover at level 2 too
+            if win._tools_box.get_visible():
+                raise AssertionError("tool switch should stay folded at level 2")
+        self._run_in_window(body)
+
+    def test_calibration_breakpoints_are_ordered(self):
+        def body(win):
+            win._calibrate_header()
+            nat = win._collapse_natural
+            # measured from the real widgets: each collapse level is narrower
+            if not (nat[2] < nat[1] < nat[0]):
+                raise AssertionError(f"breakpoints not ordered: {nat}")
+        self._run_in_window(body)
+
+    def test_collapse_decision_tracks_available_width(self):
+        def body(win):
+            win._calibrate_header()
+            nat = win._collapse_natural
+            # stub the measured width + window-button allowance and exercise the
+            # decision directly
+            win._measure_controls = lambda: 0
+            win._header.get_width = lambda: nat[0] + 50
+            win._update_header_collapse()
+            if win._collapse_level != 0:
+                raise AssertionError("should be expanded with room to spare")
+            win._header.get_width = lambda: nat[1] + 5
+            win._update_header_collapse()
+            if win._collapse_level != 1:
+                raise AssertionError("should fold pen modes when tight")
+            win._header.get_width = lambda: nat[2] - 20
+            win._update_header_collapse()
+            if win._collapse_level != 2:
+                raise AssertionError("should hide secondary actions when very tight")
+        self._run_in_window(body)
+
+    def test_popover_modes_stay_in_sync(self):
+        def body(win):
+            # switching on the bar reflects into the popover mirror, and back
+            win._mode_hl.set_active(True)
+            if not win._pmode_hl.get_active():
+                raise AssertionError("popover mode did not mirror the bar")
+            win._pmode_select.set_active(True)
+            if not win._mode_select.get_active():
+                raise AssertionError("bar mode did not mirror the popover")
+            if not win.canvas.select_mode:
+                raise AssertionError("canvas not in select mode")
+        self._run_in_window(body)
+
+    def test_select_mode_toggle(self):
+        def body(win):
+            # Ctrl+M flips select-text on/off
+            win._toggle_select_mode()
+            if not win.canvas.select_mode:
+                raise AssertionError("select toggle did not enable select mode")
+            win._toggle_select_mode()
+            if win.canvas.select_mode:
+                raise AssertionError("select toggle did not disable select mode")
+        self._run_in_window(body)
+
+    def test_add_page_button_adds_a_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "p.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                before = win.canvas.document.page_count
+                win._add_page_btn.emit("clicked")
+                after = win.canvas.document.page_count
+                if after != before + 1:
+                    raise AssertionError(f"page count {before} -> {after}")
+            self._run_in_window(body)
 
 
 class TestThumbnailSidebar(unittest.TestCase):
@@ -2881,7 +3213,7 @@ class TestHighlighter(unittest.TestCase):
                     pen_width = win.canvas.pen_width
                     pen_color = win.canvas.pen_color
 
-                    win._hl_toggle.set_active(True)
+                    win._mode_hl.set_active(True)
                     if not win.canvas.highlighter:
                         raise AssertionError("toggle did not enable highlighter")
                     win._width_scale.set_value(18.0)
@@ -2897,7 +3229,7 @@ class TestHighlighter(unittest.TestCase):
                     if win.canvas.pen_color != pen_color:
                         raise AssertionError("color button leaked into pen_color")
 
-                    win._pen_seg.set_active(True)   # grouped pair: back to pen
+                    win._mode_pen.set_active(True)   # grouped: back to pen
                     if win.canvas.highlighter:
                         raise AssertionError("pen segment did not disable highlighter")
                     if abs(win._width_scale.get_value() - pen_width) > 0.01:

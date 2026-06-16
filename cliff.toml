@@ -61,6 +61,8 @@ protect_breaking_commits = false
 commit_parsers = [
     { message = "^feat", group = "<!-- 0 -->🚀 Features" },
     { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+    # ideas.csv status bookkeeping duplicates the real feature entries — drop it
+    { message = "^docs?\\(ideas\\)", skip = true },
     { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
     { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
     { message = "^refactor", group = "<!-- 2 -->🚜 Refactor" },

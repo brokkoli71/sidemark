@@ -114,6 +114,7 @@ import numpy as np
 
 class PDFCanvas(Gtk.DrawingArea):
     SCROLL_FLIP_THRESHOLD = 3.0   # scroll notches past the page edge before flipping
+    STRAIGHT_HOLD_MS = 500        # hold still this long mid-stroke to snap to a line
 
     def __init__(self):
         super().__init__()
@@ -131,6 +132,10 @@ class PDFCanvas(Gtk.DrawingArea):
         # {page_idx: [{"pts": [...], "color": (r,g,b,a), "width": float}]}
         self.all_strokes = {}
         self.current_stroke = []
+        # GoodNotes-style straight-line snap: holding still mid-stroke collapses
+        # the in-progress stroke to a line from its start to the cursor
+        self._straight_mode = False
+        self._straight_timer = None
 
         # undo: ("draw", page, stroke) | ("erase", page, idx, stroke, group);
         # erase ops of one drag gesture share a group and undo together.
@@ -141,6 +146,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self.pen_color = (0.05, 0.05, 0.8)   # RGB — stroke alpha lives in "opacity"
         self.pen_width = 2.0
+        # freehand smoothing strength 0..1 (Laplacian passes applied on commit)
+        self.smoothing = 0.5
         # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
         self.highlighter = False
         self.hl_color = (1.0, 0.85, 0.0)
@@ -155,12 +162,18 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_change = None         # callback() whenever strokes are modified
         self.on_anchor_placed = None   # callback(page_idx, pdf_x, pdf_y)
         self.on_anchor_clicked = None  # callback(anchor_index)
+        self.on_anchor_moved = None    # callback(anchor_index, pdf_x, pdf_y)
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
         self.on_user_action = None     # callback() once per completed draw/erase gesture
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
         self._anchors = {}
         self._active_anchors = set()  # indices highlighted on current page
+        # drag-to-reposition: index of the anchor being dragged, and whether the
+        # drag moved far enough to count as a move (vs. a click that jumps notes)
+        self._anchor_dragging = None
+        self._anchor_drag_moved = False
+        self._hovering_anchor = False
 
         # Ctrl+Alt+drag: anchor placed at press (GestureClick), callout box
         # placed at release when the drag travelled far enough
@@ -668,6 +681,22 @@ class PDFCanvas(Gtk.DrawingArea):
         self._mouse_y = y
         self._hover_x, self._hover_y = x, y
         self._update_link_hover()
+        self._update_anchor_hover(x, y)
+
+    def _update_anchor_hover(self, x, y):
+        """Show a grab cursor over anchor circles so it's clear they can be
+        dragged. Yields to link-hover (Alt) and stays out of its way."""
+        over = (self._hovered_link_rect is None and not self._alt_held
+                and self.page is not None
+                and self._anchor_hit_test(x, y) is not None)
+        if over == self._hovering_anchor:
+            return
+        self._hovering_anchor = over
+        if over:
+            self.set_cursor(Gdk.Cursor.new_from_name("grab", None))
+        elif self._hovered_link_rect is None:
+            self.set_cursor(Gdk.Cursor.new_from_name("text", None)
+                            if self.select_mode else None)
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
@@ -902,9 +931,11 @@ class PDFCanvas(Gtk.DrawingArea):
             self._selected_words = []
             hit = self._anchor_hit_test(start_x, start_y)
             if hit is not None:
-                self._ignoring = True
-                if self.on_anchor_clicked:
-                    self.on_anchor_clicked(hit)
+                # begin dragging the anchor; a release with no real movement is
+                # treated as a click that jumps the notes cursor (see drag-end)
+                self._anchor_dragging = hit
+                self._anchor_drag_moved = False
+                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
                 return
             if self.select_mode:
                 # plain drag selects text instead of drawing
@@ -912,6 +943,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._alt_start = (start_x, start_y)
                 self.grab_focus()
                 return
+            self._cancel_straight_timer()
+            self._straight_mode = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
@@ -931,6 +964,16 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         logger.debug(f"drag update offset=({offset_x:.0f},{offset_y:.0f})")
         sx, sy = gesture.get_start_point()[1], gesture.get_start_point()[2]
+        if self._anchor_dragging is not None:
+            if math.hypot(offset_x, offset_y) >= 4:
+                self._anchor_drag_moved = True
+            anchors = self._anchors.get(self.current_page_idx, [])
+            if 0 <= self._anchor_dragging < len(anchors):
+                px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+                anchors[self._anchor_dragging]["x"] = round(px)
+                anchors[self._anchor_dragging]["y"] = round(py)
+                self.queue_draw()
+            return
         if self._callout_dragging:
             self._callout_cur = (sx + offset_x, sy + offset_y)
             self.queue_draw()
@@ -952,15 +995,39 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._zoom_selecting:
             self._zoom_end = self._constrain_zoom_end(sx, sy, sx + offset_x, sy + offset_y)
         else:
-            self.current_stroke.append(self._screen_to_pdf(sx + offset_x, sy + offset_y))
+            pt = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            if self._straight_mode:
+                # locked to a line: only the endpoint follows the cursor
+                self.current_stroke = [self.current_stroke[0], pt]
+            else:
+                self.current_stroke.append(pt)
+                # re-arm on every motion → the snap fires once the cursor rests
+                self._arm_straight_timer()
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
+        self._cancel_straight_timer()
+        was_straight = self._straight_mode
+        self._straight_mode = False
         if self._post_pinch:
             self._post_pinch = False
             self._post_pinch_anchor = None
             self._schedule_rerender()
+            self.queue_draw()
+            return
+        if self._anchor_dragging is not None:
+            idx = self._anchor_dragging
+            self._anchor_dragging = None
+            self.set_cursor(None)
+            self._hovering_anchor = False
+            anchors = self._anchors.get(self.current_page_idx, [])
+            if self._anchor_drag_moved and 0 <= idx < len(anchors):
+                a = anchors[idx]
+                if self.on_anchor_moved:
+                    self.on_anchor_moved(idx, a["x"], a["y"])
+            elif not self._anchor_drag_moved and self.on_anchor_clicked:
+                self.on_anchor_clicked(idx)
             self.queue_draw()
             return
         if self._ignoring:
@@ -1009,9 +1076,14 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zoom_end = None
         else:
             if self.current_stroke:
+                pts = self.current_stroke
+                # smooth freehand ink on commit; a snapped straight line and
+                # tiny strokes (dots) are left exactly as drawn
+                if not was_straight and len(pts) > 2:
+                    pts = self._smooth_points(pts, self.smoothing)
                 color, width, opacity = self._pen_attrs()
                 stroke = {
-                    "pts": self.current_stroke,
+                    "pts": pts,
                     "color": color,
                     "width": width,
                     "opacity": opacity,
@@ -1025,6 +1097,46 @@ class PDFCanvas(Gtk.DrawingArea):
                     self.on_user_action()
             self.current_stroke = []
         self.queue_draw()
+
+    def _arm_straight_timer(self):
+        self._cancel_straight_timer()
+        self._straight_timer = GLib.timeout_add(
+            self.STRAIGHT_HOLD_MS, self._snap_to_straight)
+
+    def _cancel_straight_timer(self):
+        if self._straight_timer is not None:
+            GLib.source_remove(self._straight_timer)
+            self._straight_timer = None
+
+    @staticmethod
+    def _smooth_points(pts, strength, passes=4):
+        """Clean up a freehand polyline with Laplacian (moving-average)
+        smoothing. ``strength`` 0..1 scales how far each interior point is
+        pulled toward the midpoint of its neighbours; endpoints stay fixed so
+        the stroke keeps its start and end. Returns a new list of (x, y)."""
+        if strength <= 0 or len(pts) < 3:
+            return list(pts)
+        factor = 0.5 * min(strength, 1.0)
+        cur = [(float(x), float(y)) for x, y in pts]
+        for _ in range(passes):
+            nxt = [cur[0]]
+            for i in range(1, len(cur) - 1):
+                x = cur[i][0] + factor * (cur[i - 1][0] + cur[i + 1][0] - 2 * cur[i][0])
+                y = cur[i][1] + factor * (cur[i - 1][1] + cur[i + 1][1] - 2 * cur[i][1])
+                nxt.append((x, y))
+            nxt.append(cur[-1])
+            cur = nxt
+        return cur
+
+    def _snap_to_straight(self):
+        """Fired when the cursor has rested mid-stroke: collapse the in-progress
+        free stroke into a straight line from its start to the current point."""
+        self._straight_timer = None
+        if len(self.current_stroke) >= 2:
+            self._straight_mode = True
+            self.current_stroke = [self.current_stroke[0], self.current_stroke[-1]]
+            self.queue_draw()
+        return False   # one-shot
 
     def _words_in_rect(self, px0, py0, px1, py1):
         """Return fitz word tuples whose bounding boxes overlap the given PDF rect."""
@@ -1434,6 +1546,23 @@ def _load_theme():
 def _hex_to_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+
+
+def _themed_icon(*candidates):
+    """First candidate icon the active theme actually has, else the first.
+
+    Symbolic icon names are not portable: e.g. ``view-sidebar-symbolic`` and
+    ``view-list-symbolic`` exist in Adwaita/GNOME but not in KDE's Breeze, so a
+    hard-coded name shows a blank button under Plasma. Falling back keeps the
+    button labelled on every desktop.
+    """
+    display = Gdk.Display.get_default()
+    if display is not None:
+        theme = Gtk.IconTheme.get_for_display(display)
+        for name in candidates:
+            if theme.has_icon(name):
+                return name
+    return candidates[0]
 
 
 def notes_path_for(pdf_path):
@@ -2204,6 +2333,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._dirty = False
         self._suppress_dirty = False
         self._syncing_pen = False   # guard while pen popover mirrors tool state
+        self._syncing_mode = False  # guard while tool-mode toggles mirror each other
+        # responsive header: natural width (px) of the button clusters at each
+        # collapse level, measured once from the real widgets — no hard-coded
+        # threshold. _header_controls is the non-content width (window buttons +
+        # edge padding) read from the real allocation.
+        self._collapse_natural = None
+        self._header_controls = 0
+        self._collapse_level = -1
         # global chronological undo: one entry per canvas gesture, one per
         # uninterrupted typing burst in the notes panel.
         # ("canvas",) | ("notes", page_idx, text_before_burst)
@@ -2254,6 +2391,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         GLib.timeout_add_seconds(60, self._autosave_tick)
         self.canvas.on_anchor_placed = self._on_anchor_placed
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
+        self.canvas.on_anchor_moved = self._on_anchor_moved
         self.canvas.on_callout_placed = self._on_callout_placed
         self.canvas.on_user_action = self._on_canvas_action
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
@@ -2263,12 +2401,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         fg_hex  = theme["foreground"]
         bg_hex  = theme["background"]
         css = f"""
-            .save-button {{
-                background: {acc_hex};
-                color: {fg_hex};
-                font-weight: bold;
-            }}
-            .save-button:hover {{ background: shade({acc_hex}, 1.1); }}
             .notes-view {{
                 font-family: monospace;
                 font-size: 13px;
@@ -2309,35 +2441,82 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # fullscreen.
         header = Gtk.HeaderBar()
         self._header = header
+        # Suppress the default centred window-title label; the bar is purely
+        # grouped button clusters flowing from the edges.
+        header.set_title_widget(Gtk.Box())
 
-        open_btn = Gtk.Button(label="Open")
-        open_btn.connect("clicked", self._on_open)
-        header.pack_start(open_btn)
+        def vsep():
+            s = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+            s.set_margin_start(3)
+            s.set_margin_end(3)
+            return s
 
+        # ── ☰ menu: occasional file actions live here, not on the bar ──────────
         self._recent_popover = Gtk.Popover()
         self._recent_popover.connect("show", self._rebuild_recent_menu)
-        recent_btn = Gtk.MenuButton()
-        recent_btn.set_icon_name("document-open-recent-symbolic")
-        recent_btn.set_tooltip_text("Open recent")
-        recent_btn.set_popover(self._recent_popover)
-        header.pack_start(recent_btn)
+        self._shortcuts_popover = self._build_shortcuts_popover()
 
-        new_btn = Gtk.Button(label="New")
-        new_btn.set_tooltip_text("Create a new blank A4 PDF")
-        new_btn.connect("clicked", self._on_new_pdf)
-        header.pack_start(new_btn)
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_icon_name("open-menu-symbolic")
+        menu_btn.set_tooltip_text("Menu")
+        self._recent_popover.set_parent(menu_btn)
+        self._shortcuts_popover.set_parent(menu_btn)
 
+        menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        menu_box.set_margin_top(6)
+        menu_box.set_margin_bottom(6)
+        menu_box.set_margin_start(6)
+        menu_box.set_margin_end(6)
+        menu_pop = Gtk.Popover()
+        menu_pop.set_child(menu_box)
+        menu_btn.set_popover(menu_pop)
+
+        # current filename shown at the top of the menu (no room on the bar)
+        self._file_label = Gtk.Label(label="", xalign=0)
+        self._file_label.add_css_class("dim-label")
+        self._file_label.add_css_class("caption")
+        self._file_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self._file_label.set_max_width_chars(28)
+        self._file_label.set_margin_start(6)
+        self._file_label.set_margin_bottom(2)
+        menu_box.append(self._file_label)
+        msep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        msep.set_margin_bottom(2)
+        menu_box.append(msep)
+
+        def _menu_item(label, callback):
+            item = Gtk.Button()
+            item.add_css_class("flat")
+            item.set_child(Gtk.Label(label=label, xalign=0))
+            item.connect("clicked", lambda _b: (menu_pop.popdown(), callback()))
+            menu_box.append(item)
+            return item
+
+        _menu_item("Open…", lambda: self._on_open(None))
+        _menu_item("Open recent", lambda: self._recent_popover.popup())
+        _menu_item("New", lambda: self._on_new_pdf(None))
+        _menu_item("Save", lambda: self._on_save())
+        _menu_item("Export with notes…", lambda: self._on_export())
+        msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        msep2.set_margin_top(2)
+        msep2.set_margin_bottom(2)
+        menu_box.append(msep2)
+        _menu_item("Keyboard shortcuts", lambda: self._shortcuts_popover.popup())
+
+        # ── outline / thumbnails sidebar toggle ────────────────────────────────
         # stays sensitive even without a TOC — insensitive widgets get no
         # tooltip in GTK4, and the tooltip is how we explain the situation
         self._has_toc = False
         self._toc_thumbs = False
         self._thumb_idle_id = None
         self._toc_btn = Gtk.ToggleButton()
-        self._toc_btn.set_icon_name("view-list-symbolic")
+        self._toc_btn.set_icon_name(
+            _themed_icon("view-list-symbolic", "view-list-text-symbolic",
+                         "format-justify-fill-symbolic"))
         self._toc_btn.set_tooltip_text("No document open")
         self._toc_btn.connect("toggled", self._on_toc_toggled)
-        header.pack_start(self._toc_btn)
 
+        # ── page navigation ────────────────────────────────────────────────────
         prev_btn = Gtk.Button()
         prev_btn.set_icon_name("go-previous-symbolic")
         prev_btn.set_tooltip_text("Previous page (PageUp)")
@@ -2351,85 +2530,121 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         next_btn.set_tooltip_text("Next page (PageDown)")
         next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
 
-        add_page_btn = Gtk.Button()
-        add_page_btn.set_icon_name("list-add-symbolic")
-        add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
-        add_page_btn.connect("clicked", lambda _: self._add_blank_page())
-
-        del_page_btn = Gtk.Button()
-        del_page_btn.set_icon_name("list-remove-symbolic")
-        del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
-        del_page_btn.connect("clicked", lambda _: self._delete_current_page())
-
         nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
         nav_box.append(prev_btn)
         nav_box.append(self._page_label)
         nav_box.append(next_btn)
-        nav_box.append(add_page_btn)
-        nav_box.append(del_page_btn)
 
-        self._file_label = Gtk.Label(label="")
-        self._file_label.add_css_class("dim-label")
-        self._file_label.add_css_class("caption")
-        self._file_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-        self._file_label.set_max_width_chars(28)
-        self._file_label.set_valign(Gtk.Align.CENTER)
+        # ── add / delete page (linked group next to nav) ───────────────────────
+        self._add_page_btn = Gtk.Button()
+        self._add_page_btn.set_icon_name("list-add-symbolic")
+        self._add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
+        self._add_page_btn.connect("clicked", lambda _: self._add_blank_page())
 
-        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        title_box.set_valign(Gtk.Align.CENTER)
-        title_box.append(nav_box)
-        title_box.append(self._file_label)
-        header.set_title_widget(title_box)
+        self._del_page_btn = Gtk.Button()
+        self._del_page_btn.set_icon_name("list-remove-symbolic")
+        self._del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
+        self._del_page_btn.connect("clicked", lambda _: self._delete_current_page())
 
-        redo_btn = Gtk.Button()
-        redo_btn.set_icon_name("edit-redo-symbolic")
-        redo_btn.set_tooltip_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
-        redo_btn.connect("clicked", lambda _: self._global_redo())
-        header.pack_end(redo_btn)
+        pages_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        pages_box.add_css_class("linked")
+        pages_box.append(self._add_page_btn)
+        pages_box.append(self._del_page_btn)
 
-        undo_btn = Gtk.Button()
-        undo_btn.set_icon_name("edit-undo-symbolic")
-        undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
-        undo_btn.connect("clicked", lambda _: self._global_undo())
-        header.pack_end(undo_btn)
+        # ── tool-mode switch: pen / highlighter / select (icons, segmented) ─────
+        # No themed icons exist for highlighter or text-select, so both are tiny
+        # custom cairo glyphs; pen uses the standard pencil.
+        def _draw_mode_hl(_a, ctx, w, h):
+            r, g, b = self.canvas.hl_color
+            ctx.set_source_rgba(r, g, b, max(self.canvas.hl_opacity, 0.55))
+            ctx.set_line_width(7)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.move_to(4, h - 5)
+            ctx.line_to(w - 4, 5)
+            ctx.stroke()
 
-        save_btn = Gtk.Button(label="Save")
-        save_btn.add_css_class("save-button")
-        save_btn.set_tooltip_text("Save (Ctrl+S)")
-        save_btn.connect("clicked", self._on_save)
-        header.pack_end(save_btn)
+        def _draw_mode_sel(_a, ctx, w, h):
+            ctx.set_source_rgba(*acc, 0.40)
+            ctx.rectangle(1.5, 3, w - 3, h - 6)
+            ctx.fill()
+            ctx.set_source_rgb(*fg)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(11)
+            ext = ctx.text_extents("A")
+            ctx.move_to((w - ext.width) / 2 - ext.x_bearing,
+                        (h - ext.height) / 2 - ext.y_bearing)
+            ctx.show_text("A")
 
-        export_btn = Gtk.Button()
-        export_btn.set_icon_name("document-send-symbolic")
-        export_btn.set_tooltip_text("Export with notes (Ctrl+E)")
-        export_btn.connect("clicked", lambda _: self._on_export())
-        header.pack_end(export_btn)
+        def _glyph(fn):
+            d = Gtk.DrawingArea()
+            d.set_content_width(16)
+            d.set_content_height(16)
+            d.set_draw_func(fn)
+            return d
 
-        # pen settings popover
+        self._mode_pen = Gtk.ToggleButton()
+        self._mode_pen.set_icon_name("document-edit-symbolic")
+        self._mode_pen.set_tooltip_text("Pen")
+        self._mode_pen.set_active(True)
+        self._mode_hl = Gtk.ToggleButton()
+        self._mode_hl.set_child(_glyph(_draw_mode_hl))
+        self._mode_hl.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._mode_hl.set_group(self._mode_pen)
+        self._mode_select = Gtk.ToggleButton()
+        self._mode_select.set_child(_glyph(_draw_mode_sel))
+        self._mode_select.set_tooltip_text("Select text (Ctrl+M)")
+        self._mode_select.set_group(self._mode_pen)
+        self._mode_pen.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("pen"))
+        self._mode_hl.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("highlighter"))
+        self._mode_select.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("select"))
+
+        self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        tools_box.add_css_class("linked")
+        tools_box.append(self._mode_pen)
+        tools_box.append(self._mode_hl)
+        tools_box.append(self._mode_select)
+
+        # ── pen settings popover: width / colour / smoothing (mode is on bar) ──
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         popover_box.set_margin_start(16)
         popover_box.set_margin_end(16)
         popover_box.set_margin_top(12)
         popover_box.set_margin_bottom(12)
 
-        # tool switcher — the width/color controls below edit the active tool
-        tool_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        tool_box.add_css_class("linked")
-        tool_box.set_homogeneous(True)
-        self._pen_seg = Gtk.ToggleButton(label="Pen")
-        self._pen_seg.set_active(True)
-        self._hl_toggle = Gtk.ToggleButton(label="Highlighter")
-        self._hl_toggle.set_tooltip_text("Wide translucent strokes (Ctrl+H)")
-        self._hl_toggle.set_group(self._pen_seg)
-        self._hl_toggle.connect("toggled", self._on_highlighter_toggled)
-        tool_box.append(self._pen_seg)
-        tool_box.append(self._hl_toggle)
-        popover_box.append(tool_box)
+        # ── tool-mode mirror: only shown when the bar collapses the segmented
+        # switch off the header; kept in sync with the header toggles ──────────
+        self._pen_modes_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        mode_label = Gtk.Label(label="Tool", xalign=0)
+        mode_label.add_css_class("dim-label")
+        self._pen_modes_section.append(mode_label)
+
+        self._pmode_pen = Gtk.ToggleButton()
+        self._pmode_pen.set_icon_name("document-edit-symbolic")
+        self._pmode_pen.set_tooltip_text("Pen")
+        self._pmode_pen.set_active(True)
+        self._pmode_hl = Gtk.ToggleButton()
+        self._pmode_hl.set_child(_glyph(_draw_mode_hl))
+        self._pmode_hl.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._pmode_hl.set_group(self._pmode_pen)
+        self._pmode_select = Gtk.ToggleButton()
+        self._pmode_select.set_child(_glyph(_draw_mode_sel))
+        self._pmode_select.set_tooltip_text("Select text (Ctrl+M)")
+        self._pmode_select.set_group(self._pmode_pen)
+        self._pmode_pen.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("pen"))
+        self._pmode_hl.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("highlighter"))
+        self._pmode_select.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("select"))
+        pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        pmode_box.add_css_class("linked")
+        pmode_box.append(self._pmode_pen)
+        pmode_box.append(self._pmode_hl)
+        pmode_box.append(self._pmode_select)
+        self._pen_modes_section.append(pmode_box)
+        self._pen_modes_section.set_visible(False)
+        popover_box.append(self._pen_modes_section)
 
         width_label = Gtk.Label(label="Width", xalign=0)
         width_label.add_css_class("dim-label")
-        width_label.set_margin_top(6)
         popover_box.append(width_label)
 
         self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5.0, 0.1)
@@ -2475,75 +2690,99 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             swatches_box.append(swatch)
         popover_box.append(swatches_box)
 
+        smooth_label = Gtk.Label(label="Smoothing", xalign=0)
+        smooth_label.add_css_class("dim-label")
+        smooth_label.set_margin_top(6)
+        popover_box.append(smooth_label)
+
+        self._smooth_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        self._smooth_scale.set_value(self.canvas.smoothing * 100)
+        self._smooth_scale.set_draw_value(True)
+        self._smooth_scale.set_size_request(200, -1)
+        self._smooth_scale.set_tooltip_text(
+            "How much freehand strokes are smoothed when you lift the pen")
+        self._smooth_scale.connect("value-changed", self._on_smoothing_changed)
+        popover_box.append(self._smooth_scale)
+
         popover = Gtk.Popover()
         popover.set_child(popover_box)
 
-        self._pen_btn = Gtk.MenuButton()
-        self._pen_btn.set_icon_name("document-edit-symbolic")
-        self._pen_btn.set_tooltip_text("Pen settings")
-        self._pen_btn.set_popover(popover)
-        header.pack_end(self._pen_btn)
+        # the settings button shows the active tool's colour as a swatch
+        self._color_swatch = Gtk.DrawingArea()
+        self._color_swatch.set_content_width(18)
+        self._color_swatch.set_content_height(18)
 
-        # draw ↔ select-text mode toggle (Ctrl+M). Active = a plain drag
-        # selects text instead of drawing; Alt+drag still selects in either.
-        # Custom icon: a glyph with a selection highlight behind it (Adwaita
-        # has no clear "select text" icon), mirroring the highlighter preview.
-        self._select_toggle = Gtk.ToggleButton()
-        self._select_toggle.set_tooltip_text("Select-text mode (Ctrl+M)")
-        sel_icon = Gtk.DrawingArea()
-        sel_icon.set_content_width(16)
-        sel_icon.set_content_height(16)
-
-        def _draw_sel_icon(_area, ctx, w, h):
-            # selection highlight box behind the glyph
-            ctx.set_source_rgba(*acc, 0.40)
-            ctx.rectangle(1.5, 3, w - 3, h - 6)
+        def _draw_swatch(_a, ctx, w, h):
+            color = self.canvas.hl_color if self.canvas.highlighter else self.canvas.pen_color
+            ctx.set_source_rgb(*color)
+            ctx.arc(w / 2, h / 2, min(w, h) / 2 - 2, 0, 6.2832)
             ctx.fill()
-            # the glyph
-            ctx.set_source_rgb(*fg)
-            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
-                                 cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(11)
-            ext = ctx.text_extents("A")
-            ctx.move_to((w - ext.width) / 2 - ext.x_bearing,
-                        (h - ext.height) / 2 - ext.y_bearing)
-            ctx.show_text("A")
-        sel_icon.set_draw_func(_draw_sel_icon)
-        self._select_toggle.set_child(sel_icon)
-        self._select_toggle.connect("toggled", self._on_select_mode_toggled)
-        header.pack_end(self._select_toggle)
+        self._color_swatch.set_draw_func(_draw_swatch)
 
-        # While the highlighter is active the pen button shows a mini preview
-        # of the actual highlight stroke instead of the pencil icon — Adwaita
-        # ships no marker icon, and this doubles as a color hint.
-        self._hl_icon = Gtk.DrawingArea()
-        self._hl_icon.set_content_width(18)
-        self._hl_icon.set_content_height(18)
+        self._pen_btn = Gtk.MenuButton()
+        self._pen_btn.set_child(self._color_swatch)
+        self._pen_btn.set_tooltip_text("Pen settings (colour, width, smoothing)")
+        self._pen_btn.set_popover(popover)
 
-        def _draw_hl_icon(_area, ctx, w, h):
-            r, g, b = self.canvas.hl_color
-            ctx.set_source_rgba(r, g, b, max(self.canvas.hl_opacity, 0.55))
-            ctx.set_line_width(7)
-            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-            ctx.move_to(4, h - 5)
-            ctx.line_to(w - 4, 5)
-            ctx.stroke()
-        self._hl_icon.set_draw_func(_draw_hl_icon)
+        # ── undo / redo ────────────────────────────────────────────────────────
+        self._undo_btn = Gtk.Button()
+        self._undo_btn.set_icon_name("edit-undo-symbolic")
+        self._undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
+        self._undo_btn.connect("clicked", lambda _: self._global_undo())
 
-        # notes toggle
+        self._redo_btn = Gtk.Button()
+        self._redo_btn.set_icon_name("edit-redo-symbolic")
+        self._redo_btn.set_tooltip_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+        self._redo_btn.connect("clicked", lambda _: self._global_redo())
+
+        # ── right side: search + notes panel ───────────────────────────────────
+        self._search_btn = search_btn = Gtk.Button()
+        search_btn.set_icon_name("edit-find-symbolic")
+        search_btn.set_tooltip_text("Search PDF & notes (Ctrl+F)")
+        search_btn.connect("clicked", lambda _: self._show_search())
+
         self._notes_toggle = Gtk.ToggleButton()
-        self._notes_toggle.set_icon_name("view-sidebar-symbolic")
+        self._notes_toggle.set_icon_name(
+            _themed_icon("view-sidebar-symbolic", "sidebar-show-symbolic"))
         self._notes_toggle.set_tooltip_text("Toggle notes (Ctrl+\\)")
         self._notes_toggle.set_active(True)
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
-        header.pack_end(self._notes_toggle)
 
-        # shortcuts help
-        help_btn = Gtk.MenuButton()
-        help_btn.set_label("?")
-        help_btn.set_tooltip_text("Keyboard shortcuts")
-        help_btn.set_popover(self._build_shortcuts_popover())
-        header.pack_end(help_btn)
+        # ── assemble: two cluster boxes so the bar's real content width can be
+        # measured directly (the HeaderBar's own natural width is inflated by the
+        # symmetric space it reserves to centre the — here empty — title) ───────
+        self._undo_sep = vsep()
+        self._header_start = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for w in (menu_btn, vsep(), self._toc_btn, nav_box, pages_box, vsep(),
+                  tools_box, self._pen_btn, self._undo_sep, self._undo_btn,
+                  self._redo_btn):
+            self._header_start.append(w)
+
+        self._header_end = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._header_end.append(search_btn)
+        self._header_end.append(self._notes_toggle)
+
+        # Icon buttons don't compress, so the cluster's *minimum* width equals
+        # its natural width — which would become the whole window's minimum and
+        # stop it ever getting narrow enough to collapse. Wrapping it in a
+        # non-scrolling ScrolledWindow makes the reported minimum ~0 (it could
+        # scroll) while still asking for the natural width when there's room, so
+        # the window can shrink and our resize hook collapses before any
+        # scrolling is ever needed.
+        start_scroll = Gtk.ScrolledWindow()
+        start_scroll.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+        start_scroll.set_propagate_natural_width(True)
+        start_scroll.set_child(self._header_start)
+        header.pack_start(start_scroll)
+        header.pack_end(self._header_end)
+
+        self._set_tool_mode("pen")
+
+        # responsive collapse: the canvas DrawingArea fires ::resize on every
+        # window resize (the HeaderBar itself does not), so use it as the tick
+        # and read the header's real allocated width.
+        self.canvas.connect("resize", lambda *_: self._update_header_collapse())
+        header.connect("map", lambda *_: self._update_header_collapse())
 
         # ── notes panel ───────────────────────────────────────────────────────
         self._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2791,7 +3030,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._init_pane_position)
 
     def _init_pane_position(self):
-        width = self.get_allocated_width()
+        width = self.get_width()
         if width < 200:
             return GLib.SOURCE_CONTINUE
         self._saved_pane_pos = int(width * 0.62)
@@ -3140,6 +3379,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf.insert(it, f" <!-- callout:{px}:{py} -->")
         self._mark_dirty()
 
+    def _on_anchor_moved(self, idx, px, py):
+        """Rewrite the idx-th anchor marker in the notes with its new
+        position. The buffer's changed handler refreshes the canvas anchors."""
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        matches = list(_ANCHOR_RE.finditer(text))
+        if idx >= len(matches):
+            return
+        m = matches[idx]
+        start = buf.get_iter_at_offset(m.start())
+        end = buf.get_iter_at_offset(m.end())
+        buf.delete(start, end)
+        buf.insert(start, f"<!-- anchor:{px}:{py} -->")
+        self._mark_dirty()
+
     def _on_anchor_clicked(self, idx):
         if idx >= len(self._anchor_line_nos):
             return
@@ -3310,15 +3564,97 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
-    def _on_select_mode_toggled(self, btn):
-        select = btn.get_active()
-        self.canvas.select_mode = select
-        # cursor doubles as the mode indicator
-        self.canvas.set_cursor(
-            Gdk.Cursor.new_from_name("text", None) if select else None)
+    def _set_tool_mode(self, mode):
+        """mode in {'pen', 'highlighter', 'select'} — the bar's segmented switch.
+
+        Mirrored by a second toggle group inside the pen popover (shown when the
+        bar collapses); keep both in sync without re-entering on the echo.
+        """
+        if self._syncing_mode:
+            return
+        self._syncing_mode = True
+        try:
+            self.canvas.highlighter = (mode == "highlighter")
+            self.canvas.select_mode = (mode == "select")
+            # cursor doubles as the select-mode indicator
+            self.canvas.set_cursor(
+                Gdk.Cursor.new_from_name("text", None) if mode == "select" else None)
+            for grp in ((self._mode_pen, self._mode_hl, self._mode_select),
+                        (self._pmode_pen, self._pmode_hl, self._pmode_select)):
+                {"pen": grp[0], "highlighter": grp[1], "select": grp[2]}[mode].set_active(True)
+        finally:
+            self._syncing_mode = False
+        self._sync_pen_popover()
+        self._color_swatch.queue_draw()
+
+    # ── responsive header collapse ──────────────────────────────────────────
+    def _apply_collapse_level(self, level):
+        """0: full · 1: fold pen modes into the popover · 2: also hide
+        undo/redo/find. Idempotent."""
+        if level == self._collapse_level:
+            return
+        self._collapse_level = level
+        collapse_pen = level >= 1
+        self._tools_box.set_visible(not collapse_pen)
+        self._pen_modes_section.set_visible(collapse_pen)
+        for b in (self._undo_btn, self._redo_btn, self._search_btn, self._undo_sep):
+            b.set_visible(level < 2)
+
+    # widen-to-expand needs this much extra slack over the bare fit, so a level
+    # change doesn't flicker on 1px resize jitter at the boundary
+    _COLLAPSE_HYSTERESIS = 16
+
+    def _measure_controls(self):
+        """Non-content width: window buttons + edge padding, read from the real
+        allocation (left offset of the start cluster + right gap after the end
+        cluster). Re-read each tick so a too-early first reading can't stick."""
+        oks, rs = self._header_start.compute_bounds(self._header)
+        oke, re = self._header_end.compute_bounds(self._header)
+        if not (oks and oke):
+            return self._header_controls or 80
+        left = rs.origin.x
+        right = self._header.get_width() - (re.origin.x + re.get_width())
+        return int(max(0, left) + max(0, right))
+
+    def _calibrate_header(self):
+        """Record each collapse level's real content width (both clusters), once,
+        from the actual widgets — so the breakpoints are derived, not guessed."""
+        saved = self._collapse_level
+        nat = {}
+        for lvl in (2, 1, 0):
+            self._apply_collapse_level(lvl)
+            s = self._header_start.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            e = self._header_end.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            nat[lvl] = s + e
+        self._collapse_natural = nat
+        if saved >= 0:
+            self._apply_collapse_level(saved)
+
+    def _update_header_collapse(self, *_):
+        w = self._header.get_width()
+        if w <= 1:
+            return
+        if self._collapse_natural is None:
+            self._calibrate_header()
+        self._header_controls = self._measure_controls()
+        avail = w - self._header_controls
+        nat = self._collapse_natural
+        # least collapse whose real content width still fits the space left after
+        # the window buttons
+        level = 0 if avail >= nat[0] else (1 if avail >= nat[1] else 2)
+        # hysteresis: only expand (show more) when there's clear extra room, so
+        # we don't oscillate sitting exactly on a breakpoint
+        cur = self._collapse_level
+        if 0 <= level < cur and avail < nat[level] + self._COLLAPSE_HYSTERESIS:
+            level = cur
+        self._apply_collapse_level(level)
 
     def _toggle_select_mode(self):
-        self._select_toggle.set_active(not self._select_toggle.get_active())
+        """Ctrl+M: flip select-text on/off, falling back to pen."""
+        if self._mode_select.get_active():
+            self._mode_pen.set_active(True)
+        else:
+            self._mode_select.set_active(True)
 
     def _on_notes_toggled(self, btn):
         w = self.get_width() or 1280
@@ -3399,6 +3735,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self.canvas.pen_width = scale.get_value()
 
+    def _on_smoothing_changed(self, scale):
+        self.canvas.smoothing = scale.get_value() / 100.0
+
     def _on_color_changed(self, btn, _param=None):
         if self._syncing_pen:
             return
@@ -3406,28 +3745,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         rgb = (rgba.red, rgba.green, rgba.blue)
         if self.canvas.highlighter:
             self.canvas.hl_color = rgb
-            self._hl_icon.queue_draw()
+            self._mode_hl.get_child().queue_draw()
         else:
             self.canvas.pen_color = rgb
+        self._color_swatch.queue_draw()
 
     def _toggle_highlighter(self):
-        """Ctrl+H: flip the Pen/Highlighter segment pair."""
-        if self._hl_toggle.get_active():
-            self._pen_seg.set_active(True)
+        """Ctrl+H: flip highlighter on/off, falling back to pen."""
+        if self._mode_hl.get_active():
+            self._mode_pen.set_active(True)
         else:
-            self._hl_toggle.set_active(True)
-
-    def _on_highlighter_toggled(self, btn):
-        self.canvas.highlighter = btn.get_active()
-        if self.canvas.highlighter:
-            self._pen_btn.set_child(self._hl_icon)
-            self._hl_icon.queue_draw()
-            self._pen_btn.set_tooltip_text("Pen settings — highlighter active (Ctrl+H)")
-        else:
-            self._pen_btn.set_child(None)
-            self._pen_btn.set_icon_name("document-edit-symbolic")
-            self._pen_btn.set_tooltip_text("Pen settings")
-        self._sync_pen_popover()
+            self._mode_hl.set_active(True)
 
     def _sync_pen_popover(self):
         """Point the width scale and color button at the active tool."""
