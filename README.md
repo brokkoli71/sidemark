@@ -45,7 +45,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
-- **Responsive header** — when the window gets narrow, secondary actions (New, add / delete page, export) collapse into a ⋮ overflow menu so the core controls stay reachable
+- **Responsive header** — a compact single-row toolbar (file actions live in the ☰ menu); as the window narrows it measures itself and folds progressively — first the pen / highlighter / select switch tucks into the pen-settings popover, then undo / redo / find drop away — so the core controls stay reachable at any width
 
 ## Installation
 

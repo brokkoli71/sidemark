@@ -2333,6 +2333,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._dirty = False
         self._suppress_dirty = False
         self._syncing_pen = False   # guard while pen popover mirrors tool state
+        self._syncing_mode = False  # guard while tool-mode toggles mirror each other
+        # responsive header: natural width (px) of the button clusters at each
+        # collapse level, measured once from the real widgets — no hard-coded
+        # threshold. _header_controls is the non-content width (window buttons +
+        # edge padding) read from the real allocation.
+        self._collapse_natural = None
+        self._header_controls = 0
+        self._collapse_level = -1
         # global chronological undo: one entry per canvas gesture, one per
         # uninterrupted typing burst in the notes panel.
         # ("canvas",) | ("notes", page_idx, text_before_burst)
@@ -2393,12 +2401,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         fg_hex  = theme["foreground"]
         bg_hex  = theme["background"]
         css = f"""
-            .save-button {{
-                background: {acc_hex};
-                color: {fg_hex};
-                font-weight: bold;
-            }}
-            .save-button:hover {{ background: shade({acc_hex}, 1.1); }}
             .notes-view {{
                 font-family: monospace;
                 font-size: 13px;
@@ -2439,24 +2441,69 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # fullscreen.
         header = Gtk.HeaderBar()
         self._header = header
+        # Suppress the default centred window-title label; the bar is purely
+        # grouped button clusters flowing from the edges.
+        header.set_title_widget(Gtk.Box())
 
-        open_btn = Gtk.Button(label="Open")
-        open_btn.connect("clicked", self._on_open)
-        header.pack_start(open_btn)
+        def vsep():
+            s = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+            s.set_margin_start(3)
+            s.set_margin_end(3)
+            return s
 
+        # ── ☰ menu: occasional file actions live here, not on the bar ──────────
         self._recent_popover = Gtk.Popover()
         self._recent_popover.connect("show", self._rebuild_recent_menu)
-        recent_btn = Gtk.MenuButton()
-        recent_btn.set_icon_name("document-open-recent-symbolic")
-        recent_btn.set_tooltip_text("Open recent")
-        recent_btn.set_popover(self._recent_popover)
-        header.pack_start(recent_btn)
+        self._shortcuts_popover = self._build_shortcuts_popover()
 
-        self._new_btn = Gtk.Button(label="New")
-        self._new_btn.set_tooltip_text("Create a new blank A4 PDF")
-        self._new_btn.connect("clicked", self._on_new_pdf)
-        header.pack_start(self._new_btn)
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_icon_name("open-menu-symbolic")
+        menu_btn.set_tooltip_text("Menu")
+        self._recent_popover.set_parent(menu_btn)
+        self._shortcuts_popover.set_parent(menu_btn)
 
+        menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        menu_box.set_margin_top(6)
+        menu_box.set_margin_bottom(6)
+        menu_box.set_margin_start(6)
+        menu_box.set_margin_end(6)
+        menu_pop = Gtk.Popover()
+        menu_pop.set_child(menu_box)
+        menu_btn.set_popover(menu_pop)
+
+        # current filename shown at the top of the menu (no room on the bar)
+        self._file_label = Gtk.Label(label="", xalign=0)
+        self._file_label.add_css_class("dim-label")
+        self._file_label.add_css_class("caption")
+        self._file_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self._file_label.set_max_width_chars(28)
+        self._file_label.set_margin_start(6)
+        self._file_label.set_margin_bottom(2)
+        menu_box.append(self._file_label)
+        msep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        msep.set_margin_bottom(2)
+        menu_box.append(msep)
+
+        def _menu_item(label, callback):
+            item = Gtk.Button()
+            item.add_css_class("flat")
+            item.set_child(Gtk.Label(label=label, xalign=0))
+            item.connect("clicked", lambda _b: (menu_pop.popdown(), callback()))
+            menu_box.append(item)
+            return item
+
+        _menu_item("Open…", lambda: self._on_open(None))
+        _menu_item("Open recent", lambda: self._recent_popover.popup())
+        _menu_item("New", lambda: self._on_new_pdf(None))
+        _menu_item("Save", lambda: self._on_save())
+        _menu_item("Export with notes…", lambda: self._on_export())
+        msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        msep2.set_margin_top(2)
+        msep2.set_margin_bottom(2)
+        menu_box.append(msep2)
+        _menu_item("Keyboard shortcuts", lambda: self._shortcuts_popover.popup())
+
+        # ── outline / thumbnails sidebar toggle ────────────────────────────────
         # stays sensitive even without a TOC — insensitive widgets get no
         # tooltip in GTK4, and the tooltip is how we explain the situation
         self._has_toc = False
@@ -2468,8 +2515,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                          "format-justify-fill-symbolic"))
         self._toc_btn.set_tooltip_text("No document open")
         self._toc_btn.connect("toggled", self._on_toc_toggled)
-        header.pack_start(self._toc_btn)
 
+        # ── page navigation ────────────────────────────────────────────────────
         prev_btn = Gtk.Button()
         prev_btn.set_icon_name("go-previous-symbolic")
         prev_btn.set_tooltip_text("Previous page (PageUp)")
@@ -2483,6 +2530,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         next_btn.set_tooltip_text("Next page (PageDown)")
         next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
 
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        nav_box.add_css_class("linked")
+        nav_box.append(prev_btn)
+        nav_box.append(self._page_label)
+        nav_box.append(next_btn)
+
+        # ── add / delete page (linked group next to nav) ───────────────────────
         self._add_page_btn = Gtk.Button()
         self._add_page_btn.set_icon_name("list-add-symbolic")
         self._add_page_btn.set_tooltip_text("Add blank page after this one (Ctrl+Shift+N)")
@@ -2493,107 +2547,104 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
         self._del_page_btn.connect("clicked", lambda _: self._delete_current_page())
 
-        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        nav_box.add_css_class("linked")
-        nav_box.append(prev_btn)
-        nav_box.append(self._page_label)
-        nav_box.append(next_btn)
-        nav_box.append(self._add_page_btn)
-        nav_box.append(self._del_page_btn)
+        pages_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        pages_box.add_css_class("linked")
+        pages_box.append(self._add_page_btn)
+        pages_box.append(self._del_page_btn)
 
-        self._file_label = Gtk.Label(label="")
-        self._file_label.add_css_class("dim-label")
-        self._file_label.add_css_class("caption")
-        self._file_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-        self._file_label.set_max_width_chars(28)
-        self._file_label.set_valign(Gtk.Align.CENTER)
+        # ── tool-mode switch: pen / highlighter / select (icons, segmented) ─────
+        # No themed icons exist for highlighter or text-select, so both are tiny
+        # custom cairo glyphs; pen uses the standard pencil.
+        def _draw_mode_hl(_a, ctx, w, h):
+            r, g, b = self.canvas.hl_color
+            ctx.set_source_rgba(r, g, b, max(self.canvas.hl_opacity, 0.55))
+            ctx.set_line_width(7)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.move_to(4, h - 5)
+            ctx.line_to(w - 4, 5)
+            ctx.stroke()
 
-        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        title_box.set_valign(Gtk.Align.CENTER)
-        title_box.append(nav_box)
-        title_box.append(self._file_label)
-        header.set_title_widget(title_box)
+        def _draw_mode_sel(_a, ctx, w, h):
+            ctx.set_source_rgba(*acc, 0.40)
+            ctx.rectangle(1.5, 3, w - 3, h - 6)
+            ctx.fill()
+            ctx.set_source_rgb(*fg)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(11)
+            ext = ctx.text_extents("A")
+            ctx.move_to((w - ext.width) / 2 - ext.x_bearing,
+                        (h - ext.height) / 2 - ext.y_bearing)
+            ctx.show_text("A")
 
-        # Overflow menu: holds the controls that collapse out of the bar when
-        # the window is too narrow (wired up by the Adw.Breakpoint below). Far
-        # right, hidden until the breakpoint reveals it.
-        self._overflow_btn = Gtk.MenuButton()
-        self._overflow_btn.set_icon_name(
-            _themed_icon("view-more-symbolic", "open-menu-symbolic"))
-        self._overflow_btn.set_tooltip_text("More actions")
-        self._overflow_btn.set_visible(False)
-        overflow_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        overflow_box.set_margin_top(4)
-        overflow_box.set_margin_bottom(4)
-        overflow_box.set_margin_start(4)
-        overflow_box.set_margin_end(4)
+        def _glyph(fn):
+            d = Gtk.DrawingArea()
+            d.set_content_width(16)
+            d.set_content_height(16)
+            d.set_draw_func(fn)
+            return d
 
-        def _overflow_item(label, callback):
-            item = Gtk.Button()
-            item.add_css_class("flat")
-            item.set_child(Gtk.Label(label=label, xalign=0))
-            item.connect("clicked",
-                         lambda _b: (self._overflow_btn.popdown(), callback()))
-            overflow_box.append(item)
-            return item
+        self._mode_pen = Gtk.ToggleButton()
+        self._mode_pen.set_icon_name("document-edit-symbolic")
+        self._mode_pen.set_tooltip_text("Pen")
+        self._mode_pen.set_active(True)
+        self._mode_hl = Gtk.ToggleButton()
+        self._mode_hl.set_child(_glyph(_draw_mode_hl))
+        self._mode_hl.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._mode_hl.set_group(self._mode_pen)
+        self._mode_select = Gtk.ToggleButton()
+        self._mode_select.set_child(_glyph(_draw_mode_sel))
+        self._mode_select.set_tooltip_text("Select text (Ctrl+M)")
+        self._mode_select.set_group(self._mode_pen)
+        self._mode_pen.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("pen"))
+        self._mode_hl.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("highlighter"))
+        self._mode_select.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("select"))
 
-        _overflow_item("New PDF", lambda: self._on_new_pdf(None))
-        _overflow_item("Add page after this", self._add_blank_page)
-        _overflow_item("Delete this page", self._delete_current_page)
-        _overflow_item("Export with notes…", self._on_export)
-        overflow_pop = Gtk.Popover()
-        overflow_pop.set_child(overflow_box)
-        self._overflow_btn.set_popover(overflow_pop)
-        header.pack_end(self._overflow_btn)
+        self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        tools_box.add_css_class("linked")
+        tools_box.append(self._mode_pen)
+        tools_box.append(self._mode_hl)
+        tools_box.append(self._mode_select)
 
-        redo_btn = Gtk.Button()
-        redo_btn.set_icon_name("edit-redo-symbolic")
-        redo_btn.set_tooltip_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
-        redo_btn.connect("clicked", lambda _: self._global_redo())
-        header.pack_end(redo_btn)
-
-        undo_btn = Gtk.Button()
-        undo_btn.set_icon_name("edit-undo-symbolic")
-        undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
-        undo_btn.connect("clicked", lambda _: self._global_undo())
-        header.pack_end(undo_btn)
-
-        save_btn = Gtk.Button(label="Save")
-        save_btn.add_css_class("save-button")
-        save_btn.set_tooltip_text("Save (Ctrl+S)")
-        save_btn.connect("clicked", self._on_save)
-        header.pack_end(save_btn)
-
-        self._export_btn = Gtk.Button()
-        self._export_btn.set_icon_name("document-send-symbolic")
-        self._export_btn.set_tooltip_text("Export with notes (Ctrl+E)")
-        self._export_btn.connect("clicked", lambda _: self._on_export())
-        header.pack_end(self._export_btn)
-
-        # pen settings popover
+        # ── pen settings popover: width / colour / smoothing (mode is on bar) ──
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         popover_box.set_margin_start(16)
         popover_box.set_margin_end(16)
         popover_box.set_margin_top(12)
         popover_box.set_margin_bottom(12)
 
-        # tool switcher — the width/color controls below edit the active tool
-        tool_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        tool_box.add_css_class("linked")
-        tool_box.set_homogeneous(True)
-        self._pen_seg = Gtk.ToggleButton(label="Pen")
-        self._pen_seg.set_active(True)
-        self._hl_toggle = Gtk.ToggleButton(label="Highlighter")
-        self._hl_toggle.set_tooltip_text("Wide translucent strokes (Ctrl+H)")
-        self._hl_toggle.set_group(self._pen_seg)
-        self._hl_toggle.connect("toggled", self._on_highlighter_toggled)
-        tool_box.append(self._pen_seg)
-        tool_box.append(self._hl_toggle)
-        popover_box.append(tool_box)
+        # ── tool-mode mirror: only shown when the bar collapses the segmented
+        # switch off the header; kept in sync with the header toggles ──────────
+        self._pen_modes_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        mode_label = Gtk.Label(label="Tool", xalign=0)
+        mode_label.add_css_class("dim-label")
+        self._pen_modes_section.append(mode_label)
+
+        self._pmode_pen = Gtk.ToggleButton()
+        self._pmode_pen.set_icon_name("document-edit-symbolic")
+        self._pmode_pen.set_tooltip_text("Pen")
+        self._pmode_pen.set_active(True)
+        self._pmode_hl = Gtk.ToggleButton()
+        self._pmode_hl.set_child(_glyph(_draw_mode_hl))
+        self._pmode_hl.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._pmode_hl.set_group(self._pmode_pen)
+        self._pmode_select = Gtk.ToggleButton()
+        self._pmode_select.set_child(_glyph(_draw_mode_sel))
+        self._pmode_select.set_tooltip_text("Select text (Ctrl+M)")
+        self._pmode_select.set_group(self._pmode_pen)
+        self._pmode_pen.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("pen"))
+        self._pmode_hl.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("highlighter"))
+        self._pmode_select.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("select"))
+        pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        pmode_box.add_css_class("linked")
+        pmode_box.append(self._pmode_pen)
+        pmode_box.append(self._pmode_hl)
+        pmode_box.append(self._pmode_select)
+        self._pen_modes_section.append(pmode_box)
+        self._pen_modes_section.set_visible(False)
+        popover_box.append(self._pen_modes_section)
 
         width_label = Gtk.Label(label="Width", xalign=0)
         width_label.add_css_class("dim-label")
-        width_label.set_margin_top(6)
         popover_box.append(width_label)
 
         self._width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 5.0, 0.1)
@@ -2656,73 +2707,82 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         popover = Gtk.Popover()
         popover.set_child(popover_box)
 
-        self._pen_btn = Gtk.MenuButton()
-        self._pen_btn.set_icon_name("document-edit-symbolic")
-        self._pen_btn.set_tooltip_text("Pen settings")
-        self._pen_btn.set_popover(popover)
-        header.pack_end(self._pen_btn)
+        # the settings button shows the active tool's colour as a swatch
+        self._color_swatch = Gtk.DrawingArea()
+        self._color_swatch.set_content_width(18)
+        self._color_swatch.set_content_height(18)
 
-        # draw ↔ select-text mode toggle (Ctrl+M). Active = a plain drag
-        # selects text instead of drawing; Alt+drag still selects in either.
-        # Custom icon: a glyph with a selection highlight behind it (Adwaita
-        # has no clear "select text" icon), mirroring the highlighter preview.
-        self._select_toggle = Gtk.ToggleButton()
-        self._select_toggle.set_tooltip_text("Select-text mode (Ctrl+M)")
-        sel_icon = Gtk.DrawingArea()
-        sel_icon.set_content_width(16)
-        sel_icon.set_content_height(16)
-
-        def _draw_sel_icon(_area, ctx, w, h):
-            # selection highlight box behind the glyph
-            ctx.set_source_rgba(*acc, 0.40)
-            ctx.rectangle(1.5, 3, w - 3, h - 6)
+        def _draw_swatch(_a, ctx, w, h):
+            color = self.canvas.hl_color if self.canvas.highlighter else self.canvas.pen_color
+            ctx.set_source_rgb(*color)
+            ctx.arc(w / 2, h / 2, min(w, h) / 2 - 2, 0, 6.2832)
             ctx.fill()
-            # the glyph
-            ctx.set_source_rgb(*fg)
-            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
-                                 cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(11)
-            ext = ctx.text_extents("A")
-            ctx.move_to((w - ext.width) / 2 - ext.x_bearing,
-                        (h - ext.height) / 2 - ext.y_bearing)
-            ctx.show_text("A")
-        sel_icon.set_draw_func(_draw_sel_icon)
-        self._select_toggle.set_child(sel_icon)
-        self._select_toggle.connect("toggled", self._on_select_mode_toggled)
-        header.pack_end(self._select_toggle)
+        self._color_swatch.set_draw_func(_draw_swatch)
 
-        # While the highlighter is active the pen button shows a mini preview
-        # of the actual highlight stroke instead of the pencil icon — Adwaita
-        # ships no marker icon, and this doubles as a color hint.
-        self._hl_icon = Gtk.DrawingArea()
-        self._hl_icon.set_content_width(18)
-        self._hl_icon.set_content_height(18)
+        self._pen_btn = Gtk.MenuButton()
+        self._pen_btn.set_child(self._color_swatch)
+        self._pen_btn.set_tooltip_text("Pen settings (colour, width, smoothing)")
+        self._pen_btn.set_popover(popover)
 
-        def _draw_hl_icon(_area, ctx, w, h):
-            r, g, b = self.canvas.hl_color
-            ctx.set_source_rgba(r, g, b, max(self.canvas.hl_opacity, 0.55))
-            ctx.set_line_width(7)
-            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-            ctx.move_to(4, h - 5)
-            ctx.line_to(w - 4, 5)
-            ctx.stroke()
-        self._hl_icon.set_draw_func(_draw_hl_icon)
+        # ── undo / redo ────────────────────────────────────────────────────────
+        self._undo_btn = Gtk.Button()
+        self._undo_btn.set_icon_name("edit-undo-symbolic")
+        self._undo_btn.set_tooltip_text("Undo (Ctrl+Z)")
+        self._undo_btn.connect("clicked", lambda _: self._global_undo())
 
-        # notes toggle
+        self._redo_btn = Gtk.Button()
+        self._redo_btn.set_icon_name("edit-redo-symbolic")
+        self._redo_btn.set_tooltip_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+        self._redo_btn.connect("clicked", lambda _: self._global_redo())
+
+        # ── right side: search + notes panel ───────────────────────────────────
+        self._search_btn = search_btn = Gtk.Button()
+        search_btn.set_icon_name("edit-find-symbolic")
+        search_btn.set_tooltip_text("Search PDF & notes (Ctrl+F)")
+        search_btn.connect("clicked", lambda _: self._show_search())
+
         self._notes_toggle = Gtk.ToggleButton()
         self._notes_toggle.set_icon_name(
             _themed_icon("view-sidebar-symbolic", "sidebar-show-symbolic"))
         self._notes_toggle.set_tooltip_text("Toggle notes (Ctrl+\\)")
         self._notes_toggle.set_active(True)
         self._notes_toggle.connect("toggled", self._on_notes_toggled)
-        header.pack_end(self._notes_toggle)
 
-        # shortcuts help
-        help_btn = Gtk.MenuButton()
-        help_btn.set_label("?")
-        help_btn.set_tooltip_text("Keyboard shortcuts")
-        help_btn.set_popover(self._build_shortcuts_popover())
-        header.pack_end(help_btn)
+        # ── assemble: two cluster boxes so the bar's real content width can be
+        # measured directly (the HeaderBar's own natural width is inflated by the
+        # symmetric space it reserves to centre the — here empty — title) ───────
+        self._undo_sep = vsep()
+        self._header_start = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for w in (menu_btn, vsep(), self._toc_btn, nav_box, pages_box, vsep(),
+                  tools_box, self._pen_btn, self._undo_sep, self._undo_btn,
+                  self._redo_btn):
+            self._header_start.append(w)
+
+        self._header_end = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._header_end.append(search_btn)
+        self._header_end.append(self._notes_toggle)
+
+        # Icon buttons don't compress, so the cluster's *minimum* width equals
+        # its natural width — which would become the whole window's minimum and
+        # stop it ever getting narrow enough to collapse. Wrapping it in a
+        # non-scrolling ScrolledWindow makes the reported minimum ~0 (it could
+        # scroll) while still asking for the natural width when there's room, so
+        # the window can shrink and our resize hook collapses before any
+        # scrolling is ever needed.
+        start_scroll = Gtk.ScrolledWindow()
+        start_scroll.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+        start_scroll.set_propagate_natural_width(True)
+        start_scroll.set_child(self._header_start)
+        header.pack_start(start_scroll)
+        header.pack_end(self._header_end)
+
+        self._set_tool_mode("pen")
+
+        # responsive collapse: the canvas DrawingArea fires ::resize on every
+        # window resize (the HeaderBar itself does not), so use it as the tick
+        # and read the header's real allocated width.
+        self.canvas.connect("resize", lambda *_: self._update_header_collapse())
+        header.connect("map", lambda *_: self._update_header_collapse())
 
         # ── notes panel ───────────────────────────────────────────────────────
         self._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2853,17 +2913,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         toolbar_view.add_top_bar(header)
         toolbar_view.set_content(self.toast_overlay)
         self.set_content(toolbar_view)
-
-        # Responsive header: below this width the bar gets cramped, so the
-        # secondary actions collapse into the ⋮ overflow menu. Open, Recent,
-        # navigation, undo/redo, pen, select, notes and Save stay put.
-        self._header_breakpoint = Adw.Breakpoint.new(
-            Adw.BreakpointCondition.parse("max-width: 820px"))
-        for w in (self._new_btn, self._export_btn,
-                  self._add_page_btn, self._del_page_btn):
-            self._header_breakpoint.add_setter(w, "visible", False)
-        self._header_breakpoint.add_setter(self._overflow_btn, "visible", True)
-        self.add_breakpoint(self._header_breakpoint)
 
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self._on_key)
@@ -3515,15 +3564,97 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
-    def _on_select_mode_toggled(self, btn):
-        select = btn.get_active()
-        self.canvas.select_mode = select
-        # cursor doubles as the mode indicator
-        self.canvas.set_cursor(
-            Gdk.Cursor.new_from_name("text", None) if select else None)
+    def _set_tool_mode(self, mode):
+        """mode in {'pen', 'highlighter', 'select'} — the bar's segmented switch.
+
+        Mirrored by a second toggle group inside the pen popover (shown when the
+        bar collapses); keep both in sync without re-entering on the echo.
+        """
+        if self._syncing_mode:
+            return
+        self._syncing_mode = True
+        try:
+            self.canvas.highlighter = (mode == "highlighter")
+            self.canvas.select_mode = (mode == "select")
+            # cursor doubles as the select-mode indicator
+            self.canvas.set_cursor(
+                Gdk.Cursor.new_from_name("text", None) if mode == "select" else None)
+            for grp in ((self._mode_pen, self._mode_hl, self._mode_select),
+                        (self._pmode_pen, self._pmode_hl, self._pmode_select)):
+                {"pen": grp[0], "highlighter": grp[1], "select": grp[2]}[mode].set_active(True)
+        finally:
+            self._syncing_mode = False
+        self._sync_pen_popover()
+        self._color_swatch.queue_draw()
+
+    # ── responsive header collapse ──────────────────────────────────────────
+    def _apply_collapse_level(self, level):
+        """0: full · 1: fold pen modes into the popover · 2: also hide
+        undo/redo/find. Idempotent."""
+        if level == self._collapse_level:
+            return
+        self._collapse_level = level
+        collapse_pen = level >= 1
+        self._tools_box.set_visible(not collapse_pen)
+        self._pen_modes_section.set_visible(collapse_pen)
+        for b in (self._undo_btn, self._redo_btn, self._search_btn, self._undo_sep):
+            b.set_visible(level < 2)
+
+    # widen-to-expand needs this much extra slack over the bare fit, so a level
+    # change doesn't flicker on 1px resize jitter at the boundary
+    _COLLAPSE_HYSTERESIS = 16
+
+    def _measure_controls(self):
+        """Non-content width: window buttons + edge padding, read from the real
+        allocation (left offset of the start cluster + right gap after the end
+        cluster). Re-read each tick so a too-early first reading can't stick."""
+        oks, rs = self._header_start.compute_bounds(self._header)
+        oke, re = self._header_end.compute_bounds(self._header)
+        if not (oks and oke):
+            return self._header_controls or 80
+        left = rs.origin.x
+        right = self._header.get_width() - (re.origin.x + re.get_width())
+        return int(max(0, left) + max(0, right))
+
+    def _calibrate_header(self):
+        """Record each collapse level's real content width (both clusters), once,
+        from the actual widgets — so the breakpoints are derived, not guessed."""
+        saved = self._collapse_level
+        nat = {}
+        for lvl in (2, 1, 0):
+            self._apply_collapse_level(lvl)
+            s = self._header_start.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            e = self._header_end.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            nat[lvl] = s + e
+        self._collapse_natural = nat
+        if saved >= 0:
+            self._apply_collapse_level(saved)
+
+    def _update_header_collapse(self, *_):
+        w = self._header.get_width()
+        if w <= 1:
+            return
+        if self._collapse_natural is None:
+            self._calibrate_header()
+        self._header_controls = self._measure_controls()
+        avail = w - self._header_controls
+        nat = self._collapse_natural
+        # least collapse whose real content width still fits the space left after
+        # the window buttons
+        level = 0 if avail >= nat[0] else (1 if avail >= nat[1] else 2)
+        # hysteresis: only expand (show more) when there's clear extra room, so
+        # we don't oscillate sitting exactly on a breakpoint
+        cur = self._collapse_level
+        if 0 <= level < cur and avail < nat[level] + self._COLLAPSE_HYSTERESIS:
+            level = cur
+        self._apply_collapse_level(level)
 
     def _toggle_select_mode(self):
-        self._select_toggle.set_active(not self._select_toggle.get_active())
+        """Ctrl+M: flip select-text on/off, falling back to pen."""
+        if self._mode_select.get_active():
+            self._mode_pen.set_active(True)
+        else:
+            self._mode_select.set_active(True)
 
     def _on_notes_toggled(self, btn):
         w = self.get_width() or 1280
@@ -3614,28 +3745,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         rgb = (rgba.red, rgba.green, rgba.blue)
         if self.canvas.highlighter:
             self.canvas.hl_color = rgb
-            self._hl_icon.queue_draw()
+            self._mode_hl.get_child().queue_draw()
         else:
             self.canvas.pen_color = rgb
+        self._color_swatch.queue_draw()
 
     def _toggle_highlighter(self):
-        """Ctrl+H: flip the Pen/Highlighter segment pair."""
-        if self._hl_toggle.get_active():
-            self._pen_seg.set_active(True)
+        """Ctrl+H: flip highlighter on/off, falling back to pen."""
+        if self._mode_hl.get_active():
+            self._mode_pen.set_active(True)
         else:
-            self._hl_toggle.set_active(True)
-
-    def _on_highlighter_toggled(self, btn):
-        self.canvas.highlighter = btn.get_active()
-        if self.canvas.highlighter:
-            self._pen_btn.set_child(self._hl_icon)
-            self._hl_icon.queue_draw()
-            self._pen_btn.set_tooltip_text("Pen settings — highlighter active (Ctrl+H)")
-        else:
-            self._pen_btn.set_child(None)
-            self._pen_btn.set_icon_name("document-edit-symbolic")
-            self._pen_btn.set_tooltip_text("Pen settings")
-        self._sync_pen_popover()
+            self._mode_hl.set_active(True)
 
     def _sync_pen_popover(self):
         """Point the width scale and color button at the active tool."""

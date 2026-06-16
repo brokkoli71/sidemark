@@ -2012,42 +2012,99 @@ class TestResponsiveHeader(unittest.TestCase):
         if errors:
             raise errors[0]
 
-    @staticmethod
-    def _overflow_items(win):
-        box = win._overflow_btn.get_popover().get_child()
-        items = {}
-        c = box.get_first_child()
-        while c is not None:
-            items[c.get_child().get_text()] = c
-            c = c.get_next_sibling()
-        return items
-
-    def test_overflow_hidden_by_default(self):
+    def test_default_level_is_fully_expanded(self):
         def body(win):
-            if win._overflow_btn.get_visible():
-                raise AssertionError("overflow should be hidden at full width")
-            for name in ("_new_btn", "_export_btn", "_add_page_btn", "_del_page_btn"):
-                if not getattr(win, name).get_visible():
-                    raise AssertionError(f"{name} should be visible at full width")
+            # at full width nothing is folded: the segmented tool switch is on
+            # the bar, the popover's mirror modes are hidden, undo/redo/find show
+            win._apply_collapse_level(0)
+            if not win._tools_box.get_visible():
+                raise AssertionError("tool switch should be on the bar at level 0")
+            if win._pen_modes_section.get_visible():
+                raise AssertionError("popover modes should be hidden at level 0")
+            for b in (win._undo_btn, win._redo_btn, win._search_btn):
+                if not b.get_visible():
+                    raise AssertionError("undo/redo/find should show at level 0")
         self._run_in_window(body)
 
-    def test_breakpoint_registered(self):
+    def test_level1_folds_pen_modes_into_popover(self):
         def body(win):
-            cond = win._header_breakpoint.get_condition()
-            if cond is None or "max-width" not in cond.to_string():
-                raise AssertionError("header breakpoint condition missing")
+            win._apply_collapse_level(1)
+            # the segmented switch leaves the bar; its mirror appears in the
+            # pen-settings popover; secondary actions are still present
+            if win._tools_box.get_visible():
+                raise AssertionError("tool switch should leave the bar at level 1")
+            if not win._pen_modes_section.get_visible():
+                raise AssertionError("popover modes should appear at level 1")
+            if not win._undo_btn.get_visible():
+                raise AssertionError("undo should still show at level 1")
         self._run_in_window(body)
 
-    def test_overflow_menu_mirrors_secondary_actions(self):
+    def test_level2_hides_secondary_actions(self):
         def body(win):
-            items = self._overflow_items(win)
-            for label in ("New PDF", "Add page after this",
-                          "Delete this page", "Export with notes…"):
-                if label not in items:
-                    raise AssertionError(f"overflow missing {label!r}")
+            win._apply_collapse_level(2)
+            for b in (win._undo_btn, win._redo_btn, win._search_btn, win._undo_sep):
+                if b.get_visible():
+                    raise AssertionError("undo/redo/find should hide at level 2")
+            # the tool switch stays folded into the popover at level 2 too
+            if win._tools_box.get_visible():
+                raise AssertionError("tool switch should stay folded at level 2")
         self._run_in_window(body)
 
-    def test_overflow_add_page_adds_a_page(self):
+    def test_calibration_breakpoints_are_ordered(self):
+        def body(win):
+            win._calibrate_header()
+            nat = win._collapse_natural
+            # measured from the real widgets: each collapse level is narrower
+            if not (nat[2] < nat[1] < nat[0]):
+                raise AssertionError(f"breakpoints not ordered: {nat}")
+        self._run_in_window(body)
+
+    def test_collapse_decision_tracks_available_width(self):
+        def body(win):
+            win._calibrate_header()
+            nat = win._collapse_natural
+            # stub the measured width + window-button allowance and exercise the
+            # decision directly
+            win._measure_controls = lambda: 0
+            win._header.get_width = lambda: nat[0] + 50
+            win._update_header_collapse()
+            if win._collapse_level != 0:
+                raise AssertionError("should be expanded with room to spare")
+            win._header.get_width = lambda: nat[1] + 5
+            win._update_header_collapse()
+            if win._collapse_level != 1:
+                raise AssertionError("should fold pen modes when tight")
+            win._header.get_width = lambda: nat[2] - 20
+            win._update_header_collapse()
+            if win._collapse_level != 2:
+                raise AssertionError("should hide secondary actions when very tight")
+        self._run_in_window(body)
+
+    def test_popover_modes_stay_in_sync(self):
+        def body(win):
+            # switching on the bar reflects into the popover mirror, and back
+            win._mode_hl.set_active(True)
+            if not win._pmode_hl.get_active():
+                raise AssertionError("popover mode did not mirror the bar")
+            win._pmode_select.set_active(True)
+            if not win._mode_select.get_active():
+                raise AssertionError("bar mode did not mirror the popover")
+            if not win.canvas.select_mode:
+                raise AssertionError("canvas not in select mode")
+        self._run_in_window(body)
+
+    def test_select_mode_toggle(self):
+        def body(win):
+            # Ctrl+M flips select-text on/off
+            win._toggle_select_mode()
+            if not win.canvas.select_mode:
+                raise AssertionError("select toggle did not enable select mode")
+            win._toggle_select_mode()
+            if win.canvas.select_mode:
+                raise AssertionError("select toggle did not disable select mode")
+        self._run_in_window(body)
+
+    def test_add_page_button_adds_a_page(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "p.pdf")
             make_pdf(pdf, n_pages=2)
@@ -2055,7 +2112,7 @@ class TestResponsiveHeader(unittest.TestCase):
             def body(win):
                 win._do_open_file(pdf)
                 before = win.canvas.document.page_count
-                self._overflow_items(win)["Add page after this"].emit("clicked")
+                win._add_page_btn.emit("clicked")
                 after = win.canvas.document.page_count
                 if after != before + 1:
                     raise AssertionError(f"page count {before} -> {after}")
@@ -3156,7 +3213,7 @@ class TestHighlighter(unittest.TestCase):
                     pen_width = win.canvas.pen_width
                     pen_color = win.canvas.pen_color
 
-                    win._hl_toggle.set_active(True)
+                    win._mode_hl.set_active(True)
                     if not win.canvas.highlighter:
                         raise AssertionError("toggle did not enable highlighter")
                     win._width_scale.set_value(18.0)
@@ -3172,7 +3229,7 @@ class TestHighlighter(unittest.TestCase):
                     if win.canvas.pen_color != pen_color:
                         raise AssertionError("color button leaked into pen_color")
 
-                    win._pen_seg.set_active(True)   # grouped pair: back to pen
+                    win._mode_pen.set_active(True)   # grouped: back to pen
                     if win.canvas.highlighter:
                         raise AssertionError("pen segment did not disable highlighter")
                     if abs(win._width_scale.get_value() - pen_width) > 0.01:
