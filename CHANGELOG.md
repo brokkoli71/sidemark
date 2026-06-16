@@ -1,4 +1,32 @@
-## [unreleased]
+## [0.2.1] - 2026-06-16
+
+### 🚀 Features
+
+- *(anchors)* Drag a placed anchor to reposition it
+- *(draw)* Hold mid-stroke to snap to a straight line (#34)
+- *(draw)* Smooth freehand ink on commit, tunable in pen settings (#47)
+- *(ui)* Responsive header collapses secondary actions when narrow (#45)
+- *(ui)* Single grouped-row header with measured progressive collapse
+
+### 🐛 Bug Fixes
+
+- *(icons)* Fall back to themed icon names so KDE/Breeze shows them
+
+### 📚 Documentation
+
+- *(ideas)* Add #46 draggable anchors (commit 4fc8e74)
+- *(ideas)* Mark #34 done (commit 77f21c2)
+- *(ideas)* Add #47 stroke smoothing and #48 lasso select
+- *(ideas)* Mark #47 stroke smoothing done (commit 46f7fbf)
+- Regenerate changelog and refresh ideas hashes
+- *(ideas)* Mark #45 responsive header done (commit ec41835)
+- *(ideas)* Mark #49 header redesign done (commit 7e32943)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to r173.a920636
+- *(aur)* Anchor pkgver to the latest release tag
+## [0.2.0] - 2026-06-15
 
 ### 🚀 Features
 
