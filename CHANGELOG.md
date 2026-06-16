@@ -1,3 +1,8 @@
+## [unreleased]
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to 0.2.1.r0.g62eefc7
 ## [0.2.1] - 2026-06-16
 
 ### 🚀 Features
@@ -14,13 +19,7 @@
 
 ### 📚 Documentation
 
-- *(ideas)* Add #46 draggable anchors (commit 4fc8e74)
-- *(ideas)* Mark #34 done (commit 77f21c2)
-- *(ideas)* Add #47 stroke smoothing and #48 lasso select
-- *(ideas)* Mark #47 stroke smoothing done (commit 46f7fbf)
 - Regenerate changelog and refresh ideas hashes
-- *(ideas)* Mark #45 responsive header done (commit ec41835)
-- *(ideas)* Mark #49 header redesign done (commit 7e32943)
 
 ### ⚙️ Miscellaneous Tasks
 
@@ -49,11 +48,6 @@
 - Add --noconfirm to pacman install
 - Mark text selection done, fix rows 17/18 line break
 - Add backlog from review discussion, re-rate continuous scroll
-
-### 📚 Documentation
-
-- *(ideas)* Mark #44 done (commit 163b003)
-- *(ideas)* Mark #43 done (commit 8787e81)
 
 ### ⚙️ Miscellaneous Tasks
 
