@@ -20,7 +20,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 ### Annotations
 
-- **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging; ink is smoothed on release (adjustable in pen settings)
+- **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
 - **Straight-line snap** — hold still mid-stroke to lock to a straight line; move while holding to aim, release to commit
 - **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
