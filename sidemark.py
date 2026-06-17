@@ -228,10 +228,19 @@ class PDFCanvas(Gtk.DrawingArea):
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
-        # tool mode: in "select" mode a plain drag selects text instead of
-        # drawing (Alt+drag still selects in either mode). Toggled from the
-        # header / Ctrl+R.
+        # active tool: one of pen / highlighter / select / pan / zoom / anchor.
+        # The tool decides what a *plain* (unmodified) drag does; the modifier
+        # gestures (Ctrl/Alt/Shift/Ctrl+Alt) always work regardless, and the
+        # selected tool is just the modifier-free shortcut for the same actions.
+        # ``highlighter`` and ``select_mode`` are kept in sync as the pen-attr /
+        # text-select flags the rest of the canvas already reads.
+        self.tool = "pen"
         self.select_mode = False
+        # set for the duration of a Ctrl+Shift+drag: a one-off highlighter stroke
+        self._temp_highlighter = False
+        # transient tool implied by the modifiers currently held down — surfaced
+        # to the header so the matching tool button lights up (discoverability).
+        self.on_modifier_tool = None   # callback(tool_name_or_None)
 
         # word-level text selection (Alt+drag) and link opening (Alt+click)
         self._text_selecting = False
@@ -240,8 +249,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._page_words = []       # cached for current page
         self.on_text_copied = None  # callback(text_or_None)
 
-        # link hover hint
+        # link hover hint / modifier tracking
         self._alt_held = False
+        self._ctrl_held = False
+        self._shift_held = False
         self._hover_x = 0.0
         self._hover_y = 0.0
         self._hovered_link_rect = None
@@ -303,8 +314,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
 
         key = Gtk.EventControllerKey.new()
-        key.connect("key-pressed",  self._on_alt_key, True)
-        key.connect("key-released", self._on_alt_key, False)
+        key.connect("key-pressed",  self._on_modifier_key, True)
+        key.connect("key-released", self._on_modifier_key, False)
         self.add_controller(key)
 
 
@@ -373,8 +384,9 @@ class PDFCanvas(Gtk.DrawingArea):
         return self.all_strokes.setdefault(self.current_page_idx, [])
 
     def _pen_attrs(self):
-        """(color, width, opacity) of the active drawing tool."""
-        if self.highlighter:
+        """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
+        is the transient Ctrl+Shift+drag highlighter, regardless of sticky tool."""
+        if self.highlighter or self._temp_highlighter:
             return self.hl_color, self.hl_width, self.hl_opacity
         return self.pen_color, self.pen_width, 1.0
 
@@ -701,8 +713,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if over:
             self.set_cursor(Gdk.Cursor.new_from_name("grab", None))
         elif self._hovered_link_rect is None:
-            self.set_cursor(Gdk.Cursor.new_from_name("text", None)
-                            if self.select_mode else None)
+            self.set_cursor(self._default_cursor())
 
     def _on_scroll(self, ctrl, dx, dy):
         state = ctrl.get_current_event_state()
@@ -848,10 +859,39 @@ class PDFCanvas(Gtk.DrawingArea):
             self.set_cursor(None)
             self.queue_draw()
 
-    def _on_alt_key(self, _ctrl, keyval, _keycode, _state, pressed):
+    def _on_modifier_key(self, _ctrl, keyval, _keycode, _state, pressed):
         if keyval in (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R):
             self._alt_held = pressed
-            self._update_link_hover()
+        elif keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+            self._ctrl_held = pressed
+        elif keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
+            self._shift_held = pressed
+        else:
+            return
+        self._update_link_hover()
+        if self.on_modifier_tool:
+            self.on_modifier_tool(self._modifier_tool())
+
+    def _modifier_tool(self):
+        """Which tool the held modifiers stand in for, mirroring the gesture
+        routing in _on_drag_begin — or None when nothing relevant is held."""
+        if self._ctrl_held and self._alt_held:
+            return "anchor"
+        if self._ctrl_held and self._shift_held:
+            return "highlighter"
+        if self._ctrl_held:
+            return "pan"
+        if self._alt_held:
+            return "select"
+        if self._shift_held:
+            return "zoom"
+        return None
+
+    def _default_cursor(self):
+        """Cursor that matches the active tool while idle (no drag in flight)."""
+        name = {"select": "text", "pan": "grab",
+                "zoom": "crosshair", "anchor": "crosshair"}.get(self.tool)
+        return Gdk.Cursor.new_from_name(name, None) if name else None
 
     def _update_link_hover(self):
         new_rect = None
@@ -870,7 +910,13 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_click_pressed(self, gesture, n_press, x, y):
         state = gesture.get_current_event_state()
-        if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
+        ctrl_alt = ((state & Gdk.ModifierType.CONTROL_MASK)
+                    and (state & Gdk.ModifierType.ALT_MASK))
+        any_mod = state & (Gdk.ModifierType.CONTROL_MASK
+                           | Gdk.ModifierType.ALT_MASK
+                           | Gdk.ModifierType.SHIFT_MASK)
+        # Ctrl+Alt, or the anchor tool with no modifier, drops an anchor here.
+        if ctrl_alt or (self.tool == "anchor" and not any_mod):
             if self.page is None:
                 return
             px, py = self._screen_to_pdf(x, y)
@@ -902,6 +948,7 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         self._ignoring = False
         self._erasing = False
+        self._temp_highlighter = False
         if btn == 2:
             # middle-mouse drag pans, same as Ctrl+drag
             self._panning = True
@@ -918,6 +965,18 @@ class PDFCanvas(Gtk.DrawingArea):
             self._callout_dragging = True
             self._callout_start = (start_x, start_y)
             self._callout_cur = None
+            return
+        if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.SHIFT_MASK):
+            # Ctrl+Shift+drag: a one-off highlighter stroke regardless of the
+            # sticky tool (mirrors the Ctrl+H highlighter toggle as a gesture)
+            self._temp_highlighter = True
+            self._panning = False
+            self._text_selecting = False
+            self._zoom_selecting = False
+            self._selected_words = []
+            self._cancel_straight_timer()
+            self._straight_mode = False
+            self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
             return
         if state & Gdk.ModifierType.CONTROL_MASK:
             self._panning = True
@@ -945,6 +1004,30 @@ class PDFCanvas(Gtk.DrawingArea):
             self._text_selecting = False
             self._panning = False
             self._selected_words = []
+            # the active tool is the modifier-free shortcut for a gesture: pan
+            # mirrors Ctrl, zoom mirrors Shift, anchor mirrors Ctrl+Alt (the
+            # anchor itself is dropped at press by _on_click_pressed).
+            if self.tool == "pan":
+                self._panning = True
+                self._is_fitted = False
+                self._pan_start_offset = (self.offset_x, self.offset_y)
+                return
+            if self.tool == "zoom":
+                self._zoom_selecting = True
+                self._zoom_start = (start_x, start_y)
+                self._zoom_end = (start_x, start_y)
+                return
+            if self.tool == "anchor":
+                self._callout_dragging = True
+                self._callout_start = (start_x, start_y)
+                self._callout_cur = None
+                return
+            if self.tool == "eraser":
+                # left-drag erases, same as the always-on right-drag gesture
+                self._erasing = True
+                self._erase_group += 1
+                self._erase_at(start_x, start_y)
+                return
             hit = self._anchor_hit_test(start_x, start_y)
             if hit is not None:
                 # begin dragging the anchor; a release with no real movement is
@@ -1112,6 +1195,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 if self.on_user_action:
                     self.on_user_action()
             self.current_stroke = []
+        self._temp_highlighter = False
         self.queue_draw()
 
     def _arm_straight_timer(self):
@@ -2410,6 +2494,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.canvas.on_anchor_moved = self._on_anchor_moved
         self.canvas.on_callout_placed = self._on_callout_placed
         self.canvas.on_user_action = self._on_canvas_action
+        self.canvas.on_modifier_tool = self._highlight_transient_tool
+        self._transient_tool = None
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
 
         # ── CSS ───────────────────────────────────────────────────────────────
@@ -2439,6 +2525,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 border: 1px solid shade({bg_hex}, 0.75);
             }}
             .pen-swatch:hover {{ border: 2px solid {fg_hex}; }}
+            .tool-transient {{
+                background-color: alpha({acc_hex}, 0.30);
+                box-shadow: inset 0 0 0 1px {acc_hex};
+            }}
         """
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
@@ -2592,34 +2682,137 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         (h - ext.height) / 2 - ext.y_bearing)
             ctx.show_text("A")
 
-        def _glyph(fn):
+        # the classic pointing-hand ("link") mouse cursor, the conventional
+        # drag/grab affordance, as pixel-faithful polygons from the public-domain
+        # Wikimedia cursor (commons "Mouse-cursor-hand-pointer", right glyph). The
+        # outer silhouette is filled in the theme foreground and the inner region
+        # cut out in the background, so the cursor adapts to light/dark like a
+        # symbolic icon. Source bbox is x14..31, y1..23.
+        _PAN_OUTLINE = ((19, 1), (21, 1), (21, 2), (22, 2), (22, 6), (24, 6),
+                        (24, 7), (27, 7), (27, 8), (29, 8), (29, 9), (30, 9),
+                        (30, 10), (31, 10), (31, 17), (30, 17), (30, 20), (29, 20),
+                        (29, 23), (19, 23), (19, 20), (18, 20), (18, 18), (17, 18),
+                        (17, 16), (16, 16), (16, 14), (15, 14), (15, 13), (14, 13),
+                        (14, 10), (17, 10), (17, 11), (18, 11), (18, 2), (19, 2))
+        _PAN_INNER = ((21, 2), (21, 11), (22, 11), (22, 7), (24, 7), (24, 11),
+                      (25, 11), (25, 8), (27, 8), (27, 12), (28, 12), (28, 9),
+                      (29, 9), (29, 10), (30, 10), (30, 17), (29, 17), (29, 20),
+                      (28, 20), (28, 22), (20, 22), (20, 20), (19, 20), (19, 18),
+                      (18, 18), (18, 16), (17, 16), (17, 14), (16, 14), (16, 13),
+                      (15, 13), (15, 11), (17, 11), (17, 12), (18, 12), (18, 13),
+                      (19, 13), (19, 2))
+        pan_bg = _hex_to_rgb(theme["background"])
+
+        def _draw_mode_pan(_a, ctx, w, h):
+            # fit the source bbox (17×22) into the allocation, centred, with a
+            # small margin — so the cursor scales with the drawing area and stays
+            # centred in the button at any size.
+            src_w, src_h = 17.0, 22.0
+            m = 0.5 * (w / 16.0)
+            sc = min((w - 2 * m) / src_w, (h - 2 * m) / src_h)
+            offx = (w - src_w * sc) / 2
+            offy = (h - src_h * sc) / 2
+
+            def trace(pts):
+                for i, (x, y) in enumerate(pts):
+                    X, Y = (x - 14) * sc + offx, (y - 1) * sc + offy
+                    ctx.line_to(X, Y) if i else ctx.move_to(X, Y)
+                ctx.close_path()
+
+            ctx.set_source_rgb(*fg);     trace(_PAN_OUTLINE); ctx.fill()
+            ctx.set_source_rgb(*pan_bg); trace(_PAN_INNER);   ctx.fill()
+
+        def _draw_mode_anchor(_a, ctx, w, h):
+            cx, cy = w / 2, h / 2
+            r = w / 2 - 3
+            ctx.set_source_rgba(*acc, 0.92)
+            ctx.arc(cx, cy, r, 0, 2 * math.pi)
+            ctx.fill()
+            ctx.set_source_rgb(1, 1, 1)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                                 cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(9)
+            ext = ctx.text_extents("1")
+            ctx.move_to(cx - ext.width / 2 - ext.x_bearing,
+                        cy - ext.height / 2 - ext.y_bearing)
+            ctx.show_text("1")
+
+        def _draw_mode_eraser(_a, ctx, w, h):
+            # a tilted eraser block with a band marking the worn rubber tip
+            ctx.set_source_rgb(*fg)
+            s = w / 16.0
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            ctx.set_line_width(1.3 * s)
+            ctx.translate(8 * s, 8.5 * s)
+            ctx.rotate(math.radians(-38))
+            ctx.translate(-8 * s, -8 * s)
+            x, y, bw, bh, r = 3.5 * s, 5.5 * s, 9 * s, 5 * s, 1.3 * s
+            ctx.new_sub_path()
+            ctx.arc(x + bw - r, y + r, r, -math.pi / 2, 0)
+            ctx.arc(x + bw - r, y + bh - r, r, 0, math.pi / 2)
+            ctx.arc(x + r, y + bh - r, r, math.pi / 2, math.pi)
+            ctx.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+            ctx.close_path()
+            ctx.stroke()
+            ctx.move_to(x + bw * 0.36, y)
+            ctx.line_to(x + bw * 0.36, y + bh)
+            ctx.stroke()
+
+        def _glyph(fn, size=16):
             d = Gtk.DrawingArea()
-            d.set_content_width(16)
-            d.set_content_height(16)
+            d.set_content_width(size)
+            d.set_content_height(size)
+            d.set_halign(Gtk.Align.CENTER)
+            d.set_valign(Gtk.Align.CENTER)
             d.set_draw_func(fn)
             return d
 
+        # Each tool button doubles as a discoverability cue: holding the matching
+        # modifier (Ctrl=pan, Alt=select, Shift=zoom, Ctrl+Alt=anchor) lights the
+        # button up transiently, so the hidden gestures are visible in the UI.
         self._mode_pen = Gtk.ToggleButton()
         self._mode_pen.set_icon_name("document-edit-symbolic")
         self._mode_pen.set_tooltip_text("Pen")
         self._mode_pen.set_active(True)
         self._mode_hl = Gtk.ToggleButton()
         self._mode_hl.set_child(_glyph(_draw_mode_hl))
-        self._mode_hl.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._mode_hl.set_tooltip_text("Highlighter (Ctrl+H · Ctrl+Shift+drag)")
         self._mode_hl.set_group(self._mode_pen)
+        self._mode_eraser = Gtk.ToggleButton()
+        self._mode_eraser.set_child(_glyph(_draw_mode_eraser))
+        self._mode_eraser.set_tooltip_text("Eraser (right-drag)")
+        self._mode_eraser.set_group(self._mode_pen)
         self._mode_select = Gtk.ToggleButton()
         self._mode_select.set_child(_glyph(_draw_mode_sel))
-        self._mode_select.set_tooltip_text("Select text (Ctrl+M)")
+        self._mode_select.set_tooltip_text("Select text (Alt+drag · Ctrl+M)")
         self._mode_select.set_group(self._mode_pen)
-        self._mode_pen.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("pen"))
-        self._mode_hl.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("highlighter"))
-        self._mode_select.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("select"))
+        self._mode_pan = Gtk.ToggleButton()
+        self._mode_pan.set_child(_glyph(_draw_mode_pan, 20))
+        self._mode_pan.set_tooltip_text(
+            "Pan (Ctrl+drag · middle-drag · thumb gesture button)")
+        self._mode_pan.set_group(self._mode_pen)
+        self._mode_zoom = Gtk.ToggleButton()
+        self._mode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
+        self._mode_zoom.set_tooltip_text("Zoom to region (Shift+drag)")
+        self._mode_zoom.set_group(self._mode_pen)
+        self._mode_anchor = Gtk.ToggleButton()
+        self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
+        self._mode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
+        self._mode_anchor.set_group(self._mode_pen)
+        for b, m in ((self._mode_pen, "pen"), (self._mode_hl, "highlighter"),
+                     (self._mode_eraser, "eraser"), (self._mode_select, "select"),
+                     (self._mode_pan, "pan"), (self._mode_zoom, "zoom"),
+                     (self._mode_anchor, "anchor")):
+            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
 
         self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         tools_box.add_css_class("linked")
-        tools_box.append(self._mode_pen)
-        tools_box.append(self._mode_hl)
-        tools_box.append(self._mode_select)
+        self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
+                           self._mode_select, self._mode_pan, self._mode_zoom,
+                           self._mode_anchor)
+        for b in self._tool_btns:
+            tools_box.append(b)
 
         # ── pen settings popover: width / colour / smoothing (mode is on bar) ──
         popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -2641,20 +2834,41 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_pen.set_active(True)
         self._pmode_hl = Gtk.ToggleButton()
         self._pmode_hl.set_child(_glyph(_draw_mode_hl))
-        self._pmode_hl.set_tooltip_text("Highlighter (Ctrl+H)")
+        self._pmode_hl.set_tooltip_text("Highlighter (Ctrl+H · Ctrl+Shift+drag)")
         self._pmode_hl.set_group(self._pmode_pen)
+        self._pmode_eraser = Gtk.ToggleButton()
+        self._pmode_eraser.set_child(_glyph(_draw_mode_eraser))
+        self._pmode_eraser.set_tooltip_text("Eraser (right-drag)")
+        self._pmode_eraser.set_group(self._pmode_pen)
         self._pmode_select = Gtk.ToggleButton()
         self._pmode_select.set_child(_glyph(_draw_mode_sel))
-        self._pmode_select.set_tooltip_text("Select text (Ctrl+M)")
+        self._pmode_select.set_tooltip_text("Select text (Alt+drag · Ctrl+M)")
         self._pmode_select.set_group(self._pmode_pen)
-        self._pmode_pen.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("pen"))
-        self._pmode_hl.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("highlighter"))
-        self._pmode_select.connect("toggled", lambda b: b.get_active() and self._set_tool_mode("select"))
+        self._pmode_pan = Gtk.ToggleButton()
+        self._pmode_pan.set_child(_glyph(_draw_mode_pan, 20))
+        self._pmode_pan.set_tooltip_text(
+            "Pan (Ctrl+drag · middle-drag · thumb gesture button)")
+        self._pmode_pan.set_group(self._pmode_pen)
+        self._pmode_zoom = Gtk.ToggleButton()
+        self._pmode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
+        self._pmode_zoom.set_tooltip_text("Zoom to region (Shift+drag)")
+        self._pmode_zoom.set_group(self._pmode_pen)
+        self._pmode_anchor = Gtk.ToggleButton()
+        self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
+        self._pmode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
+        self._pmode_anchor.set_group(self._pmode_pen)
+        for b, m in ((self._pmode_pen, "pen"), (self._pmode_hl, "highlighter"),
+                     (self._pmode_eraser, "eraser"), (self._pmode_select, "select"),
+                     (self._pmode_pan, "pan"), (self._pmode_zoom, "zoom"),
+                     (self._pmode_anchor, "anchor")):
+            b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
         pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pmode_box.add_css_class("linked")
-        pmode_box.append(self._pmode_pen)
-        pmode_box.append(self._pmode_hl)
-        pmode_box.append(self._pmode_select)
+        self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
+                            self._pmode_select, self._pmode_pan, self._pmode_zoom,
+                            self._pmode_anchor)
+        for b in self._ptool_btns:
+            pmode_box.append(b)
         self._pen_modes_section.append(pmode_box)
         self._pen_modes_section.set_visible(False)
         popover_box.append(self._pen_modes_section)
@@ -2955,6 +3169,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         undo_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         undo_ctrl.connect("key-pressed", self._on_undo_key)
         self.add_controller(undo_ctrl)
+
+        # The canvas key controller only tracks held modifiers while the canvas
+        # is focused, so the tool-button highlight died once the notes editor (or
+        # any other widget) took focus. A window-wide capture-phase controller
+        # keeps the modifier state — and the highlight — live everywhere. It only
+        # reads modifier keys and never consumes the event, so typing is intact.
+        mod_ctrl = Gtk.EventControllerKey()
+        mod_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        mod_ctrl.connect("key-pressed",
+                         lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, True))
+        mod_ctrl.connect("key-released",
+                         lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, False))
+        self.add_controller(mod_ctrl)
 
     # ── shortcuts popover ─────────────────────────────────────────────────────
 
@@ -3580,8 +3807,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
+    _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "select": 3,
+                   "pan": 4, "zoom": 5, "anchor": 6}
+
     def _set_tool_mode(self, mode):
-        """mode in {'pen', 'highlighter', 'select'} — the bar's segmented switch.
+        """mode in pen / highlighter / select / pan / zoom / anchor — the bar's
+        segmented switch. The tool is the modifier-free shortcut for the matching
+        drag gesture (pan↔Ctrl, zoom↔Shift, anchor↔Ctrl+Alt).
 
         Mirrored by a second toggle group inside the pen popover (shown when the
         bar collapses); keep both in sync without re-entering on the echo.
@@ -3590,18 +3822,33 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self._syncing_mode = True
         try:
+            self.canvas.tool = mode
             self.canvas.highlighter = (mode == "highlighter")
             self.canvas.select_mode = (mode == "select")
-            # cursor doubles as the select-mode indicator
-            self.canvas.set_cursor(
-                Gdk.Cursor.new_from_name("text", None) if mode == "select" else None)
-            for grp in ((self._mode_pen, self._mode_hl, self._mode_select),
-                        (self._pmode_pen, self._pmode_hl, self._pmode_select)):
-                {"pen": grp[0], "highlighter": grp[1], "select": grp[2]}[mode].set_active(True)
+            # cursor reflects the active tool (text/grab/crosshair, or default)
+            self.canvas.set_cursor(self.canvas._default_cursor())
+            idx = self._TOOL_ORDER[mode]
+            for grp in (self._tool_btns, self._ptool_btns):
+                grp[idx].set_active(True)
         finally:
             self._syncing_mode = False
         self._sync_pen_popover()
         self._color_swatch.queue_draw()
+
+    def _highlight_transient_tool(self, tool):
+        """Light up the tool button matching the modifiers currently held, so the
+        Ctrl/Alt/Shift gestures are discoverable. Purely visual — the selected
+        tool and behaviour are untouched."""
+        if tool == self._transient_tool:
+            return
+        self._transient_tool = tool
+        for grp in (self._tool_btns, self._ptool_btns):
+            for b in grp:
+                b.remove_css_class("tool-transient")
+        if tool is not None:
+            idx = self._TOOL_ORDER[tool]
+            for grp in (self._tool_btns, self._ptool_btns):
+                grp[idx].add_css_class("tool-transient")
 
     # ── responsive header collapse ──────────────────────────────────────────
     def _apply_collapse_level(self, level):

@@ -2199,6 +2199,38 @@ class TestResponsiveHeader(unittest.TestCase):
                 raise AssertionError("select toggle did not disable select mode")
         self._run_in_window(body)
 
+    def test_tool_buttons_select_canvas_tool(self):
+        def body(win):
+            # the new modifier-shortcut tools select on the canvas and mirror
+            # into the popover group
+            win._mode_pan.set_active(True)
+            if win.canvas.tool != "pan":
+                raise AssertionError("pan button did not select the pan tool")
+            if not win._pmode_pan.get_active():
+                raise AssertionError("popover pan mirror not synced")
+            win._mode_anchor.set_active(True)
+            if win.canvas.tool != "anchor":
+                raise AssertionError("anchor button did not select the anchor tool")
+            # highlighter/select flags only set for their own tools
+            if win.canvas.highlighter or win.canvas.select_mode:
+                raise AssertionError("anchor tool wrongly set hl/select flags")
+        self._run_in_window(body)
+
+    def test_modifier_highlights_matching_tool_button(self):
+        def body(win):
+            win._mode_pen.set_active(True)
+            # holding Ctrl lights the pan button transiently, no tool change
+            win._highlight_transient_tool("pan")
+            if not win._mode_pan.has_css_class("tool-transient"):
+                raise AssertionError("pan button not highlighted while Ctrl held")
+            if win.canvas.tool != "pen":
+                raise AssertionError("transient highlight must not change the tool")
+            # releasing clears it
+            win._highlight_transient_tool(None)
+            if win._mode_pan.has_css_class("tool-transient"):
+                raise AssertionError("highlight not cleared on release")
+        self._run_in_window(body)
+
     def test_add_page_button_adds_a_page(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "p.pdf")
@@ -2547,6 +2579,134 @@ class TestSelectMode(unittest.TestCase):
         self.canvas._on_drag_end(g, 60, 8)
         self.assertEqual(len(self.canvas.strokes), 0)
         self.assertFalse(self.canvas._text_selecting)
+
+
+class TestToolModes(unittest.TestCase):
+    """#52: the active tool is the modifier-free shortcut for a drag gesture —
+    pan↔Ctrl, zoom↔Shift, anchor↔Ctrl+Alt — and the held modifiers light up the
+    matching tool button (discoverability)."""
+
+    def setUp(self):
+        self.canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)
+        self.canvas.load(self._tmp)
+        self.canvas._fit_page(800, 600)
+
+    def tearDown(self):
+        os.unlink(self._tmp)
+
+    def _plain_drag(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, 100, 100)
+        return g
+
+    def test_pan_tool_pans_on_plain_drag(self):
+        self.canvas.tool = "pan"
+        g = self._plain_drag()
+        ox, oy = self.canvas.offset_x, self.canvas.offset_y
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._panning)
+        self.canvas._on_drag_update(g, 40, -25)
+        self.assertEqual((self.canvas.offset_x, self.canvas.offset_y),
+                         (ox + 40, oy - 25))
+        self.canvas._on_drag_end(g, 40, -25)
+        self.assertEqual(len(self.canvas.strokes), 0)
+
+    def test_zoom_tool_starts_region_select(self):
+        self.canvas.tool = "zoom"
+        g = self._plain_drag()
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._zoom_selecting)
+        self.assertEqual(len(self.canvas.current_stroke), 0)
+
+    def test_anchor_tool_places_anchor_on_click(self):
+        placed = []
+        self.canvas.on_anchor_placed = lambda p, x, y: placed.append((p, x, y))
+        self.canvas.tool = "anchor"
+        click = mock.Mock()
+        click.get_current_event_state.return_value = Gdk.ModifierType(0)
+        self.canvas._on_click_pressed(click, 1, 120, 130)
+        self.assertEqual(len(placed), 1)
+
+    def test_anchor_tool_drag_places_callout(self):
+        out = []
+        self.canvas.on_callout_placed = lambda x, y: out.append((x, y))
+        self.canvas.tool = "anchor"
+        g = self._plain_drag()
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._callout_dragging)
+        self.canvas._on_drag_update(g, 50, 50)
+        self.canvas._on_drag_end(g, 50, 50)
+        self.assertEqual(len(out), 1)
+
+    def test_pen_tool_still_draws(self):
+        self.canvas.tool = "pen"
+        g = self._plain_drag()
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertEqual(len(self.canvas.current_stroke), 1)
+
+    def test_eraser_tool_erases_on_plain_drag(self):
+        # the eraser tool makes a plain left-drag erase, like the always-on
+        # right-drag gesture
+        px, py = self.canvas._screen_to_pdf(100, 100)
+        self.canvas.strokes.append(
+            {"pts": [(px, py)], "color": (0, 0, 0), "width": 2.0, "opacity": 1.0})
+        n0 = len(self.canvas.strokes)
+        self.canvas.tool = "eraser"
+        g = self._plain_drag()
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._erasing)
+        self.canvas._on_drag_end(g, 0, 0)
+        self.assertLess(len(self.canvas.strokes), n0)
+        self.assertFalse(self.canvas._erasing)
+
+    def test_ctrl_shift_drag_draws_highlighter_stroke(self):
+        # Ctrl+Shift+drag lays down a highlighter stroke regardless of the
+        # sticky tool, and reverts (no sticky-tool change) on release
+        self.canvas.tool = "pen"
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = (
+            Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)
+        g.get_start_point.return_value = (True, 100, 100)
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._temp_highlighter)
+        self.canvas._on_drag_update(g, 40, 40)
+        self.canvas._on_drag_end(g, 40, 40)
+        self.assertEqual(len(self.canvas.strokes), 1)
+        self.assertEqual(self.canvas.strokes[0]["color"], self.canvas.hl_color)
+        self.assertEqual(self.canvas.strokes[0]["opacity"], self.canvas.hl_opacity)
+        self.assertFalse(self.canvas._temp_highlighter)
+        self.assertEqual(self.canvas.tool, "pen")
+
+    def test_modifier_tool_mapping(self):
+        c = self.canvas
+        c._ctrl_held = c._alt_held = c._shift_held = False
+        self.assertIsNone(c._modifier_tool())
+        c._ctrl_held = True
+        self.assertEqual(c._modifier_tool(), "pan")
+        c._alt_held = True
+        self.assertEqual(c._modifier_tool(), "anchor")   # ctrl+alt
+        c._alt_held = False
+        c._shift_held = True
+        self.assertEqual(c._modifier_tool(), "highlighter")  # ctrl+shift
+        c._ctrl_held = False
+        self.assertEqual(c._modifier_tool(), "zoom")     # shift only
+        c._shift_held = False
+        c._alt_held = True
+        self.assertEqual(c._modifier_tool(), "select")   # alt only
+
+    def test_modifier_key_fires_callback(self):
+        seen = []
+        self.canvas.on_modifier_tool = lambda t: seen.append(t)
+        # press Ctrl → pan; release → None
+        self.canvas._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, True)
+        self.canvas._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, False)
+        self.assertEqual(seen, ["pan", None])
 
 
 class TestDragAndDrop(unittest.TestCase):
