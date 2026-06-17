@@ -140,12 +140,14 @@ class PDFCanvas(Gtk.DrawingArea):
         self._straight_mode = False
         self._straight_timer = None
 
-        # undo: ("draw", page, stroke) | ("erase", page, idx, stroke, group);
-        # erase ops of one drag gesture share a group and undo together.
+        # undo: ("draw", page, stroke[, group]) | ("erase", page, idx, stroke, group);
+        # erase ops of one drag gesture share a group and undo together, as do the
+        # per-line strokes of one text-highlight (a draw group).
         # redo holds lists of ops exactly as undo_last popped them.
         self._undo_stack = []
         self._redo_stack = []
         self._erase_group = 0
+        self._draw_group = 0
 
         self.pen_color = (0.05, 0.05, 0.8)   # RGB — stroke alpha lives in "opacity"
         self.pen_width = 2.0
@@ -156,6 +158,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self.hl_color = (1.0, 0.85, 0.0)
         self.hl_width = 12.0
         self.hl_opacity = 0.40
+        # "free" = freehand highlighter strokes; "text" = drag selects text
+        # (reading order) and lays one highlight rectangle per line over the
+        # word boxes, still stored as ink. Long-press the highlighter tool.
+        self.highlight_style = "free"
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
@@ -244,6 +250,9 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # word-level text selection (Alt+drag) and link opening (Alt+click)
         self._text_selecting = False
+        # True while a text-highlight drag is in progress (highlighter tool in
+        # "text" style): same word-selection path, but commits highlight ink
+        self._text_highlighting = False
         self._alt_start = (0.0, 0.0)
         self._selected_words = []   # fitz word tuples currently highlighted
         self._page_words = []       # cached for current page
@@ -333,6 +342,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._undo_stack = []
         self._redo_stack = []
         self._erase_group = 0
+        self._draw_group = 0
         total_annots = 0
         for i in range(self.n_pages):
             page = self.document[i]   # keep reference alive while reading annotations
@@ -932,6 +942,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_drag_begin(self, gesture, start_x, start_y):
         self._post_pinch = False   # a fresh press starts a normal interaction
+        self._text_highlighting = False
         if gesture.get_current_button() == 3:
             self._erasing = True
             self._erase_group += 1
@@ -1049,6 +1060,15 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._alt_start = (start_x, start_y)
                 self.grab_focus()
                 return
+            if self.highlighter and self.highlight_style == "text":
+                # highlighter "text" style: drag selects words (reading order)
+                # and commits highlight ink over them on release
+                self._text_selecting = True
+                self._text_highlighting = True
+                self._alt_start = (start_x, start_y)
+                self._selected_words = []
+                self.grab_focus()
+                return
             self._cancel_straight_timer()
             self._straight_mode = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
@@ -1095,9 +1115,11 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._text_selecting:
             px0, py0 = self._screen_to_pdf(sx, sy)
             px1, py1 = self._screen_to_pdf(sx + offset_x, sy + offset_y)
-            if self.select_style == "rect":
+            if self.select_style == "rect" and not self._text_highlighting:
                 self._selected_words = self._words_in_rect(px0, py0, px1, py1)
             else:
+                # text-highlight always follows reading order, regardless of the
+                # select tool's rectangular/reading-order preference
                 self._selected_words = self._words_in_reading_range(px0, py0, px1, py1)
             self.queue_draw()
             return
@@ -1166,7 +1188,10 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._text_selecting:
             self._text_selecting = False
-            if abs(offset_x) < 8 and abs(offset_y) < 8:
+            if self._text_highlighting:
+                self._text_highlighting = False
+                self._commit_text_highlight()
+            elif abs(offset_x) < 8 and abs(offset_y) < 8:
                 sx, sy = self._alt_start
                 self._open_link_at(sx, sy)
             else:
@@ -1279,6 +1304,57 @@ class PDFCanvas(Gtk.DrawingArea):
         j = self._nearest_word_index(px1, py1)
         lo, hi = min(i, j), max(i, j)
         return self._ordered_words[lo:hi + 1]
+
+    def _commit_text_highlight(self):
+        """Turn the selected words into highlighter ink: one wide stroke per text
+        line covering its word boxes. Stored as ink, so save / eraser / undo all
+        work unchanged; the per-line strokes share a draw group so a single undo
+        removes the whole highlight."""
+        words = self._selected_words
+        self._selected_words = []
+        if not words:
+            self.queue_draw()
+            return
+        color = self.hl_color
+        opacity = self.hl_opacity
+        ordered = sorted(words, key=lambda w: (w[5], w[6], w[7]))
+        self._draw_group += 1
+        group = self._draw_group
+        committed = False
+        line_key = None
+        line = []
+        runs = []
+        for w in ordered:
+            key = (w[5], w[6])
+            if key != line_key and line:
+                runs.append(line)
+                line = []
+            line_key = key
+            line.append(w)
+        if line:
+            runs.append(line)
+        for run in runs:
+            x0 = min(w[0] for w in run)
+            x1 = max(w[2] for w in run)
+            y0 = min(w[1] for w in run)
+            y1 = max(w[3] for w in run)
+            ymid = 0.5 * (y0 + y1)
+            stroke = {
+                "pts": [(x0, ymid), (x1, ymid)],
+                "color": color,
+                "width": max(y1 - y0, 1.0),   # span the line height
+                "opacity": opacity,
+            }
+            self.strokes.append(stroke)
+            self._undo_stack.append(("draw", self.current_page_idx, stroke, group))
+            committed = True
+        if committed:
+            self._redo_stack.clear()
+            if self.on_change:
+                self.on_change()
+            if self.on_user_action:
+                self.on_user_action()
+        self.queue_draw()
 
     def _finish_text_selection(self):
         self.queue_draw()   # highlight stays; copy on Ctrl+C
@@ -1422,6 +1498,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self._schedule_rerender()
         self.queue_draw()
 
+    @staticmethod
+    def _remove_stroke(strokes, stroke):
+        for i, s in enumerate(strokes):
+            if s is stroke:
+                del strokes[i]
+                return
+
     def undo_last(self):
         """Undo the last draw or erase operation (an erase drag counts as one)."""
         if not self._undo_stack:
@@ -1431,10 +1514,17 @@ class PDFCanvas(Gtk.DrawingArea):
         page = op[1]
         strokes = self.all_strokes.setdefault(page, [])
         if op[0] == "draw":
-            for i, s in enumerate(strokes):
-                if s is op[2]:
-                    del strokes[i]
-                    break
+            self._remove_stroke(strokes, op[2])
+            # a text-highlight is many per-line strokes sharing a draw group;
+            # collapse them into one undo, like an erase gesture
+            if len(op) > 3:
+                group = op[3]
+                while (self._undo_stack and self._undo_stack[-1][0] == "draw"
+                       and len(self._undo_stack[-1]) > 3
+                       and self._undo_stack[-1][3] == group):
+                    op = self._undo_stack.pop()
+                    popped.append(op)
+                    self._remove_stroke(strokes, op[2])
         else:
             strokes.insert(min(op[2], len(strokes)), op[3])
             group = op[4]
@@ -1458,7 +1548,9 @@ class PDFCanvas(Gtk.DrawingArea):
         page = ops[0][1]
         strokes = self.all_strokes.setdefault(page, [])
         if ops[0][0] == "draw":
-            strokes.append(ops[0][2])
+            # re-add in chronological order (reverse of the pop order)
+            for op in reversed(ops):
+                strokes.append(op[2])
         else:
             # re-remove in the gesture's chronological order (reverse of pop order)
             for op in reversed(ops):
@@ -2812,7 +2904,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_pen.set_active(True)
         self._mode_hl = Gtk.ToggleButton()
         self._mode_hl.set_child(_glyph(_draw_mode_hl))
-        self._mode_hl.set_tooltip_text("Highlighter (Ctrl+H · Ctrl+Shift+drag)")
+        self._mode_hl.set_tooltip_text(
+            "Highlighter (Ctrl+H · Ctrl+Shift+drag · long-press for free-hand / text)")
         self._mode_hl.set_group(self._mode_pen)
         self._mode_eraser = Gtk.ToggleButton()
         self._mode_eraser.set_child(_glyph(_draw_mode_eraser))
@@ -2870,7 +2963,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_pen.set_active(True)
         self._pmode_hl = Gtk.ToggleButton()
         self._pmode_hl.set_child(_glyph(_draw_mode_hl))
-        self._pmode_hl.set_tooltip_text("Highlighter (Ctrl+H · Ctrl+Shift+drag)")
+        self._pmode_hl.set_tooltip_text(
+            "Highlighter (Ctrl+H · Ctrl+Shift+drag · long-press for free-hand / text)")
         self._pmode_hl.set_group(self._pmode_pen)
         self._pmode_eraser = Gtk.ToggleButton()
         self._pmode_eraser.set_child(_glyph(_draw_mode_eraser))
@@ -2914,6 +3008,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._select_style_radios = []
         self._attach_select_style_menu(self._mode_select)
         self._attach_select_style_menu(self._pmode_select)
+        # long-press either highlighter button → free-hand vs text marking
+        self._highlight_style_radios = []
+        self._attach_highlight_style_menu(self._mode_hl)
+        self._attach_highlight_style_menu(self._pmode_hl)
 
         width_label = Gtk.Label(label="Width", xalign=0)
         width_label.add_css_class("dim-label")
@@ -3884,6 +3982,39 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for s, cb in self._select_style_radios:
             cb.set_active(s == style)
         self._syncing_select_style = False
+
+    def _attach_highlight_style_menu(self, button):
+        """Long-press a highlighter button to pick free-hand vs text marking."""
+        pop = Gtk.Popover()
+        pop.set_parent(button)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_start(8); box.set_margin_end(8)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        r_free = Gtk.CheckButton(label="Free-hand")
+        r_text = Gtk.CheckButton(label="Mark text")
+        r_text.set_group(r_free)
+        r_free.set_active(self.canvas.highlight_style != "text")
+        r_text.set_active(self.canvas.highlight_style == "text")
+        r_free.connect("toggled",
+                       lambda b: b.get_active() and self._set_highlight_style("free"))
+        r_text.connect("toggled",
+                       lambda b: b.get_active() and self._set_highlight_style("text"))
+        box.append(r_free); box.append(r_text)
+        pop.set_child(box)
+        self._highlight_style_radios += [("free", r_free), ("text", r_text)]
+        lp = Gtk.GestureLongPress()
+        lp.connect("pressed", lambda g, x, y: pop.popup())
+        button.add_controller(lp)
+
+    def _set_highlight_style(self, style):
+        """Switch highlighter style (free-hand / text) and sync both radio menus."""
+        if getattr(self, "_syncing_highlight_style", False):
+            return
+        self._syncing_highlight_style = True
+        self.canvas.highlight_style = style
+        for s, cb in self._highlight_style_radios:
+            cb.set_active(s == style)
+        self._syncing_highlight_style = False
 
     def _set_tool_mode(self, mode):
         """mode in pen / highlighter / select / pan / zoom / anchor — the bar's

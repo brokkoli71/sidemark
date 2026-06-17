@@ -2249,6 +2249,22 @@ class TestResponsiveHeader(unittest.TestCase):
                 raise AssertionError("reading radios not synced back")
         self._run_in_window(body)
 
+    def test_highlight_style_menu_switches_canvas_style(self):
+        def body(win):
+            if win.canvas.highlight_style != "free":
+                raise AssertionError("highlighter should default to free-hand")
+            win._set_highlight_style("text")
+            if win.canvas.highlight_style != "text":
+                raise AssertionError("setting style did not reach the canvas")
+            texts = [cb for s, cb in win._highlight_style_radios if s == "text"]
+            if not texts or not all(cb.get_active() for cb in texts):
+                raise AssertionError("text radios not all active after switch")
+            win._set_highlight_style("free")
+            frees = [cb for s, cb in win._highlight_style_radios if s == "free"]
+            if not all(cb.get_active() for cb in frees):
+                raise AssertionError("free-hand radios not synced back")
+        self._run_in_window(body)
+
     def test_add_page_button_adds_a_page(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "p.pdf")
@@ -2782,6 +2798,99 @@ class TestReadingOrderSelection(unittest.TestCase):
         c.select_style = "rect"
         c._on_drag_update(g, 20, 20)
         self.assertEqual(calls, ["reading", "rect"])
+
+
+class TestTextHighlight(unittest.TestCase):
+    """#54 cheap tier: the highlighter's 'text' style selects words (reading
+    order) and lays one wide highlight ink stroke per text line over them,
+    reusing the whole ink pipeline (save / eraser / undo)."""
+
+    def setUp(self):
+        self.canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp)
+        self.canvas.load(self._tmp)
+        self.canvas._fit_page(800, 600)
+        # two lines, three words each: (x0,y0,x1,y1, word, block,line,word)
+        self.words = [
+            (10, 10,  50, 20, "Hello",  0, 0, 0),
+            (55, 10,  80, 20, "big",    0, 0, 1),
+            (85, 10, 130, 20, "world",  0, 0, 2),
+            (10, 30,  60, 40, "second", 0, 1, 0),
+            (65, 30,  95, 40, "text",   0, 1, 1),
+            (100, 30, 130, 40, "line",  0, 1, 2),
+        ]
+        self.canvas._page_words = list(self.words)
+        self.canvas._ordered_words = list(self.words)
+
+    def tearDown(self):
+        os.unlink(self._tmp)
+
+    def _plain_drag(self):
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, 100, 100)
+        return g
+
+    def test_default_highlight_style_is_free(self):
+        self.assertEqual(PDFCanvas().highlight_style, "free")
+
+    def test_text_style_drag_enters_text_highlight(self):
+        c = self.canvas
+        c.highlighter = True
+        c.highlight_style = "text"
+        c._on_drag_begin(self._plain_drag(), 100, 100)
+        self.assertTrue(c._text_selecting)
+        self.assertTrue(c._text_highlighting)
+        self.assertEqual(len(c.current_stroke), 0)   # not a freehand stroke
+
+    def test_free_style_drag_draws_freehand(self):
+        c = self.canvas
+        c.highlighter = True
+        c.highlight_style = "free"
+        c._on_drag_begin(self._plain_drag(), 100, 100)
+        self.assertFalse(c._text_highlighting)
+        self.assertEqual(len(c.current_stroke), 1)
+
+    def test_commit_lays_one_stroke_per_line(self):
+        c = self.canvas
+        c._selected_words = list(self.words)   # spans two lines
+        c._commit_text_highlight()
+        self.assertEqual(len(c.strokes), 2)
+        for s in c.strokes:
+            self.assertEqual(s["color"], c.hl_color)
+            self.assertEqual(s["opacity"], c.hl_opacity)
+            self.assertEqual(len(s["pts"]), 2)
+            self.assertGreater(s["width"], 0)
+
+    def test_stroke_spans_the_line_word_boxes(self):
+        c = self.canvas
+        line0 = [w for w in self.words if w[6] == 0]
+        c._selected_words = list(line0)
+        c._commit_text_highlight()
+        (x0, ymid), (x1, _) = c.strokes[-1]["pts"]
+        self.assertAlmostEqual(x0, min(w[0] for w in line0))
+        self.assertAlmostEqual(x1, max(w[2] for w in line0))
+        self.assertAlmostEqual(c.strokes[-1]["width"], 10.0)  # word height
+
+    def test_single_undo_removes_whole_highlight(self):
+        c = self.canvas
+        c._selected_words = list(self.words)
+        c._commit_text_highlight()
+        self.assertEqual(len(c.strokes), 2)
+        c.undo_last()
+        self.assertEqual(len(c.strokes), 0)
+        c.redo_last()
+        self.assertEqual(len(c.strokes), 2)
+
+    def test_empty_selection_commits_nothing(self):
+        c = self.canvas
+        c._selected_words = []
+        c._commit_text_highlight()
+        self.assertEqual(len(c.strokes), 0)
+        self.assertEqual(len(c._undo_stack), 0)
 
 
 class TestDragAndDrop(unittest.TestCase):

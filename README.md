@@ -22,7 +22,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
 - **Straight-line snap** — hold still mid-stroke to lock to a straight line; move while holding to aim, release to commit
-- **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation
+- **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation. Long-press the highlighter tool to switch from free-hand to **mark text**, where a drag selects words (reading order) and lays a clean highlight band over each line — still stored as ink, so it erases and undoes like any stroke
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
 ### Notes
@@ -110,6 +110,7 @@ pip install pymupdf
 | `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (the cursor changes to indicate the active mode) |
 | `Alt+drag` | Select & copy text (snaps to whole words) — works in either mode |
 | Long-press select tool | Switch text selection between reading-order (default) and rectangular |
+| Long-press highlighter tool | Switch highlighter between free-hand (default) and mark-text (drag over words to highlight whole lines) |
 
 ### Pages
 
