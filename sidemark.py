@@ -247,6 +247,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._alt_start = (0.0, 0.0)
         self._selected_words = []   # fitz word tuples currently highlighted
         self._page_words = []       # cached for current page
+        self._ordered_words = []    # _page_words sorted in reading order (block,line,word)
+        # "reading" = press-to-release contiguous run (like a normal PDF viewer);
+        # "rect" = rectangular marquee. Long-press the select tool to switch.
+        self.select_style = "reading"
         self.on_text_copied = None  # callback(text_or_None)
 
         # link hover hint / modifier tracking
@@ -365,6 +369,9 @@ class PDFCanvas(Gtk.DrawingArea):
         else:
             self._needs_fit = True    # re-fit on first draw with real canvas dimensions
         self._page_words = self.page.get_text("words")   # cache for text selection
+        # reading order: MuPDF segments columns into separate blocks, so
+        # (block, line, word) gives column-first order for free
+        self._ordered_words = sorted(self._page_words, key=lambda w: (w[5], w[6], w[7]))
         self._selected_words = []
         self.queue_draw()
         if self.on_page_changed:
@@ -1088,7 +1095,10 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._text_selecting:
             px0, py0 = self._screen_to_pdf(sx, sy)
             px1, py1 = self._screen_to_pdf(sx + offset_x, sy + offset_y)
-            self._selected_words = self._words_in_rect(px0, py0, px1, py1)
+            if self.select_style == "rect":
+                self._selected_words = self._words_in_rect(px0, py0, px1, py1)
+            else:
+                self._selected_words = self._words_in_reading_range(px0, py0, px1, py1)
             self.queue_draw()
             return
         if self._zoom_selecting:
@@ -1244,6 +1254,31 @@ class PDFCanvas(Gtk.DrawingArea):
         ry0, ry1 = min(py0, py1), max(py0, py1)
         return [w for w in self._page_words
                 if w[0] < rx1 and w[2] > rx0 and w[1] < ry1 and w[3] > ry0]
+
+    @staticmethod
+    def _word_point_dist2(w, px, py):
+        """Squared distance from point to a word's bounding box (0 if inside)."""
+        dx = max(w[0] - px, 0.0, px - w[2])
+        dy = max(w[1] - py, 0.0, py - w[3])
+        return dx * dx + dy * dy
+
+    def _nearest_word_index(self, px, py):
+        """Index into self._ordered_words of the word nearest the given point."""
+        best_i, best_d = 0, float("inf")
+        for i, w in enumerate(self._ordered_words):
+            d = self._word_point_dist2(w, px, py)
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i
+
+    def _words_in_reading_range(self, px0, py0, px1, py1):
+        """Contiguous reading-order run between the words nearest press & release."""
+        if not self._ordered_words:
+            return []
+        i = self._nearest_word_index(px0, py0)
+        j = self._nearest_word_index(px1, py1)
+        lo, hi = min(i, j), max(i, j)
+        return self._ordered_words[lo:hi + 1]
 
     def _finish_text_selection(self):
         self.queue_draw()   # highlight stays; copy on Ctrl+C
@@ -2785,7 +2820,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_eraser.set_group(self._mode_pen)
         self._mode_select = Gtk.ToggleButton()
         self._mode_select.set_child(_glyph(_draw_mode_sel))
-        self._mode_select.set_tooltip_text("Select text (Alt+drag · Ctrl+M)")
+        self._mode_select.set_tooltip_text(
+            "Select text (Alt+drag · Ctrl+M · long-press for reading-order / rectangular)")
         self._mode_select.set_group(self._mode_pen)
         self._mode_pan = Gtk.ToggleButton()
         self._mode_pan.set_child(_glyph(_draw_mode_pan, 20))
@@ -2842,7 +2878,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_eraser.set_group(self._pmode_pen)
         self._pmode_select = Gtk.ToggleButton()
         self._pmode_select.set_child(_glyph(_draw_mode_sel))
-        self._pmode_select.set_tooltip_text("Select text (Alt+drag · Ctrl+M)")
+        self._pmode_select.set_tooltip_text(
+            "Select text (Alt+drag · Ctrl+M · long-press for reading-order / rectangular)")
         self._pmode_select.set_group(self._pmode_pen)
         self._pmode_pan = Gtk.ToggleButton()
         self._pmode_pan.set_child(_glyph(_draw_mode_pan, 20))
@@ -2872,6 +2909,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pen_modes_section.append(pmode_box)
         self._pen_modes_section.set_visible(False)
         popover_box.append(self._pen_modes_section)
+
+        # long-press either select button → choose reading-order vs rectangular
+        self._select_style_radios = []
+        self._attach_select_style_menu(self._mode_select)
+        self._attach_select_style_menu(self._pmode_select)
 
         width_label = Gtk.Label(label="Width", xalign=0)
         width_label.add_css_class("dim-label")
@@ -3809,6 +3851,39 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "select": 3,
                    "pan": 4, "zoom": 5, "anchor": 6}
+
+    def _attach_select_style_menu(self, button):
+        """Long-press a select-tool button to pick reading-order vs rectangular."""
+        pop = Gtk.Popover()
+        pop.set_parent(button)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_start(8); box.set_margin_end(8)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        r_read = Gtk.CheckButton(label="Reading order")
+        r_rect = Gtk.CheckButton(label="Rectangular")
+        r_rect.set_group(r_read)
+        r_read.set_active(self.canvas.select_style != "rect")
+        r_rect.set_active(self.canvas.select_style == "rect")
+        r_read.connect("toggled",
+                       lambda b: b.get_active() and self._set_select_style("reading"))
+        r_rect.connect("toggled",
+                       lambda b: b.get_active() and self._set_select_style("rect"))
+        box.append(r_read); box.append(r_rect)
+        pop.set_child(box)
+        self._select_style_radios += [("reading", r_read), ("rect", r_rect)]
+        lp = Gtk.GestureLongPress()
+        lp.connect("pressed", lambda g, x, y: pop.popup())
+        button.add_controller(lp)
+
+    def _set_select_style(self, style):
+        """Switch text-selection style and keep both radio menus in sync."""
+        if getattr(self, "_syncing_select_style", False):
+            return
+        self._syncing_select_style = True
+        self.canvas.select_style = style
+        for s, cb in self._select_style_radios:
+            cb.set_active(s == style)
+        self._syncing_select_style = False
 
     def _set_tool_mode(self, mode):
         """mode in pen / highlighter / select / pan / zoom / anchor — the bar's

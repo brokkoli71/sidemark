@@ -43,7 +43,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice), and `.md` files; drag a file from your file manager onto the window
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
-- **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode
+- **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode. Selection defaults to **reading order** — like a normal PDF viewer, it grabs the contiguous run of text between where you press and release (column-aware) — and long-pressing the select tool switches to a **rectangular** marquee for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
 - **Tool switch** — a segmented header control selects the active tool: pen, highlighter, eraser, text-select, pan, zoom-to-region, and anchor. Each tool is just the modifier-free shortcut for a gesture (e.g. the eraser tool makes a left-drag erase, like the always-on right-drag), and holding the matching modifier (`Ctrl` pan · `Alt` select · `Shift` zoom · `Ctrl+Shift` highlighter · `Ctrl+Alt` anchor) lights up its button — so the hidden gesture shortcuts are discoverable
 - **Responsive header** — a compact single-row toolbar (file actions live in the ☰ menu); as the window narrows it measures itself and folds progressively — first the tool switch tucks into the pen-settings popover, then undo / redo / find drop away — so the core controls stay reachable at any width
@@ -109,6 +109,7 @@ pip install pymupdf
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Redo the last undone action |
 | `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (the cursor changes to indicate the active mode) |
 | `Alt+drag` | Select & copy text (snaps to whole words) — works in either mode |
+| Long-press select tool | Switch text selection between reading-order (default) and rectangular |
 
 ### Pages
 

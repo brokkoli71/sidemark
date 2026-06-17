@@ -2231,6 +2231,24 @@ class TestResponsiveHeader(unittest.TestCase):
                 raise AssertionError("highlight not cleared on release")
         self._run_in_window(body)
 
+    def test_select_style_menu_switches_canvas_style(self):
+        def body(win):
+            # the long-press radios on the select tool drive canvas.select_style
+            if win.canvas.select_style != "reading":
+                raise AssertionError("select style should default to reading order")
+            win._set_select_style("rect")
+            if win.canvas.select_style != "rect":
+                raise AssertionError("setting style did not reach the canvas")
+            # both bar + popover radio sets stay in sync
+            rects = [cb for s, cb in win._select_style_radios if s == "rect"]
+            if not rects or not all(cb.get_active() for cb in rects):
+                raise AssertionError("rect radios not all active after switch")
+            win._set_select_style("reading")
+            reads = [cb for s, cb in win._select_style_radios if s == "reading"]
+            if not all(cb.get_active() for cb in reads):
+                raise AssertionError("reading radios not synced back")
+        self._run_in_window(body)
+
     def test_add_page_button_adds_a_page(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "p.pdf")
@@ -2707,6 +2725,63 @@ class TestToolModes(unittest.TestCase):
         self.canvas._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, True)
         self.canvas._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, False)
         self.assertEqual(seen, ["pan", None])
+
+
+class TestReadingOrderSelection(unittest.TestCase):
+    """#53: reading-order text selection picks the contiguous run between the
+    words nearest the press and release points, ordered by (block,line,word)."""
+
+    def setUp(self):
+        self.canvas = PDFCanvas()
+        # synthetic two-line page; tuples are (x0,y0,x1,y1, word, block,line,word)
+        self.words = [
+            (10, 10,  50, 20, "Hello",  0, 0, 0),
+            (55, 10,  80, 20, "big",    0, 0, 1),
+            (85, 10, 130, 20, "world",  0, 0, 2),
+            (10, 30,  60, 40, "second", 0, 1, 0),
+            (65, 30,  95, 40, "text",   0, 1, 1),
+            (100, 30, 130, 40, "line",  0, 1, 2),
+        ]
+        self.canvas._page_words = list(self.words)
+        self.canvas._ordered_words = list(self.words)
+
+    def test_default_style_is_reading(self):
+        self.assertEqual(PDFCanvas().select_style, "reading")
+
+    def test_nearest_word_index(self):
+        # a point inside "text" (the 5th word, index 4)
+        self.assertEqual(self.canvas._nearest_word_index(70, 35), 4)
+        # a point off the page, closest to "Hello"
+        self.assertEqual(self.canvas._nearest_word_index(-100, -100), 0)
+
+    def test_range_within_a_line(self):
+        # from inside "big" (idx1) to inside "world" (idx2)
+        sel = self.canvas._words_in_reading_range(60, 15, 110, 15)
+        self.assertEqual([w[4] for w in sel], ["big", "world"])
+
+    def test_range_spans_lines_in_reading_order(self):
+        # from "big" (idx1) down to "second" (idx3) → contiguous run, not a rect
+        sel = self.canvas._words_in_reading_range(60, 15, 30, 35)
+        self.assertEqual([w[4] for w in sel], ["big", "world", "second"])
+
+    def test_range_is_order_independent(self):
+        a = self.canvas._words_in_reading_range(60, 15, 30, 35)
+        b = self.canvas._words_in_reading_range(30, 35, 60, 15)
+        self.assertEqual(a, b)
+
+    def test_drag_update_branches_on_style(self):
+        c = self.canvas
+        calls = []
+        c._words_in_rect = lambda *a: (calls.append("rect"), [])[1]
+        c._words_in_reading_range = lambda *a: (calls.append("reading"), [])[1]
+        g = mock.Mock()
+        g.get_start_point.return_value = (True, 100, 100)
+        c._text_selecting = True
+        c.select_style = "reading"
+        c._on_drag_update(g, 20, 20)
+        c.select_style = "rect"
+        c._on_drag_update(g, 20, 20)
+        self.assertEqual(calls, ["reading", "rect"])
 
 
 class TestDragAndDrop(unittest.TestCase):
