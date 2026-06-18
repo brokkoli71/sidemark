@@ -39,6 +39,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 - **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, drop a PDF **from a file manager** between thumbnails to insert its pages there, or drag one (or several selected) **out to a file manager or the desktop** to export those pages as a standalone PDF — annotations baked in, and any page's notes appended after it, like macOS Preview. A drop line shows where pages will land, and a confirmation dialog (with a "don't ask again" option) guards reorders and inserts
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
+- **Presenter view** (`F5`) — mirror the current page on a second screen for presenting: it goes fullscreen on the other monitor (windowed if you only have one), with no header or notes — just the page and its live ink. It follows your page changes and shows strokes as you draw them, but keeps its own fit-to-page view, so you can zoom in to edit a slide while the audience still sees it whole. `Esc` (or `F5` again) closes it
 
 ### Files & integration
 
@@ -122,6 +123,7 @@ pip install pymupdf
 | `PageUp` | Previous page (keeps current zoom) |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
+| `F5` | Toggle presenter view — mirror the page fullscreen on a second screen (`Esc` to close) |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |
 | Drag thumbnail → thumbnail | Reorder pages (in the page-thumbnail sidebar) |
 | Drop a PDF → between thumbnails | Insert that PDF's pages at the drop point (a drop line shows where) |

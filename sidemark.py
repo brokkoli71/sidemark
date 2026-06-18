@@ -146,8 +146,11 @@ class PDFCanvas(Gtk.DrawingArea):
     WHEEL_PAN_STEP = 30.0         # px panned per mouse-wheel notch
     STRAIGHT_HOLD_MS = 500        # hold still this long mid-stroke to snap to a line
 
-    def __init__(self):
+    def __init__(self, interactive=True):
         super().__init__()
+        # interactive=False makes a view-only canvas (no input controllers) — used
+        # by the presenter window, which mirrors the editor on a second screen.
+        self._interactive = interactive
         self.document = None
         self.n_pages = 0
         self.current_page_idx = 0
@@ -323,6 +326,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self.set_draw_func(self._draw)
         self.set_focusable(True)
         self.set_can_focus(True)
+
+        self._mouse_x = 0.0
+        self._mouse_y = 0.0
+        if not interactive:
+            return   # view-only mirror: no drawing/pan/zoom/key input
 
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_motion)
@@ -3026,6 +3034,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.canvas.on_modifier_tool = self._highlight_transient_tool
         self._transient_tool = None
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
+        self._presenter = None          # PresenterWindow when second-screen view is open
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -3563,6 +3572,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         search_btn.set_tooltip_text("Search PDF & notes (Ctrl+F)")
         search_btn.connect("clicked", lambda _: self._show_search())
 
+        self._present_btn = Gtk.ToggleButton()
+        self._present_btn.set_icon_name(
+            _themed_icon("video-display-symbolic", "display-symbolic"))
+        self._present_btn.set_tooltip_text(
+            "Presenter view — mirror the page on a second screen (F5)")
+        self._present_btn.connect("toggled", self._on_present_toggled)
+
         self._notes_toggle = Gtk.ToggleButton()
         self._notes_toggle.set_icon_name(
             _themed_icon("view-sidebar-symbolic", "sidebar-show-symbolic"))
@@ -3582,6 +3598,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         self._header_end = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._header_end.append(search_btn)
+        self._header_end.append(self._present_btn)
         self._header_end.append(self._notes_toggle)
 
         # Icon buttons don't compress, so the cluster's *minimum* width equals
@@ -3957,6 +3974,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _mark_dirty(self, *_):
         if not self._suppress_dirty:
             self._dirty = True
+        if self._presenter is not None:
+            self._presenter.refresh()
 
     def _on_notes_changed(self, _buf):
         # A real user edit (not a page restore, not the symbol-substitution
@@ -4034,9 +4053,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _on_close_request(self, _win):
         if not self._dirty:
+            self._close_presenter()
             return False   # allow close
-        self._ask_save_then(self.destroy)
+        self._ask_save_then(self._destroy_all)
         return True        # block default close; destroy() called from dialog
+
+    def _destroy_all(self):
+        self._close_presenter()
+        self.destroy()
 
     def _ask_save_then(self, callback):
         dlg = Adw.AlertDialog.new(
@@ -4070,6 +4094,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._update_search_canvas()
         if self._toc_thumbs and self._toc_revealer.get_reveal_child():
             self._select_thumb(idx)
+        if self._presenter is not None:
+            self._presenter.sync_page()
 
     def _go_to_page(self, idx):
         self._commit_note()
@@ -4844,7 +4870,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         collapse_pen = level >= 1
         self._tools_box.set_visible(not collapse_pen)
         self._pen_modes_section.set_visible(collapse_pen)
-        for b in (self._undo_btn, self._redo_btn, self._search_btn, self._undo_sep):
+        for b in (self._undo_btn, self._redo_btn, self._search_btn,
+                  self._present_btn, self._undo_sep):
             b.set_visible(level < 2)
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
@@ -4902,6 +4929,60 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._mode_pen.set_active(True)
         else:
             self._mode_select.set_active(True)
+
+    # ── presenter (second-screen) view ──────────────────────────────────────
+    def _on_present_toggled(self, btn):
+        if btn.get_active():
+            self._open_presenter()
+        else:
+            self._close_presenter()
+
+    def _open_presenter(self):
+        if self._presenter is not None:
+            return
+        if not self.canvas.document:
+            self._toast("Open a PDF first")
+            self._present_btn.set_active(False)
+            return
+        pres = PresenterWindow(self.get_application(), self.canvas)
+        pres.connect("close-request", self._on_presenter_closed)
+        self._presenter = pres
+        pres.present()
+        self._place_presenter(pres)
+
+    def _place_presenter(self, pres):
+        """Fullscreen on a monitor other than the editor's; fall back to a
+        normal window when there's only one screen."""
+        display = self.get_display()
+        monitors = display.get_monitors()
+        n = monitors.get_n_items() if monitors else 0
+        target = None
+        if n > 1:
+            editor_mon = None
+            surface = self.get_surface()
+            if surface is not None:
+                editor_mon = display.get_monitor_at_surface(surface)
+            for i in range(n):
+                mon = monitors.get_item(i)
+                if mon is not editor_mon:
+                    target = mon
+                    break
+        if target is not None:
+            pres.fullscreen_on_monitor(target)
+        else:
+            pres.set_default_size(960, 720)   # single-monitor: windowed mirror
+
+    def _close_presenter(self):
+        if self._presenter is not None:
+            pres, self._presenter = self._presenter, None
+            pres.close()
+
+    def _on_presenter_closed(self, _win):
+        # fired when the presenter closes itself (Esc / window close)
+        self._presenter = None
+        if self._present_btn.get_active():
+            self._present_btn.set_active(False)   # untoggle the header button
+        return False
 
     def _on_notes_toggled(self, btn):
         w = self.get_width() or 1280
@@ -5533,6 +5614,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_Delete:
                 self._delete_current_page()
                 return True
+        if keyval == Gdk.KEY_F5:
+            self._present_btn.set_active(not self._present_btn.get_active())
+            return True
         # lasso selection: Delete removes it, Escape drops it (only when the notes
         # editor isn't focused, so typing in notes is never affected)
         if (self.canvas.has_lasso_selection()
@@ -5679,6 +5763,61 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self.canvas.search_current_rect = None
         self.canvas.queue_draw()
+
+
+class PresenterWindow(Adw.Window):
+    """A view-only mirror of the editor canvas for a second screen / projector:
+    fullscreen, no header or notes — just the current page with live ink. Shares
+    the editor's document and stroke dict by reference (re-pointed on every sync,
+    so structural edits are picked up) but keeps its own fit-to-page view, so the
+    editor can zoom in to work on a slide while the audience still sees it whole.
+    """
+
+    def __init__(self, app, src_canvas):
+        super().__init__(application=app)
+        self.set_title("Sidemark — Presenter")
+        self._src = src_canvas
+        canvas = PDFCanvas(interactive=False)
+        canvas.surround_color = (0.0, 0.0, 0.0)   # black surround for projection
+        canvas.zoom_accent = src_canvas.zoom_accent
+        self.canvas = canvas
+        self.set_content(canvas)
+        self.sync_page()
+
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_key)
+        self.add_controller(key)
+
+    def _repoint(self):
+        """Re-point the shared document/stroke references at the editor's current
+        objects (they're swapped out on open / page insert / reorder)."""
+        c, src = self.canvas, self._src
+        c.document = src.document
+        c.all_strokes = src.all_strokes
+        c._anchors = src._anchors
+        c.n_pages = src.n_pages
+
+    def sync_page(self):
+        """Mirror the editor's current page (reloads + refits to our own size)."""
+        self._repoint()
+        c = self.canvas
+        if c.document is None:
+            c.page = None
+            c.queue_draw()
+            return
+        # always reload: after a reorder the page at this index has changed
+        c._load_page(self._src.current_page_idx)
+
+    def refresh(self):
+        """Strokes changed on the current page — just redraw (no reload)."""
+        self._repoint()
+        self.canvas.queue_draw()
+
+    def _on_key(self, _ctrl, keyval, _keycode, _state):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
 
 
 class PDFEditorApp(Adw.Application):

@@ -1972,6 +1972,117 @@ class TestThumbSelectionClearing(unittest.TestCase):
         self._run_in_window(body)
 
 
+class TestPresenterMode(unittest.TestCase):
+    """#55 — second-screen presenter mirror: shares document/strokes by
+    reference, follows the editor's page, view-only, toggled from the header."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.presenter")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                if win._presenter is not None:
+                    win._close_presenter()
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_open_shares_document_and_is_view_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                pres = win._presenter
+                self.assertIsNotNone(pres)
+                self.assertIsNot(pres.canvas, win.canvas)
+                self.assertIs(pres.canvas.document, win.canvas.document)
+                self.assertIs(pres.canvas.all_strokes, win.canvas.all_strokes)
+                self.assertFalse(pres.canvas._interactive)
+                self.assertEqual(pres.canvas.current_page_idx,
+                                 win.canvas.current_page_idx)
+
+            self._run_in_window(body)
+
+    def test_presenter_follows_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win.canvas.go_to_page(2)
+                self.assertEqual(win._presenter.canvas.current_page_idx, 2)
+
+            self._run_in_window(body)
+
+    def test_structural_change_repoints_shared_refs(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win._add_blank_page()   # reassigns canvas.all_strokes to a new dict
+                self.assertIs(win._presenter.canvas.all_strokes,
+                              win.canvas.all_strokes)
+                self.assertEqual(win._presenter.canvas.n_pages,
+                                 win.canvas.n_pages)
+
+            self._run_in_window(body)
+
+    def test_toggle_off_closes_presenter(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                self.assertIsNotNone(win._presenter)
+                win._present_btn.set_active(False)
+                self.assertIsNone(win._presenter)
+
+            self._run_in_window(body)
+
+    def test_presenter_closing_untoggles_button(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win._presenter._on_key(None, Gdk.KEY_Escape, 0, 0)  # Esc closes it
+                self.assertIsNone(win._presenter)
+                self.assertFalse(win._present_btn.get_active())
+
+            self._run_in_window(body)
+
+    def test_open_without_document_is_refused(self):
+        def body(win):
+            # no PDF loaded — toggling on should bounce back off, no presenter
+            win._present_btn.set_active(True)
+            self.assertIsNone(win._presenter)
+            self.assertFalse(win._present_btn.get_active())
+
+        self._run_in_window(body)
+
+
 class TestExport(unittest.TestCase):
     """
     Covers three bug classes that slipped through before:
@@ -2653,12 +2764,18 @@ class TestResponsiveHeader(unittest.TestCase):
     def test_level2_hides_secondary_actions(self):
         def body(win):
             win._apply_collapse_level(2)
-            for b in (win._undo_btn, win._redo_btn, win._search_btn, win._undo_sep):
+            for b in (win._undo_btn, win._redo_btn, win._search_btn,
+                      win._present_btn, win._undo_sep):
                 if b.get_visible():
-                    raise AssertionError("undo/redo/find should hide at level 2")
+                    raise AssertionError(
+                        "undo/redo/find/presenter should hide at level 2")
             # the tool switch stays folded into the popover at level 2 too
             if win._tools_box.get_visible():
                 raise AssertionError("tool switch should stay folded at level 2")
+            # they come back when the bar expands again
+            win._apply_collapse_level(0)
+            if not win._present_btn.get_visible():
+                raise AssertionError("presenter button should reappear at level 0")
         self._run_in_window(body)
 
     def test_calibration_breakpoints_are_ordered(self):
