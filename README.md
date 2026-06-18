@@ -23,6 +23,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
 - **Straight-line snap** — hold still mid-stroke to lock to a straight line; move while holding to aim, release to commit
 - **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width setting, preserved across save/reload like any annotation. Long-press the highlighter tool to switch from free-hand to **mark text**, where a drag selects words (reading order) and lays a clean highlight band over each line — still stored as ink, so it erases and undoes like any stroke
+- **Lasso ink** (lasso tool, or `Ctrl+Shift+Alt+drag`) — draw a freehand loop around existing strokes to select them (any stroke touching the loop is caught, GoodNotes-style), then drag the selection to **move** it, press `Delete` to remove it, or pick a new colour/width in the pen settings to **recolour** it. `Escape` clears the selection; every action is a single undo step
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
 ### Notes
@@ -45,7 +46,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode. Selection defaults to **reading order** — like a normal PDF viewer, it grabs the contiguous run of text between where you press and release (column-aware) — and long-pressing the select tool switches to a **rectangular** marquee for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
-- **Tool switch** — a segmented header control selects the active tool: pen, highlighter, eraser, text-select, pan, zoom-to-region, and anchor. Each tool is just the modifier-free shortcut for a gesture (e.g. the eraser tool makes a left-drag erase, like the always-on right-drag), and holding the matching modifier (`Ctrl` pan · `Alt` select · `Shift` zoom · `Ctrl+Shift` highlighter · `Ctrl+Alt` anchor) lights up its button — so the hidden gesture shortcuts are discoverable
+- **Tool switch** — a segmented header control selects the active tool: pen, highlighter, eraser, lasso, text-select, pan, zoom-to-region, and anchor. Each tool is just the modifier-free shortcut for a gesture (e.g. the eraser tool makes a left-drag erase, like the always-on right-drag), and holding the matching modifier (`Ctrl` pan · `Alt` select · `Shift` zoom · `Ctrl+Shift` highlighter · `Ctrl+Alt` anchor · `Ctrl+Shift+Alt` lasso) lights up its button — so the hidden gesture shortcuts are discoverable
 - **Responsive header** — a compact single-row toolbar (file actions live in the ☰ menu); as the window narrows it measures itself and folds progressively — first the tool switch tucks into the pen-settings popover, then undo / redo / find drop away — so the core controls stay reachable at any width
 
 ## Installation
@@ -105,6 +106,7 @@ pip install pymupdf
 | Right-drag | Erase stroke (including from previous sessions) |
 | `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
 | `Ctrl+Shift+drag` | Draw one highlighter stroke without switching tool (reverts on release) |
+| Lasso tool / `Ctrl+Shift+Alt+drag` | Loop around strokes to select them, then drag to move · `Delete` to remove · change colour/width to recolour · `Escape` to clear |
 | `Ctrl+Z` | Undo the last action — a stroke, an erase, or a burst of typing — works across drawing and notes regardless of where the cursor is |
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Redo the last undone action |
 | `Ctrl+M` | Toggle draw / select-text mode — in select mode a plain left-drag highlights text instead of drawing (the cursor changes to indicate the active mode) |

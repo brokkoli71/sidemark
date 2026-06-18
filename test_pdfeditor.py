@@ -1707,6 +1707,163 @@ class TestPageDragExport(unittest.TestCase):
         doc.close()
 
 
+class _FakeDrag:
+    """Minimal stand-in for a Gtk drag gesture so the canvas drag handlers can be
+    driven without a real pointer (headless: scale 1.0, offset 0 → screen==PDF)."""
+    def __init__(self, sx, sy, button=1, state=None):
+        self._sx, self._sy, self._b = sx, sy, button
+        self._st = state if state is not None else Gdk.ModifierType(0)
+
+    def get_current_button(self):
+        return self._b
+
+    def get_current_event_state(self):
+        return self._st
+
+    def get_start_point(self):
+        return (True, self._sx, self._sy)
+
+    def get_current_event(self):
+        return None
+
+
+class TestLassoSelect(unittest.TestCase):
+    """#48 — lasso-select ink strokes, then move / delete / recolour them."""
+
+    def _canvas(self, n_pages=2):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        make_pdf(path, n_pages=n_pages)
+        canvas.load(path)
+        self._tmp = path
+        canvas.tool = "lasso"
+        return canvas
+
+    def tearDown(self):
+        if hasattr(self, "_tmp") and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    @staticmethod
+    def _stroke(pts, color=(0.0, 0.0, 0.0), width=2.0, opacity=1.0):
+        return {"pts": list(pts), "color": color, "width": width, "opacity": opacity}
+
+    def _two_strokes(self, canvas):
+        """A near (50,50), B near (300,300) on page 0."""
+        a = self._stroke([(50, 50), (60, 60)])
+        b = self._stroke([(300, 300), (310, 310)])
+        canvas.all_strokes[0] = [a, b]
+        return a, b
+
+    def test_point_in_polygon(self):
+        square = [(0, 0), (100, 0), (100, 100), (0, 100)]
+        self.assertTrue(PDFCanvas._point_in_polygon(50, 50, square))
+        self.assertFalse(PDFCanvas._point_in_polygon(150, 50, square))
+
+    def test_lasso_selects_strokes_with_any_point_inside(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        # a loop around A only
+        canvas._lasso_path = [(30, 30), (90, 30), (90, 90), (30, 90)]
+        canvas._finish_lasso()
+        self.assertEqual(canvas._selected_strokes, [a])
+        self.assertTrue(canvas.has_lasso_selection())
+
+    def test_lasso_ignores_strokes_fully_outside(self):
+        canvas = self._canvas()
+        self._two_strokes(canvas)
+        canvas._lasso_path = [(120, 120), (180, 120), (180, 180), (120, 180)]
+        canvas._finish_lasso()
+        self.assertEqual(canvas._selected_strokes, [])
+
+    def test_delete_selected_and_undo_restores(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        canvas._set_selected_strokes([a])
+        canvas.delete_selected_strokes()
+        self.assertEqual(canvas.all_strokes[0], [b])
+        self.assertFalse(canvas.has_lasso_selection())
+        canvas.undo_last()
+        self.assertEqual(len(canvas.all_strokes[0]), 2)
+        self.assertIn(a, canvas.all_strokes[0])
+
+    def test_recolor_selected_and_undo_redo(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        canvas._set_selected_strokes([a])
+        canvas.recolor_selected((1.0, 0.0, 0.0), 5.0, 0.5)
+        self.assertEqual(a["color"], (1.0, 0.0, 0.0))
+        self.assertEqual(a["width"], 5.0)
+        self.assertEqual(a["opacity"], 0.5)
+        self.assertEqual(b["color"], (0.0, 0.0, 0.0))   # untouched
+        canvas.undo_last()
+        self.assertEqual(a["color"], (0.0, 0.0, 0.0))
+        self.assertEqual(a["width"], 2.0)
+        canvas.redo_last()
+        self.assertEqual(a["color"], (1.0, 0.0, 0.0))
+        self.assertEqual(a["width"], 5.0)
+
+    def test_move_translates_points_with_undo_redo(self):
+        canvas = self._canvas()
+        a, _ = self._two_strokes(canvas)
+        orig = list(a["pts"])
+        canvas._set_selected_strokes([a])
+        # grab inside A's bbox, drag by (30, 40)
+        canvas._on_drag_begin(_FakeDrag(50, 50), 50, 50)
+        self.assertTrue(canvas._lasso_moving)
+        canvas._on_drag_update(_FakeDrag(50, 50), 30, 40)
+        canvas._on_drag_end(_FakeDrag(50, 50), 30, 40)
+        self.assertEqual(a["pts"], [(x + 30, y + 40) for x, y in orig])
+        canvas.undo_last()
+        self.assertEqual(a["pts"], orig)
+        canvas.redo_last()
+        self.assertEqual(a["pts"], [(x + 30, y + 40) for x, y in orig])
+
+    def test_new_loop_clears_prior_selection(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        canvas._set_selected_strokes([a])
+        # press outside the selection starts a fresh loop, dropping the old one
+        canvas._on_drag_begin(_FakeDrag(200, 200), 200, 200)
+        self.assertTrue(canvas._lassoing)
+        self.assertEqual(canvas._selected_strokes, [])
+
+    def test_page_change_clears_selection(self):
+        canvas = self._canvas(n_pages=2)
+        a, _ = self._two_strokes(canvas)
+        canvas._set_selected_strokes([a])
+        canvas.go_to_page(1)
+        self.assertFalse(canvas.has_lasso_selection())
+
+    def test_selection_callback_fires(self):
+        canvas = self._canvas()
+        a, _ = self._two_strokes(canvas)
+        seen = []
+        canvas.on_lasso_selection = seen.append
+        canvas._set_selected_strokes([a])
+        canvas._set_selected_strokes([])
+        self.assertEqual(seen, [True, False])
+
+    def test_ctrl_shift_alt_drag_lassos_regardless_of_tool(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        canvas.tool = "pen"   # the modifier gesture overrides the sticky tool
+        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+                | Gdk.ModifierType.ALT_MASK)
+        canvas._on_drag_begin(_FakeDrag(30, 30, state=mods), 30, 30)
+        self.assertTrue(canvas._lassoing)
+        canvas._lasso_path = [(30, 30), (90, 30), (90, 90), (30, 90)]  # loop around A
+        canvas._on_drag_end(_FakeDrag(30, 30, state=mods), 60, 60)
+        self.assertEqual(canvas._selected_strokes, [a])
+
+    def test_modifier_tool_maps_lasso_before_anchor(self):
+        canvas = self._canvas()
+        canvas._ctrl_held = canvas._shift_held = canvas._alt_held = True
+        self.assertEqual(canvas._modifier_tool(), "lasso")
+        canvas._shift_held = False          # Ctrl+Alt is still anchor
+        self.assertEqual(canvas._modifier_tool(), "anchor")
+
+
 class TestThumbSelectionClearing(unittest.TestCase):
     """A plain (no Ctrl/Shift) click on a thumbnail collapses the multi-page
     export selection to that one page; clicking empty sidebar space or the main
@@ -2573,6 +2730,45 @@ class TestResponsiveHeader(unittest.TestCase):
             # highlighter/select flags only set for their own tools
             if win.canvas.highlighter or win.canvas.select_mode:
                 raise AssertionError("anchor tool wrongly set hl/select flags")
+        self._run_in_window(body)
+
+    def test_lasso_tool_button(self):
+        def body(win):
+            win._mode_lasso.set_active(True)
+            if win.canvas.tool != "lasso":
+                raise AssertionError("lasso button did not select the lasso tool")
+            if not win._pmode_lasso.get_active():
+                raise AssertionError("popover lasso mirror not synced")
+            # lasso is its own tool, not the text-select or highlighter mode
+            if win.canvas.highlighter or win.canvas.select_mode:
+                raise AssertionError("lasso tool wrongly set hl/select flags")
+
+        self._run_in_window(body)
+
+    def test_leaving_lasso_tool_clears_selection(self):
+        def body(win):
+            win._mode_lasso.set_active(True)
+            win.canvas.all_strokes[0] = [
+                {"pts": [(50, 50)], "color": (0, 0, 0), "width": 2.0, "opacity": 1.0}]
+            win.canvas._set_selected_strokes(win.canvas.all_strokes[0])
+            win._mode_pen.set_active(True)   # switching tool drops the selection
+            if win.canvas.has_lasso_selection():
+                raise AssertionError("selection survived a tool switch")
+
+        self._run_in_window(body)
+
+    def test_recolor_via_pen_popover(self):
+        def body(win):
+            win._mode_lasso.set_active(True)
+            s = {"pts": [(50, 50), (60, 60)], "color": (0.0, 0.0, 0.0),
+                 "width": 2.0, "opacity": 1.0}
+            win.canvas.all_strokes[0] = [s]
+            win.canvas._set_selected_strokes([s])
+            win.canvas.pen_color = (1.0, 0.0, 0.0)
+            win._recolor_lasso_if_any()
+            if s["color"] != (1.0, 0.0, 0.0):
+                raise AssertionError("pen colour change did not recolour selection")
+
         self._run_in_window(body)
 
     def test_modifier_highlights_matching_tool_button(self):

@@ -203,6 +203,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_callout_moved = None   # callback(anchor_index, pdf_x, pdf_y)
         self.on_user_action = None     # callback() once per completed draw/erase gesture
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
+        self.on_lasso_selection = None # callback(has_selection: bool) when the lasso set changes
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
         self._anchors = {}
@@ -255,6 +256,16 @@ class PDFCanvas(Gtk.DrawingArea):
         self._needs_fit = False        # refit on first draw after load (canvas may not be allocated yet)
 
         self._erasing = False
+
+        # lasso stroke selection (the "lasso" tool): a freehand loop selects
+        # ink strokes on the page, which can then be moved / deleted / recoloured.
+        self._lassoing = False
+        self._lasso_path = []          # screen-space points of the loop in progress
+        self._selected_strokes = []    # references into self.strokes, selected
+        self._lasso_moving = False
+        self._lasso_move_start = None
+        self._lasso_move_orig = []     # original pts of selected strokes at drag begin
+        self._lasso_moved = False
 
         self._panning = False
         self._pan_start_offset = (0.0, 0.0)
@@ -402,6 +413,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._load_page(0)
 
     def _load_page(self, idx, keep_view=False):
+        self.clear_lasso_selection()   # selection is per-page and transient
         self.current_page_idx = idx
         self.page = self.document[idx]
         self.page_width  = self.page.rect.width
@@ -575,6 +587,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.line_to(*pt)
             ctx.stroke()
         ctx.restore()
+
+        self._draw_lasso(ctx)
 
         # anchor markers
         anchors = self._anchors.get(self.current_page_idx, [])
@@ -942,6 +956,8 @@ class PDFCanvas(Gtk.DrawingArea):
     def _modifier_tool(self):
         """Which tool the held modifiers stand in for, mirroring the gesture
         routing in _on_drag_begin — or None when nothing relevant is held."""
+        if self._ctrl_held and self._shift_held and self._alt_held:
+            return "lasso"
         if self._ctrl_held and self._alt_held:
             return "anchor"
         if self._ctrl_held and self._shift_held:
@@ -956,7 +972,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _default_cursor(self):
         """Cursor that matches the active tool while idle (no drag in flight)."""
-        name = {"select": "text", "pan": "grab",
+        name = {"select": "text", "pan": "grab", "lasso": "crosshair",
                 "zoom": "crosshair", "anchor": "crosshair"}.get(self.tool)
         return Gdk.Cursor.new_from_name(name, None) if name else None
 
@@ -979,8 +995,10 @@ class PDFCanvas(Gtk.DrawingArea):
         if self.on_canvas_press:
             self.on_canvas_press()
         state = gesture.get_current_event_state()
+        # Ctrl+Alt (but not when Shift is also held — that's the lasso gesture)
         ctrl_alt = ((state & Gdk.ModifierType.CONTROL_MASK)
-                    and (state & Gdk.ModifierType.ALT_MASK))
+                    and (state & Gdk.ModifierType.ALT_MASK)
+                    and not (state & Gdk.ModifierType.SHIFT_MASK))
         any_mod = state & (Gdk.ModifierType.CONTROL_MASK
                            | Gdk.ModifierType.ALT_MASK
                            | Gdk.ModifierType.SHIFT_MASK)
@@ -1029,6 +1047,19 @@ class PDFCanvas(Gtk.DrawingArea):
             self._selected_words = []
             return
         state = gesture.get_current_event_state()
+        if ((state & Gdk.ModifierType.CONTROL_MASK)
+                and (state & Gdk.ModifierType.ALT_MASK)
+                and (state & Gdk.ModifierType.SHIFT_MASK)):
+            # Ctrl+Shift+Alt+drag: lasso-select ink, regardless of the sticky tool
+            # (mirrors the lasso tool as a discoverable modifier gesture)
+            self._panning = False
+            self._text_selecting = False
+            self._zoom_selecting = False
+            self._selected_words = []
+            self._lassoing = True
+            self._set_selected_strokes([])
+            self._lasso_path = [(start_x, start_y)]
+            return
         if (state & Gdk.ModifierType.CONTROL_MASK) and (state & Gdk.ModifierType.ALT_MASK):
             # anchor already placed at press by GestureClick; dragging on
             # places a callout box at the release point
@@ -1097,6 +1128,22 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._erasing = True
                 self._erase_group += 1
                 self._erase_at(start_x, start_y)
+                return
+            if self.tool == "lasso":
+                px, py = self._screen_to_pdf(start_x, start_y)
+                if self._selected_strokes and self._point_in_selection(px, py):
+                    # press inside the current selection grabs it for a move
+                    self._lasso_moving = True
+                    self._lasso_move_start = (start_x, start_y)
+                    self._lasso_move_orig = [list(s["pts"])
+                                            for s in self._selected_strokes]
+                    self._lasso_moved = False
+                    self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+                else:
+                    # otherwise start a fresh loop, dropping any prior selection
+                    self._lassoing = True
+                    self._set_selected_strokes([])
+                    self._lasso_path = [(start_x, start_y)]
                 return
             hit = self._anchor_hit_test(start_x, start_y)
             if hit is not None:
@@ -1179,6 +1226,18 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._erasing:
             self._erase_at(sx + offset_x, sy + offset_y)
+            return
+        if self._lasso_moving:
+            if math.hypot(offset_x, offset_y) >= 3:
+                self._lasso_moved = True
+            dx, dy = offset_x / self.scale, offset_y / self.scale
+            for s, orig in zip(self._selected_strokes, self._lasso_move_orig):
+                s["pts"] = [(x + dx, y + dy) for x, y in orig]
+            self.queue_draw()
+            return
+        if self._lassoing:
+            self._lasso_path.append((sx + offset_x, sy + offset_y))
+            self.queue_draw()
             return
         if self._panning:
             self.offset_x = self._pan_start_offset[0] + offset_x
@@ -1267,6 +1326,25 @@ class PDFCanvas(Gtk.DrawingArea):
                     and self._undo_stack[-1][4] == self._erase_group
                     and self.on_user_action):
                 self.on_user_action()
+            return
+        if self._lasso_moving:
+            self._lasso_moving = False
+            self.set_cursor(self._default_cursor())
+            if self._lasso_moved and self._selected_strokes:
+                dx, dy = offset_x / self.scale, offset_y / self.scale
+                self._undo_stack.append(("lasso_move", self.current_page_idx,
+                                         list(self._selected_strokes), dx, dy))
+                self._redo_stack.clear()
+                if self.on_change:
+                    self.on_change()
+                if self.on_user_action:
+                    self.on_user_action()
+            self.queue_draw()
+            return
+        if self._lassoing:
+            self._lassoing = False
+            self._finish_lasso()
+            self.queue_draw()
             return
         if self._panning:
             self._panning = False
@@ -1540,6 +1618,163 @@ class PDFCanvas(Gtk.DrawingArea):
                 return True
         return False
 
+    # ── lasso stroke selection ──────────────────────────────────────────────
+    @staticmethod
+    def _point_in_polygon(px, py, poly):
+        """Even-odd ray-cast test: is (px, py) inside the polygon `poly`?"""
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > py) != (yj > py)) and \
+               (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def _finish_lasso(self):
+        """Close the in-progress loop and select every stroke on the page with at
+        least one point inside it (forgiving 'any point inside' rule)."""
+        path = self._lasso_path
+        self._lasso_path = []
+        if len(path) < 3:
+            self._set_selected_strokes([])
+            return
+        poly = [self._screen_to_pdf(x, y) for x, y in path]
+        sel = [s for s in self.strokes
+               if any(self._point_in_polygon(px, py, poly) for px, py in s["pts"])]
+        self._set_selected_strokes(sel)
+
+    def _selection_bbox(self):
+        """PDF-space (x0, y0, x1, y1) bounding box of the selected strokes, or None."""
+        pts = [p for s in self._selected_strokes for p in s["pts"]]
+        if not pts:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _point_in_selection(self, px, py):
+        """Is the PDF point inside the selection's (padded) bounding box?"""
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        x0, y0, x1, y1 = bbox
+        pad = 8.0 / self.scale
+        return x0 - pad <= px <= x1 + pad and y0 - pad <= py <= y1 + pad
+
+    def _set_selected_strokes(self, strokes):
+        self._selected_strokes = strokes
+        if self.on_lasso_selection:
+            self.on_lasso_selection(bool(strokes))
+
+    def has_lasso_selection(self):
+        return bool(self._selected_strokes)
+
+    def clear_lasso_selection(self):
+        if self._selected_strokes or self._lasso_path:
+            self._lasso_path = []
+            self._set_selected_strokes([])
+            self.queue_draw()
+
+    def delete_selected_strokes(self):
+        """Remove the lasso-selected strokes (one undo entry, reusing erase ops)."""
+        if not self._selected_strokes:
+            return
+        page = self.current_page_idx
+        sel = set(id(s) for s in self._selected_strokes)
+        self._erase_group += 1
+        kept = []
+        removed = 0
+        for i, s in enumerate(self.strokes):
+            if id(s) in sel:
+                self._undo_stack.append(("erase", page, i - removed, s, self._erase_group))
+                removed += 1
+            else:
+                kept.append(s)
+        if removed:
+            self.all_strokes[page] = kept
+            self._redo_stack.clear()
+            self._set_selected_strokes([])
+            if self.on_change:
+                self.on_change()
+            if self.on_user_action:
+                self.on_user_action()
+            self.queue_draw()
+
+    def recolor_selected(self, color, width, opacity):
+        """Apply the given pen attrs to the selected strokes (one undo entry)."""
+        if not self._selected_strokes:
+            return
+        before = [(s, s["color"], s["width"], s.get("opacity", 1.0))
+                  for s in self._selected_strokes]
+        for s in self._selected_strokes:
+            s["color"] = color
+            s["width"] = width
+            s["opacity"] = opacity
+        self._undo_stack.append(("recolor", self.current_page_idx, before,
+                                 color, width, opacity))
+        self._redo_stack.clear()
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        self.queue_draw()
+
+    def _draw_lasso(self, ctx):
+        """Overlay for the lasso tool: highlight selected strokes, the live loop
+        being drawn, and a bounding box around the current selection."""
+        ar, ag, ab = self.zoom_accent
+        # retint selected strokes so they read as picked up
+        if self._selected_strokes:
+            ctx.save()
+            ctx.translate(self.offset_x, self.offset_y)
+            ctx.scale(self.scale, self.scale)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            for s in self._selected_strokes:
+                pts = s["pts"]
+                # a translucent glow wider than the stroke, so its real colour
+                # still shows through the centre
+                ctx.set_source_rgba(ar, ag, ab, 0.35)
+                ctx.set_line_width(s["width"] + 7.0 / self.scale)
+                if len(pts) < 2:
+                    if pts:
+                        ctx.arc(pts[0][0], pts[0][1],
+                                s["width"] / 2 + 3.5 / self.scale, 0, 2 * math.pi)
+                        ctx.fill()
+                    continue
+                ctx.move_to(*pts[0])
+                for pt in pts[1:]:
+                    ctx.line_to(*pt)
+                ctx.stroke()
+            ctx.restore()
+            # dashed bounding box (screen space for crisp 1px lines)
+            bbox = self._selection_bbox()
+            if bbox:
+                x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
+                x1, y1 = self._pdf_to_screen(bbox[2], bbox[3])
+                pad = 5.0
+                ctx.set_source_rgba(ar, ag, ab, 0.85)
+                ctx.set_line_width(1.0)
+                ctx.set_dash([4.0, 3.0])
+                ctx.rectangle(x0 - pad, y0 - pad,
+                              (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+                ctx.stroke()
+                ctx.set_dash([])
+        # the loop being drawn
+        if self._lassoing and len(self._lasso_path) >= 2:
+            ctx.set_source_rgba(ar, ag, ab, 0.9)
+            ctx.set_line_width(1.5)
+            ctx.set_dash([5.0, 3.0])
+            ctx.move_to(*self._lasso_path[0])
+            for pt in self._lasso_path[1:]:
+                ctx.line_to(*pt)
+            ctx.stroke()
+            ctx.set_dash([])
+
     def _constrain_zoom_end(self, sx, sy, ex, ey):
         """Constrain (ex, ey) so the rect has the same aspect ratio as the canvas."""
         cw = self.get_width() or 800
@@ -1610,6 +1845,13 @@ class PDFCanvas(Gtk.DrawingArea):
                     op = self._undo_stack.pop()
                     popped.append(op)
                     self._remove_stroke(strokes, op[2])
+        elif op[0] == "lasso_move":
+            _, _, refs, dx, dy = op
+            for s in refs:
+                s["pts"] = [(x - dx, y - dy) for x, y in s["pts"]]
+        elif op[0] == "recolor":
+            for s, oc, ow, oo in op[2]:
+                s["color"], s["width"], s["opacity"] = oc, ow, oo
         else:
             strokes.insert(min(op[2], len(strokes)), op[3])
             group = op[4]
@@ -1618,6 +1860,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 op = self._undo_stack.pop()
                 popped.append(op)
                 strokes.insert(min(op[2], len(strokes)), op[3])
+        self.clear_lasso_selection()
         self._redo_stack.append(popped)
         if page != self.current_page_idx:
             self.go_to_page(page)   # show the user what was undone
@@ -1636,6 +1879,14 @@ class PDFCanvas(Gtk.DrawingArea):
             # re-add in chronological order (reverse of the pop order)
             for op in reversed(ops):
                 strokes.append(op[2])
+        elif ops[0][0] == "lasso_move":
+            _, _, refs, dx, dy = ops[0]
+            for s in refs:
+                s["pts"] = [(x + dx, y + dy) for x, y in s["pts"]]
+        elif ops[0][0] == "recolor":
+            _, _, before, nc, nw, no = ops[0]
+            for s, _oc, _ow, _oo in before:
+                s["color"], s["width"], s["opacity"] = nc, nw, no
         else:
             # re-remove in the gesture's chronological order (reverse of pop order)
             for op in reversed(ops):
@@ -1643,6 +1894,7 @@ class PDFCanvas(Gtk.DrawingArea):
                     if s is op[3]:
                         del strokes[i]
                         break
+        self.clear_lasso_selection()
         self._undo_stack.extend(reversed(ops))
         if page != self.current_page_idx:
             self.go_to_page(page)
@@ -3045,6 +3297,32 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ctx.line_to(x + bw * 0.36, y + bh)
             ctx.stroke()
 
+        def _draw_mode_lasso(_a, ctx, w, h):
+            # a dashed selection loop with a short rope tail — GoodNotes-style
+            s = w / 16.0
+            ctx.set_source_rgb(*fg)
+            ctx.set_line_width(1.3 * s)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            # the loop: a slightly squashed ellipse (build the path under a scale,
+            # then dash + stroke outside so the line width stays uniform)
+            ctx.save()
+            ctx.translate(8 * s, 6.4 * s)
+            ctx.scale(1.0, 0.80)
+            ctx.new_sub_path()
+            ctx.arc(0, 0, 5.2 * s, 0, 2 * math.pi)
+            ctx.restore()
+            ctx.set_dash([1.7 * s, 1.7 * s])
+            ctx.stroke()
+            ctx.set_dash([])
+            # rope tail curling down from the loop's bottom to a free end
+            ctx.move_to(8 * s, 10.5 * s)
+            ctx.curve_to(6.9 * s, 12.3 * s, 9.5 * s, 12.9 * s, 8.0 * s, 14.7 * s)
+            ctx.stroke()
+            # knot where the tail leaves the loop
+            ctx.arc(8 * s, 10.5 * s, 1.05 * s, 0, 2 * math.pi)
+            ctx.fill()
+
         def _glyph(fn, size=16):
             d = Gtk.DrawingArea()
             d.set_content_width(size)
@@ -3055,8 +3333,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return d
 
         # Each tool button doubles as a discoverability cue: holding the matching
-        # modifier (Ctrl=pan, Alt=select, Shift=zoom, Ctrl+Alt=anchor) lights the
-        # button up transiently, so the hidden gestures are visible in the UI.
+        # modifier (Ctrl=pan, Alt=select, Shift=zoom, Ctrl+Shift=highlighter,
+        # Ctrl+Alt=anchor, Ctrl+Shift+Alt=lasso) lights the button up transiently,
+        # so the hidden gestures are visible in the UI.
         self._mode_pen = Gtk.ToggleButton()
         self._mode_pen.set_icon_name("document-edit-symbolic")
         self._mode_pen.set_tooltip_text("Pen")
@@ -3070,6 +3349,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_eraser.set_child(_glyph(_draw_mode_eraser))
         self._mode_eraser.set_tooltip_text("Eraser (right-drag)")
         self._mode_eraser.set_group(self._mode_pen)
+        self._mode_lasso = Gtk.ToggleButton()
+        self._mode_lasso.set_child(_glyph(_draw_mode_lasso))
+        self._mode_lasso.set_tooltip_text(
+            "Lasso ink (Ctrl+Shift+Alt+drag · drag a loop to select, then drag "
+            "to move · Delete · change colour to recolour)")
+        self._mode_lasso.set_group(self._mode_pen)
         self._mode_select = Gtk.ToggleButton()
         self._mode_select.set_child(_glyph(_draw_mode_sel))
         self._mode_select.set_tooltip_text(
@@ -3089,7 +3374,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
         self._mode_anchor.set_group(self._mode_pen)
         for b, m in ((self._mode_pen, "pen"), (self._mode_hl, "highlighter"),
-                     (self._mode_eraser, "eraser"), (self._mode_select, "select"),
+                     (self._mode_eraser, "eraser"), (self._mode_lasso, "lasso"),
+                     (self._mode_select, "select"),
                      (self._mode_pan, "pan"), (self._mode_zoom, "zoom"),
                      (self._mode_anchor, "anchor")):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
@@ -3097,8 +3383,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         tools_box.add_css_class("linked")
         self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
-                           self._mode_select, self._mode_pan, self._mode_zoom,
-                           self._mode_anchor)
+                           self._mode_lasso, self._mode_select, self._mode_pan,
+                           self._mode_zoom, self._mode_anchor)
         for b in self._tool_btns:
             tools_box.append(b)
 
@@ -3129,6 +3415,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_eraser.set_child(_glyph(_draw_mode_eraser))
         self._pmode_eraser.set_tooltip_text("Eraser (right-drag)")
         self._pmode_eraser.set_group(self._pmode_pen)
+        self._pmode_lasso = Gtk.ToggleButton()
+        self._pmode_lasso.set_child(_glyph(_draw_mode_lasso))
+        self._pmode_lasso.set_tooltip_text(
+            "Lasso ink (Ctrl+Shift+Alt+drag · drag a loop to select, then drag "
+            "to move · Delete · change colour to recolour)")
+        self._pmode_lasso.set_group(self._pmode_pen)
         self._pmode_select = Gtk.ToggleButton()
         self._pmode_select.set_child(_glyph(_draw_mode_sel))
         self._pmode_select.set_tooltip_text(
@@ -3148,15 +3440,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
         self._pmode_anchor.set_group(self._pmode_pen)
         for b, m in ((self._pmode_pen, "pen"), (self._pmode_hl, "highlighter"),
-                     (self._pmode_eraser, "eraser"), (self._pmode_select, "select"),
+                     (self._pmode_eraser, "eraser"), (self._pmode_lasso, "lasso"),
+                     (self._pmode_select, "select"),
                      (self._pmode_pan, "pan"), (self._pmode_zoom, "zoom"),
                      (self._pmode_anchor, "anchor")):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
         pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pmode_box.add_css_class("linked")
         self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
-                            self._pmode_select, self._pmode_pan, self._pmode_zoom,
-                            self._pmode_anchor)
+                            self._pmode_lasso, self._pmode_select, self._pmode_pan,
+                            self._pmode_zoom, self._pmode_anchor)
         for b in self._ptool_btns:
             pmode_box.append(b)
         self._pen_modes_section.append(pmode_box)
@@ -4430,8 +4723,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
-    _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "select": 3,
-                   "pan": 4, "zoom": 5, "anchor": 6}
+    _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "lasso": 3,
+                   "select": 4, "pan": 5, "zoom": 6, "anchor": 7}
 
     def _attach_select_style_menu(self, button):
         """Long-press a select-tool button to pick reading-order vs rectangular."""
@@ -4514,6 +4807,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self.canvas.tool = mode
             self.canvas.highlighter = (mode == "highlighter")
             self.canvas.select_mode = (mode == "select")
+            if mode != "lasso":
+                self.canvas.clear_lasso_selection()
             # cursor reflects the active tool (text/grab/crosshair, or default)
             self.canvas.set_cursor(self.canvas._default_cursor())
             idx = self._TOOL_ORDER[mode]
@@ -4686,6 +4981,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self.canvas.hl_width = scale.get_value()
         else:
             self.canvas.pen_width = scale.get_value()
+        self._recolor_lasso_if_any()
 
     def _on_smoothing_changed(self, scale):
         self.canvas.smoothing = scale.get_value() / 100.0
@@ -4701,6 +4997,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self.canvas.pen_color = rgb
         self._color_swatch.queue_draw()
+        self._recolor_lasso_if_any()
+
+    def _recolor_lasso_if_any(self):
+        """When the lasso tool holds a selection, picking a new colour/width in
+        the pen popover retints the selected strokes (one undo entry)."""
+        if self.canvas.tool == "lasso" and self.canvas.has_lasso_selection():
+            color, width, opacity = self.canvas._pen_attrs()
+            self.canvas.recolor_selected(color, width, opacity)
 
     def _toggle_highlighter(self):
         """Ctrl+H: flip highlighter on/off, falling back to pen."""
@@ -5228,6 +5532,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 return True
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_Delete:
                 self._delete_current_page()
+                return True
+        # lasso selection: Delete removes it, Escape drops it (only when the notes
+        # editor isn't focused, so typing in notes is never affected)
+        if (self.canvas.has_lasso_selection()
+                and not self._notes_view.has_focus()):
+            if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
+                self.canvas.delete_selected_strokes()
+                return True
+            if keyval == Gdk.KEY_Escape:
+                self.canvas.clear_lasso_selection()
                 return True
         # PageUp/PageDown and Ctrl+\ are handled in _on_global_key (capture phase)
         # so they work even when the notes editor has focus.
