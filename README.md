@@ -56,6 +56,22 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 yay -S sidemark-git
 ```
 
+### Flatpak
+
+```bash
+flatpak install flathub org.gnome.Sdk//47 org.gnome.Platform//47
+flatpak-builder --user --install --force-clean build-flatpak flatpak/de.hspitz.sidemark.yml
+flatpak run de.hspitz.sidemark
+```
+
+To open a file from the host shell:
+
+```bash
+flatpak run de.hspitz.sidemark --file-forwarding @@ /path/to/file.pdf @@
+```
+
+The Flatpak package is an additional distribution option; native `install.sh` and AUR installs are unchanged.
+
 ### install.sh (any Linux)
 
 ```bash
