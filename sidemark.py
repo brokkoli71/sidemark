@@ -173,6 +173,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_anchor_clicked = None  # callback(anchor_index)
         self.on_anchor_moved = None    # callback(anchor_index, pdf_x, pdf_y)
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
+        self.on_callout_moved = None   # callback(anchor_index, pdf_x, pdf_y)
         self.on_user_action = None     # callback() once per completed draw/erase gesture
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
@@ -189,6 +190,15 @@ class PDFCanvas(Gtk.DrawingArea):
         self._callout_dragging = False
         self._callout_start = None    # screen (x, y)
         self._callout_cur = None
+        # drag-to-reposition a placed callout box (mirrors anchor dragging):
+        # index of the anchor whose callout is moving, the grab offset in PDF
+        # units, and whether it moved far enough to commit
+        self._callout_moving = None
+        self._callout_move_offset = (0.0, 0.0)
+        self._callout_move_moved = False
+        # screen-space rects of callout boxes from the last draw, for hit-testing:
+        # [(anchor_index, bx, by, bw, bh), ...]
+        self._callout_boxes = []
 
         self.search_rects = []          # fitz.Rect hits for current page
         self.search_current_rect = None # the active match rect
@@ -540,11 +550,12 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # anchor markers
         anchors = self._anchors.get(self.current_page_idx, [])
+        self._callout_boxes = []
         if anchors:
             # callout boxes go under the circles so an anchor inside a box stays visible
-            for a in anchors:
+            for i, a in enumerate(anchors):
                 if a.get("callout") and a.get("text"):
-                    self._draw_callout(ctx, a)
+                    self._draw_callout(ctx, a, i)
             ctx.save()
             ctx.translate(self.offset_x, self.offset_y)
             ctx.scale(self.scale, self.scale)
@@ -637,7 +648,7 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
             ctx.set_dash([])
 
-    def _draw_callout(self, ctx, a):
+    def _draw_callout(self, ctx, a, idx=None):
         """Wrapped note text in a box at the callout position, with an arrow
         from the anchor circle to the box. Drawn in screen space for crisp
         text; all dimensions scale with zoom."""
@@ -655,6 +666,8 @@ class PDFCanvas(Gtk.DrawingArea):
         tw, th = layout.get_pixel_size()
         bx, by = cx, cy
         bw, bh = tw + 2 * pad, th + 2 * pad
+        if idx is not None:
+            self._callout_boxes.append((idx, bx, by, bw, bh))
 
         # arrow from anchor to the nearest point on the box edge
         attach_x = min(max(ax, bx), bx + bw)
@@ -719,11 +732,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._update_anchor_hover(x, y)
 
     def _update_anchor_hover(self, x, y):
-        """Show a grab cursor over anchor circles so it's clear they can be
-        dragged. Yields to link-hover (Alt) and stays out of its way."""
+        """Show a grab cursor over anchor circles and callout boxes so it's clear
+        they can be dragged. Yields to link-hover (Alt) and stays out of its way."""
         over = (self._hovered_link_rect is None and not self._alt_held
                 and self.page is not None
-                and self._anchor_hit_test(x, y) is not None)
+                and (self._anchor_hit_test(x, y) is not None
+                     or self._callout_hit_test(x, y) is not None))
         if over == self._hovering_anchor:
             return
         self._hovering_anchor = over
@@ -868,6 +882,14 @@ class PDFCanvas(Gtk.DrawingArea):
             scx, scy = self._pdf_to_screen(a["x"], a["y"])
             if math.hypot(sx - scx, sy - scy) <= 10.0:
                 return i
+        return None
+
+    def _callout_hit_test(self, sx, sy):
+        """Return the anchor index whose callout box is under the screen point,
+        or None. Uses the rects recorded during the last draw; topmost wins."""
+        for idx, bx, by, bw, bh in reversed(self._callout_boxes):
+            if bx <= sx <= bx + bw and by <= sy <= by + bh:
+                return idx
         return None
 
     def _on_motion_leave(self, _ctrl):
@@ -1054,6 +1076,17 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._anchor_drag_moved = False
                 self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
                 return
+            chit = self._callout_hit_test(start_x, start_y)
+            if chit is not None:
+                # begin dragging a callout box; keep the grab point fixed within
+                # the box so it doesn't jump to the cursor
+                self._callout_moving = chit
+                self._callout_move_moved = False
+                cpx, cpy = self._anchors[self.current_page_idx][chit]["callout"]
+                px, py = self._screen_to_pdf(start_x, start_y)
+                self._callout_move_offset = (cpx - px, cpy - py)
+                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+                return
             if self.select_mode:
                 # plain drag selects text instead of drawing
                 self._text_selecting = True
@@ -1098,6 +1131,16 @@ class PDFCanvas(Gtk.DrawingArea):
                 px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
                 anchors[self._anchor_dragging]["x"] = round(px)
                 anchors[self._anchor_dragging]["y"] = round(py)
+                self.queue_draw()
+            return
+        if self._callout_moving is not None:
+            if math.hypot(offset_x, offset_y) >= 4:
+                self._callout_move_moved = True
+            anchors = self._anchors.get(self.current_page_idx, [])
+            if 0 <= self._callout_moving < len(anchors):
+                px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+                ox, oy = self._callout_move_offset
+                anchors[self._callout_moving]["callout"] = (round(px + ox), round(py + oy))
                 self.queue_draw()
             return
         if self._callout_dragging:
@@ -1159,6 +1202,18 @@ class PDFCanvas(Gtk.DrawingArea):
                     self.on_anchor_moved(idx, a["x"], a["y"])
             elif not self._anchor_drag_moved and self.on_anchor_clicked:
                 self.on_anchor_clicked(idx)
+            self.queue_draw()
+            return
+        if self._callout_moving is not None:
+            idx = self._callout_moving
+            self._callout_moving = None
+            self.set_cursor(None)
+            self._hovering_anchor = False
+            anchors = self._anchors.get(self.current_page_idx, [])
+            if self._callout_move_moved and 0 <= idx < len(anchors):
+                cx, cy = anchors[idx]["callout"]
+                if self.on_callout_moved:
+                    self.on_callout_moved(idx, cx, cy)
             self.queue_draw()
             return
         if self._ignoring:
@@ -2620,6 +2675,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.canvas.on_anchor_clicked = self._on_anchor_clicked
         self.canvas.on_anchor_moved = self._on_anchor_moved
         self.canvas.on_callout_placed = self._on_callout_placed
+        self.canvas.on_callout_moved = self._on_callout_moved
         self.canvas.on_user_action = self._on_canvas_action
         self.canvas.on_modifier_tool = self._highlight_transient_tool
         self._transient_tool = None
@@ -3760,6 +3816,27 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf = self._notes_view.get_buffer()
         it = buf.get_iter_at_mark(self._last_anchor_mark)
         buf.insert(it, f" <!-- callout:{px}:{py} -->")
+        self._mark_dirty()
+
+    def _on_callout_moved(self, idx, cx, cy):
+        """Rewrite the callout marker belonging to the idx-th anchor with its new
+        position. The buffer's changed handler refreshes the canvas anchors."""
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        anchors = list(_ANCHOR_RE.finditer(text))
+        if idx >= len(anchors):
+            return
+        # the callout belongs to this anchor: the first callout marker after it,
+        # before the next anchor (matches how _on_callout_placed appends it)
+        region_start = anchors[idx].end()
+        region_end = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
+        cm = _CALLOUT_RE.search(text, region_start, region_end)
+        if not cm:
+            return
+        start = buf.get_iter_at_offset(cm.start())
+        end = buf.get_iter_at_offset(cm.end())
+        buf.delete(start, end)
+        buf.insert(start, f"<!-- callout:{cx}:{cy} -->")
         self._mark_dirty()
 
     def _on_anchor_moved(self, idx, px, py):

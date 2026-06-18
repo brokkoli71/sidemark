@@ -1976,6 +1976,100 @@ class TestCallouts(unittest.TestCase):
         if errors:
             raise errors[0]
 
+    # -- gesture: drag a callout box to reposition it ---------------------------
+
+    def test_draw_records_callout_box(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        try:
+            make_pdf(path)
+            canvas.load(path)
+            canvas._fit_page(800, 600)
+            canvas._anchors[0] = _parse_anchors(
+                "<!-- anchor:100:100 --> <!-- callout:300:300 -->\nCanvas note")
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+            canvas._draw(canvas, cairo.Context(surf), 800, 600)
+            self.assertEqual(len(canvas._callout_boxes), 1)
+            self.assertEqual(canvas._callout_boxes[0][0], 0)   # anchor index
+        finally:
+            os.unlink(path)
+
+    def test_callout_hit_test(self):
+        canvas = PDFCanvas()
+        canvas._callout_boxes = [(0, 90, 90, 60, 30)]
+        self.assertEqual(canvas._callout_hit_test(100, 100), 0)
+        self.assertIsNone(canvas._callout_hit_test(200, 200))
+
+    def _canvas_with_callout(self):
+        canvas = PDFCanvas()
+        canvas.scale, canvas.offset_x, canvas.offset_y = 1.0, 0.0, 0.0
+        canvas.page = object()
+        canvas.select_mode = False
+        # anchor circle far away so only the callout box is under (100,100)
+        canvas._anchors[canvas.current_page_idx] = _parse_anchors(
+            "<!-- anchor:300:300 --> <!-- callout:300:300 -->\nNote")
+        canvas._callout_boxes = [(0, 90, 90, 60, 30)]   # screen rect over (100,100)
+        return canvas
+
+    def test_drag_moves_callout_and_fires_callback(self):
+        canvas = self._canvas_with_callout()
+        moved = []
+        canvas.on_callout_moved = lambda i, x, y: moved.append((i, x, y))
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        self.assertEqual(canvas._callout_moving, 0)
+        canvas._on_drag_update(self._plain_drag_gesture(), 40, 25)
+        a = canvas._anchors[canvas.current_page_idx][0]
+        # grab offset preserved: callout (300,300) - cursor (100,100) = (200,200)
+        self.assertEqual(a["callout"], (340, 325))
+        canvas._on_drag_end(self._plain_drag_gesture(), 40, 25)
+        self.assertEqual(moved, [(0, 340, 325)])
+        self.assertIsNone(canvas._callout_moving)
+
+    def test_short_callout_drag_does_not_fire_move(self):
+        canvas = self._canvas_with_callout()
+        moved = []
+        canvas.on_callout_moved = lambda i, x, y: moved.append((i, x, y))
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        canvas._on_drag_update(self._plain_drag_gesture(), 2, 1)   # below threshold
+        canvas._on_drag_end(self._plain_drag_gesture(), 2, 1)
+        self.assertEqual(moved, [])
+
+    def test_window_callout_move_rewrites_marker(self):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.calloutmove")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    win._on_anchor_placed(0, 50, 60)
+                    win._on_callout_placed(80, 90)
+                    win._on_callout_moved(0, 200, 210)
+                    buf = win._notes_view.get_buffer()
+                    text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+                    if "<!-- callout:200:210 -->" not in text:
+                        raise AssertionError(f"callout not rewritten: {text!r}")
+                    if "<!-- callout:80:90 -->" in text:
+                        raise AssertionError(f"old callout remained: {text!r}")
+                    if "<!-- anchor:50:60 -->" not in text:
+                        raise AssertionError(f"anchor wrongly changed: {text!r}")
+                    if win.canvas._anchors[0][0]["callout"] != (200, 210):
+                        raise AssertionError(f"canvas not refreshed: {win.canvas._anchors[0]}")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
 
 class TestNotesUndoIsolation(unittest.TestCase):
     def test_undo_cannot_cross_page_boundary(self):

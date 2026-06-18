@@ -29,7 +29,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`)
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
-- **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; included in exports
+- **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; both the anchor and the box can be dragged to reposition (the arrow re-aims itself); included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 
 ### Navigation
@@ -149,6 +149,7 @@ pip install pymupdf
 | `Ctrl+\` | Toggle notes panel |
 | `Ctrl+Alt+click` | Place a numbered anchor on the PDF, linked to the note paragraph at the current cursor position |
 | Drag an anchor | Move a placed anchor to a new spot (a click without dragging still jumps to its note) |
+| Drag a callout box | Move a placed callout box to a new spot — the arrow re-aims from its anchor automatically |
 | `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
 
 ### Inline math (notes)
