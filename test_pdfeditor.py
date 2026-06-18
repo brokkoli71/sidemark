@@ -1648,6 +1648,172 @@ class TestPageDragExport(unittest.TestCase):
         self.assertEqual(doc.page_count, 1)
         doc.close()
 
+    def test_thumb_drag_export_notes_and_multipage(self):
+        """Dragging a page bakes in its notes (Ctrl+E layout); a page without
+        notes stays a bare single page; the multi-selection drives the export
+        set with Preview-style naming."""
+        errors = []
+        res = {}
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "report.pdf")
+            make_pdf(pdf, n_pages=4)
+            app = Adw.Application(application_id="test.sidemark.dragexport2")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+
+                    # notes get baked into the dragged page
+                    win.notes_model.set(2, "a note on page 3")
+                    res["notes_path"] = win._export_pages_tempfile([2]).get_path()
+                    # a page without notes drops as a single bare page
+                    res["plain_path"] = win._export_pages_tempfile([0]).get_path()
+
+                    # the listbox selection drives the export set
+                    lst = win._toc_list
+                    lst.select_row(lst.get_row_at_index(0))
+                    lst.select_row(lst.get_row_at_index(1))
+                    res["idx_in_sel"] = win._drag_export_indices(0)      # -> [0, 1]
+                    res["idx_out_of_sel"] = win._drag_export_indices(3)  # -> [3]
+                    res["multi_path"] = win._export_pages_tempfile([0, 1]).get_path()
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+        self.assertTrue(res["notes_path"].endswith("report-p3.pdf"))
+        doc = fitz.open(res["notes_path"])
+        self.assertEqual(doc.page_count, 2)                 # page + notes page
+        self.assertIn("a note on page 3", doc[1].get_text())
+        doc.close()
+
+        doc = fitz.open(res["plain_path"])
+        self.assertEqual(doc.page_count, 1)
+        doc.close()
+
+        self.assertEqual(res["idx_in_sel"], [0, 1])
+        self.assertEqual(res["idx_out_of_sel"], [3])        # outside selection
+
+        self.assertTrue(res["multi_path"].endswith("report-p1-2.pdf"))
+        doc = fitz.open(res["multi_path"])
+        self.assertEqual(doc.page_count, 2)
+        doc.close()
+
+
+class TestThumbSelectionClearing(unittest.TestCase):
+    """A plain (no Ctrl/Shift) click on a thumbnail collapses the multi-page
+    export selection to that one page; clicking empty sidebar space or the main
+    PDF canvas clears the selection entirely."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.thumbsel")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _rows(win):
+        rows = []
+        child = win._toc_list.get_first_child()
+        while child is not None:
+            rows.append(child)
+            child = child.get_next_sibling()
+        return rows
+
+    @staticmethod
+    def _selected_pages(win):
+        return sorted(r.toc_page for r in win._toc_list.get_selected_rows())
+
+    def _open(self, win, n_pages=4):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "plain.pdf")
+            make_pdf(pdf, n_pages=n_pages)
+            win._do_open_file(pdf)
+            win._toc_btn.set_active(True)
+
+    def test_plain_click_collapses_selection(self):
+        def body(win):
+            self._open(win)
+            rows = self._rows(win)
+            for r in rows[:3]:
+                win._toc_list.select_row(r)
+            self.assertEqual(self._selected_pages(win), [0, 1, 2])
+            win.canvas._ctrl_held = win.canvas._shift_held = False
+            win._on_toc_row_activated(win._toc_list, rows[1])
+            self.assertEqual(self._selected_pages(win), [1])
+
+        self._run_in_window(body)
+
+    def test_ctrl_click_keeps_selection(self):
+        def body(win):
+            self._open(win)
+            rows = self._rows(win)
+            for r in rows[:3]:
+                win._toc_list.select_row(r)
+            win.canvas._ctrl_held = True
+            win.canvas._shift_held = False
+            win._on_toc_row_activated(win._toc_list, rows[1])
+            self.assertEqual(self._selected_pages(win), [0, 1, 2])
+
+        self._run_in_window(body)
+
+    def test_canvas_press_clears_selection(self):
+        def body(win):
+            self._open(win)
+            rows = self._rows(win)
+            for r in rows[:3]:
+                win._toc_list.select_row(r)
+            self.assertTrue(self._selected_pages(win))
+            self.assertIsNotNone(win.canvas.on_canvas_press)
+            win.canvas.on_canvas_press()
+            self.assertEqual(self._selected_pages(win), [])
+
+        self._run_in_window(body)
+
+    def test_empty_sidebar_click_clears_selection(self):
+        def body(win):
+            self._open(win)
+            # let the listbox allocate so row bounds are real
+            ctx = GLib.MainContext.default()
+            for _ in range(50):
+                ctx.iteration(False)
+            rows = self._rows(win)
+            for r in rows[:3]:
+                win._toc_list.select_row(r)
+            # a click far below every row hits empty space → clears
+            win._on_toc_list_pressed(None, 1, 0.0, 1_000_000.0)
+            self.assertEqual(self._selected_pages(win), [])
+            # a click on a real row does not clear
+            for r in rows[:3]:
+                win._toc_list.select_row(r)
+            ok, bounds = rows[0].compute_bounds(win._toc_list)
+            if ok:
+                y = bounds.get_y() + bounds.get_height() / 2
+                win._on_toc_list_pressed(None, 1, 0.0, y)
+                self.assertEqual(self._selected_pages(win), [0, 1, 2])
+
+        self._run_in_window(body)
+
 
 class TestExport(unittest.TestCase):
     """
@@ -2588,9 +2754,11 @@ class TestThumbnailSidebar(unittest.TestCase):
                 win._toc_btn.set_active(True)
                 win._on_toc_row_activated(win._toc_list, rows[2])
                 self.assertEqual(win.canvas.current_page_idx, 2)
-                # page change moves the selection
+                # page change moves the current-page marker (a CSS class, not the
+                # listbox selection — the user owns that for multi-page export)
                 win.canvas.go_to_page(0)
-                self.assertIs(win._toc_list.get_selected_row(), rows[0])
+                self.assertIs(win._current_thumb_row, rows[0])
+                self.assertTrue(rows[0].has_css_class("current-page"))
 
             self._run_in_window(body)
 
@@ -2604,8 +2772,8 @@ class TestThumbnailSidebar(unittest.TestCase):
                 win._toc_btn.set_active(True)
                 win._add_blank_page()
                 self.assertEqual(len(self._rows(win)), 3)
-                # selection tracks the newly inserted current page
-                sel = win._toc_list.get_selected_row()
+                # the current-page marker tracks the newly inserted page
+                sel = win._current_thumb_row
                 self.assertIsNotNone(sel)
                 self.assertEqual(sel.toc_page, win.canvas.current_page_idx)
                 win._delete_current_page()
@@ -3258,6 +3426,182 @@ class TestReorderPages(unittest.TestCase):
             raise errors[0]
         self.assertEqual(result["n2"], "note one")  # page 1 -> 2
         self.assertEqual(result["n1"], "note two")  # page 2 -> 1
+
+
+class TestPageInsertAndConfirm(unittest.TestCase):
+    """#59/#60: drop an external PDF into the sidebar to insert its pages at the
+    drop gap (with re-keying + a gap indicator), gated by a confirm dialog."""
+
+    def _make_text_pdf(self, path, labels):
+        doc = fitz.open()
+        for lab in labels:
+            doc.new_page(width=300, height=400).insert_text((50, 50), lab)
+        doc.save(path)
+        doc.close()
+
+    def _run_in_window(self, labels, body):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._make_text_pdf(pdf, labels)
+            app = Adw.Application(application_id="test.sidemark.insert")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win, d)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+    # ── pure logic ────────────────────────────────────────────────────────────
+    def test_notes_shift_for_insert_multi(self):
+        m = NotesModel()
+        m.set(0, "zero")
+        m.set(1, "one")
+        m.shift_for_insert(1, 2)
+        self.assertEqual(m.get(0), "zero")
+        self.assertEqual(m.get(1), "")     # both inserted pages are blank
+        self.assertEqual(m.get(2), "")
+        self.assertEqual(m.get(3), "one")
+
+    def test_gap_for_picks_half(self):
+        class _Row:
+            def get_height(self):
+                return 100
+        row = _Row()
+        self.assertEqual(PDFEditorWindow._gap_for(row, 3, 10), 3)   # top half
+        self.assertEqual(PDFEditorWindow._gap_for(row, 3, 90), 4)   # bottom half
+
+    def test_gap_to_dst(self):
+        self.assertEqual(PDFEditorWindow._gap_to_dst(0, 3), 2)  # moving down
+        self.assertEqual(PDFEditorWindow._gap_to_dst(2, 0), 0)  # moving up
+        self.assertEqual(PDFEditorWindow._gap_to_dst(2, 2), 2)  # no-op (== src)
+        self.assertEqual(PDFEditorWindow._gap_to_dst(2, 3), 2)  # no-op (== src)
+
+    def test_canvas_insert_pdf_pages(self):
+        canvas = PDFCanvas()
+        with tempfile.TemporaryDirectory() as d:
+            base = os.path.join(d, "base.pdf")
+            ins = os.path.join(d, "ins.pdf")
+            self._make_text_pdf(base, ["A", "B", "C"])
+            self._make_text_pdf(ins, ["X", "Y"])
+            canvas.load(base)
+            s2 = [{"pts": [(2, 2)]}]
+            canvas.all_strokes = {2: s2}             # stroke on page C
+            count = canvas.insert_pdf_pages(1, ins)  # insert X,Y before page B
+            self.assertEqual(count, 2)
+            self.assertEqual(canvas.n_pages, 5)
+            texts = [canvas.document[i].get_text().strip() for i in range(5)]
+            self.assertEqual(texts, ["A", "X", "Y", "B", "C"])
+            self.assertEqual(canvas.all_strokes[4], s2)    # page 2 -> 4
+            self.assertEqual(canvas.current_page_idx, 1)   # navigated to first new
+
+    def test_canvas_insert_appends_when_gap_past_end(self):
+        canvas = PDFCanvas()
+        with tempfile.TemporaryDirectory() as d:
+            base = os.path.join(d, "base.pdf")
+            ins = os.path.join(d, "ins.pdf")
+            self._make_text_pdf(base, ["A", "B"])
+            self._make_text_pdf(ins, ["Z"])
+            canvas.load(base)
+            canvas.insert_pdf_pages(99, ins)   # clamped to the end
+            texts = [canvas.document[i].get_text().strip() for i in range(3)]
+            self.assertEqual(texts, ["A", "B", "Z"])
+
+    # ── window: re-keying + indicator + confirm gate ───────────────────────────
+    def test_window_insert_rekeys_notes_and_pages(self):
+        result = {}
+
+        def body(win, d):
+            ins = os.path.join(d, "ins.pdf")
+            self._make_text_pdf(ins, ["X", "Y"])
+            # notes on pages 1 and 2; stay on page 0 so _commit_note (empty
+            # buffer) doesn't clobber them
+            win.notes_model.set(1, "note B")
+            win.notes_model.set(2, "note C")
+            win._do_insert_pdfs([ins], 1)   # insert before page index 1
+            result["n"] = win.canvas.n_pages
+            result["b"] = win.notes_model.get(3)
+            result["c"] = win.notes_model.get(4)
+            result["blank"] = win.notes_model.get(1)
+
+        self._run_in_window(["A", "B", "C"], body)
+        self.assertEqual(result["n"], 5)
+        self.assertEqual(result["b"], "note B")   # page 1 -> 3
+        self.assertEqual(result["c"], "note C")   # page 2 -> 4
+        self.assertEqual(result["blank"], "")     # inserted page has no note
+
+    def test_window_insert_bad_path_is_noop(self):
+        result = {}
+
+        def body(win, d):
+            win._do_insert_pdfs([os.path.join(d, "missing.pdf")], 1)
+            result["n"] = win.canvas.n_pages
+
+        self._run_in_window(["A", "B"], body)
+        self.assertEqual(result["n"], 2)   # nothing inserted
+
+    def test_drop_indicator_classes(self):
+        def body(win, d):
+            win._populate_toc()
+            row = win._toc_list.get_row_at_index(0)
+            win._show_drop_indicator(row, after=False)
+            assert row.has_css_class("drop-before")
+            win._show_drop_indicator(row, after=True)   # switches edge
+            assert row.has_css_class("drop-after")
+            assert not row.has_css_class("drop-before")
+            win._clear_drop_indicator()
+            assert not row.has_css_class("drop-after")
+
+        self._run_in_window(["A", "B"], body)
+
+    def test_confirm_disabled_applies_immediately(self):
+        called = {}
+        with tempfile.TemporaryDirectory() as cfg:
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = cfg
+            try:
+                sidemark._save_setting("confirm_page_drops", False)
+
+                def body(win, d):
+                    win._confirm_page_change(
+                        "msg", lambda: called.__setitem__("ok", True))
+
+                self._run_in_window(["A", "B"], body)
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+        self.assertTrue(called.get("ok"))
+
+    def test_confirm_enabled_defers_to_dialog(self):
+        called = {}
+        with tempfile.TemporaryDirectory() as cfg:
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = cfg
+            try:
+                # default (no settings file) → confirmation is on
+                def body(win, d):
+                    win._confirm_page_change(
+                        "msg", lambda: called.__setitem__("ok", True))
+
+                self._run_in_window(["A", "B"], body)
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+        self.assertNotIn("ok", called)   # waits for the dialog, not applied now
 
 
 class TestThumbHoldPan(unittest.TestCase):

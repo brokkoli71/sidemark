@@ -36,7 +36,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` to zoom to region, `Shift+click` to fit page
 - **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
-- **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, or drag one **out to a file manager or the desktop** to export that page as a standalone PDF (annotations baked in), like macOS Preview
+- **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, drop a PDF **from a file manager** between thumbnails to insert its pages there, or drag one (or several selected) **out to a file manager or the desktop** to export those pages as a standalone PDF — annotations baked in, and any page's notes appended after it, like macOS Preview. A drop line shows where pages will land, and a confirmation dialog (with a "don't ask again" option) guards reorders and inserts
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
 
 ### Files & integration
@@ -122,6 +122,8 @@ pip install pymupdf
 | `Ctrl+Shift+Delete` | Delete current page |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |
 | Drag thumbnail → thumbnail | Reorder pages (in the page-thumbnail sidebar) |
+| Drop a PDF → between thumbnails | Insert that PDF's pages at the drop point (a drop line shows where) |
+| Drag thumbnail(s) → file manager / desktop | Export the dragged page(s) as a standalone PDF (notes appended), like macOS Preview |
 
 ### Zoom & pan
 

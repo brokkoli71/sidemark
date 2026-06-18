@@ -45,6 +45,33 @@ def _add_recent(path):
     os.replace(tmp, RECENT_PATH)
 
 
+def _settings_path():
+    # resolved at call time so tests can redirect via XDG_CONFIG_HOME
+    return os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "sidemark", "settings.json")
+
+
+def _load_settings():
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_setting(key, value):
+    data = _load_settings()
+    data[key] = value
+    path = _settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
 # Fast path for launcher integrations (walker/elephant menus, rofi, …):
 # print "name<TAB>path" lines and exit before any GTK import happens.
 if __name__ == "__main__" and "--list-recent" in sys.argv[1:]:
@@ -175,6 +202,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
         self.on_callout_moved = None   # callback(anchor_index, pdf_x, pdf_y)
         self.on_user_action = None     # callback() once per completed draw/erase gesture
+        self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
         self._anchors = {}
@@ -948,6 +976,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _on_click_pressed(self, gesture, n_press, x, y):
+        if self.on_canvas_press:
+            self.on_canvas_press()
         state = gesture.get_current_event_state()
         ctrl_alt = ((state & Gdk.ModifierType.CONTROL_MASK)
                     and (state & Gdk.ModifierType.ALT_MASK))
@@ -1703,6 +1733,43 @@ class PDFCanvas(Gtk.DrawingArea):
         self.n_pages = len(self.document)
         self._load_page(idx)   # navigate to the new blank page
 
+    def insert_pdf_pages(self, at_idx, src_path):
+        """Insert every page of the PDF at src_path so the first lands at index
+        at_idx, shifting strokes/anchors/undo for pages at or after it (mirrors
+        add_blank_page). Navigates to the first inserted page. Returns the number
+        of pages inserted (0 if the document is empty or unreadable)."""
+        if not self.document:
+            return 0
+        src = fitz.open(src_path)
+        try:
+            count = len(src)
+            if count == 0:
+                return 0
+            at_idx = max(0, min(at_idx, self.n_pages))
+            self.document.insert_pdf(src, start_at=at_idx)
+        finally:
+            src.close()
+        self.all_strokes = {
+            (k + count if k >= at_idx else k): v
+            for k, v in self.all_strokes.items()
+        }
+        self._anchors = {
+            (k + count if k >= at_idx else k): v
+            for k, v in self._anchors.items()
+        }
+        self._undo_stack = [
+            (op[0], op[1] + count if op[1] >= at_idx else op[1]) + op[2:]
+            for op in self._undo_stack
+        ]
+        self._redo_stack = [
+            [(op[0], op[1] + count if op[1] >= at_idx else op[1]) + op[2:]
+             for op in ops]
+            for ops in self._redo_stack
+        ]
+        self.n_pages = len(self.document)
+        self._load_page(at_idx)
+        return count
+
     def delete_current_page(self):
         """Delete the current page. Refused if it's the last one."""
         if self.n_pages <= 1:
@@ -2146,10 +2213,10 @@ class NotesModel:
             if content:
                 self._notes[int(parts[i])] = content
 
-    def shift_for_insert(self, idx):
-        """Re-key notes after a page was inserted at idx."""
+    def shift_for_insert(self, idx, count=1):
+        """Re-key notes after count pages were inserted at idx."""
         self._notes = {
-            (k + 1 if k >= idx else k): v
+            (k + count if k >= idx else k): v
             for k, v in self._notes.items()
         }
 
@@ -2703,6 +2770,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.canvas.on_callout_placed = self._on_callout_placed
         self.canvas.on_callout_moved = self._on_callout_moved
         self.canvas.on_user_action = self._on_canvas_action
+        self.canvas.on_canvas_press = self._clear_thumb_selection
         self.canvas.on_modifier_tool = self._highlight_transient_tool
         self._transient_tool = None
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
@@ -2742,6 +2810,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 box-shadow: inset 0 0 0 2px {acc_hex};
                 border-radius: 4px;
             }}
+            .drop-before {{ box-shadow: inset 0 3px 0 0 {acc_hex}; }}
+            .drop-after  {{ box-shadow: inset 0 -3px 0 0 {acc_hex}; }}
         """
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
@@ -2829,6 +2899,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._toc_thumbs = False
         self._thumb_idle_id = None
         self._current_thumb_row = None   # row carrying the .current-page CSS marker
+        self._drop_indicator_row = None  # row carrying the drop-gap CSS marker
         self._drag_export_dir = None   # lazily created temp dir for drag-exported pages
         self._toc_btn = Gtk.ToggleButton()
         self._toc_btn.set_icon_name(
@@ -3331,6 +3402,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._toc_list = Gtk.ListBox()
         self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self._toc_list.connect("row-activated", self._on_toc_row_activated)
+        # clicking the empty area below the thumbnails clears the export selection
+        toc_click = Gtk.GestureClick()
+        toc_click.connect("pressed", self._on_toc_list_pressed)
+        self._toc_list.add_controller(toc_click)
         self._toc_scroll = Gtk.ScrolledWindow()
         self._toc_scroll.set_child(self._toc_list)
         self._toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -3942,8 +4017,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_toc_row_activated(self, _list, row):
         page = getattr(row, "toc_page", None)
         if page is not None:
+            # a plain click (no Ctrl/Shift) collapses any multi-page selection to
+            # just this page; Ctrl/Shift keep extending it for drag-export
+            if (self._toc_thumbs
+                    and not (self.canvas._ctrl_held or self.canvas._shift_held)):
+                self._toc_list.unselect_all()
+                self._toc_list.select_row(row)
             self._go_to_page(page)
             self.canvas.grab_focus()
+
+    def _on_toc_list_pressed(self, _gesture, _n, _x, y):
+        # a click that misses every row (empty space below the thumbnails)
+        # clears the multi-page export selection
+        if self._toc_thumbs and self._toc_list.get_row_at_y(int(y)) is None:
+            self._toc_list.unselect_all()
+
+    def _clear_thumb_selection(self):
+        """Drop the multi-page export selection — used when the user clicks away
+        into the PDF canvas."""
+        if self._toc_thumbs:
+            self._toc_list.unselect_all()
 
     def _populate_toc(self):
         if self._thumb_idle_id is not None:
@@ -4058,26 +4151,207 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._thumb_idle_id = GLib.idle_add(render_next)
 
     def _add_thumb_dnd(self, row, idx):
-        """Make a thumbnail row draggable and a drop target. Dropping it onto
-        another thumbnail reorders the pages (intra-app MOVE, int payload);
-        dragging it out to a file manager / desktop exports that page as a
-        standalone PDF (COPY, a GdkFileList that receivers read as text/uri-list,
-        like macOS Preview). One DragSource offers both via a union provider and
-        each receiver negotiates the type it understands."""
+        """Make a thumbnail row draggable and a drop target. Dropping a thumbnail
+        onto another reorders the pages (intra-app MOVE, int payload); dropping a
+        PDF *file* from a file manager inserts its pages at that spot (COPY,
+        async because Wayland file managers transfer through the portal, which a
+        synchronous DropTarget can't read at drop time); dragging a thumbnail out
+        exports it as a standalone PDF (COPY, a GdkFileList like macOS Preview).
+        A drop-gap indicator shows where the page(s) will land."""
         src = Gtk.DragSource()
         src.set_actions(Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
         src.connect("prepare", self._on_thumb_drag_prepare, idx)
         row.add_controller(src)
 
-        target = Gtk.DropTarget.new(int, Gdk.DragAction.MOVE)
-        target.connect("drop", lambda _t, value, _x, _y, dst=idx:
-                       self._on_thumb_drop(value, dst))
-        row.add_controller(target)
+        # intra-app reorder: synchronous int target is fine (no portal involved)
+        reorder = Gtk.DropTarget.new(int, Gdk.DragAction.MOVE)
+        reorder.connect("motion", self._on_thumb_reorder_motion, idx)
+        reorder.connect("leave", lambda _t: self._clear_drop_indicator())
+        reorder.connect("drop", self._on_thumb_reorder_drop, idx)
+        row.add_controller(reorder)
+
+        # external PDF file insert: async target (portal-safe). Internal reorder
+        # drags also carry a FileList (the drag-out export), so _accept rejects
+        # anything offering the int reorder payload — those go to the target above.
+        finsert = Gtk.DropTargetAsync.new(
+            Gdk.ContentFormats.new_for_gtype(Gdk.FileList), Gdk.DragAction.COPY)
+        finsert.connect("accept", self._on_thumb_file_accept)
+        finsert.connect("drag-enter", self._on_thumb_file_motion, idx)
+        finsert.connect("drag-motion", self._on_thumb_file_motion, idx)
+        finsert.connect("drag-leave", lambda _t, _d: self._clear_drop_indicator())
+        finsert.connect("drop", self._on_thumb_file_drop, idx)
+        row.add_controller(finsert)
+
+    # ── drop-gap indicator + target geometry ──────────────────────────────────
+    @staticmethod
+    def _gap_for(row, idx, y):
+        """Gap index the cursor points at: before this row (idx) when in its top
+        half, after it (idx+1) in the bottom half."""
+        return idx + 1 if (row is not None and y > row.get_height() / 2) else idx
+
+    def _show_drop_indicator(self, row, after):
+        self._clear_drop_indicator()
+        if row is not None:
+            row.add_css_class("drop-after" if after else "drop-before")
+            self._drop_indicator_row = row
+
+    def _clear_drop_indicator(self):
+        row = self._drop_indicator_row
+        if row is not None:
+            row.remove_css_class("drop-before")
+            row.remove_css_class("drop-after")
+            self._drop_indicator_row = None
+
+    @staticmethod
+    def _gap_to_dst(src, gap):
+        """Index move_page must use so the page at src lands in gap (a boundary
+        before original page `gap`): removing src first shifts later boundaries
+        down by one."""
+        return gap if gap <= src else gap - 1
+
+    # ── reorder (internal thumbnail drag) ─────────────────────────────────────
+    def _on_thumb_reorder_motion(self, target, _x, y, idx):
+        row = target.get_widget()
+        self._show_drop_indicator(row, y > row.get_height() / 2 if row else False)
+        return Gdk.DragAction.MOVE
+
+    def _on_thumb_reorder_drop(self, target, value, _x, y, idx):
+        self._clear_drop_indicator()
+        if not isinstance(value, int):
+            return False
+        row = target.get_widget()
+        self._reorder_to_gap(value, self._gap_for(row, idx, y))
+        return True
+
+    def _reorder_to_gap(self, src, gap):
+        dst = self._gap_to_dst(src, gap)
+        if dst == src or not self.canvas.document:
+            return
+        self._confirm_page_change(
+            f"Move page {src + 1} to position {dst + 1}?",
+            lambda: self._do_reorder(src, dst))
+
+    def _do_reorder(self, src, dst):
+        self._move_page(src, dst)
+        self._toast(f"Moved page {src + 1} → {dst + 1}")
+
+    # ── insert (external PDF file dropped on the sidebar) ──────────────────────
+    def _on_thumb_file_accept(self, _target, gdk_drop):
+        fmts = gdk_drop.get_formats()
+        # let the reorder target handle our own thumbnail drags (they carry int)
+        return not (fmts and fmts.contain_gtype(GObject.TYPE_INT))
+
+    def _on_thumb_file_motion(self, target, _drop, _x, y, idx):
+        row = target.get_widget()
+        self._show_drop_indicator(row, y > row.get_height() / 2 if row else False)
+        return Gdk.DragAction.COPY   # advertise COPY so the drop is permitted
+
+    def _on_thumb_file_drop(self, target, gdk_drop, _x, y, idx):
+        self._clear_drop_indicator()
+        row = target.get_widget()
+        gap = self._gap_for(row, idx, y)
+        gdk_drop.read_value_async(
+            Gdk.FileList, GLib.PRIORITY_DEFAULT, None,
+            self._on_thumb_file_read, (gdk_drop, gap))
+        return True
+
+    def _on_thumb_file_read(self, _src, result, data):
+        gdk_drop, gap = data
+        try:
+            paths = self._dnd_paths(gdk_drop.read_value_finish(result))
+        except Exception as e:
+            logger.warning("thumbnail file-drop read failed: %s", e)
+            paths = []
+        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+        if pdfs:
+            self._insert_files_to_gap(pdfs, gap)
+            gdk_drop.finish(Gdk.DragAction.COPY)
+        else:
+            if paths:
+                self._toast("Only PDF files can be inserted into a document")
+            gdk_drop.finish(0)
+
+    def _insert_files_to_gap(self, paths, gap):
+        if not self.canvas.document:
+            return
+        names = ", ".join(os.path.basename(p) for p in paths)
+        self._confirm_page_change(
+            f"Insert pages from {names} at position {gap + 1}?",
+            lambda: self._do_insert_pdfs(paths, gap))
+
+    def _do_insert_pdfs(self, paths, gap):
+        at = max(0, min(gap, self.canvas.n_pages))
+        inserted = 0
+        for path in paths:
+            inserted += self._insert_one_pdf(at + inserted, path)
+        if inserted:
+            self._populate_toc()
+            self._mark_dirty()
+            self._toast(f"Inserted {inserted} page{'s' if inserted != 1 else ''}")
+
+    def _insert_one_pdf(self, at, path):
+        try:
+            probe = fitz.open(path)
+            count = len(probe)
+            probe.close()
+        except Exception:
+            logger.error("insert: cannot open %s\n%s", path, traceback.format_exc())
+            self._toast(f"Could not read {os.path.basename(path)}")
+            return 0
+        if count == 0:
+            return 0
+        # re-key notes/undo before the canvas inserts and navigates, so the
+        # page restore already sees the shifted model (mirrors _add_blank_page)
+        self._commit_note()
+        self.notes_model.shift_for_insert(at, count)
+        self._undo_timeline = [
+            ("notes", op[1] + count, op[2])
+            if op[0] == "notes" and op[1] >= at else op
+            for op in self._undo_timeline
+        ]
+        self._redo_timeline = [
+            ("notes", op[1] + count) + op[2:]
+            if op[0] == "notes" and op[1] >= at else op
+            for op in self._redo_timeline
+        ]
+        return self.canvas.insert_pdf_pages(at, path)
+
+    # ── confirmation (#60) ─────────────────────────────────────────────────────
+    def _confirm_page_change(self, message, on_confirm):
+        """Confirm a thumbnail-drop page change before applying it, unless the
+        user has ticked 'Don't ask again' (persisted in settings.json)."""
+        if not _load_settings().get("confirm_page_drops", True):
+            on_confirm()
+            return
+        dialog = Adw.AlertDialog.new("Apply page change?", message)
+        check = Gtk.CheckButton(label="Don't ask again")
+        dialog.set_extra_child(check)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("apply", "Apply")
+        dialog.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("apply")
+        dialog.set_close_response("cancel")
+
+        def on_resp(_d, resp):
+            if resp == "apply":
+                if check.get_active():
+                    _save_setting("confirm_page_drops", False)
+                on_confirm()
+
+        dialog.connect("response", on_resp)
+        dialog.present(self)
+
+    def _toast(self, msg, timeout=2):
+        toast = Adw.Toast.new(msg)
+        toast.set_timeout(timeout)
+        self.toast_overlay.add_toast(toast)
 
     def _on_thumb_drag_prepare(self, _src, _x, _y, idx):
+        # reorder uses only the grabbed page; export uses the whole selection
+        # when the grabbed row is part of it (macOS Finder / Preview behaviour)
         reorder = Gdk.ContentProvider.new_for_value(GObject.Value(int, idx))
         try:
-            gfile = self._export_page_tempfile(idx)
+            gfile = self._export_pages_tempfile(self._drag_export_indices(idx))
         except Exception:
             logger.error("thumbnail drag-export failed:\n" + traceback.format_exc())
             return reorder   # reorder still works even if export couldn't be built
@@ -4086,34 +4360,70 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             GObject.Value(Gdk.FileList, flist))
         return Gdk.ContentProvider.new_union([reorder, export])
 
-    def _export_page_tempfile(self, idx):
-        """Export page idx to a temp PDF named like Preview (<basename>-pN.pdf)
-        and return it as a GFile for drag-out. The temp dir is swept on exit;
-        the file the user drops is the file manager's own copy of it."""
+    def _drag_export_indices(self, idx):
+        """Pages to export when dragging thumbnail idx: the whole multi-selection
+        if the grabbed row belongs to it, otherwise just the grabbed page."""
+        selected = sorted(
+            r.toc_page for r in self._toc_list.get_selected_rows()
+            if getattr(r, "toc_page", None) is not None)
+        if idx in selected and len(selected) > 1:
+            return selected
+        return [idx]
+
+    def _export_pages_tempfile(self, indices):
+        """Export the given pages to a temp PDF (ink baked in, plus a notes page
+        after any page that has notes — the Ctrl+E layout, scoped to these
+        pages) named like Preview, returned as a GFile for drag-out. The temp
+        dir is swept on exit; the file the user drops is the manager's own copy."""
         if self._drag_export_dir is None:
             self._drag_export_dir = tempfile.mkdtemp(prefix="sidemark-pages-")
             atexit.register(shutil.rmtree, self._drag_export_dir,
                             ignore_errors=True)
+        indices = sorted(set(indices))   # match canvas.export_pages' page order
         base = "page"
         if self._path:
             base = os.path.splitext(os.path.basename(self._path))[0] or "page"
-        name = _safe_filename(f"{base}-p{idx + 1}.pdf")
-        out_path = os.path.join(self._drag_export_dir, name)
-        self.canvas.export_pages([idx], out_path)
+        if len(indices) == 1:
+            suffix = f"p{indices[0] + 1}"
+        elif indices == list(range(indices[0], indices[-1] + 1)):
+            suffix = f"p{indices[0] + 1}-{indices[-1] + 1}"   # contiguous run
+        else:
+            suffix = f"{len(indices)}pages"
+        out_path = os.path.join(self._drag_export_dir,
+                                _safe_filename(f"{base}-{suffix}.pdf"))
+
+        self._commit_note()   # flush the live notes buffer for the current page
+        pages_pdf = os.path.join(self._drag_export_dir, ".pages.tmp.pdf")
+        self.canvas.export_pages(indices, pages_pdf)
+
+        # Re-key the dragged pages' notes to the exported page order; if any has
+        # notes, bake them in (also renders anchors/callouts) via the export path.
+        sub = NotesModel()
+        has_notes = False
+        for new_idx, orig in enumerate(indices):
+            text = self.notes_model.get(orig)
+            sub.set(new_idx, text)
+            has_notes = has_notes or bool(text.strip())
+        if has_notes:
+            _export_pdf_with_notes(pages_pdf, out_path, sub,
+                                   include_empty=False,
+                                   accent=self.canvas.zoom_accent)
+            os.remove(pages_pdf)
+        else:
+            os.replace(pages_pdf, out_path)
         return Gio.File.new_for_path(out_path)
 
-    def _on_thumb_drop(self, src, dst):
-        if isinstance(src, int) and src != dst:
-            logger.info("reorder: move page %d -> %d", src, dst)
-            self._move_page(src, dst)
-        return True
-
     def _select_thumb(self, idx):
-        """Highlight the current page's thumbnail and scroll it into view."""
+        """Mark the current page's thumbnail (a CSS class, not the listbox
+        selection — which the user owns for multi-page drag-export) and scroll
+        it into view."""
         row = self._toc_list.get_row_at_index(idx)
         if row is None:
             return
-        self._toc_list.select_row(row)
+        if self._current_thumb_row is not None and self._current_thumb_row is not row:
+            self._current_thumb_row.remove_css_class("current-page")
+        row.add_css_class("current-page")
+        self._current_thumb_row = row
         ok, bounds = row.compute_bounds(self._toc_list)
         if ok:
             adj = self._toc_scroll.get_vadjustment()
