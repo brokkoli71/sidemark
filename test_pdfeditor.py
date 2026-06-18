@@ -1550,6 +1550,105 @@ class TestLatexFormatting(unittest.TestCase):
 
 # ── export ────────────────────────────────────────────────────────────────────
 
+# ── drag pages out of the thumbnail panel to export them (#57) ────────────────
+
+class TestPageDragExport(unittest.TestCase):
+    def _canvas(self, n_pages=3):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        make_pdf(path, n_pages=n_pages)
+        canvas.load(path)
+        self._tmp = path
+        return canvas
+
+    def tearDown(self):
+        if hasattr(self, "_tmp") and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def test_export_single_page(self):
+        canvas = self._canvas(n_pages=3)
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "p2.pdf")
+            canvas.export_pages([1], out)
+            doc = fitz.open(out)
+            self.assertEqual(doc.page_count, 1)
+            doc.close()
+
+    def test_export_multiple_pages_sorted_and_deduped(self):
+        canvas = self._canvas(n_pages=4)
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "multi.pdf")
+            canvas.export_pages([3, 1, 1], out)   # duplicate collapses
+            doc = fitz.open(out)
+            self.assertEqual(doc.page_count, 2)
+            doc.close()
+
+    def test_export_out_of_range_indices_ignored(self):
+        canvas = self._canvas(n_pages=2)
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "x.pdf")
+            canvas.export_pages([0, 5, -1], out)
+            doc = fitz.open(out)
+            self.assertEqual(doc.page_count, 1)
+            doc.close()
+
+    def test_export_includes_ink_strokes(self):
+        canvas = self._canvas(n_pages=2)
+        canvas.pen_color = (1, 0, 0)   # RGB; alpha lives in "opacity"
+        canvas.current_stroke = [(50, 50), (100, 100)]
+        canvas._on_drag_end(None, 0, 0)   # one stroke on page 0
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "inked.pdf")
+            canvas.export_pages([0], out)
+            doc = fitz.open(out)
+            annots = list(doc[0].annots(types=[fitz.PDF_ANNOT_INK]))
+            self.assertEqual(len(annots), 1)
+            doc.close()
+
+    def test_safe_filename(self):
+        self.assertEqual(sidemark._safe_filename("a/b.pdf"), "a-b.pdf")
+        self.assertEqual(sidemark._safe_filename('re:po*rt?.pdf'), "re_po_rt_.pdf")
+        self.assertTrue(sidemark._safe_filename(""))          # never empty
+        self.assertNotIn("\n", sidemark._safe_filename("x\ny.pdf"))
+
+    def test_thumb_drag_prepare_offers_file_and_reorder(self):
+        """The thumbnail DragSource must offer both the reorder int payload and a
+        GdkFileList pointing at a freshly exported single-page PDF named like
+        Preview (<basename>-pN.pdf)."""
+        errors = []
+        results = {}
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "report.pdf")
+            make_pdf(pdf, n_pages=3)
+            app = Adw.Application(application_id="test.sidemark.dragexport")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    provider = win._on_thumb_drag_prepare(None, 0, 0, 1)
+                    results["formats"] = provider.ref_formats().to_string()
+                    results["dir"] = win._drag_export_dir
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+        self.assertIn("GdkFileList", results["formats"])
+        self.assertIn("gint", results["formats"])   # reorder still offered
+        exported = os.path.join(results["dir"], "report-p2.pdf")
+        self.assertTrue(os.path.exists(exported))
+        doc = fitz.open(exported)
+        self.assertEqual(doc.page_count, 1)
+        doc.close()
+
+
 class TestExport(unittest.TestCase):
     """
     Covers three bug classes that slipped through before:
@@ -2341,6 +2440,54 @@ class TestResponsiveHeader(unittest.TestCase):
             reads = [cb for s, cb in win._select_style_radios if s == "reading"]
             if not all(cb.get_active() for cb in reads):
                 raise AssertionError("reading radios not synced back")
+        self._run_in_window(body)
+
+    def test_global_pagedown_navigates_with_notes_focused(self):
+        # PDF page flip must work even when the markdown sidebar has focus;
+        # _on_global_key runs in the capture phase, before the TextView
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "p.pdf")
+            make_pdf(pdf, n_pages=3)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._notes_view.grab_focus()
+                start = win.canvas.current_page_idx
+                if not win._on_global_key(None, Gdk.KEY_Page_Down, 0, Gdk.ModifierType(0)):
+                    raise AssertionError("PageDown not consumed")
+                if win.canvas.current_page_idx != start + 1:
+                    raise AssertionError("PageDown did not navigate with notes focused")
+                win._on_global_key(None, Gdk.KEY_Page_Up, 0, Gdk.ModifierType(0))
+                if win.canvas.current_page_idx != start:
+                    raise AssertionError("PageUp did not navigate back")
+            self._run_in_window(body)
+
+    def test_global_ctrl_backslash_toggles_notes(self):
+        def body(win):
+            before = win._notes_toggle.get_active()
+            handled = win._on_global_key(
+                None, Gdk.KEY_backslash, 0, Gdk.ModifierType.CONTROL_MASK)
+            if not handled:
+                raise AssertionError("Ctrl+\\ not consumed")
+            if win._notes_toggle.get_active() == before:
+                raise AssertionError("Ctrl+\\ did not toggle the notes panel")
+        self._run_in_window(body)
+
+    def test_global_ctrl_w_closes_window(self):
+        def body(win):
+            called = []
+            win.close = lambda: called.append(True)
+            handled = win._on_global_key(
+                None, Gdk.KEY_w, 0, Gdk.ModifierType.CONTROL_MASK)
+            if not handled or not called:
+                raise AssertionError("Ctrl+W did not close the window")
+        self._run_in_window(body)
+
+    def test_global_key_passes_typing_through(self):
+        def body(win):
+            # a plain character must not be consumed (typing stays intact)
+            if win._on_global_key(None, Gdk.KEY_a, 0, Gdk.ModifierType(0)):
+                raise AssertionError("plain key wrongly consumed by global handler")
         self._run_in_window(body)
 
     def test_highlight_style_menu_switches_canvas_style(self):

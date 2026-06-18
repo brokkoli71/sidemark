@@ -36,7 +36,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` to zoom to region, `Shift+click` to fit page
 - **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
-- **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages
+- **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, or drag one **out to a file manager or the desktop** to export that page as a standalone PDF (annotations baked in), like macOS Preview
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
 
 ### Files & integration
@@ -184,6 +184,9 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 | `Ctrl+O` | Open file |
 | `Ctrl+N` | New blank PDF |
 | `Ctrl+S` | Save (prompts for name if untitled) |
+| `Ctrl+W` | Close the window (prompts to save unsaved changes) |
+
+PDF-level shortcuts — `PageUp` / `PageDown` (page flip), `Ctrl+\` (toggle notes), `Ctrl+W` (close) — work no matter which side has focus, so flipping pages while typing notes works as expected.
 
 ## Tested distributions
 

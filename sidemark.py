@@ -1663,6 +1663,21 @@ class PDFCanvas(Gtk.DrawingArea):
         self.document.save(tmp)
         os.replace(tmp, path)
 
+    def export_pages(self, indices, path):
+        """Write the given page indices (with current ink strokes baked in) to a
+        standalone PDF at path. Used by thumbnail drag-to-export."""
+        self._write_ink_annotations()
+        out = fitz.open()
+        try:
+            for i in sorted(set(indices)):
+                if 0 <= i < self.n_pages:
+                    out.insert_pdf(self.document, from_page=i, to_page=i)
+            tmp = path + ".tmp"
+            out.save(tmp, garbage=4, deflate=True)
+            os.replace(tmp, path)
+        finally:
+            out.close()
+
     def add_blank_page(self):
         """Insert a blank page with the same dimensions as the current page, after it."""
         idx = self.current_page_idx + 1
@@ -1859,6 +1874,17 @@ def notes_path_for(pdf_path):
 AUTOSAVE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
     "sidemark", "autosave")
+
+
+def _safe_filename(name):
+    """Sanitise a string into a filesystem-safe filename (for drag-exported
+    pages): drop path separators and control characters, collapse the rest."""
+    name = name.replace(os.sep, "-")
+    if os.altsep:
+        name = name.replace(os.altsep, "-")
+    name = re.sub(r"[\x00-\x1f]", "", name)
+    name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .")
+    return name or "page.pdf"
 
 
 def _autosave_dir_for(path):
@@ -2712,6 +2738,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 background-color: alpha({acc_hex}, 0.30);
                 box-shadow: inset 0 0 0 1px {acc_hex};
             }}
+            .current-page {{
+                box-shadow: inset 0 0 0 2px {acc_hex};
+                border-radius: 4px;
+            }}
         """
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
@@ -2798,6 +2828,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._has_toc = False
         self._toc_thumbs = False
         self._thumb_idle_id = None
+        self._current_thumb_row = None   # row carrying the .current-page CSS marker
+        self._drag_export_dir = None   # lazily created temp dir for drag-exported pages
         self._toc_btn = Gtk.ToggleButton()
         self._toc_btn.set_icon_name(
             _themed_icon("view-list-symbolic", "view-list-text-symbolic",
@@ -3366,6 +3398,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         undo_ctrl.connect("key-pressed", self._on_undo_key)
         self.add_controller(undo_ctrl)
 
+        # PDF-level shortcuts (page flip, panel toggle, close) must work no matter
+        # what has focus. The notes TextView otherwise swallows some before the
+        # bubble handler: PageUp/PageDown scroll its text, Ctrl+\ deselects. A
+        # capture-phase controller intercepts just those, before the focus widget.
+        global_ctrl = Gtk.EventControllerKey()
+        global_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        global_ctrl.connect("key-pressed", self._on_global_key)
+        self.add_controller(global_ctrl)
+
         # The canvas key controller only tracks held modifiers while the canvas
         # is focused, so the tool-button highlight died once the notes editor (or
         # any other widget) took focus. A window-wide capture-phase controller
@@ -3712,6 +3753,27 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._undo_timeline.append(("canvas",))
         self._redo_timeline.clear()   # canvas already cleared its own redo
 
+    def _on_global_key(self, ctrl, keyval, keycode, state):
+        """PDF-level shortcuts that must fire regardless of focus, intercepted in
+        the capture phase so the notes editor can't swallow them first. Only these
+        specific keys are consumed; every other key passes through to typing."""
+        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if ctrl_held and keyval in (Gdk.KEY_w, Gdk.KEY_W):
+            # single-window today, so close the whole window; once multiple PDFs
+            # (tabs) land, this should close only the current tab.
+            self.close()   # runs the close-request handler (unsaved-changes prompt)
+            return True
+        if ctrl_held and keyval == Gdk.KEY_backslash:
+            self._notes_toggle.set_active(not self._notes_toggle.get_active())
+            return True
+        if not ctrl_held and keyval == Gdk.KEY_Page_Down:
+            self._nav_page(1)
+            return True
+        if not ctrl_held and keyval == Gdk.KEY_Page_Up:
+            self._nav_page(-1)
+            return True
+        return False
+
     def _on_undo_key(self, ctrl, keyval, keycode, state):
         if not (state & Gdk.ModifierType.CONTROL_MASK):
             return False
@@ -3943,7 +4005,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Fill the outline sidebar with page thumbnails, rendered lazily so
         opening a large document stays instant."""
         doc = self.canvas.document
-        self._toc_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        # MULTIPLE so several pages can be selected and dragged out together;
+        # the current-page indicator is a CSS class (.current-page), not the
+        # listbox selection, so the two never fight (see _select_thumb).
+        self._toc_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self._current_thumb_row = None
         pictures = []
         for i in range(len(doc)):
             rect = doc[i].rect
@@ -3992,19 +4058,49 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._thumb_idle_id = GLib.idle_add(render_next)
 
     def _add_thumb_dnd(self, row, idx):
-        """Make a thumbnail row draggable and a drop target so dragging one
-        thumbnail onto another reorders the pages. Intra-app DnD, so it uses
-        the synchronous controllers (no portal involved)."""
+        """Make a thumbnail row draggable and a drop target. Dropping it onto
+        another thumbnail reorders the pages (intra-app MOVE, int payload);
+        dragging it out to a file manager / desktop exports that page as a
+        standalone PDF (COPY, a GdkFileList that receivers read as text/uri-list,
+        like macOS Preview). One DragSource offers both via a union provider and
+        each receiver negotiates the type it understands."""
         src = Gtk.DragSource()
-        src.set_actions(Gdk.DragAction.MOVE)
-        src.connect("prepare", lambda _s, _x, _y, i=idx:
-                    Gdk.ContentProvider.new_for_value(GObject.Value(int, i)))
+        src.set_actions(Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
+        src.connect("prepare", self._on_thumb_drag_prepare, idx)
         row.add_controller(src)
 
         target = Gtk.DropTarget.new(int, Gdk.DragAction.MOVE)
         target.connect("drop", lambda _t, value, _x, _y, dst=idx:
                        self._on_thumb_drop(value, dst))
         row.add_controller(target)
+
+    def _on_thumb_drag_prepare(self, _src, _x, _y, idx):
+        reorder = Gdk.ContentProvider.new_for_value(GObject.Value(int, idx))
+        try:
+            gfile = self._export_page_tempfile(idx)
+        except Exception:
+            logger.error("thumbnail drag-export failed:\n" + traceback.format_exc())
+            return reorder   # reorder still works even if export couldn't be built
+        flist = Gdk.FileList.new_from_list([gfile])
+        export = Gdk.ContentProvider.new_for_value(
+            GObject.Value(Gdk.FileList, flist))
+        return Gdk.ContentProvider.new_union([reorder, export])
+
+    def _export_page_tempfile(self, idx):
+        """Export page idx to a temp PDF named like Preview (<basename>-pN.pdf)
+        and return it as a GFile for drag-out. The temp dir is swept on exit;
+        the file the user drops is the file manager's own copy of it."""
+        if self._drag_export_dir is None:
+            self._drag_export_dir = tempfile.mkdtemp(prefix="sidemark-pages-")
+            atexit.register(shutil.rmtree, self._drag_export_dir,
+                            ignore_errors=True)
+        base = "page"
+        if self._path:
+            base = os.path.splitext(os.path.basename(self._path))[0] or "page"
+        name = _safe_filename(f"{base}-p{idx + 1}.pdf")
+        out_path = os.path.join(self._drag_export_dir, name)
+        self.canvas.export_pages([idx], out_path)
+        return Gio.File.new_for_path(out_path)
 
     def _on_thumb_drop(self, src, dst):
         if isinstance(src, int) and src != dst:
@@ -4810,9 +4906,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if keyval == Gdk.KEY_z:
                 self._global_undo()
                 return True
-            if keyval == Gdk.KEY_backslash:
-                self._notes_toggle.set_active(not self._notes_toggle.get_active())
-                return True
             if keyval == Gdk.KEY_t:
                 # without a TOC the toggle handler bounces and shows a toast
                 self._toc_btn.set_active(not self._toc_btn.get_active())
@@ -4826,12 +4919,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if (state & Gdk.ModifierType.SHIFT_MASK) and keyval == Gdk.KEY_Delete:
                 self._delete_current_page()
                 return True
-        if keyval == Gdk.KEY_Page_Down:
-            self._nav_page(1)
-            return True
-        if keyval == Gdk.KEY_Page_Up:
-            self._nav_page(-1)
-            return True
+        # PageUp/PageDown and Ctrl+\ are handled in _on_global_key (capture phase)
+        # so they work even when the notes editor has focus.
         return False
 
 
