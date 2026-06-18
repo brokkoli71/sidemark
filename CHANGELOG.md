@@ -1,8 +1,25 @@
-## [unreleased]
+## [0.2.2] - 2026-06-18
+
+### 🚀 Features
+
+- *(canvas)* Smooth diagonal two-finger touchpad panning
+- *(tools)* Discoverable tool palette with modifier highlighting (#52)
+- *(select)* Reading-order text selection + long-press style menu (#53)
+- *(highlighter)* Mark-text style highlights whole lines as ink (#54)
+- *(callouts)* Drag a callout box to reposition it (#22)
+- *(shortcuts)* PDF keys work with sidebar focused + Ctrl+W close (#58)
+- *(pages)* Insert a dropped PDF into the sidebar + drop confirmation (#59, #60)
+- *(lasso)* Select ink strokes to move, delete, or recolour (#48)
+- *(presenter)* Second-screen live view for presenting (#55)
+
+### 🐛 Bug Fixes
+
+- *(ui)* Don't error on cancelled Open dialog or Ctrl+C
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(aur)* Bump pkgver to 0.2.1.r0.g62eefc7
+- *(changelog)* Drop ideas.csv bookkeeping from the changelog
 ## [0.2.1] - 2026-06-16
 
 ### 🚀 Features
