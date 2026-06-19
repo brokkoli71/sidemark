@@ -3102,24 +3102,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return s
 
         # ── ☰ menu: occasional file actions live here, not on the bar ──────────
-        self._recent_popover = Gtk.Popover()
-        self._recent_popover.connect("show", self._rebuild_recent_menu)
-        self._shortcuts_popover = self._build_shortcuts_popover()
-
+        # "Open recent" and "Keyboard shortcuts" used to open a *second* popover
+        # on this same button; GTK4 suppresses a popup while the first popover is
+        # still up/dismissing (the cause of the dead-first-click bug, #63). So the
+        # menu is a Gtk.Stack instead: those items switch to an in-menu page
+        # rather than opening a sibling popover — no second popover, no race.
         menu_btn = Gtk.MenuButton()
         menu_btn.set_icon_name("open-menu-symbolic")
         menu_btn.set_tooltip_text("Menu")
-        self._recent_popover.set_parent(menu_btn)
-        self._shortcuts_popover.set_parent(menu_btn)
+
+        menu_pop = Gtk.Popover()
+        menu_btn.set_popover(menu_pop)
+        self._menu_pop = menu_pop
+        self._menu_stack = Gtk.Stack()
+        self._menu_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self._menu_stack.set_transition_duration(120)
+        menu_pop.set_child(self._menu_stack)
+        # always reopen on the main page
+        menu_pop.connect("show", lambda _p: self._menu_stack.set_visible_child_name("main"))
 
         menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         menu_box.set_margin_top(6)
         menu_box.set_margin_bottom(6)
         menu_box.set_margin_start(6)
         menu_box.set_margin_end(6)
-        menu_pop = Gtk.Popover()
-        menu_pop.set_child(menu_box)
-        menu_btn.set_popover(menu_pop)
+        self._menu_stack.add_named(menu_box, "main")
 
         # current filename shown at the top of the menu (no room on the bar)
         self._file_label = Gtk.Label(label="", xalign=0)
@@ -3138,20 +3145,37 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             item = Gtk.Button()
             item.add_css_class("flat")
             item.set_child(Gtk.Label(label=label, xalign=0))
-            item.connect("clicked", lambda _b: (menu_pop.popdown(), callback()))
+            item.connect("clicked", lambda _b: callback())
             menu_box.append(item)
             return item
 
-        _menu_item("Open…", lambda: self._on_open(None))
-        _menu_item("Open recent", lambda: self._recent_popover.popup())
-        _menu_item("New", lambda: self._on_new_pdf(None))
-        _menu_item("Save", lambda: self._on_save())
-        _menu_item("Export with notes…", lambda: self._on_export())
+        _menu_item("Open…",
+                   lambda: (menu_pop.popdown(), self._on_open(None)))
+        self._recent_menu_item = _menu_item(
+            "Open recent", lambda: self._show_menu_page("recent"))
+        _menu_item("New", lambda: (menu_pop.popdown(), self._on_new_pdf(None)))
+        _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()))
+        _menu_item("Export with notes…",
+                   lambda: (menu_pop.popdown(), self._on_export()))
         msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         msep2.set_margin_top(2)
         msep2.set_margin_bottom(2)
         menu_box.append(msep2)
-        _menu_item("Keyboard shortcuts", lambda: self._shortcuts_popover.popup())
+        _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"))
+
+        # sub-pages reached from the menu (recent files, keyboard shortcuts)
+        self._recent_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        recent_scroll = Gtk.ScrolledWindow()
+        recent_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        recent_scroll.set_max_content_height(420)
+        recent_scroll.set_propagate_natural_height(True)
+        recent_scroll.set_propagate_natural_width(True)
+        recent_scroll.set_child(self._recent_list_box)
+        self._menu_stack.add_named(
+            self._menu_subpage("Recent files", recent_scroll), "recent")
+        self._menu_stack.add_named(
+            self._menu_subpage("Keyboard shortcuts",
+                               self._build_shortcuts_content()), "shortcuts")
 
         # ── outline / thumbnails sidebar toggle ────────────────────────────────
         # stays sensitive even without a TOC — insensitive widgets get no
@@ -3807,7 +3831,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     # ── shortcuts popover ─────────────────────────────────────────────────────
 
-    def _build_shortcuts_popover(self):
+    def _build_shortcuts_content(self):
         shortcuts = [
             ("Draw",          None),
             ("Left-drag",     "Draw stroke"),
@@ -3880,9 +3904,39 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         scroll.set_propagate_natural_width(True)
         scroll.set_propagate_natural_height(True)
         scroll.set_max_content_height(480)
-        popover = Gtk.Popover()
-        popover.set_child(scroll)
-        return popover
+        return scroll
+
+    def _menu_subpage(self, title, content):
+        """A menu stack sub-page: a '← title' back header above the content. The
+        back button returns to the main menu page (no popover involved)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+        back = Gtk.Button()
+        back.add_css_class("flat")
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        arrow = Gtk.Image.new_from_icon_name("go-previous-symbolic")
+        head.append(arrow)
+        head.append(Gtk.Label(label=title, xalign=0))
+        back.set_child(head)
+        back.connect("clicked",
+                     lambda _b: self._menu_stack.set_visible_child_name("main"))
+        box.append(back)
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_bottom(2)
+        box.append(sep)
+        content.set_vexpand(True)
+        box.append(content)
+        return box
+
+    def _show_menu_page(self, name):
+        """Switch the ☰ menu to a sub-page in place (recent / shortcuts) — keeps
+        the single menu popover open instead of opening a racing sibling one."""
+        if name == "recent":
+            self._rebuild_recent_menu()
+        self._menu_stack.set_visible_child_name(name)
 
     # ── page & notes handshake ────────────────────────────────────────────────
 
@@ -5139,7 +5193,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _rebuild_recent_menu(self, _popover=None):
         items = _load_recent()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box = self._recent_list_box
+        child = box.get_first_child()
+        while child is not None:            # clear previous rows
+            box.remove(child)
+            child = box.get_first_child()
         if not items:
             empty = Gtk.Label(label="No recent files")
             empty.add_css_class("dim-label")
@@ -5164,18 +5222,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
             def _make_open(p):
                 def _on_click(_btn):
-                    self._recent_popover.popdown()
+                    self._menu_pop.popdown()
                     self.open_file(p)
                 return _on_click
             row.connect("clicked", _make_open(path))
             box.append(row)
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_max_content_height(420)
-        scroller.set_propagate_natural_height(True)
-        scroller.set_propagate_natural_width(True)
-        scroller.set_child(box)
-        self._recent_popover.set_child(scroller)
 
     SUPPORTED_DND = (".pdf", ".pptx", ".md")
 

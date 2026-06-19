@@ -4660,8 +4660,7 @@ class TestRecentFiles(unittest.TestCase):
                 if paths != [pdf]:
                     raise AssertionError(f"open did not record recent: {paths}")
                 win._rebuild_recent_menu()
-                scroller = win._recent_popover.get_child()
-                box = scroller.get_child().get_child()   # viewport → box
+                box = win._recent_list_box
                 rows = []
                 child = box.get_first_child()
                 while child is not None:
@@ -4669,6 +4668,46 @@ class TestRecentFiles(unittest.TestCase):
                     child = child.get_next_sibling()
                 if len(rows) != 1:
                     raise AssertionError(f"expected 1 menu row, got {len(rows)}")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_open_recent_switches_menu_stack_in_place(self):
+        """#63: clicking 'Open recent' must navigate within the single ☰ menu
+        popover (an inline Gtk.Stack), never open a second sibling popover —
+        that synchronous popdown→popup race was the original bug."""
+        errors = []
+        pdf = os.path.join(self._tmp.name, "doc.pdf")
+        make_pdf(pdf)
+        app = Adw.Application(application_id="test.sidemark.recentstack")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._do_open_file(pdf)
+                # the menu starts on its "main" page
+                win._menu_pop.emit("show")
+                if win._menu_stack.get_visible_child_name() != "main":
+                    raise AssertionError("menu did not reset to main on show")
+                # clicking "Open recent" switches the stack page in place
+                win._recent_menu_item.emit("clicked")
+                if win._menu_stack.get_visible_child_name() != "recent":
+                    raise AssertionError("recent page did not become visible")
+                # and the recent list got (re)built with our just-opened file
+                rows = []
+                child = win._recent_list_box.get_first_child()
+                while child is not None:
+                    rows.append(child)
+                    child = child.get_next_sibling()
+                if len(rows) != 1:
+                    raise AssertionError(f"expected 1 recent row, got {len(rows)}")
             except Exception as e:
                 errors.append(e)
             finally:
