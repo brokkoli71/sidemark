@@ -72,6 +72,23 @@ def _save_setting(key, value):
     os.replace(tmp, path)
 
 
+def _notes_file_for_pdf(pdf_path):
+    """The user-chosen notes file for this PDF, if one was set via the menu;
+    otherwise None (callers fall back to notes_path_for)."""
+    m = _load_settings().get("notes_files", {})
+    if isinstance(m, dict):
+        return m.get(os.path.abspath(pdf_path))
+    return None
+
+
+def _remember_notes_file(pdf_path, notes_path):
+    m = _load_settings().get("notes_files", {})
+    if not isinstance(m, dict):
+        m = {}
+    m[os.path.abspath(pdf_path)] = notes_path
+    _save_setting("notes_files", m)
+
+
 # Fast path for launcher integrations (walker/elephant menus, rofi, …):
 # print "name<TAB>path" lines and exit before any GTK import happens.
 if __name__ == "__main__" and "--list-recent" in sys.argv[1:]:
@@ -2565,13 +2582,17 @@ class NotesModel:
     def get(self, idx):
         return self._notes.get(idx, "")
 
+    def has_content(self):
+        """True if any page has non-whitespace notes (drives lazy file creation)."""
+        return any(v.strip() for v in self._notes.values())
+
     def set(self, idx, text):
         self._notes[idx] = text
 
     def load(self, path):
         self._notes = {}
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 raw = f.read()
         except OSError:
             return
@@ -2579,6 +2600,13 @@ class NotesModel:
         raw = re.sub(r'^\s*!\[\[.*?\]\]\n+', '', raw)
         # Format: <!-- page:N --> delimiters (invisible in markdown viewers)
         parts = re.split(r'<!--\s*page:(\d+)\s*-->', raw)
+        if len(parts) == 1:
+            # No page markers — an externally authored .md or an arbitrary text
+            # file opened as notes: keep the whole thing as page-0 content.
+            text = raw.strip()
+            if text:
+                self._notes[0] = text
+            return
         for i in range(1, len(parts), 2):
             content = parts[i + 1].strip() if i + 1 < len(parts) else ""
             if content:
@@ -3075,6 +3103,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.set_default_size(1280, 800)
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
+        self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
         self._is_untitled = False  # True when working on an auto-created blank (no saved path yet)
         self._dirty = False
         self._suppress_dirty = False
@@ -3254,27 +3283,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         msep.set_margin_bottom(2)
         menu_box.append(msep)
 
-        def _menu_item(label, callback):
+        def _menu_item(label, callback, tooltip=None):
             item = Gtk.Button()
             item.add_css_class("flat")
             item.set_child(Gtk.Label(label=label, xalign=0))
             item.connect("clicked", lambda _b: callback())
+            if tooltip:
+                item.set_tooltip_text(tooltip)
             menu_box.append(item)
             return item
 
         _menu_item("Open…",
-                   lambda: (menu_pop.popdown(), self._on_open(None)))
+                   lambda: (menu_pop.popdown(), self._on_open(None)),
+                   "Open a PDF, PowerPoint, or text/Markdown file (Ctrl+O)")
         self._recent_menu_item = _menu_item(
-            "Open recent", lambda: self._show_menu_page("recent"))
-        _menu_item("New", lambda: (menu_pop.popdown(), self._on_new_pdf(None)))
-        _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()))
+            "Open recent", lambda: self._show_menu_page("recent"),
+            "Reopen a recently used file")
+        _menu_item("New", lambda: (menu_pop.popdown(), self._on_new_pdf(None)),
+                   "Start a new blank document (Ctrl+N)")
+        _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
+                   "Save the document and its notes (Ctrl+S)")
         _menu_item("Export with notes…",
-                   lambda: (menu_pop.popdown(), self._on_export()))
+                   lambda: (menu_pop.popdown(), self._on_export()),
+                   "Export a PDF with your notes laid out after each page (Ctrl+E)")
+        _menu_item("Notes file…",
+                   lambda: (menu_pop.popdown(), self._choose_notes_file()),
+                   "Choose which Markdown file this document's notes are saved to")
         msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         msep2.set_margin_top(2)
         msep2.set_margin_bottom(2)
         menu_box.append(msep2)
-        _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"))
+        _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"),
+                   "Show the full list of keyboard shortcuts")
 
         # sub-pages reached from the menu (recent files, keyboard shortcuts)
         self._recent_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -3721,7 +3761,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             _themed_icon("view-sidebar-symbolic", "sidebar-show-symbolic"))
         self._notes_toggle.set_tooltip_text("Toggle notes (Ctrl+\\)")
         self._notes_toggle.set_active(True)
-        self._notes_toggle.connect("toggled", self._on_notes_toggled)
+        self._notes_toggled_id = self._notes_toggle.connect(
+            "toggled", self._on_notes_toggled)
 
         # ── assemble: two cluster boxes so the bar's real content width can be
         # measured directly (the HeaderBar's own natural width is inflated by the
@@ -3861,7 +3902,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # Outline ⇄ Pages view switcher, shown only when the PDF has a TOC
         self._toc_seg_outline = Gtk.ToggleButton(label="Outline")
         self._toc_seg_outline.set_active(True)
+        self._toc_seg_outline.set_tooltip_text(
+            "Show the document outline (Ctrl+T toggles this sidebar)")
         self._toc_seg_pages = Gtk.ToggleButton(label="Pages")
+        self._toc_seg_pages.set_tooltip_text(
+            "Show page thumbnails (Ctrl+T toggles this sidebar)")
         self._toc_seg_pages.set_group(self._toc_seg_outline)
         self._toc_seg_pages.connect("toggled", self._on_toc_view_toggled)
         self._toc_switch = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -4584,6 +4629,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 row = Gtk.ListBoxRow()
                 row.set_child(label)
                 row.toc_page = page - 1   # get_toc() pages are 1-based
+                row.set_tooltip_text(
+                    (title.strip() or "—")
+                    + " — click to jump (PageUp/PageDown to flip pages)")
                 self._toc_list.append(row)
             self._toc_btn.set_tooltip_text("Toggle outline (Ctrl+T)")
 
@@ -4622,6 +4670,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.set_child(box)
             row.toc_page = i
+            row.set_tooltip_text(
+                f"Page {i + 1} — click to open (PageUp/PageDown to flip), "
+                "Ctrl+click to select, drag to reorder or export")
             self._add_thumb_dnd(row, i)
             self._toc_list.append(row)
             pictures.append(pic)
@@ -4682,6 +4733,31 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         finsert.connect("drag-leave", lambda _t, _d: self._clear_drop_indicator())
         finsert.connect("drop", self._on_thumb_file_drop, idx)
         row.add_controller(finsert)
+
+        # Ctrl+click toggles this page in/out of the multi-page export selection
+        # (file-manager / Preview behaviour). Handled in the capture phase and
+        # claimed so neither the row's DragSource nor GtkListBox's own selection
+        # also acts on it — otherwise a stationary Ctrl+click can be swallowed by
+        # the drag source and never deselect. Plain/Shift clicks fall through.
+        ctrl_click = Gtk.GestureClick()
+        ctrl_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        ctrl_click.connect("pressed", self._on_thumb_ctrl_pressed, row)
+        row.add_controller(ctrl_click)
+
+    def _on_thumb_ctrl_pressed(self, gesture, _n_press, _x, _y, row):
+        state = gesture.get_current_event_state()
+        # only plain Ctrl (no Shift) toggles; Ctrl+Shift stays a native range op
+        if (state & Gdk.ModifierType.CONTROL_MASK
+                and not (state & Gdk.ModifierType.SHIFT_MASK)):
+            self._toggle_thumb_selection(row)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _toggle_thumb_selection(self, row):
+        """Add/remove a single page from the multi-page export selection."""
+        if row.is_selected():
+            self._toc_list.unselect_row(row)
+        else:
+            self._toc_list.select_row(row)
 
     # ── drop-gap indicator + target geometry ──────────────────────────────────
     @staticmethod
@@ -5166,6 +5242,93 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._present_btn.set_active(False)   # untoggle the header button
         return False
 
+    def _current_notes_path(self):
+        """The .md file the current document's notes are read from / written to."""
+        if self._notes_path:          # a .md opened directly (no PDF)
+            return self._notes_path
+        if self._path:
+            return self._active_notes_path or notes_path_for(self._path)
+        return None
+
+    def _set_notes_shown(self, shown):
+        """Show/hide the notes panel immediately (no slide animation), keeping
+        the toggle button in sync without re-triggering its handler. Used on
+        document open to start collapsed when there are no notes yet."""
+        self._notes_toggle.handler_block(self._notes_toggled_id)
+        self._notes_toggle.set_active(shown)
+        self._notes_toggle.handler_unblock(self._notes_toggled_id)
+        self._notes_box.set_visible(shown)
+        if shown:
+            w = self.get_width() or 1280
+            pos = self._saved_pane_pos
+            if not (100 < pos < w - 150):
+                pos = int(w * 0.62)
+                self._saved_pane_pos = pos
+            self._paned.set_position(pos)
+
+    def _choose_notes_file(self):
+        if not self._path and not self._notes_path:
+            self._toast("Open a document first")
+            return
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Choose notes file")
+        md_filter = Gtk.FileFilter()
+        md_filter.set_name("Markdown / text")
+        for pat in ("*.md", "*.markdown", "*.txt"):
+            md_filter.add_pattern(pat)
+        any_file = Gtk.FileFilter()
+        any_file.set_name("All files")
+        any_file.add_pattern("*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(md_filter)
+        filters.append(any_file)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(md_filter)
+        folder = self._current_dir_gfile()
+        if folder:
+            dialog.set_initial_folder(folder)
+        # an OPEN dialog: we only *read* the chosen file (no overwrite prompt)
+        dialog.open(self, None, self._on_notes_file_chosen)
+
+    def _on_notes_file_chosen(self, dialog, result):
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error:
+            return  # user cancelled
+        if gfile is None:
+            return
+        path = gfile.get_path()
+        if not path:
+            return
+        self._switch_notes_file(path)
+
+    def _switch_notes_file(self, new_path):
+        """Point the notes panel at a different .md: save the current notes to
+        their existing file first (lazily), then load the chosen file (or start
+        empty if it doesn't exist yet) and remember the choice for this PDF."""
+        self._commit_note()
+        old = self._current_notes_path()
+        if old and old != new_path and (self.notes_model.has_content()
+                                        or os.path.exists(old)):
+            try:
+                self.notes_model.save(old)
+            except OSError:
+                logger.debug("saving notes to old path failed", exc_info=True)
+        self._active_notes_path = new_path
+        if self._path:
+            self._notes_path = None
+            _remember_notes_file(self._path, new_path)
+        else:
+            self._notes_path = new_path   # notes-only mode
+        self.notes_model = NotesModel()
+        if self._path:
+            self.notes_model.pdf_name = os.path.basename(self._path)
+        self.notes_model.load(new_path)   # no-op if the file doesn't exist yet
+        self._restore_note()              # refresh the panel for the current page
+        self._set_notes_shown(True)       # the user explicitly wants notes now
+        self._notes_view.grab_focus()
+        self._toast(f"Notes file: {os.path.basename(new_path)}")
+
     def _on_notes_toggled(self, btn):
         w = self.get_width() or 1280
         if btn.get_active():
@@ -5425,20 +5588,76 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self._do_open_file(path)
 
+    # files larger than this are unlikely to be text the user wants in the
+    # notes panel; opening them is gated behind a confirmation
+    MAX_TEXT_BYTES = 5 * 1024 * 1024
+
     def _do_open_file(self, path):
         if path.lower().endswith(".pptx"):
             self._convert_pptx_then_open(path)
             return
-        if path.lower().endswith(".md"):
+        if path.lower().endswith((".md", ".markdown")):
             self._open_markdown(path)
             return
+        if path.lower().endswith(".pdf"):
+            self._open_pdf(path)
+            return
+        # any other file: interpret it as text/Markdown, but warn first if it
+        # looks binary, isn't valid UTF-8, or is very large
+        warning = self._text_open_warning(path)
+        if warning:
+            self._confirm_open_as_text(path, warning)
+        else:
+            self._open_markdown(path)
+
+    def _text_open_warning(self, path):
+        """Return a human-readable reason this file may not be text (so opening
+        it as notes should be confirmed), or None if it looks fine."""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        if size > self.MAX_TEXT_BYTES:
+            return (f"This file is large ({size / 1024 / 1024:.1f} MB) — "
+                    "opening it as text may be slow.")
+        try:
+            with open(path, "rb") as f:
+                chunk = f.read(4096)
+        except OSError:
+            return None
+        if b"\x00" in chunk:
+            return "This file looks binary (it contains NUL bytes), not text."
+        try:
+            chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            return ("This file isn't valid UTF-8 text and may display "
+                    "with replacement characters.")
+        return None
+
+    def _confirm_open_as_text(self, path, warning):
+        dialog = Adw.AlertDialog.new(
+            "Open as text?",
+            f"{os.path.basename(path)}\n\n{warning}\n\n"
+            "Open it as a text / Markdown note anyway?")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("open", "Open anyway")
+        dialog.set_response_appearance("open", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect(
+            "response",
+            lambda _d, r: self._open_markdown(path) if r == "open" else None)
+        dialog.present(self)
+
+    def _open_pdf(self, path):
         self._path = path
         self._notes_path = None
+        self._active_notes_path = _notes_file_for_pdf(path) or notes_path_for(path)
         self._is_untitled = False
         self._set_file_title(os.path.basename(path), path)
         self.notes_model = NotesModel()
         self.notes_model.pdf_name = os.path.basename(path)
-        self.notes_model.load(notes_path_for(path))
+        self.notes_model.load(self._active_notes_path)
         self._hide_search()
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
         self._populate_toc()
@@ -5446,6 +5665,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._undo_timeline.clear()
         self._redo_timeline.clear()
         self._notes_burst_open = False
+        # A PDF with no notes yet opens with the notes panel collapsed; it
+        # springs open as soon as the user toggles it (Ctrl+\) and the .md is
+        # created lazily on first save once something is actually written.
+        self._set_notes_shown(self.notes_model.has_content())
         self._remember_recent(path)
         self._maybe_offer_recovery(path)
 
@@ -5681,15 +5904,32 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _current_dir_gfile(self):
+        """The folder of the currently open file, so file dialogs start there."""
+        cur = self._path if (self._path and not self._is_untitled) else self._notes_path
+        if cur:
+            folder = os.path.dirname(os.path.abspath(cur))
+            if os.path.isdir(folder):
+                return Gio.File.new_for_path(folder)
+        return None
+
     def _on_open(self, _btn):
         dialog = Gtk.FileDialog.new()
-        f = Gtk.FileFilter()
-        f.set_name("PDF / PPTX files")
-        f.add_pattern("*.pdf")
-        f.add_pattern("*.pptx")
+        docs = Gtk.FileFilter()
+        docs.set_name("Documents (PDF, PPTX, Markdown, text)")
+        for pat in ("*.pdf", "*.pptx", "*.md", "*.markdown", "*.txt"):
+            docs.add_pattern(pat)
+        any_file = Gtk.FileFilter()
+        any_file.set_name("All files")
+        any_file.add_pattern("*")
         filters = Gio.ListStore.new(Gtk.FileFilter)
-        filters.append(f)
+        filters.append(docs)
+        filters.append(any_file)
         dialog.set_filters(filters)
+        dialog.set_default_filter(docs)
+        folder = self._current_dir_gfile()
+        if folder:
+            dialog.set_initial_folder(folder)
         dialog.open(self, None, self._open_done)
 
     def _open_done(self, dialog, result):
@@ -5713,14 +5953,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._is_untitled:
             self._on_save_as(after=after)
             return
-        notes_file = notes_path_for(self._path) if self._path else self._notes_path
+        notes_file = self._current_notes_path()
         if not self._path and not notes_file:
             return
         try:
             self._commit_note()
             if self._path:
                 self.canvas.save(self._path)
-            if notes_file:
+            # lazy-create: don't bring an empty sidecar into existence just
+            # because the PDF was saved — only write notes once there's content
+            # (or the file already exists, so edits/clears still persist)
+            if notes_file and (self.notes_model.has_content()
+                               or os.path.exists(notes_file)):
                 self.notes_model.save(notes_file)
             self._clear_dirty()
             toast = Adw.Toast.new("Saved")

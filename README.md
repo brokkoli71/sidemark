@@ -34,6 +34,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
 - **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; both the anchor and the box can be dragged to reposition (the arrow re-aims itself); included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
+- **Choose where notes live** — by default each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something (a PDF you never annotate stays clutter-free, and its notes panel opens collapsed). Pick **Notes file…** from the ☰ menu to point a document at a different Markdown file — handy for sharing one notes file across several PDFs; the choice is remembered per PDF
 
 ### Navigation
 
@@ -46,7 +47,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 ### Files & integration
 
-- **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice), and `.md` files; drag a file from your file manager onto the window
+- **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice), and `.md` files; drag a file from your file manager onto the window. Any other file opens as text in the notes panel — handy for `.txt`, code, or config files — with a warning to confirm first if it looks binary, isn't valid UTF-8, or is very large
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode. Selection defaults to **reading order** — like a normal PDF viewer, it grabs the contiguous run of text between where you press and release (column-aware) — and long-pressing the select tool switches to a **rectangular** marquee for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
@@ -232,4 +233,4 @@ For other launchers (rofi, fuzzel, …) `sidemark --list-recent` prints `name<TA
 
 ## Notes format
 
-Notes are saved alongside the PDF as `<filename>-notes.md` using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault. Anchor markers (`<!-- anchor:X:Y -->`) and callout markers (`<!-- callout:X:Y -->`) are stored the same way — invisible in external viewers. Inside Sidemark, anchors appear as numbered circles on the PDF canvas; a callout additionally renders its anchor's note paragraph in a box at the callout position, with an arrow from the anchor. Callouts are included in Ctrl+E exports.
+Notes are saved alongside the PDF as `<filename>-notes.md` (or a custom file you pick via **Notes file…**, remembered per PDF; the file is created lazily, only once you write something) using invisible `<!-- page:N -->` markers, so the file renders cleanly in any Markdown viewer or Obsidian vault. Anchor markers (`<!-- anchor:X:Y -->`) and callout markers (`<!-- callout:X:Y -->`) are stored the same way — invisible in external viewers. Inside Sidemark, anchors appear as numbered circles on the PDF canvas; a callout additionally renders its anchor's note paragraph in a box at the callout position, with an arrow from the anchor. Callouts are included in Ctrl+E exports.

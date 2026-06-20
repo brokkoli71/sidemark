@@ -669,6 +669,31 @@ class TestNotes(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_load_markerless_file_as_page0(self):
+        # an externally authored .md / plain text file (no <!-- page:N --> markers)
+        # loads its whole content as page-0 notes
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                         encoding="utf-8") as f:
+            f.write("# Just a heading\n\nsome prose, no markers")
+            path = f.name
+        try:
+            m = NotesModel()
+            m.load(path)
+            self.assertEqual(m.get(0), "# Just a heading\n\nsome prose, no markers")
+        finally:
+            os.unlink(path)
+
+    def test_load_non_utf8_does_not_raise(self):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"caf\xe9 \xff\xfe latin-1 bytes")
+            path = f.name
+        try:
+            m = NotesModel()
+            m.load(path)  # must not raise; replacement chars are fine
+            self.assertTrue(m.has_content())
+        finally:
+            os.unlink(path)
+
     def test_empty_pages_not_written(self):
         with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
             path = f.name
@@ -2044,6 +2069,39 @@ class TestThumbSelectionClearing(unittest.TestCase):
             win.canvas._shift_held = False
             win._on_toc_row_activated(win._toc_list, rows[1])
             self.assertEqual(self._selected_pages(win), [0, 1, 2])
+
+        self._run_in_window(body)
+
+    def test_ctrl_click_toggles_page_off_and_on(self):
+        def body(win):
+            self._open(win)
+            rows = self._rows(win)
+            for r in rows[:3]:
+                win._toc_list.select_row(r)
+            # Ctrl+click an already-selected page removes just that one (#65)
+            win._toggle_thumb_selection(rows[1])
+            self.assertEqual(self._selected_pages(win), [0, 2])
+            # Ctrl+click it again adds it back
+            win._toggle_thumb_selection(rows[1])
+            self.assertEqual(self._selected_pages(win), [0, 1, 2])
+            # toggling an unselected page from empty selection adds only it
+            win._toc_list.unselect_all()
+            win._toggle_thumb_selection(rows[2])
+            self.assertEqual(self._selected_pages(win), [2])
+
+        self._run_in_window(body)
+
+    def test_sidebar_elements_have_shortcut_tooltips(self):
+        def body(win):
+            self._open(win)
+            rows = self._rows(win)
+            tip = rows[0].get_tooltip_text()
+            self.assertIn("Page 1", tip)
+            self.assertIn("Ctrl+click", tip)
+            self.assertIn("PageUp", tip)
+            # the Outline/Pages switcher buttons mention the Ctrl+T sidebar toggle
+            self.assertIn("Ctrl+T", win._toc_seg_pages.get_tooltip_text())
+            self.assertIn("Ctrl+T", win._toc_seg_outline.get_tooltip_text())
 
         self._run_in_window(body)
 
@@ -4858,6 +4916,225 @@ class TestRecentFiles(unittest.TestCase):
             raise errors[0]
 
 
+class TestNotesFileSwitching(unittest.TestCase):
+    """#66 — switchable notes file, lazy sidecar creation, auto-collapse when
+    a PDF has no notes yet."""
+
+    def test_has_content(self):
+        m = NotesModel()
+        self.assertFalse(m.has_content())
+        m.set(0, "   \n  ")
+        self.assertFalse(m.has_content())   # whitespace doesn't count
+        m.set(1, "real")
+        self.assertTrue(m.has_content())
+
+    def test_notes_file_mapping_persists(self):
+        with tempfile.TemporaryDirectory() as cfg:
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = cfg
+            try:
+                self.assertIsNone(sidemark._notes_file_for_pdf("/x/y.pdf"))
+                sidemark._remember_notes_file("/x/y.pdf", "/notes/shared.md")
+                self.assertEqual(
+                    sidemark._notes_file_for_pdf("/x/y.pdf"), "/notes/shared.md")
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+
+    def _run(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.notesswitch")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_lazy_create_no_file_without_notes(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._on_save()
+                # nothing typed → no sidecar conjured into existence
+                self.assertFalse(os.path.exists(notes_path_for(pdf)))
+
+            self._run(body)
+
+    def test_save_creates_file_once_written(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._notes_view.get_buffer().set_text("hello")
+                win._on_save()
+                self.assertTrue(os.path.exists(notes_path_for(pdf)))
+
+            self._run(body)
+
+    def test_auto_collapse_when_no_notes(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertFalse(win._notes_toggle.get_active())
+                self.assertFalse(win._notes_box.get_visible())
+
+            self._run(body)
+
+    def test_panel_shown_when_notes_exist(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            with open(notes_path_for(pdf), "w", encoding="utf-8") as f:
+                f.write("<!-- page:0 -->\n\nexisting note\n")
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertTrue(win._notes_toggle.get_active())
+                self.assertTrue(win._notes_box.get_visible())
+
+            self._run(body)
+
+    def test_switch_loads_chosen_file_and_remembers(self):
+        with tempfile.TemporaryDirectory() as d, \
+                tempfile.TemporaryDirectory() as cfg:
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = cfg
+            try:
+                pdf = os.path.join(d, "doc.pdf")
+                make_pdf(pdf)
+                shared = os.path.join(d, "shared.md")
+                with open(shared, "w", encoding="utf-8") as f:
+                    f.write("<!-- page:0 -->\n\nshared note\n")
+
+                def body(win):
+                    win._do_open_file(pdf)
+                    win._switch_notes_file(shared)
+                    self.assertEqual(win._current_notes_path(), shared)
+                    self.assertEqual(win.notes_model.get(0), "shared note")
+                    self.assertEqual(sidemark._notes_file_for_pdf(pdf), shared)
+                    # switching also reveals the notes panel
+                    self.assertTrue(win._notes_box.get_visible())
+
+                self._run(body)
+
+                # reopening the PDF reuses the remembered notes file
+                def body2(win):
+                    win._do_open_file(pdf)
+                    self.assertEqual(win._current_notes_path(), shared)
+                    self.assertEqual(win.notes_model.get(0), "shared note")
+
+                self._run(body2)
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+
+
+class TestOpenAnyFile(unittest.TestCase):
+    """Open can read any file as text/Markdown, warning first for binary /
+    non-UTF-8 / oversized files; the ☰ menu items carry shortcut tooltips."""
+
+    def _run(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.openany")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_text_warning_detection(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "notes.txt")
+            with open(txt, "w", encoding="utf-8") as f:
+                f.write("plain text is fine")
+            binf = os.path.join(d, "blob.bin")
+            with open(binf, "wb") as f:
+                f.write(b"\x00\x01\x02binary\x00")
+
+            def body(win):
+                self.assertIsNone(win._text_open_warning(txt))
+                self.assertIn("binary", win._text_open_warning(binf).lower())
+
+            self._run(body)
+
+    def test_open_plain_text_loads_as_notes(self):
+        with tempfile.TemporaryDirectory() as d:
+            txt = os.path.join(d, "todo.txt")
+            with open(txt, "w", encoding="utf-8") as f:
+                f.write("- buy milk\n- read paper")
+
+            def body(win):
+                win._do_open_file(txt)
+                self.assertEqual(win._notes_path, txt)
+                self.assertEqual(win.notes_model.get(0), "- buy milk\n- read paper")
+
+            self._run(body)
+
+    def test_binary_file_does_not_open_without_confirmation(self):
+        # a binary file must NOT load straight into the notes model — it waits
+        # behind the confirmation dialog
+        with tempfile.TemporaryDirectory() as d:
+            binf = os.path.join(d, "weird")
+            with open(binf, "wb") as f:
+                f.write(b"\x00\x01\x02\x03")
+
+            def body(win):
+                win._do_open_file(binf)
+                self.assertNotEqual(win._notes_path, binf)
+                self.assertFalse(win.notes_model.has_content())
+
+            self._run(body)
+
+    def test_menu_items_have_tooltips(self):
+        def body(win):
+            # the file label is first; the action buttons follow the separator
+            tips = []
+            child = win._menu_stack.get_child_by_name("main").get_first_child()
+            while child is not None:
+                if isinstance(child, Gtk.Button):
+                    tips.append(child.get_tooltip_text())
+                child = child.get_next_sibling()
+            joined = " ".join(t for t in tips if t)
+            self.assertIn("Ctrl+O", joined)
+            self.assertIn("Ctrl+S", joined)
+            self.assertIn("Ctrl+E", joined)
+            self.assertIn("Ctrl+N", joined)
+
+        self._run(body)
+
+
 class TestNotesSidebarAnimation(unittest.TestCase):
     def test_toggle_animates_hide_then_show(self):
         """Toggling the notes panel slides the paned position; the box is
@@ -4873,6 +5150,9 @@ class TestNotesSidebarAnimation(unittest.TestCase):
                     win = PDFEditorWindow(a)
                     win.present()
                     win._do_open_file(pdf)
+                    # a notes-less PDF now opens collapsed (#66); start from a
+                    # shown panel so the hide→show toggle animation is exercised
+                    win._set_notes_shown(True)
                     win._notes_toggle.set_active(False)
                     if win._pane_anim is None:
                         raise AssertionError("toggle did not start an animation")
