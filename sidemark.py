@@ -207,6 +207,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_user_action = None     # callback() once per completed draw/erase gesture
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
         self.on_lasso_selection = None # callback(has_selection: bool) when the lasso set changes
+        self.on_nav_history = None     # callback(can_go_back: bool) when the link back-stack changes
+
+        # link navigation: following an internal (GOTO) link — e.g. a footnote or
+        # citation reference — pushes the reading location here so it can be
+        # restored with nav_back() (Alt+Left). Each entry: (page, ox, oy, scale).
+        self._nav_history = []
 
         # {page_idx: [anchor dict from _parse_anchors, ...]}
         self._anchors = {}
@@ -400,6 +406,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._redo_stack = []
         self._erase_group = 0
         self._draw_group = 0
+        self._nav_history = []
+        if self.on_nav_history:
+            self.on_nav_history(False)
         total_annots = 0
         for i in range(self.n_pages):
             page = self.document[i]   # keep reference alive while reading annotations
@@ -1544,24 +1553,126 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _open_link_at(self, sx, sy):
         if not self.page:
+            logger.debug("link click: no page loaded")
             return
         px, py = self._screen_to_pdf(sx, sy)
-        for link in self.page.get_links():
+        links = self.page.get_links()
+        logger.debug(
+            f"link click: screen=({sx:.0f},{sy:.0f}) pdf=({px:.1f},{py:.1f}) "
+            f"page={self.current_page_idx} scale={self.scale:.3f} "
+            f"offset=({self.offset_x:.0f},{self.offset_y:.0f}) "
+            f"{len(links)} link(s) on page")
+        for link in links:
             r = link["from"]
-            if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
+            hit = r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1
+            logger.debug(
+                f"  link kind={link.get('kind')} from=({r.x0:.0f},{r.y0:.0f},"
+                f"{r.x1:.0f},{r.y1:.0f}) page={link.get('page')} "
+                f"to={link.get('to')} uri={link.get('uri')!r} hit={hit}")
+            if hit:
                 kind = link.get("kind", 0)
                 if kind == fitz.LINK_URI:
                     uri = link.get("uri", "")
                     if uri:
+                        logger.debug(f"link: launching uri {uri!r}")
                         try:
                             Gio.AppInfo.launch_default_for_uri(uri, None)
                         except Exception:
-                            pass
-                elif kind == fitz.LINK_GOTO:
+                            logger.debug("link: launch_default_for_uri failed",
+                                         exc_info=True)
+                elif kind in (fitz.LINK_GOTO, fitz.LINK_NAMED):
+                    # LINK_NAMED is what LaTeX/hyperref emits for \cite, \ref and
+                    # cross-references; PyMuPDF resolves the named destination into
+                    # the same page/to fields as a plain GOTO.
                     page_no = link.get("page", -1)
+                    to = link.get("to")
+                    to_y = to.y if to is not None else None
+                    kname = "NAMED" if kind == fitz.LINK_NAMED else "GOTO"
+                    logger.debug(f"link: {kname} page={page_no} to_y={to_y}")
+                    if page_no < 0 and kind == fitz.LINK_NAMED:
+                        page_no, to_y = self._resolve_named_dest(
+                            link.get("name") or link.get("nameddest"))
+                        logger.debug(
+                            f"link: NAMED resolved to page={page_no} to_y={to_y}")
                     if page_no >= 0:
-                        self.go_to_page(page_no)
+                        self.follow_goto(page_no, to_y)
+                    else:
+                        logger.debug(f"link: {kname} ignored (page < 0)")
+                else:
+                    logger.debug(f"link: unhandled kind={kind}")
                 break
+        else:
+            logger.debug("link click: no link under cursor")
+
+    def _resolve_named_dest(self, name):
+        """Best-effort resolution of an unresolved named destination to
+        (page_index, y) — for the rare LaTeX/hyperref link PyMuPDF leaves with
+        page=-1. Returns (-1, None) if it can't be resolved."""
+        if not name or not self.document:
+            return -1, None
+        try:
+            dests = self.document.resolve_names()
+            d = dests.get(name)
+            if d:
+                page_no = d.get("page", -1)
+                to = d.get("to")
+                to_y = to[1] if to is not None else None
+                return page_no, to_y
+        except Exception:
+            logger.debug("resolve_names failed", exc_info=True)
+        return -1, None
+
+    def follow_goto(self, page_no, to_y=None):
+        """Jump to an internal link destination (footnote, citation, TOC entry),
+        scrolling to the target point — not just the page top — and remembering
+        the current reading location so nav_back() can return to it."""
+        page_no = max(0, min(self.n_pages - 1, page_no))
+        logger.debug(
+            f"follow_goto: page {self.current_page_idx} -> {page_no} to_y={to_y}")
+        self._push_nav_history()
+        if page_no != self.current_page_idx:
+            if self.on_page_will_change:
+                self.on_page_will_change()
+            self._load_page(page_no, keep_view=True)
+        if to_y is not None:
+            self._scroll_to_pdf_y(to_y)
+        logger.debug(
+            f"follow_goto: now page={self.current_page_idx} "
+            f"offset=({self.offset_x:.0f},{self.offset_y:.0f}) scale={self.scale:.3f}")
+        self._is_fitted = False
+        self.queue_draw()
+
+    def _scroll_to_pdf_y(self, py, top_frac=0.18):
+        """Position PDF y-coordinate ``py`` ``top_frac`` of the way down the
+        viewport, keeping the current zoom. Won't reveal empty space above the
+        page top (footnote destinations sit low, so this usually scrolls down)."""
+        h = self.get_height() or 600
+        self.offset_y = min(8.0, h * top_frac - py * self.scale)
+
+    def _push_nav_history(self):
+        self._nav_history.append(
+            (self.current_page_idx, self.offset_x, self.offset_y, self.scale))
+        if self.on_nav_history:
+            self.on_nav_history(True)
+
+    def can_nav_back(self):
+        return bool(self._nav_history)
+
+    def nav_back(self):
+        """Return to the reading location saved before the last followed link."""
+        if not self._nav_history:
+            return False
+        page, ox, oy, scale = self._nav_history.pop()
+        if page != self.current_page_idx:
+            if self.on_page_will_change:
+                self.on_page_will_change()
+            self._load_page(page, keep_view=True)
+        self.offset_x, self.offset_y, self.scale = ox, oy, scale
+        self._is_fitted = False
+        self.queue_draw()
+        if self.on_nav_history:
+            self.on_nav_history(bool(self._nav_history))
+        return True
 
     @staticmethod
     def _words_to_text(words):
@@ -3031,6 +3142,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.canvas.on_callout_moved = self._on_callout_moved
         self.canvas.on_user_action = self._on_canvas_action
         self.canvas.on_canvas_press = self._clear_thumb_selection
+        self.canvas.on_nav_history = self._on_nav_history
+        self._link_hint_shown = False
         self.canvas.on_modifier_tool = self._highlight_transient_tool
         self._transient_tool = None
         self._last_anchor_mark = None   # TextMark right after the last placed anchor
@@ -3844,7 +3957,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Alt+Drag",      "Select text (word-level)"),
             ("Left-drag",     "Select text (in select-text mode)"),
             ("Ctrl+C",        "Copy selected text"),
-            ("Alt+Click",     "Open link under cursor"),
+            ("Alt+Click",     "Follow link under cursor (footnote, citation, URL)"),
+            ("Alt+Left",      "Back to where you were before following a link"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Ctrl+Alt+Drag","Place anchor + callout box at drag end"),
             ("Ctrl+T",       "Toggle outline / page-thumbnail sidebar"),
@@ -4168,6 +4282,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._commit_note()
         c._flip_page(target - c.current_page_idx)
 
+    def _on_nav_history(self, can_back):
+        """Canvas pushed/popped a link-jump location. The first time a link is
+        followed in a session, hint that Alt+Left returns — the jump itself is
+        otherwise silent."""
+        if can_back and not self._link_hint_shown:
+            self._link_hint_shown = True
+            self._toast("Jumped to link — press Alt+Left to go back")
+
     def _commit_note(self):
         if not self._path and not self._notes_path and not self._is_untitled:
             return
@@ -4219,6 +4341,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return True
         if not ctrl_held and keyval == Gdk.KEY_Page_Up:
             self._nav_page(-1)
+            return True
+        if (state & Gdk.ModifierType.ALT_MASK) and keyval == Gdk.KEY_Left:
+            # return to the reading spot we left when following a link (footnote,
+            # citation, internal cross-reference)
+            if self.canvas.nav_back():
+                self._toast("Back to where you were")
             return True
         return False
 

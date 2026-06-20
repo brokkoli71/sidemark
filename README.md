@@ -7,6 +7,8 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 
 ![Screenshot](screenshot.png)
 
+> If Sidemark is useful to you, please ⭐ [star it on GitHub](https://github.com/brokkoli71/sidemark) and 🗳️ [vote for it on the AUR](https://aur.archlinux.org/packages/sidemark-git) — it's the main way other people discover the project.
+
 ## Why Sidemark
 
 Most PDF tools treat notes as an afterthought. Sidemark is built around them:
@@ -37,6 +39,7 @@ Most PDF tools treat notes as an afterthought. Sidemark is built around them:
 
 - **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` to zoom to region, `Shift+click` to fit page
 - **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
+- **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, drop a PDF **from a file manager** between thumbnails to insert its pages there, or drag one (or several selected) **out to a file manager or the desktop** to export those pages as a standalone PDF — annotations baked in, and any page's notes appended after it, like macOS Preview. A drop line shows where pages will land, and a confirmation dialog (with a "don't ask again" option) guards reorders and inserts
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
 - **Presenter view** (`F5`) — mirror the current page on a second screen for presenting: it goes fullscreen on the other monitor (windowed if you only have one), with no header or notes — just the page and its live ink. It follows your page changes and shows strokes as you draw them, but keeps its own fit-to-page view, so you can zoom in to edit a slide while the audience still sees it whole. `Esc` (or `F5` again) closes it
@@ -121,6 +124,8 @@ pip install pymupdf
 |-----|--------|
 | `PageDown` | Next page (keeps current zoom) |
 | `PageUp` | Previous page (keeps current zoom) |
+| `Alt+click` | Follow the link under the cursor — a footnote, citation, or cross-reference jumps to its target (URLs open in your browser) |
+| `Alt+Left` | Jump back to where you were before following a link |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
 | `F5` | Toggle presenter view — mirror the page fullscreen on a second screen (`Esc` to close) |

@@ -48,6 +48,22 @@ def make_pdf(path, n_pages=1, width=595, height=842):
     surface.finish()
 
 
+def make_linked_pdf(path, n_pages=3):
+    """A PDF whose page 0 carries an internal GOTO link (like a footnote /
+    citation reference) pointing low on page 1."""
+    doc = fitz.open()
+    for _ in range(n_pages):
+        doc.new_page(width=595, height=842)
+    doc[0].insert_link({
+        "kind": fitz.LINK_GOTO,
+        "from": fitz.Rect(100, 100, 140, 120),
+        "page": 1,
+        "to": fitz.Point(0, 700),
+    })
+    doc.save(path)
+    doc.close()
+
+
 # ── coordinate math ───────────────────────────────────────────────────────────
 
 class TestCoordinates(unittest.TestCase):
@@ -85,6 +101,103 @@ class TestCoordinates(unittest.TestCase):
         pdf_y_after = (my - canvas.offset_y) / canvas.scale
         self.assertAlmostEqual(pdf_x_before, pdf_x_after, places=10)
         self.assertAlmostEqual(pdf_y_before, pdf_y_after, places=10)
+
+
+# ── link navigation (footnotes / citations) ────────────────────────────────────
+
+class TestLinkNavigation(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _canvas(self, n_pages=3):
+        pdf = os.path.join(self._tmp.name, "doc.pdf")
+        make_pdf(pdf, n_pages=n_pages)
+        c = PDFCanvas()
+        c.load(pdf)
+        return c
+
+    def test_follow_goto_changes_page_and_records_history(self):
+        c = self._canvas()
+        c.scale, c.offset_x, c.offset_y = 1.5, 12.0, -40.0
+        c.follow_goto(2, to_y=700)
+        self.assertEqual(c.current_page_idx, 2)
+        self.assertTrue(c.can_nav_back())
+        # destination point scrolled into view (not the page top); 700*1.5 is well
+        # below a 600px viewport, so we scroll down (offset_y goes negative)
+        self.assertLess(c.offset_y, 0)
+
+    def test_nav_back_restores_page_and_view(self):
+        c = self._canvas()
+        c.scale, c.offset_x, c.offset_y = 1.5, 12.0, -40.0
+        c.follow_goto(2, to_y=700)
+        self.assertTrue(c.nav_back())
+        self.assertEqual(c.current_page_idx, 0)
+        self.assertAlmostEqual(c.offset_x, 12.0)
+        self.assertAlmostEqual(c.offset_y, -40.0)
+        self.assertAlmostEqual(c.scale, 1.5)
+        self.assertFalse(c.can_nav_back())
+
+    def test_same_page_footnote_scrolls_and_round_trips(self):
+        c = self._canvas(n_pages=1)
+        c.scale, c.offset_y = 1.0, 0.0
+        c.follow_goto(0, to_y=760)   # footnote at the bottom of the same page
+        self.assertEqual(c.current_page_idx, 0)
+        self.assertTrue(c.can_nav_back())
+        self.assertNotAlmostEqual(c.offset_y, 0.0)   # the view actually moved
+        c.nav_back()
+        self.assertAlmostEqual(c.offset_y, 0.0)
+
+    def test_nav_back_on_empty_history_is_noop(self):
+        c = self._canvas()
+        self.assertFalse(c.nav_back())
+
+    def test_load_clears_nav_history(self):
+        c = self._canvas()
+        c.follow_goto(1, to_y=300)
+        self.assertTrue(c.can_nav_back())
+        pdf2 = os.path.join(self._tmp.name, "other.pdf")
+        make_pdf(pdf2, n_pages=2)
+        c.load(pdf2)
+        self.assertFalse(c.can_nav_back())
+
+    def test_history_callback_fires_on_push_and_pop(self):
+        c = self._canvas()
+        seen = []
+        c.on_nav_history = lambda can_back: seen.append(can_back)
+        c.follow_goto(1, to_y=300)
+        c.nav_back()
+        self.assertEqual(seen, [True, False])
+
+    def test_alt_click_on_goto_link_follows_and_records(self):
+        pdf = os.path.join(self._tmp.name, "linked.pdf")
+        make_linked_pdf(pdf)
+        c = PDFCanvas()
+        c.load(pdf)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        # screen == PDF coords at scale 1 / no offset; click inside the link rect
+        c._open_link_at(120, 110)
+        self.assertEqual(c.current_page_idx, 1)
+        self.assertTrue(c.can_nav_back())
+        c.nav_back()
+        self.assertEqual(c.current_page_idx, 0)
+
+    def test_alt_click_on_named_link_follows(self):
+        # LaTeX/hyperref \cite emits LINK_NAMED (kind 4), which PyMuPDF resolves
+        # into the same page/to fields as a GOTO. It must be followed too.
+        c = self._canvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.page.get_links = lambda: [{
+            "kind": fitz.LINK_NAMED,
+            "from": fitz.Rect(100, 100, 140, 120),
+            "page": 2,
+            "to": fitz.Point(0, 680),
+        }]
+        c._open_link_at(120, 110)
+        self.assertEqual(c.current_page_idx, 2)
+        self.assertTrue(c.can_nav_back())
 
 
 # ── zoom to region ────────────────────────────────────────────────────────────
