@@ -11,12 +11,14 @@ Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes pan
 
 ## Why Sidemark
 
-Most PDF tools treat notes as an afterthought. Sidemark is built around them:
+Sidemark was built for taking lecture notes. It works with two plain files and nothing else: your document stays a `.pdf` and your notes are a `.md` sidecar you can open in any editor. Annotations are written straight back into the PDF as native ink, so what you draw and write stays in formats you already use everywhere.
 
-- **Page-linked Markdown notes** — a full Markdown editor sits beside the PDF; notes are automatically scoped to whichever page you're on and scroll with it
-- **Anchor markers & callouts** — pin a note to a precise spot on the page; callouts render the note text directly on the PDF with an arrow, so context stays visible even without the notes panel open
-- **Portable plain-text notes** — notes are saved as a standard `.md` sidecar file, Obsidian-compatible and readable anywhere, with no proprietary format
-- **Unified search** — `Ctrl+F` searches the PDF text and your Markdown notes in one pass
+- **Just PDF and Markdown** — strokes save as native PDF ink annotations; notes save as a standard `.md` sidecar that's Obsidian-compatible and readable anywhere
+- **Markdown notes built for lectures** — a full Markdown editor sits beside the page, scoped to whichever page you're on, with fast inline math for the things that actually come up in a lecture: indices, exponents, and Greek letters (`x^2`, `\alpha`, `\sum` …)
+- **Open PowerPoints directly — and present on them** — drop a `.pptx` in and it's converted to PDF automatically; presenter view (`F5`) mirrors the current slide to a second screen and shows your ink live, so you can draw on the slides while you teach
+- **Anchor notes to the page** — `Ctrl+Alt+click` drops a numbered marker that links an exact spot on the PDF to the matching paragraph in your notes; callouts render the note right on the page with an arrow
+- **Rearrange pages by drag-and-drop** — reorder, import, and export pages from the thumbnail sidebar by dragging (drag pages out to a file manager to export, drop a PDF in to insert), inspired by Apple's Preview
+- **GoodNotes-style lasso** — loop around existing ink to select it, then drag to move, recolour, or delete it as a single undo step
 
 ## Features
 
