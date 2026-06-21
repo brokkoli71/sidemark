@@ -249,6 +249,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_anchor_moved = None    # callback(anchor_index, pdf_x, pdf_y)
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
         self.on_callout_moved = None   # callback(anchor_index, pdf_x, pdf_y)
+        self.on_textbox_placed = None  # callback(page_idx, pdf_x, pdf_y) — standalone box
+        self.on_textbox_moved = None   # callback(textbox_index, pdf_x, pdf_y)
         self.on_user_action = None     # callback() once per completed draw/erase gesture
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
         self.on_lasso_selection = None # callback(has_selection: bool) when the lasso set changes
@@ -282,6 +284,14 @@ class PDFCanvas(Gtk.DrawingArea):
         # screen-space rects of callout boxes from the last draw, for hit-testing:
         # [(anchor_index, bx, by, bw, bh), ...]
         self._callout_boxes = []
+
+        # standalone text boxes (#56): like a callout but with no anchor/arrow.
+        # {page_idx: [textbox dict from _parse_textboxes, ...]}
+        self._textboxes = {}
+        self._textbox_boxes = []       # [(index, bx, by, bw, bh), ...] last draw
+        self._textbox_moving = None
+        self._textbox_move_offset = (0.0, 0.0)
+        self._textbox_move_moved = False
 
         self.search_rects = []          # fitz.Rect hits for current page
         self.search_current_rect = None # the active match rect
@@ -652,6 +662,12 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self._draw_lasso(ctx)
 
+        # standalone text boxes (#56) — drawn before anchors so anchor circles
+        # stay on top if they overlap
+        self._textbox_boxes = []
+        for i, t in enumerate(self._textboxes.get(self.current_page_idx, [])):
+            self._draw_text_box(ctx, t, i)
+
         # anchor markers
         anchors = self._anchors.get(self.current_page_idx, [])
         self._callout_boxes = []
@@ -752,14 +768,8 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
             ctx.set_dash([])
 
-    def _draw_callout(self, ctx, a, idx=None):
-        """Wrapped note text in a box at the callout position, with an arrow
-        from the anchor circle to the box. Drawn in screen space for crisp
-        text; all dimensions scale with zoom."""
-        ax, ay = self._pdf_to_screen(a["x"], a["y"])
-        cx, cy = self._pdf_to_screen(*a["callout"])
-        pad = max(3.0, 5.0 * self.scale)
-
+    def _note_box_layout(self, ctx, text):
+        """A Pango layout for a callout / text box, rendering symbols + markup."""
         layout = PangoCairo.create_layout(ctx)
         desc = Pango.FontDescription("Sans")
         desc.set_absolute_size(max(6.0, 8.5 * self.scale) * Pango.SCALE)
@@ -769,9 +779,33 @@ class PDFCanvas(Gtk.DrawingArea):
         # render symbols (always), super/subscripts and inline Markdown; fall
         # back to plain symbolized text if the generated markup is ever invalid
         try:
-            layout.set_markup(_notes_to_pango_markup(a["text"]))
+            layout.set_markup(_notes_to_pango_markup(text))
         except GLib.Error:
-            layout.set_text(_symbolize(a["text"]))
+            layout.set_text(_symbolize(text))
+        return layout
+
+    def _paint_note_box(self, ctx, layout, bx, by, bw, bh, pad):
+        """White rounded-less box with an accent border and the laid-out text."""
+        ar, ag, ab = self.zoom_accent
+        ctx.set_source_rgba(1, 1, 1, 0.95)
+        ctx.rectangle(bx, by, bw, bh)
+        ctx.fill()
+        ctx.set_source_rgba(ar, ag, ab, 0.9)
+        ctx.set_line_width(max(1.0, 1.2 * self.scale))
+        ctx.rectangle(bx, by, bw, bh)
+        ctx.stroke()
+        ctx.set_source_rgb(0.1, 0.1, 0.1)
+        ctx.move_to(bx + pad, by + pad)
+        PangoCairo.show_layout(ctx, layout)
+
+    def _draw_callout(self, ctx, a, idx=None):
+        """Wrapped note text in a box at the callout position, with an arrow
+        from the anchor circle to the box. Drawn in screen space for crisp
+        text; all dimensions scale with zoom."""
+        ax, ay = self._pdf_to_screen(a["x"], a["y"])
+        cx, cy = self._pdf_to_screen(*a["callout"])
+        pad = max(3.0, 5.0 * self.scale)
+        layout = self._note_box_layout(ctx, a["text"])
         tw, th = layout.get_pixel_size()
         bx, by = cx, cy
         bw, bh = tw + 2 * pad, th + 2 * pad
@@ -799,16 +833,19 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.close_path()
             ctx.fill()
 
-        ctx.set_source_rgba(1, 1, 1, 0.95)
-        ctx.rectangle(bx, by, bw, bh)
-        ctx.fill()
-        ctx.set_source_rgba(ar, ag, ab, 0.9)
-        ctx.set_line_width(max(1.0, 1.2 * self.scale))
-        ctx.rectangle(bx, by, bw, bh)
-        ctx.stroke()
-        ctx.set_source_rgb(0.1, 0.1, 0.1)
-        ctx.move_to(bx + pad, by + pad)
-        PangoCairo.show_layout(ctx, layout)
+        self._paint_note_box(ctx, layout, bx, by, bw, bh, pad)
+
+    def _draw_text_box(self, ctx, t, idx=None):
+        """A standalone text box (#56) — like a callout but with no anchor or
+        arrow; just the box with its rendered note text at its PDF position."""
+        cx, cy = self._pdf_to_screen(t["x"], t["y"])
+        pad = max(3.0, 5.0 * self.scale)
+        layout = self._note_box_layout(ctx, t["text"] or " ")
+        tw, th = layout.get_pixel_size()
+        bw, bh = tw + 2 * pad, th + 2 * pad
+        if idx is not None:
+            self._textbox_boxes.append((idx, cx, cy, bw, bh))
+        self._paint_note_box(ctx, layout, cx, cy, bw, bh, pad)
 
     # ── input handlers ────────────────────────────────────────────────────────
 
@@ -846,7 +883,8 @@ class PDFCanvas(Gtk.DrawingArea):
         over = (self._hovered_link_rect is None and not self._alt_held
                 and self.page is not None
                 and (self._anchor_hit_test(x, y) is not None
-                     or self._callout_hit_test(x, y) is not None))
+                     or self._callout_hit_test(x, y) is not None
+                     or self._textbox_hit_test(x, y) is not None))
         if over == self._hovering_anchor:
             return
         self._hovering_anchor = over
@@ -1019,6 +1057,14 @@ class PDFCanvas(Gtk.DrawingArea):
                 return idx
         return None
 
+    def _textbox_hit_test(self, sx, sy):
+        """Return the index of the standalone text box under the screen point,
+        or None (topmost wins)."""
+        for idx, bx, by, bw, bh in reversed(self._textbox_boxes):
+            if bx <= sx <= bx + bw and by <= sy <= by + bh:
+                return idx
+        return None
+
     def _on_motion_leave(self, _ctrl):
         if self._hovered_link_rect is not None:
             self._hovered_link_rect = None
@@ -1099,6 +1145,16 @@ class PDFCanvas(Gtk.DrawingArea):
         self._post_pinch = False   # a fresh press starts a normal interaction
         self._text_highlighting = False
         if gesture.get_current_button() == 3:
+            state = gesture.get_current_event_state()
+            if ((state & Gdk.ModifierType.CONTROL_MASK)
+                    and (state & Gdk.ModifierType.ALT_MASK)
+                    and not (state & Gdk.ModifierType.SHIFT_MASK)):
+                # Ctrl+Alt+right-click drops a standalone text box here (#56)
+                self._ignoring = True
+                if self.page is not None and self.on_textbox_placed:
+                    px, py = self._screen_to_pdf(start_x, start_y)
+                    self.on_textbox_placed(self.current_page_idx, round(px), round(py))
+                return
             self._erasing = True
             self._erase_group += 1
             self._panning = False
@@ -1249,6 +1305,16 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._callout_move_offset = (cpx - px, cpy - py)
                 self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
                 return
+            thit = self._textbox_hit_test(start_x, start_y)
+            if thit is not None:
+                # begin dragging a standalone text box (same feel as callouts)
+                self._textbox_moving = thit
+                self._textbox_move_moved = False
+                t = self._textboxes[self.current_page_idx][thit]
+                px, py = self._screen_to_pdf(start_x, start_y)
+                self._textbox_move_offset = (t["x"] - px, t["y"] - py)
+                self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+                return
             if self.select_mode:
                 # plain drag selects text instead of drawing
                 self._text_selecting = True
@@ -1303,6 +1369,17 @@ class PDFCanvas(Gtk.DrawingArea):
                 px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
                 ox, oy = self._callout_move_offset
                 anchors[self._callout_moving]["callout"] = (round(px + ox), round(py + oy))
+                self.queue_draw()
+            return
+        if self._textbox_moving is not None:
+            if math.hypot(offset_x, offset_y) >= 4:
+                self._textbox_move_moved = True
+            boxes = self._textboxes.get(self.current_page_idx, [])
+            if 0 <= self._textbox_moving < len(boxes):
+                px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+                ox, oy = self._textbox_move_offset
+                boxes[self._textbox_moving]["x"] = round(px + ox)
+                boxes[self._textbox_moving]["y"] = round(py + oy)
                 self.queue_draw()
             return
         if self._callout_dragging:
@@ -1388,6 +1465,17 @@ class PDFCanvas(Gtk.DrawingArea):
                 cx, cy = anchors[idx]["callout"]
                 if self.on_callout_moved:
                     self.on_callout_moved(idx, cx, cy)
+            self.queue_draw()
+            return
+        if self._textbox_moving is not None:
+            idx = self._textbox_moving
+            self._textbox_moving = None
+            self.set_cursor(None)
+            self._hovering_anchor = False
+            boxes = self._textboxes.get(self.current_page_idx, [])
+            if self._textbox_move_moved and 0 <= idx < len(boxes):
+                if self.on_textbox_moved:
+                    self.on_textbox_moved(idx, boxes[idx]["x"], boxes[idx]["y"])
             self.queue_draw()
             return
         if self._ignoring:
@@ -2447,6 +2535,7 @@ def _prune_autosaves(max_age_days=30):
 
 _ANCHOR_RE = re.compile(r'<!--\s*anchor:(\d+):(\d+)\s*-->')
 _CALLOUT_RE = re.compile(r'<!--\s*callout:(\d+):(\d+)\s*-->')
+_TEXTBOX_RE = re.compile(r'<!--\s*textbox:(\d+):(\d+)\s*-->')
 _MD_STRIP = [
     (re.compile(r'^#{1,6}\s+', re.MULTILINE), ''),
     (re.compile(r'\*\*(.+?)\*\*'), r'\1'),
@@ -2458,6 +2547,7 @@ _MD_STRIP = [
 def _strip_markers(text):
     text = _ANCHOR_RE.sub('', text)
     text = _CALLOUT_RE.sub('', text)
+    text = _TEXTBOX_RE.sub('', text)
     for pattern, repl in _MD_STRIP:
         text = pattern.sub(repl, text)
     return text.strip()
@@ -2494,6 +2584,28 @@ def _parse_anchors(text):
         result.append({
             "x": int(m.group(1)), "y": int(m.group(2)),
             "callout": (int(cm.group(1)), int(cm.group(2))) if cm else None,
+            "text": _strip_markers('\n'.join(lines[ln:para_end + 1])),
+            "line": ln, "para_end": para_end,
+        })
+    return result
+
+
+def _parse_textboxes(text):
+    """Parse standalone text-box markers (`<!-- textbox:X:Y -->`, no anchor).
+    Returns one dict per box: {x, y, text, line, para_end} — the text is the
+    box's paragraph (up to the next blank line), markers stripped."""
+    lines = text.split('\n')
+    n_lines = len(lines)
+    result = []
+    for m in _TEXTBOX_RE.finditer(text):
+        ln = text[:m.start()].count('\n')
+        para_end = n_lines - 1
+        for j in range(ln + 1, n_lines):
+            if not lines[j].strip():
+                para_end = j - 1
+                break
+        result.append({
+            "x": int(m.group(1)), "y": int(m.group(2)),
             "text": _strip_markers('\n'.join(lines[ln:para_end + 1])),
             "line": ln, "para_end": para_end,
         })
@@ -2607,11 +2719,14 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accen
         out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
         out_page = out_doc[-1]
 
-        # Callout boxes under the anchor circles
+        # Standalone text boxes (#56) first, then callout boxes, then the
+        # numbered anchor circles on top — same stacking as the canvas
+        for t in _parse_textboxes(notes_text):
+            if t["text"]:
+                _draw_export_textbox(out_page, t, anchor_color)
         for a in anchors:
             if a["callout"] and a["text"]:
                 _draw_export_callout(out_page, a, anchor_color)
-        # Draw numbered anchor markers on top of the page
         for i, a in enumerate(anchors):
             _draw_export_anchor(out_page, a["x"], a["y"], i + 1, anchor_color)
 
@@ -2680,6 +2795,35 @@ def _draw_export_callout(page, a, color):
         page.draw_line(attach, left, color=color, width=1.2)
         page.draw_line(attach, right, color=color, width=1.2)
 
+    page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
+    text_rect = fitz.Rect(box.x0 + pad, box.y0 + pad, box.x1 - pad, box.y1 - pad)
+    page.insert_textbox(text_rect, text, fontsize=fontsize,
+                        color=(0.1, 0.1, 0.1), fontname="helv", align=0)
+
+
+def _draw_export_textbox(page, t, color):
+    """A standalone text box (#56) in the export — a callout box without the
+    anchor/arrow, positioned at its own (x, y)."""
+    fontsize = 8.5
+    pad = 5.0
+    box_w = 170.0
+    page_rect = page.rect
+    text = t["text"]
+    measure_doc = fitz.open()
+    measure_page = measure_doc.new_page(width=page_rect.width, height=page_rect.height)
+    measure_rect = fitz.Rect(0, 0, box_w - 2 * pad, page_rect.height)
+    spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
+                                        fontname="helv", align=0)
+    while spare < 0 and len(text) > 8:
+        text = text[:int(len(text) * 0.8)].rstrip() + "…"
+        spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
+                                            fontname="helv", align=0)
+    measure_doc.close()
+    box_h = (measure_rect.height - max(spare, 0)) + 2 * pad + 2
+
+    bx = min(max(t["x"], 0), page_rect.width - box_w)
+    by = min(max(t["y"], 0), page_rect.height - box_h)
+    box = fitz.Rect(bx, by, bx + box_w, by + box_h)
     page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
     text_rect = fitz.Rect(box.x0 + pad, box.y0 + pad, box.x1 - pad, box.y1 - pad)
     page.insert_textbox(text_rect, text, fontsize=fontsize,
@@ -4153,6 +4297,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.on_anchor_moved = lambda *a: s.win._on_anchor_moved(*a)
         s.canvas.on_callout_placed = lambda *a: s.win._on_callout_placed(*a)
         s.canvas.on_callout_moved = lambda *a: s.win._on_callout_moved(*a)
+        s.canvas.on_textbox_placed = lambda *a: s.win._on_textbox_placed(*a)
+        s.canvas.on_textbox_moved = lambda *a: s.win._on_textbox_moved(*a)
         s.canvas.on_user_action = lambda *a: s.win._on_canvas_action(*a)
         s.canvas.on_canvas_press = lambda *a: s.win._clear_thumb_selection(*a)
         s.canvas.on_nav_history = lambda *a: s.win._on_nav_history(*a)
@@ -4299,6 +4445,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Alt+Left",      "Back to where you were before following a link"),
             ("Ctrl+Alt+Click","Place anchor marker in notes"),
             ("Ctrl+Alt+Drag","Place anchor + callout box at drag end"),
+            ("Ctrl+Alt+Right-click","Place a standalone text box on the page"),
             ("Ctrl+T",       "Toggle outline / page-thumbnail sidebar"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
@@ -4966,6 +5113,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
         parsed = _parse_anchors(text)
         self.canvas._anchors[page_idx] = parsed
+        self.canvas._textboxes[page_idx] = _parse_textboxes(text)
         self._anchor_line_nos = [a["line"] for a in parsed]
         self._anchor_para_ends = [a["para_end"] for a in parsed]
         self._on_notes_cursor_moved(buf, None)
@@ -5034,6 +5182,48 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         end = buf.get_iter_at_offset(m.end())
         buf.delete(start, end)
         buf.insert(start, f"<!-- anchor:{px}:{py} -->")
+        self._mark_dirty()
+
+    def _on_textbox_placed(self, page_idx, px, py):
+        """Ctrl+Alt+right-click dropped a standalone text box. Insert its marker
+        and a placeholder paragraph in the notes and select the placeholder so
+        the user can type straight over it."""
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        if text == "" or text.endswith("\n\n"):
+            prefix = ""
+        elif text.endswith("\n"):
+            prefix = "\n"
+        else:
+            prefix = "\n\n"
+        placeholder = "Text"
+        buf.insert(buf.get_end_iter(),
+                   f"{prefix}<!-- textbox:{px}:{py} -->\n{placeholder}\n")
+        # select the placeholder line so typing replaces it
+        end = buf.get_end_iter()
+        ok, ls = buf.get_iter_at_line(end.get_line() - 1)
+        if ok:
+            le = ls.copy()
+            if not le.ends_line():
+                le.forward_to_line_end()
+            buf.select_range(ls, le)
+        if not self._notes_toggle.get_active():
+            self._notes_toggle.set_active(True)   # reveal the panel to edit
+        self._notes_view.grab_focus()
+        self._mark_dirty()
+
+    def _on_textbox_moved(self, idx, x, y):
+        """Rewrite the idx-th text-box marker with its new position."""
+        buf = self._notes_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        matches = list(_TEXTBOX_RE.finditer(text))
+        if idx >= len(matches):
+            return
+        m = matches[idx]
+        start = buf.get_iter_at_offset(m.start())
+        end = buf.get_iter_at_offset(m.end())
+        buf.delete(start, end)
+        buf.insert(start, f"<!-- textbox:{x}:{y} -->")
         self._mark_dirty()
 
     def _on_anchor_clicked(self, idx):

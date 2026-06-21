@@ -1837,6 +1837,72 @@ class TestExportSymbolizes(unittest.TestCase):
             self.assertEqual(m.get(0), r'the sum \sum and map \mapsto')
 
 
+class TestTextBox(unittest.TestCase):
+    """Standalone text boxes (#56): a `<!-- textbox:X:Y -->` marker whose
+    paragraph is rendered in a box on the page, placed with Ctrl+Alt+right-click
+    and edited in the notes panel."""
+
+    def test_parse_textboxes(self):
+        from sidemark import _parse_textboxes
+        text = "intro\n\n<!-- textbox:120:300 -->\nHello \\alpha world\n\nmore"
+        boxes = _parse_textboxes(text)
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual((boxes[0]["x"], boxes[0]["y"]), (120, 300))
+        self.assertEqual(boxes[0]["text"], r'Hello \alpha world')
+
+    def test_strip_markers_drops_textbox(self):
+        from sidemark import _strip_markers
+        self.assertEqual(_strip_markers("<!-- textbox:1:2 -->\nhi"), "hi")
+
+    def test_place_and_move_in_window(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.textbox")
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf"); make_pdf(pdf, n_pages=2)
+            out = {}
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    win._on_textbox_placed(0, 100, 200)
+                    boxes = win.canvas._textboxes.get(0, [])
+                    out["n"] = len(boxes)
+                    out["pos"] = (boxes[0]["x"], boxes[0]["y"]) if boxes else None
+                    out["text"] = boxes[0]["text"] if boxes else None
+                    win._on_textbox_moved(0, 150, 260)
+                    moved = win.canvas._textboxes.get(0, [])
+                    out["moved"] = (moved[0]["x"], moved[0]["y"]) if moved else None
+                except Exception:
+                    import traceback
+                    errors.append(traceback.format_exc())
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+            if errors:
+                raise AssertionError(errors[0])
+            self.assertEqual(out["n"], 1)
+            self.assertEqual(out["pos"], (100, 200))
+            self.assertEqual(out["text"], "Text")          # placeholder inserted
+            self.assertEqual(out["moved"], (150, 260))      # marker rewritten
+
+    def test_export_includes_textbox(self):
+        from sidemark import _export_pdf_with_notes
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.pdf"); out = os.path.join(d, "o.pdf")
+            make_pdf(src, n_pages=1)
+            m = NotesModel()
+            m.set(0, "<!-- textbox:50:60 -->\nHello box")
+            _export_pdf_with_notes(src, out, m, include_empty=False,
+                                   accent=(0.5, 0.7, 0.3))
+            doc = fitz.open(out)
+            text = "".join(p.get_text() for p in doc)
+            doc.close()
+            self.assertIn("Hello box", text)
+
+
 # ── drag pages out of the thumbnail panel to export them (#57) ────────────────
 
 class TestPageDragExport(unittest.TestCase):
