@@ -230,7 +230,11 @@ _install_ocr() {
             [[ -z "$helper" ]] && command -v yay >/dev/null 2>&1 && helper="yay"
             if [[ -n "$helper" ]]; then
                 # AUR helpers call sudo themselves — never run them as root.
-                "$helper" -S --needed --noconfirm ocrmypdf tesseract-data-eng
+                # Put the system python first: a version manager (mise/pyenv/
+                # asdf) shim shadowing /usr/bin/python breaks makepkg's
+                # `python -m build` when building AUR Python deps (e.g. fpdf2).
+                PATH="/usr/bin:$PATH" "$helper" -S --needed --noconfirm \
+                    ocrmypdf tesseract-data-eng
             else
                 warn "No AUR helper (paru/yay) found — installing the engine from the"
                 warn "official repos and ocrmypdf itself via pip."
@@ -262,10 +266,13 @@ else
             ok "OCR support installed."
         else
             warn "Could not install ocrmypdf — Sidemark still runs; OCR just stays unavailable."
-            [[ "$_DISTRO" == "arch" ]] && \
-                warn "If you saw 404 download errors, your package DB is stale: run"
-            [[ "$_DISTRO" == "arch" ]] && \
-                warn "  sudo pacman -Syu   then   ./install.sh --with-ocr"
+            if [[ "$_DISTRO" == "arch" ]]; then
+                warn "Common causes on Arch, then retry  ./install.sh --with-ocr :"
+                warn "  • stale package DB / 404s        → sudo pacman -Syu"
+                warn "  • a Python version manager (mise/pyenv/asdf) shadowing the"
+                warn "    system python during the AUR build → build in a shell where"
+                warn "    /usr/bin/python comes first (e.g. 'mise deactivate')"
+            fi
         fi
     else
         ok "Skipping OCR support."
