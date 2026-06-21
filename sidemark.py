@@ -866,6 +866,7 @@ class PDFCanvas(Gtk.DrawingArea):
             step = 1.0 if smooth else self.WHEEL_PAN_STEP
             self.offset_x -= dx * step
             self.offset_y -= dy * step
+            self._clamp_scroll_offset()
             self._is_fitted = False
             self.queue_draw()
             return True
@@ -875,6 +876,23 @@ class PDFCanvas(Gtk.DrawingArea):
             factor = 0.9 if dy > 0 else 1.1
         self._zoom_at(factor, self._mouse_x, self._mouse_y)
         return True
+
+    def _clamp_scroll_offset(self):
+        """Stop wheel/touchpad scrolling from pushing the document's outer
+        boundaries into empty space: the first page can't scroll below its top,
+        the last page can't rise above its bottom. (Within the document, edges
+        flip to the next page; drag-panning is intentionally left unclamped, so
+        you can still pan a page freely when you really want to.)"""
+        if self.page is None:
+            return
+        ch = self.get_height() or 600
+        page_h = self.page_height * self.scale
+        lo = min(0.0, ch - page_h)   # top-most scroll (page bottom at viewport bottom)
+        hi = max(0.0, ch - page_h)   # bottom-most scroll (page top at viewport top)
+        if self.current_page_idx <= 0:
+            self.offset_y = min(self.offset_y, hi)
+        if self.current_page_idx >= self.n_pages - 1:
+            self.offset_y = max(self.offset_y, lo)
 
     def _zoom_at(self, factor, cx, cy):
         """Multiply the zoom by ``factor`` keeping the document point under

@@ -41,7 +41,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### Navigation
 
 - **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` to zoom to region, `Shift+click` to fit page
-- **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically
+- **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically. At the very first and last page, scrolling stops at the boundary instead of drifting into empty space (drag-pan still moves freely)
 - **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, drop a PDF **from a file manager** between thumbnails to insert its pages there, or drag one (or several — `Ctrl+click` thumbnails to add or remove pages from the selection) **out to a file manager or the desktop** to export those pages as a standalone PDF — annotations baked in, and any page's notes appended after it, like macOS Preview. A drop line shows where pages will land, and a confirmation dialog (with a "don't ask again" option) guards reorders and inserts. Hover any sidebar item to see what it does and its shortcuts
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page

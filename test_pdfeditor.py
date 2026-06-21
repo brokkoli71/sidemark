@@ -386,6 +386,50 @@ class TestPinchZoom(unittest.TestCase):
         self.assertEqual(c.scale, 1.0)
 
 
+# ── scroll boundary clamp (idea #20 follow-up) ────────────────────────────────
+
+class TestScrollClamp(unittest.TestCase):
+    """Wheel/touchpad scrolling can't push the first/last page off into empty
+    space; interior pages are unaffected (their edges flip)."""
+
+    def _canvas(self, n=3):
+        c = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            self._tmp = f.name
+        make_pdf(self._tmp, n_pages=n)
+        c.load(self._tmp)
+        return c
+
+    def tearDown(self):
+        if hasattr(self, "_tmp") and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def test_last_page_cannot_scroll_below_bottom(self):
+        c = self._canvas(3)
+        c.go_to_page(2)
+        c.scale = 1.0                       # page (842) taller than viewport (600)
+        c.offset_y = -5000.0               # absurdly scrolled past the bottom
+        c._clamp_scroll_offset()
+        ch = c.get_height() or 600
+        self.assertAlmostEqual(c.offset_y, ch - c.page_height * c.scale)
+
+    def test_first_page_cannot_scroll_above_top(self):
+        c = self._canvas(3)
+        c.go_to_page(0)
+        c.scale = 1.0
+        c.offset_y = 500.0                  # scrolled above the page top
+        c._clamp_scroll_offset()
+        self.assertEqual(c.offset_y, 0.0)
+
+    def test_interior_page_unclamped(self):
+        c = self._canvas(3)
+        c.go_to_page(1)
+        c.scale = 1.0
+        c.offset_y = -5000.0
+        c._clamp_scroll_offset()
+        self.assertEqual(c.offset_y, -5000.0)
+
+
 # ── stroke storage ────────────────────────────────────────────────────────────
 
 class TestStrokes(unittest.TestCase):
