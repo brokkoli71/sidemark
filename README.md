@@ -32,7 +32,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Notes
 
-- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`)
+- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum`, `\mapsto` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`). Symbols are rendered for display only — the `.md` file always keeps the source `\commands`, so notes round-trip cleanly through other editors
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
 - **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; both the anchor and the box can be dragged to reposition (the arrow re-aims itself); included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand

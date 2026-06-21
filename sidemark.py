@@ -2505,6 +2505,37 @@ def _pdf_needs_ocr(path, sample=10):
         doc.close()
 
 
+# Symbol substitution table — \sum → Σ etc. Applied for *display* only (the
+# notes editor, callout boxes, PDF export). The .md sidecar always stores the
+# source \commands so files round-trip cleanly through other Markdown editors.
+_MD_SYMBOLS = {
+    r'\sum': 'Σ', r'\prod': 'Π', r'\int': '∫',
+    r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+    r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+    r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
+    r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
+    r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
+    r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+    r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
+    r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
+    r'\Psi': 'Ψ', r'\Omega': 'Ω',
+    r'\infty': '∞', r'\approx': '≈', r'\neq': '≠',
+    r'\leq': '≤', r'\geq': '≥', r'\pm': '±', r'\times': '×',
+    r'\div': '÷', r'\cdot': '·', r'\to': '→', r'\gets': '←', r'\mapsto': '↦',
+    r'\in': '∈', r'\notin': '∉', r'\subset': '⊂', r'\supset': '⊃',
+    r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅',
+    r'\forall': '∀', r'\exists': '∃',
+    r'\partial': '∂', r'\nabla': '∇',
+}
+_MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)')
+
+
+def _symbolize(text):
+    """Replace LaTeX-style \\commands with their Unicode symbols (display only)."""
+    return _MD_SYMBOL_RE.sub(
+        lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), text)
+
+
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
@@ -2512,7 +2543,8 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accen
     anchor_color = (r, g, b)
 
     for page_idx in range(len(src_doc)):
-        notes_text = notes_model.get(page_idx)
+        # the model stores source \commands; render their symbols in the export
+        notes_text = _symbolize(notes_model.get(page_idx))
         anchors = _parse_anchors(notes_text)
         has_notes = bool(notes_text.strip())
 
@@ -2719,27 +2751,9 @@ class MarkdownNotesView(GtkSource.View):
     # Super/subscript: ^{content} or ^x  /  _{content} or _x
     _SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
 
-    # Symbol substitution table
-    _SYMBOLS = {
-        r'\sum': 'Σ', r'\prod': 'Π', r'\int': '∫',
-        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
-        r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
-        r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
-        r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
-        r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
-        r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
-        r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
-        r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
-        r'\Psi': 'Ψ', r'\Omega': 'Ω',
-        r'\infty': '∞', r'\approx': '≈', r'\neq': '≠',
-        r'\leq': '≤', r'\geq': '≥', r'\pm': '±', r'\times': '×',
-        r'\div': '÷', r'\cdot': '·', r'\to': '→', r'\gets': '←',
-        r'\in': '∈', r'\notin': '∉', r'\subset': '⊂', r'\supset': '⊃',
-        r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅',
-        r'\forall': '∀', r'\exists': '∃',
-        r'\partial': '∂', r'\nabla': '∇',
-    }
-    _SYMBOL_RE = re.compile(r'\\([A-Za-z]+)')
+    # Symbol substitution table (module-level; shared with export rendering)
+    _SYMBOLS = _MD_SYMBOLS
+    _SYMBOL_RE = _MD_SYMBOL_RE
 
     def __init__(self, scheme_id="Adwaita"):
         buf = GtkSource.Buffer()
@@ -2785,6 +2799,10 @@ class MarkdownNotesView(GtkSource.View):
         self._line_originals: dict[int, str] = {}
         buf.connect("notify::cursor-position", self._on_cursor_moved)
         buf.connect("changed", self._on_changed)
+        # keep _line_originals keyed correctly when whole lines are added/removed,
+        # so an already-rendered symbol line never loses its source \command
+        buf.connect("insert-text", self._on_insert_text)
+        buf.connect("delete-range", self._on_delete_range)
 
         key = Gtk.EventControllerKey()
         key.connect("key-pressed", self._on_key)
@@ -3038,9 +3056,68 @@ class MarkdownNotesView(GtkSource.View):
     # ── rendering ─────────────────────────────────────────────────────────────
 
     def _apply_symbol_subs(self, text):
-        def _repl(m):
-            return self._SYMBOLS.get('\\' + m.group(1), m.group(0))
-        return self._SYMBOL_RE.sub(_repl, text)
+        return _symbolize(text)
+
+    def reset_render_state(self):
+        """Forget per-line render bookkeeping. Call after replacing the whole
+        buffer (page switch, undo) so a previous document's substituted-line
+        originals can't leak onto the new content."""
+        self._line_originals.clear()
+        buf = self.get_buffer()
+        self._cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
+
+    def get_source_text(self):
+        """The buffer's text with display substitutions reversed — i.e. the
+        canonical Markdown source (\\sum, not Σ). This, not the raw buffer, is
+        what gets saved, autosaved, diffed for undo and stored in the model."""
+        buf = self.get_buffer()
+        out = []
+        for ln in range(buf.get_line_count()):
+            ok, ls = buf.get_iter_at_line(ln)
+            if not ok:
+                continue
+            le = ls.copy()
+            if not le.ends_line():
+                le.forward_to_line_end()
+            cur = buf.get_text(ls, le, False)
+            orig = self._line_originals.get(ln)
+            # only trust the stored source if it still renders to this line
+            if orig is not None and _symbolize(orig) == cur:
+                out.append(orig)
+            else:
+                out.append(cur)
+        return "\n".join(out)
+
+    def _on_insert_text(self, _buf, location, text, _len):
+        # a real edit that adds whole lines shifts every substituted line below
+        # the insertion point down by that many lines
+        if self._in_highlight:
+            return
+        n = text.count("\n")
+        if not n or not self._line_originals:
+            return
+        ins_line = location.get_line()
+        self._line_originals = {
+            (ln + n if ln > ins_line else ln): orig
+            for ln, orig in self._line_originals.items()
+        }
+
+    def _on_delete_range(self, _buf, start, end):
+        if self._in_highlight:
+            return
+        sl, el = start.get_line(), end.get_line()
+        if sl == el or not self._line_originals:
+            return
+        n = el - sl
+        shifted = {}
+        for ln, orig in self._line_originals.items():
+            if ln <= sl:
+                shifted[ln] = orig
+            elif ln <= el:
+                continue          # this line is being deleted away
+            else:
+                shifted[ln - n] = orig
+        self._line_originals = shifted
 
     def _buf_replace_line(self, buf, ln, new_text):
         ok, ls = buf.get_iter_at_line(ln)
@@ -4709,8 +4786,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _commit_note_for(self, s):
         if not s._path and not s._notes_path and not s._is_untitled:
             return
-        buf = s._notes_view.get_buffer()
-        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        text = s._notes_view.get_source_text()
         s.notes_model.set(s.canvas.current_page_idx, text)
 
     def _restore_note(self):
@@ -4723,6 +4799,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf.begin_irreversible_action()
         buf.set_text(text)
         buf.end_irreversible_action()
+        self._notes_view.reset_render_state()
         self._suppress_dirty = False
         # a page switch ends any typing burst; future bursts diff against this text
         self._notes_burst_open = False
@@ -4734,8 +4811,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_canvas_action(self):
         """A draw/erase gesture finished: record it and end any typing burst."""
         self._notes_burst_open = False
-        buf = self._notes_view.get_buffer()
-        self._burst_base = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        self._burst_base = self._notes_view.get_source_text()
         self._undo_timeline.append(("canvas",))
         self._redo_timeline.clear()   # canvas already cleared its own redo
 
@@ -4794,6 +4870,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf.begin_irreversible_action()
         buf.set_text(text)
         buf.end_irreversible_action()
+        self._notes_view.reset_render_state()
         self._suppress_dirty = False
         self._notes_burst_open = False
         self._burst_base = text
@@ -4814,8 +4891,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _, page, before = op
         if page != self.canvas.current_page_idx:
             self._go_to_page(page)
-        buf = self._notes_view.get_buffer()
-        after = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        after = self._notes_view.get_source_text()
         self._redo_timeline.append(("notes", page, before, after))
         self._set_notes_text(page, before)
 
@@ -6066,6 +6142,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf.begin_irreversible_action()
         buf.set_text(self.notes_model.get(0))
         buf.end_irreversible_action()
+        self._notes_view.reset_render_state()
         self._undo_timeline.clear()
         self._redo_timeline.clear()
         self._notes_burst_open = False

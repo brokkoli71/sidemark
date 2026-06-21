@@ -1686,8 +1686,78 @@ class TestLatexFormatting(unittest.TestCase):
         result = buf.get_text(ls, le, False)
         self.assertEqual(result, r'\alpha')
 
+    def test_mapsto_symbol(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'f: A \mapsto B'), 'f: A ↦ B')
+
+    # ── source text round-trips \commands, never the rendered glyph ───────────
+    def test_get_source_text_keeps_command_after_render(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\sum x' + '\nother')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])   # leave line 0 to render
+        v._rehighlight()
+        # the buffer now shows the glyph...
+        ok, ls = buf.get_iter_at_line(0); le = ls.copy(); le.forward_to_line_end()
+        self.assertIn('Σ', buf.get_text(ls, le, False))
+        # ...but the source text we persist still has \sum
+        self.assertEqual(v.get_source_text(), r'\sum x' + '\nother')
+
+    def test_get_source_text_plain_when_nothing_rendered(self):
+        v = self._view()
+        v.get_buffer().set_text('just text\nx_1 and \\beta')
+        self.assertEqual(v.get_source_text(), 'just text\nx_1 and \\beta')
+
+    def test_source_survives_line_inserted_above_rendered_symbol(self):
+        """Adding lines above an already-rendered symbol line must not lose its
+        source \\command (the _line_originals keys are shifted to follow)."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text('first\n' + r'\sum here')
+        buf.place_cursor(buf.get_iter_at_line(0)[1])   # line 1 renders to Σ
+        v._rehighlight()
+        # insert two whole lines above the symbol line (cursor on line 0)
+        buf.insert(buf.get_iter_at_line(0)[1], 'a\nb\n')
+        self.assertEqual(
+            v.get_source_text(), 'a\nb\nfirst\n' + r'\sum here')
+
+    def test_reset_render_state_drops_stale_originals(self):
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(r'\sum' + '\nother')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        v._rehighlight()
+        self.assertTrue(v._line_originals)      # something was rendered
+        buf.set_text('brand new')
+        v.reset_render_state()
+        self.assertFalse(v._line_originals)
+        self.assertEqual(v.get_source_text(), 'brand new')
+
 
 # ── export ────────────────────────────────────────────────────────────────────
+
+class TestExportSymbolizes(unittest.TestCase):
+    """The notes model stores source \\commands; the PDF export substitutes the
+    symbols so it doesn't print raw \\sum (the glyph itself may not draw if the
+    base font lacks it — that's a separate font concern)."""
+
+    def test_export_substitutes_commands(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf"); out = os.path.join(d, "out.pdf")
+            make_pdf(src, n_pages=1)
+            m = NotesModel()
+            m.set(0, r'the sum \sum and map \mapsto')
+            _export_pdf_with_notes(src, out, m, include_empty=False,
+                                   accent=(0.5, 0.7, 0.3))
+            doc = fitz.open(out)
+            text = "".join(p.get_text() for p in doc)
+            doc.close()
+            # the raw source commands must not survive into the export
+            self.assertNotIn(r'\sum', text)
+            self.assertNotIn(r'\mapsto', text)
+            # the model itself is untouched (still source)
+            self.assertEqual(m.get(0), r'the sum \sum and map \mapsto')
+
 
 # ── drag pages out of the thumbnail panel to export them (#57) ────────────────
 
