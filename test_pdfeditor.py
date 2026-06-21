@@ -1931,6 +1931,22 @@ class TestShareToPhone(unittest.TestCase):
             finally:
                 srv.stop()
 
+    def test_url_for_builds_host_specific_link(self):
+        from sidemark import _ShareServer
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "doc.pdf"); make_pdf(p)
+            srv = _ShareServer(p)
+            srv.port = 1234
+            u = srv.url_for("100.70.12.127")
+            self.assertEqual(
+                u, f"http://100.70.12.127:1234/{srv.token}/{srv.filename}")
+
+    def test_tailscale_ip_shape(self):
+        from sidemark import _tailscale_ip
+        ip = _tailscale_ip()
+        # may be None on machines without Tailscale; otherwise a dotted IPv4
+        self.assertTrue(ip is None or (isinstance(ip, str) and ip.count(".") == 3))
+
     def test_qr_png_absent_tool_returns_false(self):
         from sidemark import _make_qr_png
         import shutil as _sh

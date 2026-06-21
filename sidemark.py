@@ -2717,6 +2717,36 @@ def _lan_ip():
         s.close()
 
 
+def _tailscale_ip():
+    """This machine's Tailscale (tailnet) IPv4, or None. A URL on this address
+    reaches a phone that's on the same tailnet from anywhere — handy when LAN
+    sharing is blocked by AP isolation or a repeater on a different subnet."""
+    if shutil.which("tailscale"):
+        try:
+            out = subprocess.run(["tailscale", "ip", "-4"],
+                                 capture_output=True, text=True, timeout=3)
+            for line in out.stdout.splitlines():
+                if line.strip():
+                    return line.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # fall back: a 100.64.0.0/10 (CGNAT, what Tailscale uses) addr on any iface
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr"],
+                             capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and "/" in parts[3]:
+                addr = parts[3].split("/")[0]
+                octs = addr.split(".")
+                if (len(octs) == 4 and octs[0] == "100"
+                        and octs[1].isdigit() and 64 <= int(octs[1]) <= 127):
+                    return addr
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
 def _make_qr_png(url, out_path):
     """Render a QR PNG for url via the optional 'qrencode' tool. Returns True on
     success, False if qrencode isn't installed or fails (caller shows the URL)."""
@@ -2776,10 +2806,13 @@ class _ShareServer:
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         return self
 
+    def url_for(self, host):
+        from urllib.parse import quote
+        return f"http://{host}:{self.port}/{self.token}/{quote(self.filename)}"
+
     @property
     def url(self):
-        from urllib.parse import quote
-        return f"http://{self.ip}:{self.port}/{self.token}/{quote(self.filename)}"
+        return self.url_for(self.ip)
 
     def stop(self):
         if self._httpd is not None:
@@ -6796,35 +6829,56 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             shutil.rmtree(out_dir, ignore_errors=True)
             self._show_error("Share failed", f"Could not start the share server:\n{e}")
             return
-        qr_path = os.path.join(out_dir, "qr.png")
-        qr = qr_path if _make_qr_png(server.url, qr_path) else None
-        self._show_share_dialog(server, qr, out_dir)
+        self._show_share_dialog(server, out_dir)
 
-    def _show_share_dialog(self, server, qr_path, out_dir):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(6)
-        if qr_path:
+    def _share_entry(self, caption, url, out_dir, tag):
+        """One column of the share dialog: a QR (if qrencode is present) plus the
+        link as selectable text, under a caption."""
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        col.set_hexpand(True)
+        head = Gtk.Label(label=caption)
+        head.add_css_class("heading")
+        col.append(head)
+        qr_path = os.path.join(out_dir, f"qr-{tag}.png")
+        if _make_qr_png(url, qr_path):
             pic = Gtk.Picture.new_for_filename(qr_path)
             pic.set_can_shrink(False)
-            pic.set_size_request(220, 220)
-            box.append(pic)
+            pic.set_size_request(200, 200)
+            col.append(pic)
         else:
-            hint = Gtk.Label(
-                label="Install ‘qrencode’ to show a scannable QR code.")
+            hint = Gtk.Label(label="Install ‘qrencode’ for a scannable code.")
             hint.add_css_class("dim-label")
             hint.set_wrap(True)
-            box.append(hint)
-        url = Gtk.Label(label=server.url)
-        url.set_selectable(True)
-        url.set_wrap(True)
-        url.add_css_class("monospace")
-        box.append(url)
+            col.append(hint)
+        link = Gtk.Label(label=url)
+        link.set_selectable(True)
+        link.set_wrap(True)
+        link.set_max_width_chars(28)
+        link.add_css_class("monospace")
+        link.add_css_class("caption")
+        col.append(link)
+        return col
 
-        dlg = Adw.AlertDialog.new(
-            "Open on your phone",
-            "Scan the code (or open the link) on a phone on the same Wi-Fi. "
-            "The link works until you close this dialog.")
-        dlg.set_extra_child(box)
+    def _show_share_dialog(self, server, out_dir):
+        entries = [("Same Wi-Fi", server.url_for(server.ip), "lan")]
+        ts = _tailscale_ip()
+        if ts and ts != server.ip:
+            entries.append(("Over Tailscale", server.url_for(ts), "ts"))
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        row.set_margin_top(6)
+        row.set_homogeneous(True)
+        for caption, url, tag in entries:
+            row.append(self._share_entry(caption, url, out_dir, tag))
+
+        body = ("Scan a code (or open a link) on your phone. The link works "
+                "until you close this dialog.")
+        if len(entries) > 1:
+            body += ("\n\n“Same Wi-Fi” needs both devices on the same network; "
+                     "“Over Tailscale” works anywhere if the phone has the "
+                     "Tailscale app on your tailnet.")
+        dlg = Adw.AlertDialog.new("Open on your phone", body)
+        dlg.set_extra_child(row)
         dlg.add_response("close", "Close")
         dlg.set_default_response("close")
         dlg.set_close_response("close")
