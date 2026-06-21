@@ -1778,6 +1778,40 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(v.get_source_text(), 'brand new')
 
 
+class TestCalloutMarkup(unittest.TestCase):
+    """Callout boxes render LaTeX symbols (always), super/subscripts and inline
+    Markdown via Pango markup — independent of which notes line is selected."""
+
+    def _markup(self, text):
+        from sidemark import _notes_to_pango_markup
+        return _notes_to_pango_markup(text)
+
+    def _parses(self, markup):
+        from gi.repository import Pango
+        ok, _attr, _txt, _accel = Pango.parse_markup(markup, -1, '\0')
+        return ok
+
+    def test_symbols_always_substituted(self):
+        self.assertEqual(self._markup(r'\alpha + \beta'), 'α + β')
+        self.assertEqual(self._markup(r'\sum \mapsto'), 'Σ ↦')
+
+    def test_superscript_and_subscript(self):
+        self.assertEqual(self._markup('x^2'), 'x<sup>2</sup>')
+        self.assertEqual(self._markup('a_{ij}'), 'a<sub>ij</sub>')
+
+    def test_inline_markdown(self):
+        self.assertEqual(
+            self._markup(r'**b** *i* `c`'), '<b>b</b> <i>i</i> <tt>c</tt>')
+
+    def test_escapes_special_chars(self):
+        self.assertEqual(self._markup('a < b & c'), 'a &lt; b &amp; c')
+
+    def test_output_is_valid_pango_markup(self):
+        for s in (r'\alpha x^2 **b** a_{ij}', '`x_1 < 2`', 'plain text',
+                  r'i=1^n \to \infty'):
+            self.assertTrue(self._parses(self._markup(s)), s)
+
+
 # ── export ────────────────────────────────────────────────────────────────────
 
 class TestExportSymbolizes(unittest.TestCase):

@@ -34,7 +34,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 - **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum`, `\mapsto` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`). Symbols are rendered for display only — the `.md` file always keeps the source `\commands`, so notes round-trip cleanly through other editors
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
-- **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; both the anchor and the box can be dragged to reposition (the arrow re-aims itself); included in exports
+- **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; both the anchor and the box can be dragged to reposition (the arrow re-aims itself); included in exports. The box renders the note's symbols (`\alpha`→α), super/subscripts (`x^2`, `a_{ij}`) and inline Markdown (`**bold**`, `*italic*`, `` `code` ``) — always, regardless of which notes line is selected
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — by default each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something (a PDF you never annotate stays clutter-free, and its notes panel opens collapsed). Pick **Notes file…** from the ☰ menu to point a document at a different Markdown file — handy for sharing one notes file across several PDFs; the choice is remembered per PDF
 

@@ -766,7 +766,12 @@ class PDFCanvas(Gtk.DrawingArea):
         layout.set_font_description(desc)
         layout.set_width(int(170 * self.scale * Pango.SCALE))
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
-        layout.set_text(a["text"])
+        # render symbols (always), super/subscripts and inline Markdown; fall
+        # back to plain symbolized text if the generated markup is ever invalid
+        try:
+            layout.set_markup(_notes_to_pango_markup(a["text"]))
+        except GLib.Error:
+            layout.set_text(_symbolize(a["text"]))
         tw, th = layout.get_pixel_size()
         bx, by = cx, cy
         bw, bh = tw + 2 * pad, th + 2 * pad
@@ -2554,6 +2559,38 @@ def _symbolize(text):
         lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), text)
 
 
+# Shared inline-Markdown / script regexes (used by the notes editor's TextTag
+# rendering and by the callout Pango-markup rendering).
+# Bold must come before italic so ** is consumed first; italic uses [^*\n] to
+# avoid matching across ** markers or newlines.
+_MD_INLINE_RE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
+# Super/subscript: ^{content} or ^x  /  _{content} or _x
+_MD_SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
+
+
+def _notes_to_pango_markup(text):
+    """One paragraph of notes source → Pango markup for callout rendering:
+    \\commands become symbols (always), ^x/_x become super/subscripts, and
+    **bold** / *italic* / `code` become the matching tags. Markers themselves
+    are dropped (like the editor hides them off the cursor line)."""
+    s = _symbolize(text)
+    s = GLib.markup_escape_text(s)
+    # scripts first (operate on clean escaped text), then inline can wrap them
+    def _script(m):
+        content = m.group(2) if m.group(2) is not None else m.group(3)
+        tag = "sup" if m.group(1) == '^' else "sub"
+        return f"<{tag}>{content}</{tag}>"
+    s = _MD_SCRIPT_RE.sub(_script, s)
+
+    def _inline(m):
+        if m.group(1) is not None:
+            return f"<b>{m.group(1)}</b>"
+        if m.group(2) is not None:
+            return f"<i>{m.group(2)}</i>"
+        return f"<tt>{m.group(3)}</tt>"
+    return _MD_INLINE_RE.sub(_inline, s)
+
+
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
@@ -2762,12 +2799,9 @@ class MarkdownNotesView(GtkSource.View):
     Cursor line: raw markdown visible for editing.
     """
 
-    # Combined regex — bold must come before italic so ** is consumed first.
-    # Italic uses [^*\n] to prevent matching across ** markers or newlines.
-    _INLINE = re.compile(r'\*\*(.+?)\*\*|\*([^*\n]+?)\*|`([^`\n]+?)`')
-
-    # Super/subscript: ^{content} or ^x  /  _{content} or _x
-    _SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
+    # Inline-Markdown / script regexes (module-level; shared with callout markup)
+    _INLINE = _MD_INLINE_RE
+    _SCRIPT_RE = _MD_SCRIPT_RE
 
     # Symbol substitution table (module-level; shared with export rendering)
     _SYMBOLS = _MD_SYMBOLS
