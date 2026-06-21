@@ -21,6 +21,7 @@ optdepends=(
     'librsvg: render PNG icon sizes at install time'
     'libreoffice: convert PPTX files to PDF'
     'ocrmypdf: add a searchable text layer to scanned PDFs (OCR)'
+    'qrencode: show a QR code to share the PDF to a phone'
     'jq: recent-files menu for the walker launcher'
 )
 source=("sidemark::git+https://github.com/brokkoli71/sidemark.git")

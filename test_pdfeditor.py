@@ -1903,6 +1903,46 @@ class TestTextBox(unittest.TestCase):
             self.assertIn("Hello box", text)
 
 
+class TestShareToPhone(unittest.TestCase):
+    """LAN HTTP + QR sharing (#62): a one-shot server serves the file under a
+    random path; wrong paths 404."""
+
+    def test_lan_ip_is_a_string(self):
+        from sidemark import _lan_ip
+        ip = _lan_ip()
+        self.assertIsInstance(ip, str)
+        self.assertEqual(ip.count("."), 3)
+
+    def test_server_serves_only_the_token_path(self):
+        from sidemark import _ShareServer
+        import urllib.request, urllib.error
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "doc.pdf"); make_pdf(p)
+            srv = _ShareServer(p); srv.start()
+            try:
+                base = f"http://127.0.0.1:{srv.port}"
+                got = urllib.request.urlopen(
+                    f"{base}/{srv.token}/{srv.filename}", timeout=5).read()
+                self.assertEqual(got, open(p, "rb").read())
+                self.assertTrue(srv.served)
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(f"{base}/wrong/{srv.filename}", timeout=5)
+                self.assertEqual(cm.exception.code, 404)
+            finally:
+                srv.stop()
+
+    def test_qr_png_absent_tool_returns_false(self):
+        from sidemark import _make_qr_png
+        import shutil as _sh
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "q.png")
+            result = _make_qr_png("http://x", out)
+            if _sh.which("qrencode"):
+                self.assertTrue(result and os.path.exists(out))
+            else:
+                self.assertFalse(result)
+
+
 # ── drag pages out of the thumbnail panel to export them (#57) ────────────────
 
 class TestPageDragExport(unittest.TestCase):

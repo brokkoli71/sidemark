@@ -2703,6 +2703,91 @@ def _notes_to_pango_markup(text):
     return _MD_INLINE_RE.sub(_inline, s)
 
 
+# ── share a PDF to a phone over the LAN (#62) ─────────────────────────────────
+def _lan_ip():
+    """Best-effort LAN IP for a URL the phone can reach (no packet is sent)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))   # just selects the outgoing route
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _make_qr_png(url, out_path):
+    """Render a QR PNG for url via the optional 'qrencode' tool. Returns True on
+    success, False if qrencode isn't installed or fails (caller shows the URL)."""
+    if not shutil.which("qrencode"):
+        return False
+    try:
+        subprocess.run(["qrencode", "-s", "8", "-m", "2", "-o", out_path, url],
+                       check=True, capture_output=True)
+        return os.path.exists(out_path)
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+class _ShareServer:
+    """A one-shot LAN HTTP server that serves a single file under a random,
+    unguessable path — used to hand a PDF to a phone via a QR code / URL."""
+
+    def __init__(self, file_path):
+        import secrets
+        self.file_path = file_path
+        self.filename = os.path.basename(file_path) or "document.pdf"
+        self.token = secrets.token_urlsafe(8)
+        self.ip = _lan_ip()
+        self.port = 0
+        self.served = False
+        self._httpd = None
+
+    def start(self):
+        import http.server
+        from urllib.parse import unquote
+        token, fpath, fname, server = self.token, self.file_path, self.filename, self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if unquote(self.path) != f"/{token}/{fname}":
+                    self.send_error(404)
+                    return
+                try:
+                    with open(fpath, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Disposition", f'inline; filename="{fname}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                server.served = True
+
+            def log_message(self, *_a):
+                pass   # don't spam stderr
+
+        self._httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _Handler)
+        self.port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        return self
+
+    @property
+    def url(self):
+        from urllib.parse import quote
+        return f"http://{self.ip}:{self.port}/{self.token}/{quote(self.filename)}"
+
+    def stop(self):
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+
+
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
@@ -3698,6 +3783,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _menu_item("Add text layer (OCR)",
                    lambda: (menu_pop.popdown(), self._ocr_current()),
                    "Run OCR so a scanned document's text becomes selectable and searchable")
+        _menu_item("Share to phone…",
+                   lambda: (menu_pop.popdown(), self._on_share_to_phone()),
+                   "Show a QR code to open this PDF on a phone on the same Wi-Fi")
         _menu_item("Notes file…",
                    lambda: (menu_pop.popdown(), self._choose_notes_file()),
                    "Choose which Markdown file this document's notes are saved to")
@@ -6682,6 +6770,72 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._restore_note()              # notes are untouched — re-show them
         self._mark_dirty()                # save writes the text layer to disk
         self._toast("Added a searchable text layer — save to keep it.")
+
+    # ── share to phone (LAN HTTP + QR, #62) ─────────────────────────────────────
+    def _on_share_to_phone(self):
+        if self.canvas.document is None:
+            self._toast("Open a PDF first to share it.")
+            return
+        self._commit_note()
+        out_dir = tempfile.mkdtemp(prefix="sidemark-share-")
+        name = (os.path.basename(self._path)
+                if (self._path and not self._is_untitled) else "document.pdf")
+        if not name.lower().endswith(".pdf"):
+            name += ".pdf"
+        out_path = os.path.join(out_dir, name)
+        try:
+            self.canvas.save_copy(out_path)   # current state, ink baked in
+        except Exception as e:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            self._show_error("Share failed", str(e))
+            return
+        server = _ShareServer(out_path)
+        try:
+            server.start()
+        except OSError as e:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            self._show_error("Share failed", f"Could not start the share server:\n{e}")
+            return
+        qr_path = os.path.join(out_dir, "qr.png")
+        qr = qr_path if _make_qr_png(server.url, qr_path) else None
+        self._show_share_dialog(server, qr, out_dir)
+
+    def _show_share_dialog(self, server, qr_path, out_dir):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(6)
+        if qr_path:
+            pic = Gtk.Picture.new_for_filename(qr_path)
+            pic.set_can_shrink(False)
+            pic.set_size_request(220, 220)
+            box.append(pic)
+        else:
+            hint = Gtk.Label(
+                label="Install ‘qrencode’ to show a scannable QR code.")
+            hint.add_css_class("dim-label")
+            hint.set_wrap(True)
+            box.append(hint)
+        url = Gtk.Label(label=server.url)
+        url.set_selectable(True)
+        url.set_wrap(True)
+        url.add_css_class("monospace")
+        box.append(url)
+
+        dlg = Adw.AlertDialog.new(
+            "Open on your phone",
+            "Scan the code (or open the link) on a phone on the same Wi-Fi. "
+            "The link works until you close this dialog.")
+        dlg.set_extra_child(box)
+        dlg.add_response("close", "Close")
+        dlg.set_default_response("close")
+        dlg.set_close_response("close")
+
+        def _cleanup(*_a):
+            server.stop()
+            shutil.rmtree(out_dir, ignore_errors=True)
+        dlg.connect("response", _cleanup)
+        # safety net: stop serving after 10 minutes even if left open
+        GLib.timeout_add_seconds(600, lambda: (server.stop(), False)[1])
+        dlg.present(self)
 
     def _current_dir_gfile(self):
         """The folder of the currently open file, so file dialogs start there."""
