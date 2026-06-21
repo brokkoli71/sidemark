@@ -50,6 +50,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### Files & integration
 
 - **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice), and `.md` files; drag a file from your file manager onto the window. Any other file opens as text in the notes panel — handy for `.txt`, code, or config files — with a warning to confirm first if it looks binary, isn't valid UTF-8, or is very large
+- **OCR for scans** — open a scanned PDF with no text layer and Sidemark offers to **add a searchable text layer** so you can select, copy, and find its text (and anchor notes to it). It runs in the background and reopens the searchable result; you can also trigger it on demand from **Add text layer (OCR)** in the ☰ menu. Needs the optional [`ocrmypdf`](https://ocrmypdf.readthedocs.io) tool — `./install.sh` offers to install it (or `./install.sh --with-ocr`); on Arch it lives in the AUR (`yay -S ocrmypdf`, plus `pacman -S tesseract-data-eng`)
 - **Tabs** — opening a file from inside a window (`Ctrl+O`, Open recent, `Ctrl+N`, or dropping a file onto the window) opens it in a **new tab** in that window. The tab strip stays **hidden until you have more than one document open**, so a single PDF costs no vertical space and the page never moves down; with multiple tabs a full-width strip appears just below the header. `Ctrl+W` closes the current tab (prompting if it has unsaved changes); the window closes when its last tab does. **Drag a tab out** to the desktop to pop it into its own window, or onto another Sidemark window to regroup it side by side. Files opened from outside (file manager, command line) still open in their own window
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode. Selection defaults to **reading order** — like a normal PDF viewer, it grabs the contiguous run of text between where you press and release (column-aware) — and long-pressing the select tool switches to a **rectangular** marquee for tables and code
@@ -73,11 +74,21 @@ cd sidemark
 ./install.sh
 ```
 
-Installs the app, creates a launcher entry, and registers it as the default handler for PDF and Markdown files. Optional flags: `--walker-menu` (launcher recent-files menu, see below) and `--register-pptx` (also become the default handler for PowerPoint files, which open via LibreOffice conversion).
+Installs the app, creates a launcher entry, registers it as the default handler for PDF and Markdown files, and installs bash tab-completion for the `sidemark` command. If OCR support isn't already present it offers to install it (see below). Run `./install.sh --help` for all flags; the main ones are `--with-ocr` (install OCR support for scanned PDFs without prompting), `--walker-menu` (launcher recent-files menu, see below) and `--register-pptx` (also become the default handler for PowerPoint files, which open via LibreOffice conversion).
 
 ```bash
 ./install.sh --uninstall
 ```
+
+### Command line
+
+```bash
+sidemark [OPTIONS] [FILE]      # FILE: a .pdf, .pptx, .md, or text file
+sidemark --help                # full option list
+sidemark --page 5 lecture.pdf  # open at a given page
+```
+
+Tab-completion for the `sidemark` command's options and files is installed automatically (start a new shell to pick it up). To complete `./install.sh`'s own flags, `source extras/install.sh.bash` from the repo (both work in zsh after `autoload -U +X bashcompinit && bashcompinit`).
 
 ### Run directly (no install)
 

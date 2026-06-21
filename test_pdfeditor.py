@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
                       _export_pdf_with_notes, _parse_anchors, PDFEditorWindow,
-                      DocumentSession)
+                      DocumentSession, _pdf_needs_ocr)
 
 # window tests open files, which records recents — keep that out of the user's
 # real ~/.local/share/sidemark/recent.json (TestRecentFiles patches its own)
@@ -5327,6 +5327,134 @@ class TestMultiTab(unittest.TestCase):
         win_dummy = DocumentSession()
         self.assertIn("_path", DocumentSession.STATE)
         self.assertIn("canvas", DocumentSession.WIDGETS)
+
+
+class TestCLIHelp(unittest.TestCase):
+    """`-h`/`--help` for the sidemark CLI and shell-completion scripts."""
+
+    _SCRIPT = os.path.join(os.path.dirname(__file__), "sidemark.py")
+    _ROOT = os.path.dirname(__file__)
+
+    def _run(self, *flags):
+        import subprocess
+        return subprocess.run(["/usr/bin/python3", self._SCRIPT, *flags],
+                              capture_output=True, text=True, timeout=15)
+
+    def test_help_long_flag(self):
+        out = self._run("--help")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("Usage:", out.stdout)
+        self.assertIn("--page", out.stdout)
+        self.assertIn("--list-recent", out.stdout)
+
+    def test_help_short_flag(self):
+        out = self._run("-h")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("sidemark", out.stdout)
+
+    def test_help_exits_before_gtk_and_ignores_other_args(self):
+        # help must short-circuit even with a (nonexistent) file argument,
+        # without trying to open a window
+        out = self._run("/nonexistent/file.pdf", "--help")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("Usage:", out.stdout)
+
+    def test_completion_scripts_are_valid_bash(self):
+        import subprocess
+        for name in ("sidemark.bash", "install.sh.bash"):
+            p = os.path.join(self._ROOT, "extras", name)
+            self.assertTrue(os.path.exists(p), f"missing {name}")
+            r = subprocess.run(["bash", "-n", p], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
+
+    def test_install_sh_help(self):
+        import subprocess
+        r = subprocess.run(["bash", os.path.join(self._ROOT, "install.sh"), "-h"],
+                           capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Usage:", r.stdout)
+        self.assertIn("--uninstall", r.stdout)
+
+
+def _make_scanned_pdf(path, n_pages=2):
+    """A PDF whose pages carry an image but no text layer (like a scan)."""
+    doc = fitz.open()
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 80, 80))
+    pix.clear_with(210)
+    for _ in range(n_pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(fitz.Rect(40, 40, 555, 802), pixmap=pix)
+    doc.save(path)
+    doc.close()
+
+
+def _make_text_pdf(path, n_pages=2):
+    """A born-digital PDF with a real, extractable text layer."""
+    doc = fitz.open()
+    for i in range(n_pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 72), f"This is searchable page {i} with real text.")
+    doc.save(path)
+    doc.close()
+
+
+class TestOCR(unittest.TestCase):
+    """OCR for scanned documents (idea #3): detect a missing text layer and
+    offer to add one via the optional 'ocrmypdf' tool."""
+
+    def test_needs_ocr_detects_scanned_pdf(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "scan.pdf")
+            _make_scanned_pdf(p)
+            self.assertTrue(_pdf_needs_ocr(p))
+
+    def test_needs_ocr_skips_text_pdf(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "text.pdf")
+            _make_text_pdf(p)
+            self.assertFalse(_pdf_needs_ocr(p))
+
+    def test_needs_ocr_skips_blank_pdf(self):
+        """A blank vector PDF (no images) is not treated as a scan to OCR."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "blank.pdf")
+            make_pdf(p, n_pages=2)
+            self.assertFalse(_pdf_needs_ocr(p))
+
+    def test_offer_marks_scanned_seen_but_not_text(self):
+        """Offering OCR records the scanned file (so it isn't re-offered) and
+        leaves a born-digital document untouched — independent of whether
+        ocrmypdf is installed."""
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.ocr")
+
+        with tempfile.TemporaryDirectory() as d:
+            scan = os.path.join(d, "scan.pdf"); text = os.path.join(d, "text.pdf")
+            _make_scanned_pdf(scan); _make_text_pdf(text)
+            out = {}
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._maybe_offer_ocr(scan)
+                    out["scan_seen"] = scan in win._ocr_seen
+                    win._maybe_offer_ocr(text)
+                    out["text_seen"] = text in win._ocr_seen
+                    # no PDF semantics for the menu action when nothing is open
+                    win._ocr_current()   # must not raise
+                except Exception:
+                    import traceback
+                    errors.append(traceback.format_exc())
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+            if errors:
+                raise AssertionError(errors[0])
+            self.assertTrue(out["scan_seen"])
+            self.assertFalse(out["text_seen"])
 
 
 if __name__ == "__main__":

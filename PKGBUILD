@@ -20,6 +20,7 @@ depends=(
 optdepends=(
     'librsvg: render PNG icon sizes at install time'
     'libreoffice: convert PPTX files to PDF'
+    'ocrmypdf: add a searchable text layer to scanned PDFs (OCR)'
     'jq: recent-files menu for the walker launcher'
 )
 source=("sidemark::git+https://github.com/brokkoli71/sidemark.git")
@@ -52,6 +53,10 @@ EOF
     # Desktop entry
     install -Dm644 de.hspitz.sidemark.desktop \
         "$pkgdir/usr/share/applications/de.hspitz.sidemark.desktop"
+
+    # Bash completion for the 'sidemark' command
+    install -Dm644 extras/sidemark.bash \
+        "$pkgdir/usr/share/bash-completion/completions/sidemark"
 
     # Walker/elephant menu (copy to ~/.config/elephant/menus/ to enable)
     install -Dm644 extras/sidemark_recent.lua \

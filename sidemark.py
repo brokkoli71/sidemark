@@ -89,7 +89,35 @@ def _remember_notes_file(pdf_path, notes_path):
     _save_setting("notes_files", m)
 
 
-# Fast path for launcher integrations (walker/elephant menus, rofi, …):
+_USAGE = """\
+sidemark — PDF viewer and annotator with a live Markdown notes sidebar
+
+Usage:
+  sidemark [OPTIONS] [FILE]
+
+Arguments:
+  FILE                  PDF, PowerPoint (.pptx), or Markdown/text file to open.
+                        Any other file opens as text in the notes panel.
+
+Options:
+  -h, --help            Show this help message and exit.
+  -v, --verbose         Enable verbose (debug-level) logging.
+      --page N          Open FILE at page N (0-based page index).
+      --list-recent     Print recent files as "name<TAB>path" and exit
+                        (for launcher integrations); no window is shown.
+
+Examples:
+  sidemark lecture.pdf
+  sidemark --page 5 lecture.pdf
+  sidemark notes.md
+"""
+
+# Fast paths handled before any GTK import: print and exit straight away.
+if __name__ == "__main__" and ("-h" in sys.argv[1:] or "--help" in sys.argv[1:]):
+    print(_USAGE, end="")
+    sys.exit(0)
+
+# Launcher integrations (walker/elephant menus, rofi, …):
 # print "name<TAB>path" lines and exit before any GTK import happens.
 if __name__ == "__main__" and "--list-recent" in sys.argv[1:]:
     for _it in _load_recent():
@@ -2449,6 +2477,34 @@ def _parse_anchors(text):
     return result
 
 
+def _pdf_needs_ocr(path, sample=10):
+    """Heuristic: does this PDF look like a scan with no searchable text?
+
+    Samples the first few pages; a document that carries images but has almost
+    no extractable text is very likely a scan that would benefit from OCR.
+    """
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return False
+    try:
+        n = doc.page_count
+        if n == 0:
+            return False
+        pages = min(sample, n)
+        text_chars = 0
+        has_image = False
+        for i in range(pages):
+            page = doc.load_page(i)
+            text_chars += len(page.get_text().strip())
+            if not has_image and page.get_images(full=False):
+                has_image = True
+        # images present, but essentially no text → scanned
+        return has_image and text_chars < 8 * pages
+    finally:
+        doc.close()
+
+
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
@@ -3235,6 +3291,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         GLib.timeout_add_seconds(60, self._autosave_tick)
         self._transient_tool = None    # window-level: highlights a shared tool button
+        self._ocr_seen = set()         # PDFs we've already offered to OCR this session
+        self._ocr_hint_shown = False   # one-time "install ocrmypdf" hint
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -3364,6 +3422,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _menu_item("Export with notes…",
                    lambda: (menu_pop.popdown(), self._on_export()),
                    "Export a PDF with your notes laid out after each page (Ctrl+E)")
+        _menu_item("Add text layer (OCR)",
+                   lambda: (menu_pop.popdown(), self._ocr_current()),
+                   "Run OCR so a scanned document's text becomes selectable and searchable")
         _menu_item("Notes file…",
                    lambda: (menu_pop.popdown(), self._choose_notes_file()),
                    "Choose which Markdown file this document's notes are saved to")
@@ -5981,6 +6042,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._set_notes_shown(self.notes_model.has_content())
         self._remember_recent(path)
         self._maybe_offer_recovery(path)
+        self._maybe_offer_ocr(path)
 
     def _open_markdown(self, md_path):
         # If there's an associated PDF (e.g. lecture-notes.md → lecture.pdf), open it.
@@ -6212,6 +6274,64 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
                 GLib.idle_add(lambda: (toast.dismiss(),
                     self._show_error("Conversion failed", msg)) and None)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ── OCR (optional: needs the external 'ocrmypdf' tool) ──────────────────────
+    def _maybe_offer_ocr(self, path):
+        """If a just-opened PDF looks scanned, offer to add a searchable text layer."""
+        if path in self._ocr_seen or not _pdf_needs_ocr(path):
+            return
+        self._ocr_seen.add(path)
+        if shutil.which("ocrmypdf"):
+            toast = Adw.Toast.new("This document looks scanned — no searchable text.")
+            toast.set_button_label("Add text layer")
+            toast.set_timeout(8)
+            toast.connect("button-clicked", lambda _t: self._ocr_document(path))
+            self.toast_overlay.add_toast(toast)
+        elif not self._ocr_hint_shown:
+            self._ocr_hint_shown = True
+            self.toast_overlay.add_toast(Adw.Toast.new(
+                "Scanned document — install ‘ocrmypdf’ to make it searchable."))
+
+    def _ocr_current(self):
+        """OCR the document in the current tab (menu action)."""
+        if not self._path or self._is_untitled or not self._path.lower().endswith(".pdf"):
+            self._toast("Open a PDF first to add a text layer.")
+            return
+        self._ocr_document(self._path)
+
+    def _ocr_document(self, path):
+        if not shutil.which("ocrmypdf"):
+            self._show_error("OCR unavailable",
+                "The 'ocrmypdf' tool is not installed.\n\n"
+                "Install it with:\n  pacman -S ocrmypdf")
+            return
+        toast = Adw.Toast.new(f"Running OCR on {os.path.basename(path)}…")
+        toast.set_timeout(0)
+        self.toast_overlay.add_toast(toast)
+        out_dir = tempfile.mkdtemp(prefix="sidemark-ocr-")
+        out_path = os.path.join(out_dir, os.path.basename(path))
+
+        def run():
+            try:
+                subprocess.run(
+                    ["ocrmypdf", "--skip-text", path, out_path],
+                    check=True, capture_output=True,
+                )
+                GLib.idle_add(lambda: (
+                    toast.dismiss(),
+                    self._ocr_seen.add(out_path),     # the result already has text
+                    self._toast("Added a searchable text layer."),
+                    self.open_file(out_path)) and None)
+            except FileNotFoundError:
+                GLib.idle_add(lambda: (toast.dismiss(),
+                    self._show_error("OCR failed",
+                        "ocrmypdf not found. Install it with:\n  pacman -S ocrmypdf")) and None)
+            except subprocess.CalledProcessError as e:
+                msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
+                GLib.idle_add(lambda: (toast.dismiss(),
+                    self._show_error("OCR failed", msg)) and None)
 
         threading.Thread(target=run, daemon=True).start()
 
