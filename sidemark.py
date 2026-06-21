@@ -6402,23 +6402,34 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 "The 'ocrmypdf' tool is not installed.\n\n"
                 "Install it with:\n  pacman -S ocrmypdf")
             return
+        s = self._active_session
+        if s.canvas.document is None:
+            self._toast("Open a PDF first to add a text layer.")
+            return
         toast = Adw.Toast.new(f"Running OCR on {os.path.basename(path)}…")
         toast.set_timeout(0)
         self.toast_overlay.add_toast(toast)
         out_dir = tempfile.mkdtemp(prefix="sidemark-ocr-")
+        # OCR the document's *current* state (any strokes/page edits baked in),
+        # not the on-disk original, so nothing drawn so far is lost.
+        in_path = os.path.join(out_dir, "input.pdf")
         out_path = os.path.join(out_dir, os.path.basename(path))
+        try:
+            s.canvas.save_copy(in_path)
+        except Exception as e:
+            toast.dismiss()
+            self._show_error("OCR failed", str(e))
+            return
 
         def run():
             try:
                 subprocess.run(
-                    ["ocrmypdf", "--skip-text", path, out_path],
+                    ["ocrmypdf", "--skip-text", in_path, out_path],
                     check=True, capture_output=True,
                 )
                 GLib.idle_add(lambda: (
                     toast.dismiss(),
-                    self._ocr_seen.add(out_path),     # the result already has text
-                    self._toast("Added a searchable text layer."),
-                    self.open_file(out_path)) and None)
+                    self._apply_ocr_result(s, path, out_path)) and None)
             except FileNotFoundError:
                 GLib.idle_add(lambda: (toast.dismiss(),
                     self._show_error("OCR failed",
@@ -6429,6 +6440,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     self._show_error("OCR failed", msg)) and None)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _apply_ocr_result(self, s, original_path, out_path):
+        """Swap the searchable PDF into the document that was OCR'd while keeping
+        its identity: the same notes sidecar and the same save target. OCR only
+        adds a text layer, so the notes must NOT be reloaded from a new path."""
+        if s not in self._sessions:
+            return   # the tab was closed while OCR ran in the background
+        # the canvas callbacks act on the active session, so focus the OCR'd one
+        if s is not self._active_session and s._tab_page is not None:
+            self._tab_view.set_selected_page(s._tab_page)
+        self._commit_note()
+        self.canvas.load(out_path)        # in-memory doc is now searchable
+        self._path = original_path        # but we still save to the original file
+        self._ocr_seen.add(original_path)
+        self._populate_toc()
+        self._restore_note()              # notes are untouched — re-show them
+        self._mark_dirty()                # save writes the text layer to disk
+        self._toast("Added a searchable text layer — save to keep it.")
 
     def _current_dir_gfile(self):
         """The folder of the currently open file, so file dialogs start there."""

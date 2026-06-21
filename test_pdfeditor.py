@@ -5570,6 +5570,45 @@ class TestOCR(unittest.TestCase):
             self.assertTrue(out["scan_seen"])
             self.assertFalse(out["text_seen"])
 
+    def test_ocr_result_keeps_notes_and_save_target(self):
+        """Applying an OCR result must NOT sever the document from its notes:
+        the notes model, the notes sidecar path and the save target all stay,
+        and only the (now searchable) PDF is swapped in. Regression test for
+        OCR wiping notes by opening the temp output as a new document."""
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.ocrkeep")
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf"); make_pdf(pdf, n_pages=2)
+            ocrd = os.path.join(d, "doc_ocr.pdf"); make_pdf(ocrd, n_pages=2)
+            out = {}
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    win._notes_view.get_buffer().set_text(r'note with \sum')
+                    win._commit_note()
+                    out["notes_path_before"] = win._active_notes_path
+                    win._apply_ocr_result(win._active_session, pdf, ocrd)
+                    out["note"] = win.notes_model.get(0)
+                    out["path"] = win._path
+                    out["notes_path"] = win._active_notes_path
+                    out["dirty"] = win._dirty
+                except Exception:
+                    import traceback
+                    errors.append(traceback.format_exc())
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+            if errors:
+                raise AssertionError(errors[0])
+            self.assertEqual(out["note"], r'note with \sum')   # notes preserved
+            self.assertEqual(out["path"], pdf)                 # save target unchanged
+            self.assertEqual(out["notes_path"], out["notes_path_before"])
+            self.assertTrue(out["dirty"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
