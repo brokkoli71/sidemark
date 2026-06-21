@@ -3097,10 +3097,85 @@ class MarkdownNotesView(GtkSource.View):
                     apply(tag_name, a + 1, b)
 
 
+def _session_prop(name):
+    """A per-document attribute that physically lives on the active
+    DocumentSession. The window's ~140 methods keep reading/writing self.<name>
+    unchanged; it transparently follows whichever tab is active."""
+    return property(
+        lambda self: getattr(self._active_session, name),
+        lambda self, value: setattr(self._active_session, name, value),
+    )
+
+
+class DocumentSession:
+    """One open document — its canvas, notes editor, sidebar, search bar and all
+    the per-document state. The window owns an Adw.TabView of these and proxies
+    the active one's attributes onto itself via _session_prop, so multiple PDFs
+    can be open as tabs without rewriting every method to thread a session."""
+
+    # names proxied onto PDFEditorWindow via _session_prop — keep in sync with
+    # the property declarations in the window class body.
+    STATE = (
+        "_path", "_notes_path", "_active_notes_path", "_is_untitled", "_dirty",
+        "notes_model", "_undo_timeline", "_redo_timeline", "_notes_burst_open",
+        "_burst_base", "_anchor_line_nos", "_anchor_para_ends", "_search_hits",
+        "_note_hits", "_search_matches", "_search_current", "_presenter",
+        "_last_anchor_mark", "_link_hint_shown", "_saved_pane_pos", "_pane_anim",
+        "_thumb_idle_id", "_current_thumb_row", "_drag_export_dir",
+        "_has_toc", "_toc_thumbs", "_drop_indicator_row",
+    )
+    WIDGETS = (
+        "canvas", "_notes_view", "_notes_box", "_search_revealer",
+        "_search_entry", "_search_label", "_paned", "_toc_list", "_toc_scroll",
+        "_toc_revealer", "_toc_switch", "_toc_seg_outline", "_toc_seg_pages",
+        "content",
+    )
+
+    def __init__(self):
+        self._path = None
+        self._notes_path = None     # set when a .md is opened without a PDF
+        self._active_notes_path = None
+        self._is_untitled = False
+        self._dirty = False
+        self.notes_model = NotesModel()
+        self._undo_timeline = []
+        self._redo_timeline = []
+        self._notes_burst_open = False
+        self._burst_base = ""
+        self._anchor_line_nos = []
+        self._anchor_para_ends = []
+        self._search_hits = {}
+        self._note_hits = {}
+        self._search_matches = []
+        self._search_current = -1
+        self._presenter = None
+        self._last_anchor_mark = None
+        self._link_hint_shown = False
+        self._saved_pane_pos = 800
+        self._pane_anim = None
+        self._thumb_idle_id = None
+        self._current_thumb_row = None
+        self._drag_export_dir = None
+        self._has_toc = False
+        self._toc_thumbs = False
+        self._drop_indicator_row = None
+        self._tab_page = None       # the Adw.TabPage hosting this session
+        # widgets are built by the window and assigned through the proxies
+        for w in self.WIDGETS:
+            setattr(self, w, None)
+
+
 class PDFEditorWindow(Adw.ApplicationWindow):
+    # per-document attributes proxied to self._active_session (see DocumentSession)
+    for _n in DocumentSession.STATE + DocumentSession.WIDGETS:
+        locals()[_n] = _session_prop(_n)
+    del _n
+
     def __init__(self, app):
         super().__init__(application=app, title="Sidemark")
         self.set_default_size(1280, 800)
+        self._active_session = DocumentSession()
+        self._sessions = [self._active_session]
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
         self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
@@ -3141,6 +3216,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         surround = tuple(b + 0.12 * (f - b) for b, f in zip(bg, fg))
         _lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         _src_scheme = "Adwaita-dark" if _lum < 0.5 else "Adwaita"
+        # stashed so _build_document_widgets can build each tab's subtree
+        self._theme_surround = surround
+        self._theme_acc = acc
+        self._src_scheme = _src_scheme
         self._swatch_presets = [
             ("Accent", acc),
             ("Red",    _hex_to_rgb(theme["color1"])),
@@ -3150,33 +3229,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Gray",   _hex_to_rgb(theme["color8"])),
         ]
 
-        self.canvas = PDFCanvas()
-        self.canvas.surround_color = surround
-        self.canvas.zoom_accent = acc
-        self.canvas.set_vexpand(True)
-        self.canvas.set_hexpand(True)
-        self.canvas.on_page_changed = self._on_page_changed
-        self.canvas.on_change = self._mark_dirty
-        self.canvas.on_text_copied = self._on_text_copied
-        self.canvas.on_nav_button = lambda d: self._nav_page(d)
-        # commit the current note before any canvas-initiated page change
-        # (scroll flip, link jump, undo on another page)
-        self.canvas.on_page_will_change = self._commit_note
+        # build the first document's canvas / notes / sidebar / search subtree
+        # into the active session (additional tabs reuse the same builder)
+        self._build_document_widgets(self._active_session)
 
         GLib.timeout_add_seconds(60, self._autosave_tick)
-        self.canvas.on_anchor_placed = self._on_anchor_placed
-        self.canvas.on_anchor_clicked = self._on_anchor_clicked
-        self.canvas.on_anchor_moved = self._on_anchor_moved
-        self.canvas.on_callout_placed = self._on_callout_placed
-        self.canvas.on_callout_moved = self._on_callout_moved
-        self.canvas.on_user_action = self._on_canvas_action
-        self.canvas.on_canvas_press = self._clear_thumb_selection
-        self.canvas.on_nav_history = self._on_nav_history
-        self._link_hint_shown = False
-        self.canvas.on_modifier_tool = self._highlight_transient_tool
-        self._transient_tool = None
-        self._last_anchor_mark = None   # TextMark right after the last placed anchor
-        self._presenter = None          # PresenterWindow when second-screen view is open
+        self._transient_tool = None    # window-level: highlights a shared tool button
 
         # ── CSS ───────────────────────────────────────────────────────────────
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
@@ -3795,147 +3853,41 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         self._set_tool_mode("pen")
 
-        # responsive collapse: the canvas DrawingArea fires ::resize on every
-        # window resize (the HeaderBar itself does not), so use it as the tick
-        # and read the header's real allocated width.
-        self.canvas.connect("resize", lambda *_: self._update_header_collapse())
+        # responsive collapse: each session's canvas fires ::resize on every
+        # window resize (the HeaderBar does not) and is hooked in
+        # _build_document_widgets; re-check when the header maps too.
         header.connect("map", lambda *_: self._update_header_collapse())
 
-        # ── notes panel ───────────────────────────────────────────────────────
-        self._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-
-        notes_header = Gtk.Label(label="Notes")
-        notes_header.add_css_class("dim-label")
-        notes_header.set_xalign(0)
-        notes_header.set_margin_start(10)
-        notes_header.set_margin_top(6)
-        notes_header.set_margin_bottom(4)
-        self._notes_box.append(notes_header)
-
-        notes_scroll = Gtk.ScrolledWindow()
-        notes_scroll.set_vexpand(True)
-        notes_scroll.set_hexpand(True)
-        self._notes_view = MarkdownNotesView(_src_scheme)
-        self._notes_view.get_buffer().connect("changed", self._on_notes_changed)
-        self._notes_view.get_buffer().connect("notify::cursor-position", self._on_notes_cursor_moved)
-        notes_scroll.set_child(self._notes_view)
-        self._notes_box.append(notes_scroll)
-
-        # ── search bar ────────────────────────────────────────────────────────
-        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        search_box.set_margin_start(6)
-        search_box.set_margin_end(6)
-        search_box.set_margin_top(4)
-        search_box.set_margin_bottom(4)
-
-        self._search_entry = Gtk.SearchEntry()
-        self._search_entry.set_hexpand(True)
-        self._search_entry.set_placeholder_text("Search PDF & notes…")
-        self._search_entry.connect("search-changed", self._on_search_changed)
-        self._search_entry.connect("stop-search", lambda _: self._hide_search())
-        self._search_entry.connect("activate", lambda _: self._search_next())
-
-        search_key = Gtk.EventControllerKey()
-        search_key.connect("key-pressed", self._on_search_key)
-        self._search_entry.add_controller(search_key)
-
-        search_prev_btn = Gtk.Button()
-        search_prev_btn.set_icon_name("go-up-symbolic")
-        search_prev_btn.set_tooltip_text("Previous match")
-        search_prev_btn.connect("clicked", lambda _: self._search_prev())
-
-        search_next_btn = Gtk.Button()
-        search_next_btn.set_icon_name("go-down-symbolic")
-        search_next_btn.set_tooltip_text("Next match")
-        search_next_btn.connect("clicked", lambda _: self._search_next())
-
-        self._search_label = Gtk.Label(label="")
-        self._search_label.add_css_class("dim-label")
-        self._search_label.set_width_chars(7)
-
-        search_close_btn = Gtk.Button()
-        search_close_btn.set_icon_name("window-close-symbolic")
-        search_close_btn.connect("clicked", lambda _: self._hide_search())
-
-        search_box.append(self._search_entry)
-        search_box.append(search_prev_btn)
-        search_box.append(search_next_btn)
-        search_box.append(self._search_label)
-        search_box.append(search_close_btn)
-
-        self._search_revealer = Gtk.Revealer()
-        self._search_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        self._search_revealer.set_child(search_box)
-        self._search_revealer.set_reveal_child(False)
-
-        canvas_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        canvas_box.append(self._search_revealer)
-        canvas_box.append(self.canvas)
-
-        # ── split pane ────────────────────────────────────────────────────────
-        self._saved_pane_pos = 800
-        self._pane_anim = None   # running notes show/hide animation
-        self._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self._paned.set_start_child(canvas_box)
-        self._paned.set_resize_start_child(True)
-        self._paned.set_shrink_start_child(False)
-        self._paned.set_end_child(self._notes_box)
-        self._paned.set_resize_end_child(True)
-        self._paned.set_shrink_end_child(True)
-        self._paned.set_hexpand(True)
         self.connect("realize", self._on_realize)
         self.connect("close-request", self._on_close_request)
 
-        # ── outline (TOC) sidebar ─────────────────────────────────────────────
-        self._toc_list = Gtk.ListBox()
-        self._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self._toc_list.connect("row-activated", self._on_toc_row_activated)
-        # clicking the empty area below the thumbnails clears the export selection
-        toc_click = Gtk.GestureClick()
-        toc_click.connect("pressed", self._on_toc_list_pressed)
-        self._toc_list.add_controller(toc_click)
-        self._toc_scroll = Gtk.ScrolledWindow()
-        self._toc_scroll.set_child(self._toc_list)
-        self._toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self._toc_scroll.set_size_request(230, -1)
-        self._toc_scroll.set_vexpand(True)
-        # Outline ⇄ Pages view switcher, shown only when the PDF has a TOC
-        self._toc_seg_outline = Gtk.ToggleButton(label="Outline")
-        self._toc_seg_outline.set_active(True)
-        self._toc_seg_outline.set_tooltip_text(
-            "Show the document outline (Ctrl+T toggles this sidebar)")
-        self._toc_seg_pages = Gtk.ToggleButton(label="Pages")
-        self._toc_seg_pages.set_tooltip_text(
-            "Show page thumbnails (Ctrl+T toggles this sidebar)")
-        self._toc_seg_pages.set_group(self._toc_seg_outline)
-        self._toc_seg_pages.connect("toggled", self._on_toc_view_toggled)
-        self._toc_switch = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        self._toc_switch.add_css_class("linked")
-        self._toc_switch.set_homogeneous(True)
-        self._toc_switch.set_margin_top(8)
-        self._toc_switch.set_margin_bottom(4)
-        self._toc_switch.set_margin_start(8)
-        self._toc_switch.set_margin_end(8)
-        self._toc_switch.append(self._toc_seg_outline)
-        self._toc_switch.append(self._toc_seg_pages)
-        self._toc_switch.set_visible(False)
-        toc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        toc_box.append(self._toc_switch)
-        toc_box.append(self._toc_scroll)
-        self._toc_revealer = Gtk.Revealer()
-        self._toc_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
-        self._toc_revealer.set_child(toc_box)
-        self._toc_revealer.set_reveal_child(False)
+        # ── tabs ───────────────────────────────────────────────────────────────
+        # Each open document is a page in an Adw.TabView; a real Adw.TabBar (so
+        # native reorder / cross-window drag / tear-off come for free) sits as a
+        # second top bar BELOW the header. set_autohide(True) hides it entirely
+        # for a single document — so one PDF costs no vertical space and the PDF
+        # never moves down — and reveals a full-width, usable strip only once a
+        # second tab exists. (Putting it inline in the header title slot left the
+        # tabs clipped to ~half their width because the toolbar is button-dense.)
+        self._tab_view = Adw.TabView()
+        self._add_session_tab(self._active_session)
+        self._tab_view.connect("notify::selected-page", self._on_tab_switched)
+        self._tab_view.connect("close-page", self._on_tab_close)
+        self._tab_view.connect("page-detached", self._on_page_detached)
+        # tab dragged out to empty space / onto another window
+        self._tab_view.connect("create-window", self._on_tab_create_window)
+        self._tab_view.connect("page-attached", self._on_page_attached)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        content.append(self._toc_revealer)
-        content.append(self._paned)
+        self._tab_bar = Adw.TabBar()
+        self._tab_bar.set_view(self._tab_view)
+        self._tab_bar.set_autohide(True)
 
         self.toast_overlay = Adw.ToastOverlay()
-        self.toast_overlay.set_child(content)
+        self.toast_overlay.set_child(self._tab_view)
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
+        toolbar_view.add_top_bar(self._tab_bar)
         toolbar_view.set_content(self.toast_overlay)
         self.set_content(toolbar_view)
 
@@ -3986,6 +3938,157 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         mod_ctrl.connect("key-released",
                          lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, False))
         self.add_controller(mod_ctrl)
+
+    def _build_document_widgets(self, s):
+        """Build one document's canvas / notes editor / search bar / sidebar
+        subtree into the given DocumentSession. Every signal is routed through
+        `s.win` (not `self`) so that when a tab is torn off into another window,
+        re-pointing s.win retargets the whole document — no disconnecting needed.
+        Writes per-document widgets onto `s`, never onto self. Called once/tab."""
+        s.win = self
+        s.canvas = PDFCanvas()
+        s.canvas.surround_color = self._theme_surround
+        s.canvas.zoom_accent = self._theme_acc
+        s.canvas.set_vexpand(True)
+        s.canvas.set_hexpand(True)
+        s.canvas.on_page_changed = lambda *a: s.win._on_page_changed(*a)
+        s.canvas.on_change = lambda *a: s.win._mark_dirty(*a)
+        s.canvas.on_text_copied = lambda *a: s.win._on_text_copied(*a)
+        s.canvas.on_nav_button = lambda d: s.win._nav_page(d)
+        # commit the current note before any canvas-initiated page change
+        # (scroll flip, link jump, undo on another page)
+        s.canvas.on_page_will_change = lambda *a: s.win._commit_note()
+        s.canvas.on_anchor_placed = lambda *a: s.win._on_anchor_placed(*a)
+        s.canvas.on_anchor_clicked = lambda *a: s.win._on_anchor_clicked(*a)
+        s.canvas.on_anchor_moved = lambda *a: s.win._on_anchor_moved(*a)
+        s.canvas.on_callout_placed = lambda *a: s.win._on_callout_placed(*a)
+        s.canvas.on_callout_moved = lambda *a: s.win._on_callout_moved(*a)
+        s.canvas.on_user_action = lambda *a: s.win._on_canvas_action(*a)
+        s.canvas.on_canvas_press = lambda *a: s.win._clear_thumb_selection(*a)
+        s.canvas.on_nav_history = lambda *a: s.win._on_nav_history(*a)
+        s.canvas.on_modifier_tool = lambda *a: s.win._highlight_transient_tool(*a)
+        # responsive collapse tick (the HeaderBar itself never fires ::resize)
+        s.canvas.connect("resize", lambda *_: s.win._update_header_collapse())
+
+        # ── notes panel ───────────────────────────────────────────────────────
+        s._notes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        notes_header = Gtk.Label(label="Notes")
+        notes_header.add_css_class("dim-label")
+        notes_header.set_xalign(0)
+        notes_header.set_margin_start(10)
+        notes_header.set_margin_top(6)
+        notes_header.set_margin_bottom(4)
+        s._notes_box.append(notes_header)
+        notes_scroll = Gtk.ScrolledWindow()
+        notes_scroll.set_vexpand(True)
+        notes_scroll.set_hexpand(True)
+        s._notes_view = MarkdownNotesView(self._src_scheme)
+        s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
+        s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
+        notes_scroll.set_child(s._notes_view)
+        s._notes_box.append(notes_scroll)
+
+        # ── search bar ────────────────────────────────────────────────────────
+        search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        search_box.set_margin_start(6)
+        search_box.set_margin_end(6)
+        search_box.set_margin_top(4)
+        search_box.set_margin_bottom(4)
+        s._search_entry = Gtk.SearchEntry()
+        s._search_entry.set_hexpand(True)
+        s._search_entry.set_placeholder_text("Search PDF & notes…")
+        s._search_entry.connect("search-changed", lambda *a: s.win._on_search_changed(*a))
+        s._search_entry.connect("stop-search", lambda _: s.win._hide_search())
+        s._search_entry.connect("activate", lambda _: s.win._search_next())
+        search_key = Gtk.EventControllerKey()
+        search_key.connect("key-pressed", lambda *a: s.win._on_search_key(*a))
+        s._search_entry.add_controller(search_key)
+        search_prev_btn = Gtk.Button()
+        search_prev_btn.set_icon_name("go-up-symbolic")
+        search_prev_btn.set_tooltip_text("Previous match")
+        search_prev_btn.connect("clicked", lambda _: s.win._search_prev())
+        search_next_btn = Gtk.Button()
+        search_next_btn.set_icon_name("go-down-symbolic")
+        search_next_btn.set_tooltip_text("Next match")
+        search_next_btn.connect("clicked", lambda _: s.win._search_next())
+        s._search_label = Gtk.Label(label="")
+        s._search_label.add_css_class("dim-label")
+        s._search_label.set_width_chars(7)
+        search_close_btn = Gtk.Button()
+        search_close_btn.set_icon_name("window-close-symbolic")
+        search_close_btn.connect("clicked", lambda _: s.win._hide_search())
+        search_box.append(s._search_entry)
+        search_box.append(search_prev_btn)
+        search_box.append(search_next_btn)
+        search_box.append(s._search_label)
+        search_box.append(search_close_btn)
+        s._search_revealer = Gtk.Revealer()
+        s._search_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        s._search_revealer.set_child(search_box)
+        s._search_revealer.set_reveal_child(False)
+
+        canvas_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        canvas_box.append(s._search_revealer)
+        canvas_box.append(s.canvas)
+
+        # ── split pane ────────────────────────────────────────────────────────
+        s._saved_pane_pos = 800
+        s._pane_anim = None   # running notes show/hide animation
+        s._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        s._paned.set_start_child(canvas_box)
+        s._paned.set_resize_start_child(True)
+        s._paned.set_shrink_start_child(False)
+        s._paned.set_end_child(s._notes_box)
+        s._paned.set_resize_end_child(True)
+        s._paned.set_shrink_end_child(True)
+        s._paned.set_hexpand(True)
+
+        # ── outline (TOC) sidebar ─────────────────────────────────────────────
+        s._toc_list = Gtk.ListBox()
+        s._toc_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        s._toc_list.connect("row-activated", lambda *a: s.win._on_toc_row_activated(*a))
+        # clicking the empty area below the thumbnails clears the export selection
+        toc_click = Gtk.GestureClick()
+        toc_click.connect("pressed", lambda *a: s.win._on_toc_list_pressed(*a))
+        s._toc_list.add_controller(toc_click)
+        s._toc_scroll = Gtk.ScrolledWindow()
+        s._toc_scroll.set_child(s._toc_list)
+        s._toc_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        s._toc_scroll.set_size_request(230, -1)
+        s._toc_scroll.set_vexpand(True)
+        # Outline ⇄ Pages view switcher, shown only when the PDF has a TOC
+        s._toc_seg_outline = Gtk.ToggleButton(label="Outline")
+        s._toc_seg_outline.set_active(True)
+        s._toc_seg_outline.set_tooltip_text(
+            "Show the document outline (Ctrl+T toggles this sidebar)")
+        s._toc_seg_pages = Gtk.ToggleButton(label="Pages")
+        s._toc_seg_pages.set_tooltip_text(
+            "Show page thumbnails (Ctrl+T toggles this sidebar)")
+        s._toc_seg_pages.set_group(s._toc_seg_outline)
+        s._toc_seg_pages.connect("toggled", lambda *a: s.win._on_toc_view_toggled(*a))
+        s._toc_switch = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        s._toc_switch.add_css_class("linked")
+        s._toc_switch.set_homogeneous(True)
+        s._toc_switch.set_margin_top(8)
+        s._toc_switch.set_margin_bottom(4)
+        s._toc_switch.set_margin_start(8)
+        s._toc_switch.set_margin_end(8)
+        s._toc_switch.append(s._toc_seg_outline)
+        s._toc_switch.append(s._toc_seg_pages)
+        s._toc_switch.set_visible(False)
+        toc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        toc_box.append(s._toc_switch)
+        toc_box.append(s._toc_scroll)
+        s._toc_revealer = Gtk.Revealer()
+        s._toc_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        s._toc_revealer.set_child(toc_box)
+        s._toc_revealer.set_reveal_child(False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content.append(s._toc_revealer)
+        content.append(s._paned)
+        s.content = content
+        return s
 
     # ── shortcuts popover ─────────────────────────────────────────────────────
 
@@ -4103,6 +4206,171 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._file_label.set_label(subtitle)
         self._file_label.set_tooltip_text(full_path or subtitle)
         self.set_title(f"Sidemark — {subtitle}")
+        self._update_tab_title(self._active_session)
+
+    # ── tabs ──────────────────────────────────────────────────────────────────
+
+    def _add_session_tab(self, s):
+        """Append a session's document subtree as a new tab page."""
+        page = self._tab_view.append(s.content)
+        page.session = s          # so a torn-off page can find its session
+        s._tab_page = page
+        self._update_tab_title(s)
+        return page
+
+    def _update_tab_title(self, s):
+        if s is None or s._tab_page is None:
+            return
+        if s._path:
+            title = os.path.basename(s._path)
+        elif s._notes_path:
+            title = os.path.basename(s._notes_path)
+        else:
+            title = "Untitled"
+        s._tab_page.set_title(title)
+        s._tab_page.set_tooltip(s._path or s._notes_path or "")
+
+    def _session_for_page(self, page):
+        for s in self._sessions:
+            if s._tab_page is page:
+                return s
+        return None
+
+    def _on_tab_switched(self, tab_view, _pspec):
+        page = tab_view.get_selected_page()
+        if page is None:
+            return
+        s = self._session_for_page(page)
+        if s is not None and s is not self._active_session:
+            self._activate_session(s)
+
+    def _activate_session(self, s):
+        """Make `s` the active document and sync the shared header chrome, which
+        all acts on self._active_session through the per-document proxies."""
+        # flush the outgoing document's in-progress note into its model first
+        if self._active_session is not None and self._active_session is not s:
+            self._commit_note_for(self._active_session)
+        self._active_session = s
+        # notes panel toggle reflects this document's panel visibility
+        self._notes_toggle.handler_block(self._notes_toggled_id)
+        self._notes_toggle.set_active(
+            bool(s._notes_box) and s._notes_box.get_visible())
+        self._notes_toggle.handler_unblock(self._notes_toggled_id)
+        # sidebar toggle reflects this document's revealer (idempotent set)
+        self._toc_btn.set_active(
+            bool(s._toc_revealer) and s._toc_revealer.get_reveal_child())
+        # menu filename label + window subtitle
+        name = (os.path.basename(s._path) if s._path
+                else os.path.basename(s._notes_path) if s._notes_path
+                else "")
+        self._set_file_title(name, s._path or s._notes_path)
+        self._update_header_collapse()
+
+    def _new_tab(self):
+        """Create a fresh document session in a new tab and make it active."""
+        s = DocumentSession()
+        self._build_document_widgets(s)
+        self._sessions.append(s)
+        page = self._add_session_tab(s)
+        # selecting the page fires notify::selected-page -> _activate_session
+        self._tab_view.set_selected_page(page)
+        return s
+
+    def _session_is_pristine(self, s):
+        """True for an untitled, unmodified, empty scratchpad tab — safe to reuse
+        for the next open instead of leaving it behind as an empty tab."""
+        return (s._path is None and s._notes_path is None
+                and not s._dirty and not s.notes_model.has_content())
+
+    def open_file_in_tab(self, path):
+        """Open from *within* the window: reuse a pristine scratchpad tab if the
+        active one is empty, else add a new tab, then load the file into it.
+        (Opens that originate outside the window get their own window instead.)"""
+        if not self._session_is_pristine(self._active_session):
+            self._new_tab()
+        self.open_file(path)
+
+    def _close_active_tab(self):
+        page = self._tab_view.get_selected_page()
+        if page is None:
+            self.close()
+        else:
+            self._tab_view.close_page(page)   # fires close-page below
+
+    def _on_tab_close(self, tab_view, page):
+        """A tab's close button (or Ctrl+W) was used. Prompt for unsaved changes
+        in that document, then confirm or veto the close asynchronously."""
+        s = self._session_for_page(page)
+        if s is None or not s._dirty:
+            tab_view.close_page_finish(page, True)
+            return True
+        tab_view.set_selected_page(page)   # show which document is being closed
+        dlg = Adw.AlertDialog.new(
+            "Unsaved changes",
+            f"Save changes to "
+            f"{os.path.basename(s._path or s._notes_path or 'Untitled')}?")
+        dlg.add_response("discard", "Discard")
+        dlg.add_response("cancel",  "Cancel")
+        dlg.add_response("save",    "Save")
+        dlg.set_default_response("save")
+        dlg.set_close_response("cancel")
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def on_response(_d, r):
+            if r == "save":
+                self._on_save(after=lambda: tab_view.close_page_finish(page, True))
+            elif r == "discard":
+                if s._path:
+                    _discard_autosave(s._path)
+                tab_view.close_page_finish(page, True)
+            else:
+                tab_view.close_page_finish(page, False)   # veto
+        dlg.connect("response", on_response)
+        dlg.present(self)
+        return True
+
+    def _on_page_detached(self, tab_view, page, _position):
+        """A page was closed (or torn off into another window). Drop its session
+        from this window and close the window once its last tab is gone."""
+        s = getattr(page, "session", None)
+        if s is not None and s in self._sessions:
+            self._sessions.remove(s)
+            # the presenter is bound to this window; drop it on the way out
+            if s._presenter is not None:
+                s._presenter.close()
+                s._presenter = None
+        if tab_view.get_n_pages() == 0:
+            self.close()
+
+    def _on_tab_create_window(self, _tab_view):
+        """A tab was dragged out to empty space: host it in a fresh window and
+        hand libadwaita that window's TabView to move the page into."""
+        new_win = PDFEditorWindow(self.get_application())
+        new_win.present()
+        return new_win._tab_view
+
+    def _on_page_attached(self, _tab_view, page, _position):
+        """Adopt a page torn off from another window. The per-document signals
+        already route through s.win, so re-pointing it (plus repopulating the
+        dynamically-built sidebar) hands the whole document to this window."""
+        s = getattr(page, "session", None)
+        if s is None or s in self._sessions:
+            return   # our own append — already tracked
+        s.win = self
+        self._sessions.append(s)
+        self._activate_session(s)
+        # the thumbnail/outline rows are built dynamically and were wired to the
+        # old window; rebuild them against this one
+        self._populate_toc()
+        # this window opened with an empty scratchpad tab — drop it now
+        GLib.idle_add(self._prune_pristine_tabs, s)
+
+    def _prune_pristine_tabs(self, keep):
+        for s in list(self._sessions):
+            if s is not keep and s._tab_page is not None \
+                    and self._session_is_pristine(s):
+                self._tab_view.close_page(s._tab_page)
+        return False
 
     def _on_realize(self, _widget):
         GLib.idle_add(self._init_pane_position)
@@ -4209,25 +4477,30 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # ── autosave ──────────────────────────────────────────────────────────────
 
     def _autosave_tick(self):
-        if self._dirty and self._path:
-            try:
-                self._write_autosave()
-            except Exception:
-                logger.error("autosave failed:\n" + traceback.format_exc())
+        # snapshot every dirty tab, not just the active one
+        for s in self._sessions:
+            if s._dirty and s._path:
+                try:
+                    self._write_autosave_for(s)
+                except Exception:
+                    logger.error("autosave failed:\n" + traceback.format_exc())
         return True   # keep the timer running
 
     def _write_autosave(self):
-        d = _autosave_dir_for(self._path)
+        self._write_autosave_for(self._active_session)
+
+    def _write_autosave_for(self, s):
+        d = _autosave_dir_for(s._path)
         os.makedirs(d, exist_ok=True)
-        self.canvas.save_copy(os.path.join(d, "doc.pdf"))
-        self._commit_note()
-        self.notes_model.save(os.path.join(d, "notes.md"))
-        meta = {"path": os.path.abspath(self._path), "saved_at": time.time()}
+        s.canvas.save_copy(os.path.join(d, "doc.pdf"))
+        self._commit_note_for(s)
+        s.notes_model.save(os.path.join(d, "notes.md"))
+        meta = {"path": os.path.abspath(s._path), "saved_at": time.time()}
         tmp = os.path.join(d, "meta.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
         os.replace(tmp, os.path.join(d, "meta.json"))
-        logger.info(f"autosave: snapshot written for {self._path}")
+        logger.info(f"autosave: snapshot written for {s._path}")
 
     def _maybe_offer_recovery(self, path):
         found = _find_autosave(path)
@@ -4265,14 +4538,48 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # ── unsaved-changes dialog ────────────────────────────────────────────────
 
     def _on_close_request(self, _win):
-        if not self._dirty:
-            self._close_presenter()
+        if not any(s._dirty for s in self._sessions):
+            self._destroy_all()
             return False   # allow close
-        self._ask_save_then(self._destroy_all)
-        return True        # block default close; destroy() called from dialog
+        self._prompt_close_next_dirty()
+        return True        # block default close; destroy() called once resolved
+
+    def _prompt_close_next_dirty(self):
+        """Walk the dirty tabs one at a time on window close, then destroy."""
+        dirty = [s for s in self._sessions if s._dirty]
+        if not dirty:
+            self._destroy_all()
+            return
+        s = dirty[0]
+        self._tab_view.set_selected_page(s._tab_page)   # show which document
+        dlg = Adw.AlertDialog.new(
+            "Unsaved changes",
+            f"Save changes to "
+            f"{os.path.basename(s._path or s._notes_path or 'Untitled')}?")
+        dlg.add_response("discard", "Discard")
+        dlg.add_response("cancel",  "Cancel")
+        dlg.add_response("save",    "Save")
+        dlg.set_default_response("save")
+        dlg.set_close_response("cancel")
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def on_response(_d, r):
+            if r == "save":
+                self._on_save(after=lambda: (self._clear_dirty(),
+                                             self._prompt_close_next_dirty()))
+            elif r == "discard":
+                if s._path:
+                    _discard_autosave(s._path)
+                self._clear_dirty()
+                self._prompt_close_next_dirty()
+            # cancel: stop closing, leave the window open
+        dlg.connect("response", on_response)
+        dlg.present(self)
 
     def _destroy_all(self):
-        self._close_presenter()
+        for s in self._sessions:
+            if s._presenter is not None:
+                s._presenter.close()
         self.destroy()
 
     def _ask_save_then(self, callback):
@@ -4336,11 +4643,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._toast("Jumped to link — press Alt+Left to go back")
 
     def _commit_note(self):
-        if not self._path and not self._notes_path and not self._is_untitled:
+        self._commit_note_for(self._active_session)
+
+    def _commit_note_for(self, s):
+        if not s._path and not s._notes_path and not s._is_untitled:
             return
-        buf = self._notes_view.get_buffer()
+        buf = s._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
-        self.notes_model.set(self.canvas.current_page_idx, text)
+        s.notes_model.set(s.canvas.current_page_idx, text)
 
     def _restore_note(self):
         self._suppress_dirty = True
@@ -4374,9 +4684,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         specific keys are consumed; every other key passes through to typing."""
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
         if ctrl_held and keyval in (Gdk.KEY_w, Gdk.KEY_W):
-            # single-window today, so close the whole window; once multiple PDFs
-            # (tabs) land, this should close only the current tab.
-            self.close()   # runs the close-request handler (unsaved-changes prompt)
+            # close the current tab (with its own unsaved-changes prompt); the
+            # window closes once its last tab is gone.
+            self._close_active_tab()
             return True
         if ctrl_held and keyval == Gdk.KEY_backslash:
             self._notes_toggle.set_active(not self._notes_toggle.get_active())
@@ -5514,7 +5824,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             def _make_open(p):
                 def _on_click(_btn):
                     self._menu_pop.popdown()
-                    self.open_file(p)
+                    self.open_file_in_tab(p)
                 return _on_click
             row.connect("clicked", _make_open(path))
             box.append(row)
@@ -5575,7 +5885,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for path in paths:
             if path.lower().endswith(self.SUPPORTED_DND):
                 logger.info("DnD: opening %s", path)
-                self.open_file(path)
+                self.open_file_in_tab(path)
                 return True
         logger.info("DnD: no supported file among %s", paths)
         self.toast_overlay.add_toast(
@@ -5701,10 +6011,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._remember_recent(md_path)
 
     def _on_new_pdf(self, _btn):
-        if self._dirty:
-            self._ask_save_then(self._create_blank)
-        else:
-            self._create_blank()
+        # New, like Open, originates from within the window: a fresh tab rather
+        # than discarding the current document (reuse a pristine scratchpad tab).
+        if not self._session_is_pristine(self._active_session):
+            self._new_tab()
+        self._create_blank()
 
     def _create_blank(self):
         """Open a blank A4 page — user will be prompted for a name on first save."""
@@ -5943,7 +6254,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not file:
             return
         try:
-            self.open_file(file.get_path())
+            self.open_file_in_tab(file.get_path())
         except Exception as e:
             self._show_error("Could not open file", str(e))
 

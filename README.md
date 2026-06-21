@@ -50,6 +50,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### Files & integration
 
 - **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice), and `.md` files; drag a file from your file manager onto the window. Any other file opens as text in the notes panel — handy for `.txt`, code, or config files — with a warning to confirm first if it looks binary, isn't valid UTF-8, or is very large
+- **Tabs** — opening a file from inside a window (`Ctrl+O`, Open recent, `Ctrl+N`, or dropping a file onto the window) opens it in a **new tab** in that window. The tab strip stays **hidden until you have more than one document open**, so a single PDF costs no vertical space and the page never moves down; with multiple tabs a full-width strip appears just below the header. `Ctrl+W` closes the current tab (prompting if it has unsaved changes); the window closes when its last tab does. **Drag a tab out** to the desktop to pop it into its own window, or onto another Sidemark window to regroup it side by side. Files opened from outside (file manager, command line) still open in their own window
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects words and copies to clipboard; `Ctrl+M` switches the primary drag to select mode. Selection defaults to **reading order** — like a normal PDF viewer, it grabs the contiguous run of text between where you press and release (column-aware) — and long-pressing the select tool switches to a **rectangular** marquee for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
@@ -196,12 +197,12 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+O` | Open file |
-| `Ctrl+N` | New blank PDF |
+| `Ctrl+O` | Open file (in a new tab) |
+| `Ctrl+N` | New blank PDF (in a new tab) |
 | `Ctrl+S` | Save (prompts for name if untitled) |
-| `Ctrl+W` | Close the window (prompts to save unsaved changes) |
+| `Ctrl+W` | Close the current tab (prompts to save unsaved changes; closes the window with the last tab) |
 
-PDF-level shortcuts — `PageUp` / `PageDown` (page flip), `Ctrl+\` (toggle notes), `Ctrl+W` (close) — work no matter which side has focus, so flipping pages while typing notes works as expected.
+PDF-level shortcuts — `PageUp` / `PageDown` (page flip), `Ctrl+\` (toggle notes), `Ctrl+W` (close tab) — work no matter which side has focus, so flipping pages while typing notes works as expected.
 
 ## Tested distributions
 

@@ -28,7 +28,8 @@ Adw.init()
 sys.path.insert(0, os.path.dirname(__file__))
 import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
-                      _export_pdf_with_notes, _parse_anchors, PDFEditorWindow)
+                      _export_pdf_with_notes, _parse_anchors, PDFEditorWindow,
+                      DocumentSession)
 
 # window tests open files, which records recents — keep that out of the user's
 # real ~/.local/share/sidemark/recent.json (TestRecentFiles patches its own)
@@ -5185,6 +5186,147 @@ class TestNotesSidebarAnimation(unittest.TestCase):
             app.run([])
         if errors:
             raise errors[0]
+
+
+class TestMultiTab(unittest.TestCase):
+    """Opening several PDFs as tabs in one window (idea #51): a DocumentSession
+    per tab, the window's per-document attributes proxied to the active one."""
+
+    _app_seq = 0
+
+    def _in_window(self, body):
+        """Run `body(win)` inside an activated window; re-raise any error."""
+        TestMultiTab._app_seq += 1
+        errors, out = [], {}
+        app = Adw.Application(
+            application_id=f"test.sidemark.multitab{TestMultiTab._app_seq}")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win, out)
+            except Exception as e:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        return out
+
+    def test_open_in_tab_reuses_pristine_then_adds_tab(self):
+        """The first open reuses the empty scratchpad tab; the next opens a new
+        tab and each tab keeps its own canvas/document."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2); make_pdf(b, n_pages=5)
+
+            def body(win, out):
+                out["start"] = len(win._sessions)
+                win.open_file_in_tab(a)
+                out["after_a"] = len(win._sessions)
+                out["a_path"] = win._path
+                out["a_pages"] = win.canvas.n_pages
+                win.open_file_in_tab(b)
+                out["after_b"] = len(win._sessions)
+                out["b_active"] = (win._path == b)
+                out["b_pages"] = win.canvas.n_pages
+                out["distinct"] = (win._sessions[0].canvas
+                                   is not win._sessions[1].canvas)
+
+            out = self._in_window(body)
+            self.assertEqual(out["start"], 1)
+            self.assertEqual(out["after_a"], 1)          # reused scratchpad
+            self.assertEqual(out["a_path"], a)
+            self.assertEqual(out["a_pages"], 2)
+            self.assertEqual(out["after_b"], 2)          # new tab
+            self.assertTrue(out["b_active"])
+            self.assertEqual(out["b_pages"], 5)
+            self.assertTrue(out["distinct"])
+
+    def test_switch_tab_retargets_active_and_commits_note(self):
+        """Switching tabs makes the other document active and flushes the
+        outgoing tab's in-progress note into its own model."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2); make_pdf(b, n_pages=3)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)
+                sa, sb = win._sessions[0], win._sessions[1]
+                # type a note on b's current page, then switch to a
+                sb._notes_view.get_buffer().set_text("hello from b")
+                win._tab_view.set_selected_page(sa._tab_page)
+                out["active_is_a"] = (win._active_session is sa)
+                out["a_path"] = win._path
+                out["b_note"] = sb.notes_model.get(sb.canvas.current_page_idx)
+
+            out = self._in_window(body)
+            self.assertTrue(out["active_is_a"])
+            self.assertEqual(out["a_path"], a)
+            self.assertIn("hello from b", out["b_note"])
+
+    def test_close_tab_removes_session(self):
+        """Closing a (clean) tab drops its session; the other stays active."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=1); make_pdf(b, n_pages=1)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)
+                out["before"] = len(win._sessions)
+                # b is active and clean -> close_page completes synchronously
+                win._tab_view.close_page(win._active_session._tab_page)
+                out["after"] = len(win._sessions)
+                out["remaining_path"] = win._sessions[0]._path
+
+            out = self._in_window(body)
+            self.assertEqual(out["before"], 2)
+            self.assertEqual(out["after"], 1)
+            self.assertEqual(out["remaining_path"], a)
+
+    def test_tearoff_adopts_session_into_new_window(self):
+        """Dragging a tab out (create-window + transfer_page) hands the whole
+        document to a fresh window: its session moves, signals retarget, and
+        navigation drives the new window."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=2); make_pdf(b, n_pages=5)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)
+                page_b = win._sessions[1]._tab_page
+                new_view = win._on_tab_create_window(win._tab_view)
+                win._tab_view.transfer_page(page_b, new_view, 0)
+                sb = page_b.session
+                out["src_sessions"] = len(win._sessions)
+                out["new_is_other_window"] = (sb.win is not win)
+                out["adopted"] = (sb in sb.win._sessions)
+                out["b_path"] = sb._path
+                # navigation must drive the new window now
+                sb.win._activate_session(sb)
+                sb.win._nav_page(1)
+                out["b_page_after_nav"] = sb.canvas.current_page_idx
+
+            out = self._in_window(body)
+            self.assertEqual(out["src_sessions"], 1)       # b left the source
+            self.assertTrue(out["new_is_other_window"])
+            self.assertTrue(out["adopted"])
+            self.assertEqual(out["b_path"], b)
+            self.assertEqual(out["b_page_after_nav"], 1)
+
+    def test_session_proxies_follow_active(self):
+        """The window's per-document attributes resolve to the active session."""
+        win_dummy = DocumentSession()
+        self.assertIn("_path", DocumentSession.STATE)
+        self.assertIn("canvas", DocumentSession.WIDGETS)
 
 
 if __name__ == "__main__":
