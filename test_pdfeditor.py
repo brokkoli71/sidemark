@@ -2028,13 +2028,189 @@ class TestShareToPhone(unittest.TestCase):
             else:
                 self.assertFalse(result)
 
-    def _prepare(self, d):
-        """Drive _share_prepare with a stub save_copy; returns (server, entries).
-        Caller must stop the server."""
+    def _live_server(self, png_bytes=b"\x89PNG\r\n\x1a\nfake", pdf_bytes=b"%PDF-1.4"):
+        """A live-mode _ShareServer backed by plain (non-GTK) provider stubs."""
         import sidemark
-        def _save(p):
-            make_pdf(p)
-        return sidemark.PDFEditorWindow._share_prepare(d, _save, "doc.pdf")
+        state = {"rev": 0, "page": 0, "pages": 3}
+        providers = {
+            "title": "deck.pdf",
+            "state": lambda: (state["rev"], state["page"], state["pages"]),
+            "render": lambda p: open(p, "wb").write(png_bytes),
+            "pdf": lambda p: open(p, "wb").write(pdf_bytes),
+        }
+        return sidemark._ShareServer(providers=providers), state
+
+    def test_live_viewer_serves_page_state_and_pdf(self):
+        import urllib.request, urllib.error
+        srv, state = self._live_server()
+        srv.start()
+        try:
+            base = f"http://127.0.0.1:{srv.port}/{srv.token}/"
+            html = urllib.request.urlopen(base, timeout=5).read().decode()
+            self.assertIn("deck.pdf", html)
+            self.assertIn("page.png", html)               # live image viewer
+            import json
+            st = json.loads(urllib.request.urlopen(base + "state", timeout=5).read())
+            self.assertEqual(st, {"rev": 0, "page": 0, "pages": 3})
+            img = urllib.request.urlopen(base + "page.png", timeout=5).read()
+            self.assertTrue(img.startswith(b"\x89PNG"))
+            pdf = urllib.request.urlopen(base + "doc.pdf", timeout=5).read()
+            self.assertTrue(pdf.startswith(b"%PDF"))
+            self.assertTrue(srv.served)
+            # wrong token / unknown sub-path → 404
+            for bad in (f"http://127.0.0.1:{srv.port}/wrong/state",
+                        base + "secret"):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(bad, timeout=5)
+                self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv.stop()
+
+    def test_live_image_recached_only_when_state_changes(self):
+        import urllib.request
+        renders = {"n": 0}
+        import sidemark
+        state = {"rev": 0, "page": 0, "pages": 2}
+
+        def _render(p):
+            renders["n"] += 1
+            open(p, "wb").write(b"\x89PNG" + bytes([state["rev"]]))
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf",
+            "state": lambda: (state["rev"], state["page"], state["pages"]),
+            "render": _render, "pdf": lambda p: open(p, "wb").write(b"%PDF"),
+        })
+        srv.start()
+        try:
+            url = f"http://127.0.0.1:{srv.port}/{srv.token}/page.png"
+            urllib.request.urlopen(url, timeout=5).read()
+            urllib.request.urlopen(url, timeout=5).read()   # cached, no re-render
+            self.assertEqual(renders["n"], 1)
+            state["rev"] = 1                                # a change happened
+            urllib.request.urlopen(url, timeout=5).read()
+            self.assertEqual(renders["n"], 2)
+        finally:
+            srv.stop()
+
+    def test_share_window_is_non_modal_so_you_can_keep_editing(self):
+        """The share view must be a non-modal window, not a blocking dialog —
+        otherwise you couldn't draw on the PDF while the phone follows along."""
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.sharemodal")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf)
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    win._show_share_dialog()
+                    sw = win._share_window
+                    out["is_window"] = isinstance(sw, Gtk.Window)
+                    out["modal"] = sw.get_modal()
+                    out["main_sensitive"] = win.get_sensitive()
+                    sw.close()        # stops the server + cleans up
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(80, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertTrue(out["is_window"])
+        self.assertFalse(out["modal"])           # non-modal
+        self.assertTrue(out["main_sensitive"])   # main window still interactive
+
+    def test_share_button_next_to_presenter_opens_share(self):
+        """A QR button sits beside the presenter-view button and opens sharing."""
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.sharebtn")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf)
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    # both live in the same end-of-header cluster
+                    kids = []
+                    c = win._header_end.get_first_child()
+                    while c is not None:
+                        kids.append(c); c = c.get_next_sibling()
+                    out["both_in_header"] = (win._share_btn in kids
+                                             and win._present_btn in kids)
+                    win._share_btn.emit("clicked")
+                    out["opened"] = win._share_window is not None
+                    if win._share_window:
+                        win._share_window.close()
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(80, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertTrue(out["both_in_header"])
+        self.assertTrue(out["opened"])
+
+    def test_render_share_page_writes_png_and_revision_bumps(self):
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.liveshare")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf, n_pages=2)
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    png = os.path.join(d, "page.png")
+                    win._render_share_page(win.canvas, png)
+                    out["png_ok"] = (os.path.getsize(png) > 0
+                                     and open(png, "rb").read(4) == b"\x89PNG")
+                    r0 = win._share_revision
+                    win._mark_dirty()
+                    out["bumped"] = (win._share_revision > r0)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertTrue(out["png_ok"])
+        self.assertTrue(out["bumped"])
+
+    def test_live_url_for_points_at_viewer_page(self):
+        import sidemark
+        srv = sidemark._ShareServer(providers={
+            "title": "d.pdf", "state": lambda: (0, 0, 1),
+            "render": lambda p: None, "pdf": lambda p: None})
+        srv.port = 1234
+        self.assertEqual(srv.url_for("100.0.0.1"),
+                         f"http://100.0.0.1:1234/{srv.token}/")
+        srv.stop()
+
+    def _prepare(self, d):
+        """Drive _share_prepare with a stub live server; returns (server,
+        entries). Caller must stop the server."""
+        import sidemark
+        providers = {
+            "title": "doc.pdf",
+            "state": lambda: (0, 0, 1),
+            "render": lambda p: make_pdf(p),
+            "pdf": lambda p: make_pdf(p),
+        }
+        server = sidemark._ShareServer(providers=providers)
+        return sidemark.PDFEditorWindow._share_prepare(d, server, "doc.pdf")
 
     def test_prepare_always_offers_tailscale_with_hint_when_off(self):
         import sidemark

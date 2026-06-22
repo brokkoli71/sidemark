@@ -2854,43 +2854,201 @@ def _make_qr_png(url, out_path):
         return False
 
 
-class _ShareServer:
-    """A one-shot LAN HTTP server that serves a single file under a random,
-    unguessable path — used to hand a PDF to a phone via a QR code / URL."""
+def _html_escape(s):
+    import html
+    return html.escape(s or "", quote=True)
 
-    def __init__(self, file_path):
+
+def _run_on_main(func, timeout=30):
+    """Call func() on the GTK main thread from a worker thread and block until
+    it returns (or raises). Used by the live share server, whose HTTP requests
+    arrive on worker threads but must touch the document, which the UI owns.
+    Must NOT be called from the main thread itself (it would deadlock)."""
+    box, done = {}, threading.Event()
+
+    def _cb():
+        try:
+            box["r"] = func()
+        except Exception as e:                      # noqa: BLE001
+            box["e"] = e
+        finally:
+            done.set()
+        return False
+
+    GLib.idle_add(_cb)
+    if not done.wait(timeout):
+        raise TimeoutError("main-thread call timed out")
+    if "e" in box:
+        raise box["e"]
+    return box.get("r")
+
+
+# The phone-facing page: a current-page image that auto-refreshes (so the viewer
+# follows along live as you draw / flip pages) plus a Download button for the
+# full annotated PDF. An <img> renders on every mobile browser; an embedded PDF
+# does not (Android Chrome won't render PDFs inline in an iframe).
+_SHARE_VIEWER_HTML = """<!doctype html>
+<html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}
+ header{position:sticky;top:0;z-index:1;display:flex;gap:.6rem;align-items:center;
+   padding:.5rem .75rem;background:#1c1c1c;border-bottom:1px solid #333}
+ header .t{flex:1;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;
+   white-space:nowrap}
+ #page{font-size:.8rem;color:#bbb}
+ a.btn{background:#3584e4;color:#fff;border-radius:7px;padding:.45rem .8rem;
+   font-size:.85rem;text-decoration:none;white-space:nowrap}
+ #live{display:flex;align-items:center;gap:.35rem;font-size:.72rem;color:#9ad29a;
+   padding:.25rem .75rem}
+ #dot{width:.5rem;height:.5rem;border-radius:50%;background:#9ad29a;
+   animation:pulse 1.6s infinite}
+ @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+ #img{display:block;max-width:100%;height:auto;margin:0 auto;background:#fff}
+ #err{display:none;color:#e0a0a0;padding:.5rem .75rem;font-size:.8rem}
+</style></head>
+<body>
+<header>
+ <span class=t>__TITLE__</span>
+ <span id=page></span>
+ <a class=btn href="doc.pdf" download="__TITLE__">Download</a>
+</header>
+<div id=live><span id=dot></span><span>Live — follows the presenter</span></div>
+<div id=err>Lost connection to the computer.</div>
+<img id=img alt="current page" src="page.png">
+<script>
+ let cur=null, fails=0;
+ async function tick(){
+   try{
+     const r=await fetch('state',{cache:'no-store'});
+     if(!r.ok) throw 0;
+     const s=await r.json();
+     fails=0; document.getElementById('err').style.display='none';
+     document.getElementById('page').textContent='Page '+(s.page+1)+' / '+s.pages;
+     const key=s.rev+'-'+s.page;
+     if(key!==cur){cur=key;
+       document.getElementById('img').src='page.png?v='+encodeURIComponent(key);}
+   }catch(e){ if(++fails>3) document.getElementById('err').style.display='block'; }
+   setTimeout(tick, 1500);
+ }
+ tick();
+</script>
+</body></html>"""
+
+
+class _ShareServer:
+    """A one-shot LAN HTTP server under a random, unguessable path. Two modes:
+
+    * static  — serves a single file (legacy; `_ShareServer(path)`).
+    * live    — serves a phone viewer that follows the document as it changes:
+                `_ShareServer(providers=...)`, where providers is a dict with
+                'title' (str), 'state' ()->(rev,page,pages), 'render'(path) and
+                'pdf'(path). render/pdf are expected to already marshal to the
+                main thread; state is read straight (cheap int reads)."""
+
+    def __init__(self, file_path=None, *, providers=None):
         import secrets
-        self.file_path = file_path
-        self.filename = os.path.basename(file_path) or "document.pdf"
         self.token = secrets.token_urlsafe(8)
         self.ip = _lan_ip()
         self.port = 0
         self.served = False
         self._httpd = None
+        self.providers = providers
+        self.file_path = file_path
+        self.filename = (os.path.basename(file_path) if file_path
+                         else (providers or {}).get("title", "document.pdf"))
+        self._lock = threading.Lock()
+        self._img_cache = {"key": None, "data": None}
+        self._pdf_cache = {"rev": None, "data": None}
+        self._tmp = (tempfile.mkdtemp(prefix="sidemark-live-")
+                     if providers is not None else None)
+
+    # ── live-mode body builders (cached; rendered/baked on demand) ──────────
+    def _live_image(self):
+        rev, page, _ = self.providers["state"]()
+        key = (rev, page)
+        with self._lock:
+            if self._img_cache["key"] != key:
+                p = os.path.join(self._tmp, "page.png")
+                self.providers["render"](p)
+                with open(p, "rb") as f:
+                    self._img_cache = {"key": key, "data": f.read()}
+            return self._img_cache["data"]
+
+    def _live_pdf(self):
+        rev, _, _ = self.providers["state"]()
+        with self._lock:
+            if self._pdf_cache["rev"] != rev or self._pdf_cache["data"] is None:
+                p = os.path.join(self._tmp, "doc.pdf")
+                self.providers["pdf"](p)
+                with open(p, "rb") as f:
+                    self._pdf_cache = {"rev": rev, "data": f.read()}
+            return self._pdf_cache["data"]
 
     def start(self):
         import http.server
+        import json as _json
         from urllib.parse import unquote
-        token, fpath, fname, server = self.token, self.file_path, self.filename, self
+        server = self
+        token, fname = self.token, self.filename
 
         class _Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                if unquote(self.path) != f"/{token}/{fname}":
-                    self.send_error(404)
-                    return
-                try:
-                    with open(fpath, "rb") as f:
-                        data = f.read()
-                except OSError:
-                    self.send_error(404)
-                    return
+            def _send(self, data, ctype, disposition=None):
                 self.send_response(200)
-                self.send_header("Content-Type", "application/pdf")
-                self.send_header("Content-Disposition", f'inline; filename="{fname}"')
+                self.send_header("Content-Type", ctype)
+                if disposition:
+                    self.send_header("Content-Disposition", disposition)
                 self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
-                server.served = True
+
+            def do_GET(self):
+                path = unquote(self.path.split("?", 1)[0])
+                base = f"/{token}/"
+                if not path.startswith(base):
+                    self.send_error(404)
+                    return
+                sub = path[len(base):]
+
+                if server.providers is None:           # static, single file
+                    if sub != fname:
+                        self.send_error(404)
+                        return
+                    try:
+                        with open(server.file_path, "rb") as f:
+                            data = f.read()
+                    except OSError:
+                        self.send_error(404)
+                        return
+                    self._send(data, "application/pdf",
+                               f'inline; filename="{fname}"')
+                    server.served = True
+                    return
+
+                try:
+                    if sub in ("", "index.html"):
+                        html = _SHARE_VIEWER_HTML.replace(
+                            "__TITLE__", _html_escape(fname))
+                        self._send(html.encode("utf-8"),
+                                   "text/html; charset=utf-8")
+                    elif sub == "state":
+                        rev, page, pages = server.providers["state"]()
+                        body = _json.dumps(
+                            {"rev": rev, "page": page, "pages": pages})
+                        self._send(body.encode("utf-8"), "application/json")
+                    elif sub == "page.png":
+                        self._send(server._live_image(), "image/png")
+                    elif sub == "doc.pdf":
+                        self._send(server._live_pdf(), "application/pdf",
+                                   f'attachment; filename="{fname}"')
+                        server.served = True
+                    else:
+                        self.send_error(404)
+                except Exception:                      # noqa: BLE001
+                    self.send_error(503)
 
             def log_message(self, *_a):
                 pass   # don't spam stderr
@@ -2902,6 +3060,8 @@ class _ShareServer:
 
     def url_for(self, host):
         from urllib.parse import quote
+        if self.providers is not None:
+            return f"http://{host}:{self.port}/{self.token}/"
         return f"http://{host}:{self.port}/{self.token}/{quote(self.filename)}"
 
     @property
@@ -2913,6 +3073,8 @@ class _ShareServer:
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None
+        if self._tmp:
+            shutil.rmtree(self._tmp, ignore_errors=True)
 
 
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
@@ -3888,6 +4050,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._active_session = DocumentSession()
         self._sessions = [self._active_session]
         self._closed_tabs = []   # reopen stack for Ctrl+Shift+T (file paths)
+        self._share_revision = 0  # bumps on every change; drives live phone share
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
         self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
@@ -4534,6 +4697,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Presenter view — mirror the page on a second screen (F5)")
         self._present_btn.connect("toggled", self._on_present_toggled)
 
+        # Sibling of the presenter button: mirror the page to a phone instead of
+        # a second screen — a live view the audience can follow, QR to connect.
+        self._share_btn = Gtk.Button()
+        self._share_btn.set_icon_name(
+            _themed_icon("qr-code-symbolic", "phone-symbolic"))
+        self._share_btn.set_tooltip_text(
+            "Share to phone — live view + QR code")
+        self._share_btn.connect("clicked", lambda _: self._on_share_to_phone())
+
         self._notes_toggle = Gtk.ToggleButton()
         self._notes_toggle.set_icon_name(
             _themed_icon("view-sidebar-symbolic", "sidebar-show-symbolic"))
@@ -4555,6 +4727,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._header_end = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._header_end.append(search_btn)
         self._header_end.append(self._present_btn)
+        self._header_end.append(self._share_btn)
         self._header_end.append(self._notes_toggle)
 
         # Icon buttons don't compress, so the cluster's *minimum* width equals
@@ -5201,6 +5374,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _mark_dirty(self, *_):
         if not self._suppress_dirty:
             self._dirty = True
+        # bump the revision so any live phone-share view knows to refresh
+        self._share_revision += 1
         if self._presenter is not None:
             self._presenter.refresh()
 
@@ -6232,7 +6407,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._tools_box.set_visible(not collapse_pen)
         self._pen_modes_section.set_visible(collapse_pen)
         for b in (self._undo_btn, self._redo_btn, self._search_btn,
-                  self._present_btn, self._undo_sep):
+                  self._present_btn, self._share_btn, self._undo_sep):
             b.set_visible(level < 2)
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
@@ -7146,13 +7321,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._show_share_dialog()
 
     @staticmethod
-    def _share_prepare(out_dir, bake, name):
-        """Worker-thread body: bake the PDF, start the server, render QR PNGs.
-        Returns (server, entries) or raises. Each entry is a dict with a
-        caption and either a ready QR path + url, or a hint string."""
-        out_path = os.path.join(out_dir, name)
-        bake(out_path)                            # current state + notes baked in
-        server = _ShareServer(out_path)
+    def _share_prepare(out_dir, server, name):
+        """Worker-thread body: start the (already-built) server and render the QR
+        PNGs. Returns (server, entries) or raises. Each entry is a dict with a
+        caption and either a ready QR path + url, or a hint string. Nothing is
+        baked up front — the live server renders/bakes on demand."""
         server.start()
 
         entries = []
@@ -7223,19 +7396,32 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             col.append(hint)
         return col
 
+    def _render_share_page(self, canvas, path):
+        """Render the document's current page (with ink) to a PNG. Runs on the
+        main thread — fitz objects belong to the UI."""
+        canvas._write_ink_annotations()          # sync live strokes into the page
+        page = canvas.document[canvas.current_page_idx]
+        zoom = 1500.0 / max(page.rect.width, 1)   # ~1500px wide is crisp on phones
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                              annots=True, alpha=False)
+        pix.save(path)
+
     def _show_share_dialog(self):
         out_dir = tempfile.mkdtemp(prefix="sidemark-share-")
-        save_copy = self.canvas.save_copy
+        # Bind to the document that's active *now*, so the live view keeps
+        # following it even if the user switches tabs while sharing.
+        canvas = self.canvas
+        save_copy = canvas.save_copy
         notes_model = self.notes_model
-        accent = self.canvas.zoom_accent
+        accent = canvas.zoom_accent
         name = (os.path.basename(self._path)
                 if (self._path and not self._is_untitled) else "document.pdf")
         if not name.lower().endswith(".pdf"):
             name += ".pdf"
 
         def bake(out_path):
-            # Share the *exported* version: bake ink, then render notes/anchors/
-            # callouts/text boxes (grouped) into the shared copy.
+            # The full annotated export (ink + grouped notes/anchors/callouts/
+            # text boxes) served behind the Download button.
             ink = out_path + ".ink.pdf"
             save_copy(ink)
             try:
@@ -7248,63 +7434,114 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 except OSError:
                     pass
 
-        # A placeholder shown while the worker prepares everything.
-        loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        loading.set_size_request(420, 240)
-        loading.set_valign(Gtk.Align.CENTER)
-        loading.set_halign(Gtk.Align.CENTER)
-        spinner = Gtk.Spinner()
-        spinner.set_size_request(48, 48)
-        spinner.start()
-        loading.append(spinner)
-        msg = Gtk.Label(label="Preparing a link for your phone…")
-        msg.add_css_class("dim-label")
-        loading.append(msg)
+        providers = {
+            "title": name,
+            # cheap int reads — safe to call straight from the server thread
+            "state": lambda: (self._share_revision,
+                              canvas.current_page_idx, canvas.n_pages),
+            # these touch the document, so hop to the main thread and block
+            "render": lambda p: _run_on_main(
+                lambda: self._render_share_page(canvas, p)),
+            "pdf": lambda p: _run_on_main(lambda: bake(p)),
+        }
+        server = _ShareServer(providers=providers)
 
-        dlg = Adw.AlertDialog.new(
-            "Open on your phone",
-            "Scan a code (or open a link) on your phone. The link works "
-            "until you close this dialog.")
-        dlg.set_extra_child(loading)
-        dlg.add_response("close", "Close")
-        dlg.set_default_response("close")
-        dlg.set_close_response("close")
+        # A *non-modal* companion window (not an AlertDialog) so you can keep
+        # drawing on / flipping through the PDF while the phone follows along —
+        # the whole point of the live view. Set it aside and work behind it.
+        win = Adw.Window()
+        self._share_window = win   # kept for testing / single-instance reuse
+        win.set_title("Sharing to phone")
+        win.set_transient_for(self)
+        win.set_modal(False)
+        win.set_default_size(520, 420)
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        body.set_margin_top(12)
+        body.set_margin_bottom(18)
+        body.set_margin_start(18)
+        body.set_margin_end(18)
+        toolbar.set_content(body)
+        win.set_content(toolbar)
 
-        state = {"server": None, "done": False}
+        def _clear(box):
+            child = box.get_first_child()
+            while child is not None:
+                box.remove(child)
+                child = box.get_first_child()
+
+        def _show_loading():
+            _clear(body)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            box.set_vexpand(True)
+            box.set_valign(Gtk.Align.CENTER)
+            box.set_halign(Gtk.Align.CENTER)
+            spinner = Gtk.Spinner()
+            spinner.set_size_request(48, 48)
+            spinner.start()
+            box.append(spinner)
+            msg = Gtk.Label(label="Preparing a link for your phone…")
+            msg.add_css_class("dim-label")
+            box.append(msg)
+            body.append(box)
+        _show_loading()
+
+        stopped = {"v": False}
 
         def _cleanup(*_a):
-            if state["server"] is not None:
-                state["server"].stop()
+            if stopped["v"]:
+                return False
+            stopped["v"] = True
+            server.stop()      # safe even if it never started; also rmtree's tmp
             shutil.rmtree(out_dir, ignore_errors=True)
-        dlg.connect("response", _cleanup)
-        dlg.present(self)
+            return False
+        win.connect("close-request", _cleanup)
+        win.present()
 
-        def _ready(server, entries):
-            state["server"], state["done"] = server, True
+        def _ready(srv, entries):
+            _clear(body)
+            intro = Gtk.Label(
+                label="Scan to open a <b>live view</b> on your phone — it follows "
+                      "along as you draw and flip pages. Tap <b>Download</b> there "
+                      "for the full annotated PDF. Keep this window open while you "
+                      "work; closing it stops sharing.")
+            intro.set_use_markup(True)
+            intro.set_wrap(True)
+            intro.set_xalign(0)
+            body.append(intro)
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
             row.set_margin_top(6)
             row.set_homogeneous(True)
             for entry in entries:
                 row.append(self._share_entry(entry))
-            dlg.set_extra_child(row)
+            body.append(row)
+            live = Gtk.Label(label="●  Live — your phone mirrors this document")
+            live.add_css_class("dim-label")
+            live.add_css_class("caption")
+            live.set_margin_top(4)
+            body.append(live)
             # safety net: stop serving after 10 minutes even if left open
-            GLib.timeout_add_seconds(600, lambda: (server.stop(), False)[1])
+            GLib.timeout_add_seconds(
+                600, lambda: (_cleanup(), win.close(), False)[2])
             return False
 
         def _failed(message):
-            spinner.stop()
+            _clear(body)
             shutil.rmtree(out_dir, ignore_errors=True)
-            dlg.set_extra_child(None)
-            dlg.set_body(f"Could not prepare the share:\n{message}")
+            lbl = Gtk.Label(label=f"Could not prepare the share:\n{message}")
+            lbl.set_wrap(True)
+            lbl.set_xalign(0)
+            body.append(lbl)
             return False
 
         def _worker():
             try:
-                server, entries = self._share_prepare(out_dir, bake, name)
+                srv, entries = self._share_prepare(out_dir, server, name)
             except Exception as e:                          # noqa: BLE001
                 GLib.idle_add(_failed, str(e))
                 return
-            GLib.idle_add(_ready, server, entries)
+            GLib.idle_add(_ready, srv, entries)
 
         threading.Thread(target=_worker, daemon=True).start()
 
