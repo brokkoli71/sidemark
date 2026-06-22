@@ -2124,6 +2124,52 @@ class TestShareToPhone(unittest.TestCase):
         self.assertFalse(out["modal"])           # non-modal
         self.assertTrue(out["main_sensitive"])   # main window still interactive
 
+    def test_live_render_includes_overlays_without_touching_live_doc(self):
+        """The live page image must show anchors/callouts/text boxes (drawn in
+        the accent colour), and must NOT bake them into the live document."""
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.liveoverlay")
+
+        def _red(png):
+            pix = fitz.Pixmap(png)
+            s, n = pix.samples, pix.n
+            return sum(1 for i in range(0, len(s), n)
+                       if s[i] > 150 and s[i + 1] < 90 and s[i + 2] < 90)
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf)
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    accent = (1, 0, 0)
+                    blank = os.path.join(d, "blank.png")
+                    win._render_share_page(win.canvas, win.notes_model, accent, blank)
+                    out["blank_red"] = _red(blank)          # white page → ~no red
+                    win.notes_model.set(
+                        0, "<!-- anchor:100:200 --> <!-- callout:300:300 -->\n"
+                           "Callout body\n\n<!-- textbox:120:500 -->\nBox text")
+                    marked = os.path.join(d, "marked.png")
+                    win._render_share_page(win.canvas, win.notes_model, accent, marked)
+                    out["marked_red"] = _red(marked)        # overlays in accent
+                    out["pages"] = win.canvas.n_pages       # live doc untouched
+                    # the live page itself must not have gained the overlay text
+                    out["live_text"] = win.canvas.document[0].get_text()
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(60, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertEqual(out["blank_red"], 0)
+        self.assertGreater(out["marked_red"], 0)
+        self.assertEqual(out["pages"], 1)
+        self.assertNotIn("Box text", out["live_text"])     # not baked into doc
+
     def test_share_button_next_to_presenter_opens_share(self):
         """A QR button sits beside the presenter-view button and opens sharing."""
         errors, out = [], {}
@@ -2170,7 +2216,8 @@ class TestShareToPhone(unittest.TestCase):
                     win = PDFEditorWindow(a); win.present()
                     win.open_file_in_tab(pdf)
                     png = os.path.join(d, "page.png")
-                    win._render_share_page(win.canvas, png)
+                    win._render_share_page(win.canvas, win.notes_model,
+                                           win.canvas.zoom_accent, png)
                     out["png_ok"] = (os.path.getsize(png) > 0
                                      and open(png, "rb").read(4) == b"\x89PNG")
                     r0 = win._share_revision

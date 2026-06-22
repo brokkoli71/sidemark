@@ -3077,6 +3077,23 @@ class _ShareServer:
             shutil.rmtree(self._tmp, ignore_errors=True)
 
 
+def _draw_page_marks(out_page, notes_text, accent):
+    """Draw a page's on-page marks into the given (copied) page: flatten ink to
+    content first, then text boxes, callout boxes, and numbered anchor circles on
+    top — same stacking as the canvas. Shared by the PDF export and the live
+    phone-share page render so both look identical."""
+    _flatten_ink(out_page)
+    anchors = _parse_anchors(notes_text)
+    for t in _parse_textboxes(notes_text):
+        if t["text"]:
+            _draw_export_textbox(out_page, t, accent)
+    for a in anchors:
+        if a["callout"] and a["text"]:
+            _draw_export_callout(out_page, a, accent)
+    for i, a in enumerate(anchors):
+        _draw_export_anchor(out_page, a["x"], a["y"], i + 1, accent)
+
+
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
                            accent, group=False):
     """Bake the notes into a copy of the PDF.
@@ -3095,21 +3112,8 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
     out_doc = fitz.open()
     anchor_color = accent
 
-    def _draw_marks(out_page, notes_text, anchors):
-        # Flatten ink strokes into the page content first, so they sit *under*
-        # the notes marks and — crucially — render in viewers that ignore PDF
-        # annotations (most phone browsers do).
-        _flatten_ink(out_page)
-        # text boxes (#56) first, then callout boxes, then numbered anchor
-        # circles on top — same stacking as the canvas
-        for t in _parse_textboxes(notes_text):
-            if t["text"]:
-                _draw_export_textbox(out_page, t, anchor_color)
-        for a in anchors:
-            if a["callout"] and a["text"]:
-                _draw_export_callout(out_page, a, anchor_color)
-        for i, a in enumerate(anchors):
-            _draw_export_anchor(out_page, a["x"], a["y"], i + 1, anchor_color)
+    def _draw_marks(out_page, notes_text, _anchors):
+        _draw_page_marks(out_page, notes_text, anchor_color)
 
     if group:
         pending = []          # [(page_idx, [blocks])] waiting for a notes page
@@ -7396,15 +7400,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             col.append(hint)
         return col
 
-    def _render_share_page(self, canvas, path):
-        """Render the document's current page (with ink) to a PNG. Runs on the
-        main thread — fitz objects belong to the UI."""
+    def _render_share_page(self, canvas, notes_model, accent, path):
+        """Render the document's current page to a PNG for the live phone view —
+        with ink, text boxes, callouts and anchor circles drawn in, exactly like
+        the export. Runs on the main thread (fitz objects belong to the UI) and
+        works on a one-page *copy* so the live document is never modified."""
         canvas._write_ink_annotations()          # sync live strokes into the page
-        page = canvas.document[canvas.current_page_idx]
-        zoom = 1500.0 / max(page.rect.width, 1)   # ~1500px wide is crisp on phones
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
-                              annots=True, alpha=False)
-        pix.save(path)
+        idx = canvas.current_page_idx
+        out = fitz.open()
+        try:
+            out.insert_pdf(canvas.document, from_page=idx, to_page=idx)
+            page = out[0]
+            _draw_page_marks(page, _symbolize(notes_model.get(idx)), accent)
+            zoom = 1500.0 / max(page.rect.width, 1)   # ~1500px is crisp on phones
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            pix.save(path)
+        finally:
+            out.close()
 
     def _show_share_dialog(self):
         out_dir = tempfile.mkdtemp(prefix="sidemark-share-")
@@ -7441,7 +7453,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                               canvas.current_page_idx, canvas.n_pages),
             # these touch the document, so hop to the main thread and block
             "render": lambda p: _run_on_main(
-                lambda: self._render_share_page(canvas, p)),
+                lambda: self._render_share_page(canvas, notes_model, accent, p)),
             "pdf": lambda p: _run_on_main(lambda: bake(p)),
         }
         server = _ShareServer(providers=providers)
