@@ -1,3 +1,40 @@
+## [0.3.0] - 2026-06-22 — Reaching Out
+
+### 🚀 Features
+
+- *(nav)* Follow footnote/citation links and jump back (Alt+Left)
+- Sidebar selection/tooltips, switchable notes file, open-any-file
+- Open multiple PDFs as tabs in one window (#51)
+- *(ocr)* OCR for scanned PDFs, plus CLI --help and shell completion
+- *(nav)* Stop wheel/touchpad scroll from over-scrolling past first/last page
+- *(callouts)* Render symbols, super/subscripts and Markdown in callout boxes
+- *(callouts)* Standalone text boxes on the page (Ctrl+Alt+right-click)
+- *(share)* Share the current PDF to a phone via a QR code (#62)
+- *(share)* Offer an "Over Tailscale" QR when a tailnet IP is present
+- *(export)* Flatten ink, trim notes pages, group them, and share the export
+- *(tabs)* Reopen the last closed tab with Ctrl+Shift+T
+- *(pptx)* Import slide speaker notes into the notes sidebar
+
+### 🐛 Bug Fixes
+
+- *(menu)* Use an inline stack so first 'Open recent' click works (#63)
+- *(notes)* Keep \sum etc. as source in saved notes; render symbols for display only
+- *(install)* Build ocrmypdf with system python so a mise/pyenv shim can't break it
+- *(ocr)* No longer wipe a document's notes
+
+### 📚 Documentation
+
+- Add discovery keywords and a star/vote nudge
+- Lead the README with lecture-focused selling points
+
+### 🧪 Testing
+
+- Add headless Weston wrapper to run the suite without spawning windows
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to 0.2.2.r0.ge73476b
+- Ignore notes/ scratch dir and sync ideas.csv issue metadata
 ## [0.2.2] - 2026-06-18
 
 ### 🚀 Features
