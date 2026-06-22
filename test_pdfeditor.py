@@ -49,6 +49,52 @@ def make_pdf(path, n_pages=1, width=595, height=842):
     surface.finish()
 
 
+def make_pptx(path, slide_notes):
+    """Write a minimal .pptx (OOXML zip) whose slides carry the given speaker
+    notes. slide_notes maps a 0-based slide index to its notes text (or None for
+    a slide with no notes). Used to test _extract_pptx_notes without LibreOffice
+    or python-pptx."""
+    import zipfile
+    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    PR = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def notes_xml(text):
+        paras = "".join(f'<a:p><a:r><a:t>{ln}</a:t></a:r></a:p>'
+                        for ln in text.split("\n"))
+        return (f'<p:notes xmlns:p="{PR}" xmlns:a="{A}"><p:cSld><p:spTree>'
+                f'<p:sp><p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr>'
+                f'</p:nvSpPr><p:txBody>{paras}</p:txBody></p:sp>'
+                f'<p:sp><p:nvSpPr><p:nvPr><p:ph type="sldNum"/></p:nvPr>'
+                f'</p:nvSpPr><p:txBody><a:p><a:r><a:t>9</a:t></a:r></a:p>'
+                f'</p:txBody></p:sp></p:spTree></p:cSld></p:notes>')
+
+    n = len(slide_notes)
+    with zipfile.ZipFile(path, "w") as z:
+        slds = "".join(f'<p:sldId id="{256 + i}" r:id="rId{i + 1}"/>'
+                       for i in range(n))
+        z.writestr("ppt/presentation.xml",
+                   f'<p:presentation xmlns:p="{PR}" xmlns:r="{R}">'
+                   f'<p:sldIdLst>{slds}</p:sldIdLst></p:presentation>')
+        rels = "".join(
+            f'<Relationship Id="rId{i + 1}" Type="{R}/slide" '
+            f'Target="slides/slide{i + 1}.xml"/>' for i in range(n))
+        z.writestr("ppt/_rels/presentation.xml.rels",
+                   f'<Relationships xmlns="{REL}">{rels}</Relationships>')
+        for i in range(n):
+            z.writestr(f"ppt/slides/slide{i + 1}.xml", "<p:sld/>")
+            text = slide_notes[i]
+            if text is None:
+                continue
+            z.writestr(f"ppt/slides/_rels/slide{i + 1}.xml.rels",
+                       f'<Relationships xmlns="{REL}"><Relationship Id="rIdN" '
+                       f'Type="{R}/notesSlide" '
+                       f'Target="../notesSlides/notesSlide{i + 1}.xml"/>'
+                       f'</Relationships>')
+            z.writestr(f"ppt/notesSlides/notesSlide{i + 1}.xml", notes_xml(text))
+
+
 def make_linked_pdf(path, n_pages=3):
     """A PDF whose page 0 carries an internal GOTO link (like a footnote /
     citation reference) pointing low on page 1."""
@@ -5591,6 +5637,91 @@ class TestNotesSidebarAnimation(unittest.TestCase):
             app.run([])
         if errors:
             raise errors[0]
+
+
+class TestPptxNotes(unittest.TestCase):
+    """Importing a PowerPoint deck pulls its speaker notes into the sidebar."""
+
+    def test_extract_in_slide_order_skips_empty_and_placeholders(self):
+        from sidemark import _extract_pptx_notes
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "deck.pptx")
+            make_pptx(p, {0: "First slide notes", 1: None,
+                          2: "Third\nsecond line"})
+            got = _extract_pptx_notes(p)
+            self.assertEqual(set(got), {0, 2})           # slide 1 had no notes
+            self.assertEqual(got[0], "First slide notes")
+            self.assertEqual(got[2], "Third\nsecond line")
+            # the slide-number placeholder ("9") must not leak in
+            self.assertNotIn("9", got[0])
+
+    def test_extract_returns_empty_on_non_pptx(self):
+        from sidemark import _extract_pptx_notes
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "not.pptx")
+            with open(p, "wb") as f:
+                f.write(b"not a zip")
+            self.assertEqual(_extract_pptx_notes(p), {})
+
+    def test_apply_pptx_notes_populates_sidebar(self):
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.pptxnotes")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf, n_pages=3)
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    win._apply_pptx_notes({0: "intro notes", 2: "outro notes"})
+                    out["p0"] = win.notes_model.get(0)
+                    out["p1"] = win.notes_model.get(1)
+                    out["p2"] = win.notes_model.get(2)
+                    out["dirty"] = win._dirty
+                    out["visible"] = win._notes_view.get_buffer().get_text(
+                        *win._notes_view.get_buffer().get_bounds(), False)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertEqual(out["p0"], "intro notes")
+        self.assertEqual(out["p1"], "")                  # untouched
+        self.assertEqual(out["p2"], "outro notes")
+        self.assertTrue(out["dirty"])
+        self.assertIn("intro notes", out["visible"])     # page 0 shown
+
+    def test_apply_pptx_notes_ignores_out_of_range_slides(self):
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.pptxnotes2")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf, n_pages=1)
+                    win = PDFEditorWindow(a); win.present()
+                    win.open_file_in_tab(pdf)
+                    # only 1 page; slide index 5 must be dropped, not crash
+                    win._apply_pptx_notes({0: "ok", 5: "too far"})
+                    out["p0"] = win.notes_model.get(0)
+                    out["has5"] = 5 in win.notes_model._notes
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertEqual(out["p0"], "ok")
+        self.assertFalse(out["has5"])
 
 
 class TestMultiTab(unittest.TestCase):

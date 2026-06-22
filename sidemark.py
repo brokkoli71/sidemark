@@ -2612,6 +2612,88 @@ def _parse_textboxes(text):
     return result
 
 
+def _extract_pptx_notes(pptx_path):
+    """Return {0-based slide index: speaker-notes text} for a .pptx, in the
+    presentation's slide order, for slides that actually carry notes.
+
+    A .pptx is a zip of OOXML parts: presentation.xml lists the slides in order
+    (by relationship id), each slide's .rels points at its notesSlide part, and
+    the notes text lives in the notes slide's body placeholder. Best-effort —
+    any problem yields {} so importing notes never blocks opening the deck."""
+    import zipfile
+    import posixpath
+    from xml.etree import ElementTree as ET
+
+    A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    PR = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+    R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    SKIP_PH = {"sldNum", "dt", "ftr", "hdr"}   # non-notes placeholders
+
+    def _resolve(target, base_dir):
+        if target.startswith("/"):
+            return target.lstrip("/")
+        return posixpath.normpath(posixpath.join(base_dir, target))
+
+    def _rels_for(part):
+        d, b = posixpath.split(part)
+        return posixpath.join(d, "_rels", b + ".rels")
+
+    def _rel_map(z, rels_part):
+        out = {}
+        try:
+            root = ET.fromstring(z.read(rels_part))
+        except (KeyError, ET.ParseError):
+            return out
+        for rel in root.findall(f"{REL}Relationship"):
+            out[rel.get("Id")] = (rel.get("Type", ""), rel.get("Target", ""))
+        return out
+
+    def _notes_text(xml_bytes):
+        root = ET.fromstring(xml_bytes)
+        paras = []
+        for sp in root.iter(f"{PR}sp"):
+            ph = sp.find(f".//{PR}nvSpPr/{PR}nvPr/{PR}ph")
+            if ph is not None and ph.get("type") in SKIP_PH:
+                continue
+            txbody = sp.find(f"{PR}txBody")
+            if txbody is None:
+                continue
+            for p in txbody.findall(f"{A}p"):
+                paras.append("".join(t.text or "" for t in p.iter(f"{A}t")))
+        return "\n".join(paras)
+
+    notes = {}
+    try:
+        with zipfile.ZipFile(pptx_path) as z:
+            names = set(z.namelist())
+            pres = ET.fromstring(z.read("ppt/presentation.xml"))
+            lst = pres.find(f"{PR}sldIdLst")
+            if lst is None:
+                return {}
+            rids = [s.get(f"{R}id") for s in lst.findall(f"{PR}sldId")]
+            pres_rels = _rel_map(z, "ppt/_rels/presentation.xml.rels")
+            for idx, rid in enumerate(rids):
+                _, target = pres_rels.get(rid, ("", ""))
+                if not target:
+                    continue
+                slide_part = _resolve(target, "ppt")
+                slide_rels = _rel_map(z, _rels_for(slide_part))
+                notes_part = None
+                for _id, (rtype, rtarget) in slide_rels.items():
+                    if rtype.endswith("/notesSlide"):
+                        notes_part = _resolve(rtarget, posixpath.dirname(slide_part))
+                        break
+                if not notes_part or notes_part not in names:
+                    continue
+                text = _notes_text(z.read(notes_part)).strip()
+                if text:
+                    notes[idx] = text
+    except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError):
+        return {}
+    return notes
+
+
 def _pdf_needs_ocr(path, sample=10):
     """Heuristic: does this PDF look like a scan with no searchable text?
 
@@ -6929,7 +7011,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     check=True, capture_output=True,
                 )
                 pdf_path = os.path.join(out_dir, base + ".pdf")
-                GLib.idle_add(lambda: (toast.dismiss(), self.open_file(pdf_path)) and None)
+                # Slide notes live in the .pptx (the PDF doesn't carry them);
+                # pull them so they can land in the notes sidebar.
+                slide_notes = _extract_pptx_notes(pptx_path)
+                GLib.idle_add(lambda: (toast.dismiss(), self.open_file(pdf_path),
+                                       self._apply_pptx_notes(slide_notes)) and None)
             except FileNotFoundError:
                 GLib.idle_add(lambda: (toast.dismiss(),
                     self._show_error("Conversion failed",
@@ -6940,6 +7026,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     self._show_error("Conversion failed", msg)) and None)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _apply_pptx_notes(self, slide_notes):
+        """Drop a converted deck's speaker notes into the notes sidebar, one
+        slide → one page. The deck just opened, so notes_model is fresh; mark the
+        document dirty so the notes are saved on first save."""
+        if not slide_notes:
+            return
+        n = self.canvas.n_pages
+        applied = 0
+        for idx, text in slide_notes.items():
+            if 0 <= idx < n:
+                self.notes_model.set(idx, text)
+                applied += 1
+        if not applied:
+            return
+        self._restore_note()              # refresh the visible page's note
+        self._set_notes_shown(True)
+        self._mark_dirty()
+        self._toast(f"Imported speaker notes from {applied} "
+                    f"slide{'s' if applied != 1 else ''}")
 
     # ── OCR (optional: needs the external 'ocrmypdf' tool) ──────────────────────
     def _maybe_offer_ocr(self, path):

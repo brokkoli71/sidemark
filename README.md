@@ -15,7 +15,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 - **Just PDF and Markdown** — strokes save as native PDF ink annotations; notes save as a standard `.md` sidecar that's Obsidian-compatible and readable anywhere
 - **Markdown notes built for lectures** — a full Markdown editor sits beside the page, scoped to whichever page you're on, with fast inline math for the things that actually come up in a lecture: indices, exponents, and Greek letters (`x^2`, `\alpha`, `\sum` …)
-- **Open PowerPoints directly — and present on them** — drop a `.pptx` in and it's converted to PDF automatically; presenter view (`F5`) mirrors the current slide to a second screen and shows your ink live, so you can draw on the slides while you teach
+- **Open PowerPoints directly — and present on them** — drop a `.pptx` in and it's converted to PDF automatically, with each slide's **speaker notes imported into the notes sidebar** (one slide → one page) so your talking points come along; presenter view (`F5`) mirrors the current slide to a second screen and shows your ink live, so you can draw on the slides while you teach
 - **Anchor notes to the page** — `Ctrl+Alt+click` drops a numbered marker that links an exact spot on the PDF to the matching paragraph in your notes; callouts render the note right on the page with an arrow
 - **Rearrange pages by drag-and-drop** — reorder, import, and export pages from the thumbnail sidebar by dragging (drag pages out to a file manager to export, drop a PDF in to insert), inspired by Apple's Preview
 - **GoodNotes-style lasso** — loop around existing ink to select it, then drag to move, recolour, or delete it as a single undo step
