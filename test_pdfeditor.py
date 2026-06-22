@@ -1947,6 +1947,30 @@ class TestShareToPhone(unittest.TestCase):
         # may be None on machines without Tailscale; otherwise a dotted IPv4
         self.assertTrue(ip is None or (isinstance(ip, str) and ip.count(".") == 3))
 
+    def test_tailscale_ip_none_when_backend_stopped(self):
+        # `tailscale ip -4` keeps printing the address after `tailscale down`,
+        # so we must gate on BackendState — otherwise we hand out a dead QR.
+        import sidemark, json as _json
+        stopped = _json.dumps({
+            "BackendState": "Stopped",
+            "Self": {"TailscaleIPs": ["100.70.12.127", "fd7a:115c:a1e0::1"]},
+        })
+        running = _json.dumps({
+            "BackendState": "Running",
+            "Self": {"TailscaleIPs": ["100.70.12.127", "fd7a:115c:a1e0::1"]},
+        })
+
+        class _R:
+            def __init__(self, out): self.stdout = out
+
+        with mock.patch.object(sidemark.shutil, "which", return_value="/usr/bin/tailscale"):
+            with mock.patch.object(sidemark.subprocess, "run",
+                                   return_value=_R(stopped)):
+                self.assertIsNone(sidemark._tailscale_ip())
+            with mock.patch.object(sidemark.subprocess, "run",
+                                   return_value=_R(running)):
+                self.assertEqual(sidemark._tailscale_ip(), "100.70.12.127")
+
     def test_qr_png_absent_tool_returns_false(self):
         from sidemark import _make_qr_png
         import shutil as _sh
@@ -1957,6 +1981,44 @@ class TestShareToPhone(unittest.TestCase):
                 self.assertTrue(result and os.path.exists(out))
             else:
                 self.assertFalse(result)
+
+    def _prepare(self, d):
+        """Drive _share_prepare with a stub save_copy; returns (server, entries).
+        Caller must stop the server."""
+        import sidemark
+        def _save(p):
+            make_pdf(p)
+        return sidemark.PDFEditorWindow._share_prepare(d, _save, "doc.pdf")
+
+    def test_prepare_always_offers_tailscale_with_hint_when_off(self):
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip", return_value=None):
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    self.assertEqual(entries[0]["caption"], "Same Wi-Fi")
+                    self.assertIn("url", entries[0])
+                    # the Tailscale column is always present...
+                    ts = entries[1]
+                    self.assertEqual(ts["caption"], "Over Tailscale")
+                    # ...but as an explanatory hint, not a live link, when off
+                    self.assertNotIn("url", ts)
+                    self.assertIn("Tailscale", ts["hint"])
+                finally:
+                    server.stop()
+
+    def test_prepare_offers_tailscale_link_when_connected(self):
+        import sidemark
+        with mock.patch.object(sidemark, "_tailscale_ip",
+                               return_value="100.70.12.127"):
+            with tempfile.TemporaryDirectory() as d:
+                server, entries = self._prepare(d)
+                try:
+                    ts = entries[1]
+                    self.assertEqual(ts["caption"], "Over Tailscale")
+                    self.assertIn("100.70.12.127", ts["url"])
+                finally:
+                    server.stop()
 
 
 # ── drag pages out of the thumbnail panel to export them (#57) ────────────────
@@ -2589,6 +2651,78 @@ class TestExport(unittest.TestCase):
             self.assertEqual(doc.page_count, 6)
             doc.close()
 
+    def test_export_omits_empty_anchor_from_notes_page(self):
+        """An anchor with no text is drawn on the page (numbered circle) but
+        must NOT produce a notes page — there's nothing extra to show."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf"); out = os.path.join(d, "out.pdf")
+            make_pdf(src)
+            model = NotesModel()
+            model.set(0, "<!-- anchor:100:200 -->")
+            _export_pdf_with_notes(src, out, model, include_empty=False,
+                                   accent=(0.2, 0.5, 0.9))
+            doc = fitz.open(out)
+            self.assertEqual(doc.page_count, 1)            # no notes page
+            self.assertIn("1", doc[0].get_text())          # circle still drawn
+            doc.close()
+
+    def test_export_groups_small_notes_with_page_references(self):
+        """group=True packs short notes from several pages onto one notes page,
+        each labelled with the page it came from."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf"); out = os.path.join(d, "out.pdf")
+            make_pdf(src, n_pages=3)
+            model = NotesModel()
+            model.set(0, "first short note")
+            model.set(2, "third short note")
+            _export_pdf_with_notes(src, out, model, include_empty=False,
+                                   accent=(0.2, 0.5, 0.9), group=True)
+            doc = fitz.open(out)
+            # 3 source pages + a single shared notes page at the end
+            self.assertEqual(doc.page_count, 4)
+            notes = doc[3].get_text()
+            self.assertIn("Page 1", notes)
+            self.assertIn("Page 3", notes)
+            self.assertIn("first short note", notes)
+            self.assertIn("third short note", notes)
+            doc.close()
+
+    def test_export_flattens_ink_into_page_content(self):
+        """Pen strokes must survive as page *content*, not annotations, so they
+        render in viewers (phone browsers) that ignore PDF annotations."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf"); out = os.path.join(d, "out.pdf")
+            doc = fitz.open(); page = doc.new_page()
+            a = page.add_ink_annot([[(40, 40), (300, 300)]])
+            a.set_colors(stroke=(1, 0, 0)); a.set_border(width=3); a.update()
+            doc.save(src); doc.close()
+            _export_pdf_with_notes(src, out, NotesModel(), include_empty=False,
+                                   accent=(0.2, 0.5, 0.9))
+            o = fitz.open(out)
+            # no ink annotations left...
+            self.assertEqual(len(list(o[0].annots(types=[fitz.PDF_ANNOT_INK]))), 0)
+            # ...but the stroke still renders when annotations are not drawn
+            pix = o[0].get_pixmap(annots=False)
+            s, st = pix.samples, pix.n
+            red = sum(1 for i in range(0, len(s), st)
+                      if s[i] > 150 and s[i + 1] < 100 and s[i + 2] < 100)
+            self.assertGreater(red, 0)
+            o.close()
+
+    def test_export_anchor_note_is_numbered_on_notes_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src.pdf"); out = os.path.join(d, "out.pdf")
+            make_pdf(src)
+            model = NotesModel()
+            model.set(0, "<!-- anchor:50:60 -->\nremember this")
+            _export_pdf_with_notes(src, out, model, include_empty=False,
+                                   accent=(0.2, 0.5, 0.9), group=True)
+            doc = fitz.open(out)
+            notes = doc[-1].get_text()
+            self.assertIn("[1]", notes)
+            self.assertIn("remember this", notes)
+            doc.close()
+
     # -- Exception-path closure -----------------------------------------------
 
     def test_export_bad_source_raises(self):
@@ -2783,8 +2917,9 @@ class TestCallouts(unittest.TestCase):
             source_text = doc[0].get_text()
             self.assertIn("Important callout fact", source_text)   # box on the page
             self.assertIn("1", source_text)                        # anchor number
-            notes_text = doc[1].get_text()
-            self.assertNotIn("callout:", notes_text)   # marker stripped from notes page
+            # The callout's text is on the page, so it must NOT be repeated on a
+            # notes page — and a callout-only page yields no notes page at all.
+            self.assertEqual(doc.page_count, 1)
             doc.close()
 
     def test_export_callout_near_page_edge_is_clamped(self):

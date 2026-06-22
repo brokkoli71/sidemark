@@ -2718,19 +2718,31 @@ def _lan_ip():
 
 
 def _tailscale_ip():
-    """This machine's Tailscale (tailnet) IPv4, or None. A URL on this address
-    reaches a phone that's on the same tailnet from anywhere — handy when LAN
-    sharing is blocked by AP isolation or a repeater on a different subnet."""
+    """This machine's Tailscale (tailnet) IPv4 *while actually connected*, or
+    None. A URL on this address reaches a phone that's on the same tailnet from
+    anywhere — handy when LAN sharing is blocked by AP isolation or a repeater
+    on a different subnet.
+
+    NB: `tailscale ip -4` keeps printing the assigned address even after
+    `tailscale down`, so we gate on the backend being "Running" (otherwise we'd
+    hand out a QR that doesn't route)."""
     if shutil.which("tailscale"):
         try:
-            out = subprocess.run(["tailscale", "ip", "-4"],
+            out = subprocess.run(["tailscale", "status", "--json"],
                                  capture_output=True, text=True, timeout=3)
-            for line in out.stdout.splitlines():
-                if line.strip():
-                    return line.strip()
-        except (OSError, subprocess.SubprocessError):
+            data = json.loads(out.stdout)
+            if data.get("BackendState") != "Running":
+                return None
+            for ip in data.get("Self", {}).get("TailscaleIPs", []):
+                if ip.count(".") == 3:        # IPv4 only (skip the v6 address)
+                    return ip
+            return None
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
-    # fall back: a 100.64.0.0/10 (CGNAT, what Tailscale uses) addr on any iface
+    # fall back (no tailscale CLI / unparseable status): look for a live
+    # 100.64.0.0/10 (CGNAT, what Tailscale uses) address on an interface. When
+    # Tailscale is down the tun interface drops its address, so this won't
+    # false-positive the way `tailscale ip` does.
     try:
         out = subprocess.run(["ip", "-4", "-o", "addr"],
                              capture_output=True, text=True, timeout=3)
@@ -2821,24 +2833,31 @@ class _ShareServer:
             self._httpd = None
 
 
-def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accent):
+def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
+                           accent, group=False):
+    """Bake the notes into a copy of the PDF.
+
+    Each source page gets its on-page marks (text boxes, callout boxes, numbered
+    anchor circles). A *notes page* then carries only the information that is NOT
+    already on the page: callout and text-box text are skipped (they're drawn on
+    the page) and empty anchors are skipped (only their circle is drawn). Anchor
+    notes are prefixed with their [N] number.
+
+    With group=True, small notes from consecutive pages are packed onto shared
+    notes pages, each section headed by the page it came from. With group=False
+    each annotated page is followed by its own notes page (and include_empty adds
+    a notes page even for pages with nothing extra)."""
     src_doc = fitz.open(src_path)
     out_doc = fitz.open()
-    r, g, b = accent
-    anchor_color = (r, g, b)
+    anchor_color = accent
 
-    for page_idx in range(len(src_doc)):
-        # the model stores source \commands; render their symbols in the export
-        notes_text = _symbolize(notes_model.get(page_idx))
-        anchors = _parse_anchors(notes_text)
-        has_notes = bool(notes_text.strip())
-
-        # Copy source page
-        out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
-        out_page = out_doc[-1]
-
-        # Standalone text boxes (#56) first, then callout boxes, then the
-        # numbered anchor circles on top — same stacking as the canvas
+    def _draw_marks(out_page, notes_text, anchors):
+        # Flatten ink strokes into the page content first, so they sit *under*
+        # the notes marks and — crucially — render in viewers that ignore PDF
+        # annotations (most phone browsers do).
+        _flatten_ink(out_page)
+        # text boxes (#56) first, then callout boxes, then numbered anchor
+        # circles on top — same stacking as the canvas
         for t in _parse_textboxes(notes_text):
             if t["text"]:
                 _draw_export_textbox(out_page, t, anchor_color)
@@ -2848,15 +2867,80 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty, accen
         for i, a in enumerate(anchors):
             _draw_export_anchor(out_page, a["x"], a["y"], i + 1, anchor_color)
 
-        # Notes page
-        if has_notes or include_empty:
-            w, h = out_page.rect.width, out_page.rect.height
-            notes_page = out_doc.new_page(width=w, height=h)
-            _render_export_notes(notes_page, page_idx, notes_text, anchor_color)
+    if group:
+        pending = []          # [(page_idx, [blocks])] waiting for a notes page
+        last_dims = [595.0, 842.0]
+
+        def _flush():
+            if not pending:
+                return
+            w, h = last_dims
+            wr = _NotesWriter(out_doc, w, h, anchor_color, title="Notes")
+            for pi, blocks in pending:
+                wr.section_heading(f"Page {pi + 1}")
+                for b in blocks:
+                    wr.paragraph(b)
+                    wr.gap()
+            pending.clear()
+
+        for page_idx in range(len(src_doc)):
+            notes_text = _symbolize(notes_model.get(page_idx))
+            anchors = _parse_anchors(notes_text)
+            out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+            out_page = out_doc[-1]
+            last_dims[0], last_dims[1] = out_page.rect.width, out_page.rect.height
+            _draw_marks(out_page, notes_text, anchors)
+
+            blocks = _export_notes_blocks(notes_text)
+            if blocks:
+                w, h = out_page.rect.width, out_page.rect.height
+                usable = h - 45 - 40
+                if (pending and _estimate_notes_height(pending, w)
+                        + _estimate_notes_height([(page_idx, blocks)], w) > usable):
+                    _flush()
+                pending.append((page_idx, blocks))
+        _flush()
+    else:
+        for page_idx in range(len(src_doc)):
+            notes_text = _symbolize(notes_model.get(page_idx))
+            anchors = _parse_anchors(notes_text)
+            out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+            out_page = out_doc[-1]
+            _draw_marks(out_page, notes_text, anchors)
+
+            blocks = _export_notes_blocks(notes_text)
+            if blocks or include_empty:
+                w, h = out_page.rect.width, out_page.rect.height
+                wr = _NotesWriter(out_doc, w, h, anchor_color,
+                                  title=f"Notes — Page {page_idx + 1}")
+                wr.ensure_page()
+                for b in blocks:
+                    wr.paragraph(b)
+                    wr.gap()
 
     out_doc.save(out_path, garbage=4, deflate=True)
     out_doc.close()
     src_doc.close()
+
+
+def _flatten_ink(page):
+    """Redraw the page's ink annotations as ordinary vector content and remove
+    the annotations. Ink (pen/highlighter strokes) otherwise lives in annotation
+    objects that many viewers — notably mobile browsers — don't render."""
+    for annot in list(page.annots(types=[fitz.PDF_ANNOT_INK])):
+        stroke = annot.colors.get("stroke") or [0, 0, 0]
+        color = tuple(stroke[:3])
+        width = (annot.border or {}).get("width", 1) or 1
+        opacity = annot.opacity
+        opacity = 1.0 if opacity is None or opacity < 0 else opacity
+        for sub in annot.vertices or []:
+            pts = [tuple(p) for p in sub]
+            if len(pts) == 1:
+                pts = [pts[0], pts[0]]      # a dot — draw a degenerate segment
+            if len(pts) >= 2:
+                page.draw_polyline(pts, color=color, width=width,
+                                   stroke_opacity=opacity, lineCap=1, lineJoin=1)
+        page.delete_annot(annot)
 
 
 def _draw_export_anchor(page, px, py, number, color):
@@ -2948,33 +3032,131 @@ def _draw_export_textbox(page, t, color):
                         color=(0.1, 0.1, 0.1), fontname="helv", align=0)
 
 
-def _render_export_notes(page, page_idx, notes_text, anchor_color):
-    margin = 40
-    w, h = page.rect.width, page.rect.height
-    r, g, b = anchor_color
+def _export_notes_blocks(notes_text):
+    """Content for one source page's notes page: one string per paragraph that
+    carries information *not* already drawn on the page. Callout and text-box
+    paragraphs are omitted (their text is rendered on the page), and empty
+    anchors are omitted (only their numbered circle is drawn). Anchor notes are
+    prefixed with their [N] number so they line up with the circles."""
+    text = notes_text
+    anchor_matches = list(_ANCHOR_RE.finditer(text))
+    anchor_number = {m.start(): i + 1 for i, m in enumerate(anchor_matches)}
 
-    # Header
-    page.draw_line((margin, 30), (w - margin, 30), color=(0.7, 0.7, 0.7))
-    page.insert_text((margin, 24), f"Notes — Page {page_idx + 1}",
-                     fontsize=11, color=(0.3, 0.3, 0.3), fontname="hebo")
+    lines = text.split('\n')
+    n = len(lines)
+    line_off, off = [], 0
+    for l in lines:
+        line_off.append(off)
+        off += len(l) + 1
 
-    # Process notes text: replace anchors, strip markdown
-    counter = [0]
+    blocks = []
+    i = 0
+    while i < n:
+        if not lines[i].strip():
+            i += 1
+            continue
+        j = i
+        while j < n and lines[j].strip():
+            j += 1
+        start = line_off[i]
+        end = line_off[j - 1] + len(lines[j - 1])
+        para = '\n'.join(lines[i:j])
+        i = j
+        # drawn on the page already → don't repeat it on the notes page
+        if (_TEXTBOX_RE.search(text, start, end)
+                or _CALLOUT_RE.search(text, start, end)):
+            continue
+        cleaned = _strip_markers(para)
+        cleaned = re.sub(r'\n[ \t]*\n+', '\n', cleaned).strip()
+        if not cleaned:
+            continue                       # empty anchor / blank paragraph
+        nums = [anchor_number[m.start()] for m in anchor_matches
+                if start <= m.start() < end]
+        if nums:
+            cleaned = ''.join(f"[{k}] " for k in nums) + cleaned
+        blocks.append(cleaned)
+    return blocks
 
-    def _replace_anchor(m):
-        counter[0] += 1
-        return f"[{counter[0]}]"
 
-    text = _ANCHOR_RE.sub(_replace_anchor, notes_text)
-    text = _CALLOUT_RE.sub('', text)
-    for pattern, repl in _MD_STRIP:
-        text = pattern.sub(repl, text)
-    text = text.strip()
+def _estimate_notes_height(sections, width):
+    """Rough rendered height (pt) of grouped note sections — used only to decide
+    when to start a new notes page; the actual layout wraps precisely."""
+    lh = 10 * 1.45
+    chars = max(10, int((width - 80) / (10 * 0.5)))
+    total = 0.0
+    for _pi, blocks in sections:
+        total += lh + 6                    # section heading + gap
+        for b in blocks:
+            for logical in b.split('\n'):
+                total += lh * max(1, math.ceil(len(logical) / chars))
+            total += lh * 0.4              # inter-paragraph gap
+    return total
 
-    if text:
-        rect = fitz.Rect(margin, 45, w - margin, h - margin)
-        page.insert_textbox(rect, text, fontsize=10, color=(0, 0, 0),
-                            fontname="helv", align=0)
+
+class _NotesWriter:
+    """Lays notes text across one or more notes pages, wrapping and page-breaking
+    by hand so arbitrarily long notes flow cleanly. Pages are appended to the
+    output document as they fill."""
+
+    def __init__(self, out_doc, width, height, accent, title="Notes"):
+        self.doc = out_doc
+        self.w = width
+        self.h = height
+        self.accent = accent
+        self.title = title
+        self.margin = 40
+        self.size = 10
+        self.line_h = self.size * 1.45
+        self.font = fitz.Font("helv")
+        self.page = None
+        self.y = 0.0
+
+    def _new_page(self):
+        self.page = self.doc.new_page(width=self.w, height=self.h)
+        self.page.draw_line((self.margin, 30), (self.w - self.margin, 30),
+                            color=(0.7, 0.7, 0.7))
+        self.page.insert_text((self.margin, 24), self.title,
+                              fontsize=11, color=(0.3, 0.3, 0.3), fontname="hebo")
+        self.y = 45.0
+
+    def ensure_page(self):
+        """Make sure at least one (possibly empty) notes page exists."""
+        if self.page is None:
+            self._new_page()
+
+    def _wrap(self, text, max_w):
+        out = []
+        for word in text.split(' '):
+            if not out:
+                out.append(word)
+                continue
+            trial = out[-1] + ' ' + word
+            if self.font.text_length(trial, self.size) <= max_w:
+                out[-1] = trial
+            else:
+                out.append(word)
+        return out or ['']
+
+    def _line(self, text, fontname, color, indent):
+        if self.page is None or self.y + self.line_h > self.h - self.margin:
+            self._new_page()
+        self.page.insert_text((self.margin + indent, self.y + self.size),
+                              text, fontsize=self.size, color=color,
+                              fontname=fontname)
+        self.y += self.line_h
+
+    def section_heading(self, label):
+        self.y += 6
+        self._line(label, "hebo", self.accent, 0)
+
+    def paragraph(self, text, indent=0):
+        max_w = self.w - 2 * self.margin - indent
+        for logical in text.split('\n'):
+            for dl in self._wrap(logical, max_w):
+                self._line(dl, "helv", (0, 0, 0), indent)
+
+    def gap(self):
+        self.y += self.line_h * 0.4
 
 
 class NotesModel:
@@ -6620,15 +6802,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._show_export_options()
 
     def _show_export_options(self):
-        check = Gtk.CheckButton(label="Include pages with no notes")
-        check.set_active(False)
+        group = Gtk.CheckButton(label="Group small notes together")
+        group.set_active(True)
+        empty = Gtk.CheckButton(label="Include pages with no notes")
+        empty.set_active(False)
+        # "Include pages with no notes" only makes sense one-page-per-page;
+        # grouping packs notes densely and never emits an empty notes page.
+        empty.set_sensitive(not group.get_active())
+        group.connect("toggled",
+                      lambda b: empty.set_sensitive(not b.get_active()))
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_top(8)
-        box.append(check)
+        box.append(group)
+        box.append(empty)
 
         dlg = Adw.AlertDialog(
             heading="Export with notes",
-            body="Each page will be followed by its notes page.",
+            body=("Notes pages carry only what isn't already on the page "
+                  "(callouts, text boxes and empty anchors are drawn in place). "
+                  "Grouping packs short notes from several pages together, each "
+                  "labelled with the page it came from."),
             extra_child=box,
         )
         dlg.add_response("cancel", "Cancel")
@@ -6636,13 +6829,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dlg.set_response_appearance("export", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("export")
         dlg.set_close_response("cancel")
-        dlg.connect("response", self._export_options_response, check)
+        dlg.connect("response", self._export_options_response, group, empty)
         dlg.present(self)
 
-    def _export_options_response(self, dlg, response, check):
+    def _export_options_response(self, dlg, response, group, empty):
         if response != "export":
             return
-        include_empty = check.get_active()
+        include_empty = empty.get_active()
+        do_group = group.get_active()
         file_dlg = Gtk.FileDialog.new()
         file_dlg.set_title("Export PDF as…")
         base = os.path.splitext(os.path.basename(self._path))[0]
@@ -6653,9 +6847,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         store = Gio.ListStore.new(Gtk.FileFilter)
         store.append(f)
         file_dlg.set_filters(store)
-        file_dlg.save(self, None, lambda d, r: self._export_file_done(d, r, include_empty))
+        file_dlg.save(self, None,
+                      lambda d, r: self._export_file_done(d, r, include_empty, do_group))
 
-    def _export_file_done(self, dialog, result, include_empty):
+    def _export_file_done(self, dialog, result, include_empty, do_group):
         try:
             gfile = dialog.save_finish(result)
             if not gfile:
@@ -6675,7 +6870,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         def run():
             try:
                 _export_pdf_with_notes(self._path, path, self.notes_model,
-                                       include_empty, accent)
+                                       include_empty, accent, group=do_group)
                 GLib.idle_add(lambda: (
                     toast.dismiss(),
                     self.toast_overlay.add_toast(
@@ -6810,86 +7005,173 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._toast("Open a PDF first to share it.")
             return
         self._commit_note()
+        # Show the dialog *immediately* with a spinner; the slow parts
+        # (baking the PDF, starting the server, rendering QR codes) run in a
+        # worker thread so the button feels responsive.
+        self._show_share_dialog()
+
+    @staticmethod
+    def _share_prepare(out_dir, bake, name):
+        """Worker-thread body: bake the PDF, start the server, render QR PNGs.
+        Returns (server, entries) or raises. Each entry is a dict with a
+        caption and either a ready QR path + url, or a hint string."""
+        out_path = os.path.join(out_dir, name)
+        bake(out_path)                            # current state + notes baked in
+        server = _ShareServer(out_path)
+        server.start()
+
+        entries = []
+        lan_url = server.url_for(server.ip)
+        lan_qr = os.path.join(out_dir, "qr-lan.png")
+        entries.append({"caption": "Same Wi-Fi", "url": lan_url,
+                        "qr": lan_qr if _make_qr_png(lan_url, lan_qr) else None})
+
+        ts = _tailscale_ip()
+        if ts and ts != server.ip:
+            ts_url = server.url_for(ts)
+            ts_qr = os.path.join(out_dir, "qr-ts.png")
+            entries.append({"caption": "Over Tailscale", "url": ts_url,
+                            "qr": ts_qr if _make_qr_png(ts_url, ts_qr) else None})
+        else:
+            if shutil.which("tailscale"):
+                hint = ("Tailscale is installed but not connected. Run "
+                        "“tailscale up” here and add the Tailscale app to your "
+                        "phone to share securely from any network.")
+            else:
+                hint = ("Set up Tailscale on both devices to share securely "
+                        "from anywhere — even when the Wi-Fi blocks the direct "
+                        "link (repeaters, guest networks, AP isolation).")
+            entries.append({"caption": "Over Tailscale", "hint": hint})
+        return server, entries
+
+    def _share_entry(self, entry):
+        """One column of the share dialog: a QR (if available) plus the link as
+        selectable text, or an explanatory hint, under a caption."""
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        col.set_hexpand(True)
+        head = Gtk.Label(label=entry["caption"])
+        head.add_css_class("heading")
+        col.append(head)
+        if "url" in entry:
+            if entry.get("qr"):
+                pic = Gtk.Picture.new_for_filename(entry["qr"])
+                pic.set_can_shrink(False)
+                pic.set_size_request(200, 200)
+                col.append(pic)
+            else:
+                hint = Gtk.Label(label="Install ‘qrencode’ for a scannable code.")
+                hint.add_css_class("dim-label")
+                hint.set_wrap(True)
+                col.append(hint)
+            link = Gtk.Label(label=entry["url"])
+            link.set_selectable(True)
+            link.set_wrap(True)
+            link.set_max_width_chars(28)
+            link.add_css_class("monospace")
+            link.add_css_class("caption")
+            col.append(link)
+        else:
+            spacer = Gtk.Box()
+            spacer.set_size_request(200, 200)
+            icon = Gtk.Image.new_from_icon_name("network-vpn-symbolic")
+            icon.set_pixel_size(48)
+            icon.set_vexpand(True)
+            icon.set_valign(Gtk.Align.CENTER)
+            icon.add_css_class("dim-label")
+            spacer.append(icon)
+            col.append(spacer)
+            hint = Gtk.Label(label=entry["hint"])
+            hint.add_css_class("dim-label")
+            hint.set_wrap(True)
+            hint.set_max_width_chars(28)
+            hint.set_justify(Gtk.Justification.CENTER)
+            col.append(hint)
+        return col
+
+    def _show_share_dialog(self):
         out_dir = tempfile.mkdtemp(prefix="sidemark-share-")
+        save_copy = self.canvas.save_copy
+        notes_model = self.notes_model
+        accent = self.canvas.zoom_accent
         name = (os.path.basename(self._path)
                 if (self._path and not self._is_untitled) else "document.pdf")
         if not name.lower().endswith(".pdf"):
             name += ".pdf"
-        out_path = os.path.join(out_dir, name)
-        try:
-            self.canvas.save_copy(out_path)   # current state, ink baked in
-        except Exception as e:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            self._show_error("Share failed", str(e))
-            return
-        server = _ShareServer(out_path)
-        try:
-            server.start()
-        except OSError as e:
-            shutil.rmtree(out_dir, ignore_errors=True)
-            self._show_error("Share failed", f"Could not start the share server:\n{e}")
-            return
-        self._show_share_dialog(server, out_dir)
 
-    def _share_entry(self, caption, url, out_dir, tag):
-        """One column of the share dialog: a QR (if qrencode is present) plus the
-        link as selectable text, under a caption."""
-        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        col.set_hexpand(True)
-        head = Gtk.Label(label=caption)
-        head.add_css_class("heading")
-        col.append(head)
-        qr_path = os.path.join(out_dir, f"qr-{tag}.png")
-        if _make_qr_png(url, qr_path):
-            pic = Gtk.Picture.new_for_filename(qr_path)
-            pic.set_can_shrink(False)
-            pic.set_size_request(200, 200)
-            col.append(pic)
-        else:
-            hint = Gtk.Label(label="Install ‘qrencode’ for a scannable code.")
-            hint.add_css_class("dim-label")
-            hint.set_wrap(True)
-            col.append(hint)
-        link = Gtk.Label(label=url)
-        link.set_selectable(True)
-        link.set_wrap(True)
-        link.set_max_width_chars(28)
-        link.add_css_class("monospace")
-        link.add_css_class("caption")
-        col.append(link)
-        return col
+        def bake(out_path):
+            # Share the *exported* version: bake ink, then render notes/anchors/
+            # callouts/text boxes (grouped) into the shared copy.
+            ink = out_path + ".ink.pdf"
+            save_copy(ink)
+            try:
+                _export_pdf_with_notes(ink, out_path, notes_model,
+                                       include_empty=False, accent=accent,
+                                       group=True)
+            finally:
+                try:
+                    os.remove(ink)
+                except OSError:
+                    pass
 
-    def _show_share_dialog(self, server, out_dir):
-        entries = [("Same Wi-Fi", server.url_for(server.ip), "lan")]
-        ts = _tailscale_ip()
-        if ts and ts != server.ip:
-            entries.append(("Over Tailscale", server.url_for(ts), "ts"))
+        # A placeholder shown while the worker prepares everything.
+        loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        loading.set_size_request(420, 240)
+        loading.set_valign(Gtk.Align.CENTER)
+        loading.set_halign(Gtk.Align.CENTER)
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(48, 48)
+        spinner.start()
+        loading.append(spinner)
+        msg = Gtk.Label(label="Preparing a link for your phone…")
+        msg.add_css_class("dim-label")
+        loading.append(msg)
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
-        row.set_margin_top(6)
-        row.set_homogeneous(True)
-        for caption, url, tag in entries:
-            row.append(self._share_entry(caption, url, out_dir, tag))
-
-        body = ("Scan a code (or open a link) on your phone. The link works "
-                "until you close this dialog.")
-        if len(entries) > 1:
-            body += ("\n\n“Same Wi-Fi” needs both devices on the same network; "
-                     "“Over Tailscale” works anywhere if the phone has the "
-                     "Tailscale app on your tailnet.")
-        dlg = Adw.AlertDialog.new("Open on your phone", body)
-        dlg.set_extra_child(row)
+        dlg = Adw.AlertDialog.new(
+            "Open on your phone",
+            "Scan a code (or open a link) on your phone. The link works "
+            "until you close this dialog.")
+        dlg.set_extra_child(loading)
         dlg.add_response("close", "Close")
         dlg.set_default_response("close")
         dlg.set_close_response("close")
 
+        state = {"server": None, "done": False}
+
         def _cleanup(*_a):
-            server.stop()
+            if state["server"] is not None:
+                state["server"].stop()
             shutil.rmtree(out_dir, ignore_errors=True)
         dlg.connect("response", _cleanup)
-        # safety net: stop serving after 10 minutes even if left open
-        GLib.timeout_add_seconds(600, lambda: (server.stop(), False)[1])
         dlg.present(self)
+
+        def _ready(server, entries):
+            state["server"], state["done"] = server, True
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+            row.set_margin_top(6)
+            row.set_homogeneous(True)
+            for entry in entries:
+                row.append(self._share_entry(entry))
+            dlg.set_extra_child(row)
+            # safety net: stop serving after 10 minutes even if left open
+            GLib.timeout_add_seconds(600, lambda: (server.stop(), False)[1])
+            return False
+
+        def _failed(message):
+            spinner.stop()
+            shutil.rmtree(out_dir, ignore_errors=True)
+            dlg.set_extra_child(None)
+            dlg.set_body(f"Could not prepare the share:\n{message}")
+            return False
+
+        def _worker():
+            try:
+                server, entries = self._share_prepare(out_dir, bake, name)
+            except Exception as e:                          # noqa: BLE001
+                GLib.idle_add(_failed, str(e))
+                return
+            GLib.idle_add(_ready, server, entries)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _current_dir_gfile(self):
         """The folder of the currently open file, so file dialogs start there."""
