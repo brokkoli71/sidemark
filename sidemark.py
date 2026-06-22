@@ -3805,6 +3805,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.set_default_size(1280, 800)
         self._active_session = DocumentSession()
         self._sessions = [self._active_session]
+        self._closed_tabs = []   # reopen stack for Ctrl+Shift+T (file paths)
         self._path = None
         self._notes_path = None   # set when a .md file is opened without an associated PDF
         self._active_notes_path = None  # the .md a loaded PDF saves notes to (default sidecar, or a user-chosen file remembered per-PDF)
@@ -4770,6 +4771,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+E",        "Export PDF with notes"),
             ("Ctrl+R",        "Reload (new instance)"),
             ("Ctrl+\\",       "Toggle notes"),
+            ("Tabs",          None),
+            ("Ctrl+W",        "Close tab"),
+            ("Ctrl+Shift+T",  "Reopen the last closed tab"),
         ]
 
         grid = Gtk.Grid()
@@ -4937,11 +4941,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self._tab_view.close_page(page)   # fires close-page below
 
+    def _remember_closed(self, s):
+        """Push a just-closed document onto the reopen stack so Ctrl+Shift+T can
+        bring it back. Only files with a real path are reopenable (their notes
+        are remembered per-PDF); untitled scratch tabs are skipped."""
+        path = getattr(s, "_path", None)
+        if path and not getattr(s, "_is_untitled", False):
+            self._closed_tabs.append(path)
+            del self._closed_tabs[:-20]   # keep the stack bounded
+
+    def _reopen_closed_tab(self):
+        while self._closed_tabs:
+            path = self._closed_tabs.pop()
+            if os.path.exists(path):
+                self.open_file_in_tab(path)
+                return
+        self._toast("No recently closed tabs")
+
     def _on_tab_close(self, tab_view, page):
         """A tab's close button (or Ctrl+W) was used. Prompt for unsaved changes
         in that document, then confirm or veto the close asynchronously."""
         s = self._session_for_page(page)
         if s is None or not s._dirty:
+            self._remember_closed(s)
             tab_view.close_page_finish(page, True)
             return True
         tab_view.set_selected_page(page)   # show which document is being closed
@@ -4958,10 +4980,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         def on_response(_d, r):
             if r == "save":
+                self._remember_closed(s)
                 self._on_save(after=lambda: tab_view.close_page_finish(page, True))
             elif r == "discard":
                 if s._path:
                     _discard_autosave(s._path)
+                self._remember_closed(s)
                 tab_view.close_page_finish(page, True)
             else:
                 tab_view.close_page_finish(page, False)   # veto
@@ -5322,6 +5346,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         the capture phase so the notes editor can't swallow them first. Only these
         specific keys are consumed; every other key passes through to typing."""
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if ctrl_held and shift_held and keyval in (Gdk.KEY_t, Gdk.KEY_T):
+            # reopen the most recently closed tab (browser-style)
+            self._reopen_closed_tab()
+            return True
         if ctrl_held and keyval in (Gdk.KEY_w, Gdk.KEY_W):
             # close the current tab (with its own unsaved-changes prompt); the
             # window closes once its last tab is gone.

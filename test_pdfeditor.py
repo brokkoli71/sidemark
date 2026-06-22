@@ -5696,6 +5696,44 @@ class TestMultiTab(unittest.TestCase):
             self.assertEqual(out["after"], 1)
             self.assertEqual(out["remaining_path"], a)
 
+    def test_reopen_closed_tab(self):
+        """Closing a tab records its path; Ctrl+Shift+T (_reopen_closed_tab)
+        brings the document back in a new tab."""
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); b = os.path.join(d, "b.pdf")
+            make_pdf(a, n_pages=1); make_pdf(b, n_pages=2)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                win.open_file_in_tab(b)
+                # close b (active, clean) -> path pushed onto the reopen stack
+                win._tab_view.close_page(win._active_session._tab_page)
+                out["closed_stack"] = list(win._closed_tabs)
+                out["after_close"] = len(win._sessions)
+                win._reopen_closed_tab()
+                out["after_reopen"] = len(win._sessions)
+                out["reopened_path"] = win._path
+                out["stack_emptied"] = list(win._closed_tabs)
+
+            out = self._in_window(body)
+            self.assertEqual(out["closed_stack"], [b])
+            self.assertEqual(out["after_close"], 1)
+            self.assertEqual(out["after_reopen"], 2)         # b is back
+            self.assertEqual(out["reopened_path"], b)
+            self.assertEqual(out["stack_emptied"], [])       # popped off
+
+    def test_reopen_with_empty_stack_is_safe(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf"); make_pdf(a)
+
+            def body(win, out):
+                win.open_file_in_tab(a)
+                win._reopen_closed_tab()                     # nothing to reopen
+                out["sessions"] = len(win._sessions)
+
+            out = self._in_window(body)
+            self.assertEqual(out["sessions"], 1)             # no crash, no tab
+
     def test_tearoff_adopts_session_into_new_window(self):
         """Dragging a tab out (create-window + transfer_page) hands the whole
         document to a fresh window: its session moves, signals retarget, and
