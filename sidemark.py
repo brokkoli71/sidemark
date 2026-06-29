@@ -3552,12 +3552,41 @@ class MarkdownNotesView(GtkSource.View):
         key.connect("key-pressed", self._on_key)
         self.add_controller(key)
 
+        # Ctrl+scroll rescales the notes font (mirrors the canvas zoom gesture)
+        scroll = Gtk.EventControllerScroll(
+            flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self._on_scroll)
+        self.add_controller(scroll)
+
+        # set by the window: called with +1 / -1 / 0 to grow / shrink / reset
+        self.font_zoom_cb = None
+
     # ── formatting shortcuts ──────────────────────────────────────────────────
+
+    def _on_scroll(self, ctrl, _dx, dy):
+        ev = ctrl.get_current_event()
+        if ev and (ev.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK):
+            if self.font_zoom_cb and dy:
+                self.font_zoom_cb(-1 if dy > 0 else 1)
+            return True
+        return False
 
     def _on_key(self, ctrl, keyval, keycode, state):
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
         alt_held = bool(state & Gdk.ModifierType.ALT_MASK)
         if ctrl_held and not alt_held:
+            if keyval in (Gdk.KEY_plus, Gdk.KEY_KP_Add, Gdk.KEY_equal):
+                if self.font_zoom_cb:
+                    self.font_zoom_cb(1)
+                return True
+            if keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
+                if self.font_zoom_cb:
+                    self.font_zoom_cb(-1)
+                return True
+            if keyval in (Gdk.KEY_0, Gdk.KEY_KP_0):
+                if self.font_zoom_cb:
+                    self.font_zoom_cb(0)
+                return True
             if keyval == Gdk.KEY_b:
                 self._wrap_selection("**")
                 return True
@@ -4124,7 +4153,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         css = f"""
             .notes-view {{
                 font-family: monospace;
-                font-size: 13px;
                 background-color: {bg_hex};
                 color: {fg_hex};
             }}
@@ -4165,6 +4193,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
+
+        # Notes-panel font size lives in its own provider so Ctrl+± / Ctrl+scroll
+        # can rescale it at runtime (handy for reading presenter notes). Added
+        # after the base sheet so it wins; the value is a global preference.
+        self._notes_font_px = max(
+            self._NOTES_FONT_MIN,
+            min(self._NOTES_FONT_MAX,
+                int(_load_settings().get("notes_font_px", self._NOTES_FONT_DEFAULT))),
+        )
+        self._notes_font_provider = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self._notes_font_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        )
+        self._apply_notes_font()
 
         # ── header bar ────────────────────────────────────────────────────────
         # Adw.ApplicationWindow has no titlebar slot; the header goes in an
@@ -4882,6 +4925,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         notes_scroll.set_vexpand(True)
         notes_scroll.set_hexpand(True)
         s._notes_view = MarkdownNotesView(self._src_scheme)
+        s._notes_view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
@@ -5030,6 +5074,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+E",        "Export PDF with notes"),
             ("Ctrl+R",        "Reload (new instance)"),
             ("Ctrl+\\",       "Toggle notes"),
+            ("Notes panel",   None),
+            ("Ctrl++ / Ctrl+-", "Bigger / smaller notes font"),
+            ("Ctrl+0",        "Reset notes font size"),
+            ("Ctrl+Scroll",   "Bigger / smaller notes font"),
             ("Tabs",          None),
             ("Ctrl+W",        "Close tab"),
             ("Ctrl+Shift+T",  "Reopen the last closed tab"),
@@ -6400,19 +6448,43 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             for grp in (self._tool_btns, self._ptool_btns):
                 grp[idx].add_css_class("tool-transient")
 
+    # ── notes-panel font size ────────────────────────────────────────────────
+    _NOTES_FONT_DEFAULT = 13
+    _NOTES_FONT_MIN = 9
+    _NOTES_FONT_MAX = 40
+    _NOTES_FONT_STEP = 2
+
+    def _apply_notes_font(self):
+        self._notes_font_provider.load_from_data(
+            f".notes-view {{ font-size: {self._notes_font_px}px; }}".encode())
+
+    def _change_notes_font(self, direction):
+        """direction: +1 bigger, -1 smaller, 0 reset to default. Persisted."""
+        if direction == 0:
+            self._notes_font_px = self._NOTES_FONT_DEFAULT
+        else:
+            self._notes_font_px = max(
+                self._NOTES_FONT_MIN,
+                min(self._NOTES_FONT_MAX,
+                    self._notes_font_px + self._NOTES_FONT_STEP * direction))
+        self._apply_notes_font()
+        _save_setting("notes_font_px", self._notes_font_px)
+
     # ── responsive header collapse ──────────────────────────────────────────
     def _apply_collapse_level(self, level):
         """0: full · 1: fold pen modes into the popover · 2: also hide
-        undo/redo/find. Idempotent."""
+        undo/redo · 3: also hide find/presenter/share. Idempotent."""
         if level == self._collapse_level:
             return
         self._collapse_level = level
         collapse_pen = level >= 1
         self._tools_box.set_visible(not collapse_pen)
         self._pen_modes_section.set_visible(collapse_pen)
-        for b in (self._undo_btn, self._redo_btn, self._search_btn,
-                  self._present_btn, self._share_btn, self._undo_sep):
+        # undo/redo go first (level 2); the rest hold on until it gets tighter
+        for b in (self._undo_btn, self._redo_btn, self._undo_sep):
             b.set_visible(level < 2)
+        for b in (self._search_btn, self._present_btn, self._share_btn):
+            b.set_visible(level < 3)
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
     # change doesn't flicker on 1px resize jitter at the boundary
@@ -6435,7 +6507,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         from the actual widgets — so the breakpoints are derived, not guessed."""
         saved = self._collapse_level
         nat = {}
-        for lvl in (2, 1, 0):
+        for lvl in (3, 2, 1, 0):
             self._apply_collapse_level(lvl)
             s = self._header_start.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             e = self._header_end.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
@@ -6455,7 +6527,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         nat = self._collapse_natural
         # least collapse whose real content width still fits the space left after
         # the window buttons
-        level = 0 if avail >= nat[0] else (1 if avail >= nat[1] else 2)
+        level = (0 if avail >= nat[0] else
+                 1 if avail >= nat[1] else
+                 2 if avail >= nat[2] else 3)
         # hysteresis: only expand (show more) when there's clear extra room, so
         # we don't oscillate sitting exactly on a breakpoint
         cur = self._collapse_level

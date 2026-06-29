@@ -3607,17 +3607,31 @@ class TestResponsiveHeader(unittest.TestCase):
                 raise AssertionError("undo should still show at level 1")
         self._run_in_window(body)
 
-    def test_level2_hides_secondary_actions(self):
+    def test_level2_hides_undo_redo_first(self):
         def body(win):
             win._apply_collapse_level(2)
-            for b in (win._undo_btn, win._redo_btn, win._search_btn,
-                      win._present_btn, win._undo_sep):
+            # undo/redo (and their separator) fold one step before the rest
+            for b in (win._undo_btn, win._redo_btn, win._undo_sep):
                 if b.get_visible():
+                    raise AssertionError("undo/redo should hide at level 2")
+            # find/presenter/share are still on the bar at level 2
+            for b in (win._search_btn, win._present_btn, win._share_btn):
+                if not b.get_visible():
                     raise AssertionError(
-                        "undo/redo/find/presenter should hide at level 2")
+                        "find/presenter/share should still show at level 2")
             # the tool switch stays folded into the popover at level 2 too
             if win._tools_box.get_visible():
                 raise AssertionError("tool switch should stay folded at level 2")
+        self._run_in_window(body)
+
+    def test_level3_hides_remaining_secondary_actions(self):
+        def body(win):
+            win._apply_collapse_level(3)
+            for b in (win._undo_btn, win._redo_btn, win._search_btn,
+                      win._present_btn, win._share_btn, win._undo_sep):
+                if b.get_visible():
+                    raise AssertionError(
+                        "all secondary actions should hide at level 3")
             # they come back when the bar expands again
             win._apply_collapse_level(0)
             if not win._present_btn.get_visible():
@@ -3629,7 +3643,7 @@ class TestResponsiveHeader(unittest.TestCase):
             win._calibrate_header()
             nat = win._collapse_natural
             # measured from the real widgets: each collapse level is narrower
-            if not (nat[2] < nat[1] < nat[0]):
+            if not (nat[3] < nat[2] < nat[1] < nat[0]):
                 raise AssertionError(f"breakpoints not ordered: {nat}")
         self._run_in_window(body)
 
@@ -3648,10 +3662,15 @@ class TestResponsiveHeader(unittest.TestCase):
             win._update_header_collapse()
             if win._collapse_level != 1:
                 raise AssertionError("should fold pen modes when tight")
-            win._header.get_width = lambda: nat[2] - 20
+            win._header.get_width = lambda: nat[2] + 5
             win._update_header_collapse()
             if win._collapse_level != 2:
-                raise AssertionError("should hide secondary actions when very tight")
+                raise AssertionError("should hide undo/redo when tight")
+            win._header.get_width = lambda: nat[3] - 20
+            win._update_header_collapse()
+            if win._collapse_level != 3:
+                raise AssertionError(
+                    "should hide remaining actions when very tight")
         self._run_in_window(body)
 
     def test_popover_modes_stay_in_sync(self):
@@ -3844,6 +3863,90 @@ class TestResponsiveHeader(unittest.TestCase):
                 if after != before + 1:
                     raise AssertionError(f"page count {before} -> {after}")
             self._run_in_window(body)
+
+
+class TestNotesFontZoom(unittest.TestCase):
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.notesfont")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def setUp(self):
+        # isolate settings.json so the persisted font size doesn't leak
+        self._cfg = tempfile.mkdtemp()
+        self._old_cfg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = self._cfg
+
+    def tearDown(self):
+        import shutil
+        if self._old_cfg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._old_cfg
+        shutil.rmtree(self._cfg, ignore_errors=True)
+
+    def test_grow_shrink_and_reset(self):
+        def body(win):
+            base = win._notes_font_px
+            win._change_notes_font(1)
+            if win._notes_font_px != base + win._NOTES_FONT_STEP:
+                raise AssertionError("growing did not bump the font size")
+            win._change_notes_font(-1)
+            if win._notes_font_px != base:
+                raise AssertionError("shrinking did not restore the font size")
+            win._change_notes_font(1)
+            win._change_notes_font(0)
+            if win._notes_font_px != win._NOTES_FONT_DEFAULT:
+                raise AssertionError("reset did not return to the default size")
+        self._run_in_window(body)
+
+    def test_clamps_to_bounds(self):
+        def body(win):
+            for _ in range(100):
+                win._change_notes_font(1)
+            if win._notes_font_px != win._NOTES_FONT_MAX:
+                raise AssertionError("font size exceeded the max")
+            for _ in range(100):
+                win._change_notes_font(-1)
+            if win._notes_font_px != win._NOTES_FONT_MIN:
+                raise AssertionError("font size dropped below the min")
+        self._run_in_window(body)
+
+    def test_size_persists_to_settings(self):
+        def body(win):
+            win._change_notes_font(1)
+            win._change_notes_font(1)
+            want = win._notes_font_px
+            from sidemark import _load_settings
+            if _load_settings().get("notes_font_px") != want:
+                raise AssertionError("font size was not persisted to settings")
+        self._run_in_window(body)
+
+    def test_notes_view_zoom_callback_is_wired(self):
+        def body(win):
+            # the live notes editor delegates Ctrl+± / Ctrl+scroll to the window
+            cb = win._notes_view.font_zoom_cb
+            if cb is None:
+                raise AssertionError("notes view zoom callback not wired")
+            base = win._notes_font_px
+            cb(1)
+            if win._notes_font_px != base + win._NOTES_FONT_STEP:
+                raise AssertionError("notes view callback did not resize the font")
+        self._run_in_window(body)
 
 
 class TestThumbnailSidebar(unittest.TestCase):
