@@ -475,6 +475,36 @@ class TestScrollClamp(unittest.TestCase):
         c._clamp_scroll_offset()
         self.assertEqual(c.offset_y, -5000.0)
 
+    def test_short_first_page_centers_instead_of_top(self):
+        c = self._canvas(3)
+        c.go_to_page(0)
+        c.scale = 0.5                      # page 842*0.5=421 < viewport 600
+        ch = c.get_height() or 600
+        center = (ch - c.page_height * c.scale) / 2
+        c.offset_y = 500.0                 # scrolled way up (empty space above)
+        c._clamp_scroll_offset()
+        self.assertAlmostEqual(c.offset_y, center)
+
+    def test_short_last_page_centers_instead_of_bottom(self):
+        c = self._canvas(3)
+        c.go_to_page(2)
+        c.scale = 0.5
+        ch = c.get_height() or 600
+        center = (ch - c.page_height * c.scale) / 2
+        c.offset_y = -500.0                # scrolled way down (empty space below)
+        c._clamp_scroll_offset()
+        self.assertAlmostEqual(c.offset_y, center)
+
+    def test_flip_to_short_page_centers_it(self):
+        c = self._canvas(3)
+        c.go_to_page(0)
+        c._is_fitted = False               # zoomed-out reading position
+        c.scale = 0.5
+        ch = c.get_height() or 600
+        center = (ch - c.page_height * c.scale) / 2
+        c._flip_page(1)                    # forward to a short page
+        self.assertAlmostEqual(c.offset_y, center)
+
 
 # ── stroke storage ────────────────────────────────────────────────────────────
 
@@ -1713,6 +1743,34 @@ class TestLatexFormatting(unittest.TestCase):
         v = self._view()
         self.assertEqual(v._apply_symbol_subs('alpha'), 'alpha')
 
+    # ── accents (\hat, \bar, \tilde, \vec) ────────────────────────────────────
+
+    def test_accent_hat_braced(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\hat{x}'), 'x̂')
+
+    def test_accent_all_kinds(self):
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\bar{x}'), 'x̄')
+        self.assertEqual(v._apply_symbol_subs(r'\tilde{n}'), 'ñ')
+        self.assertEqual(v._apply_symbol_subs(r'\vec{v}'), 'v⃗')
+
+    def test_accent_space_form(self):
+        v = self._view()
+        # \hat x (space-delimited, no braces) also works
+        self.assertEqual(v._apply_symbol_subs(r'\hat x'), 'x̂')
+
+    def test_accent_over_greek_symbol(self):
+        v = self._view()
+        # symbols resolve first, so the mark lands on the resulting glyph
+        self.assertEqual(v._apply_symbol_subs(r'\vec{\alpha}'), 'α⃗')
+
+    def test_accent_in_sentence(self):
+        v = self._view()
+        self.assertEqual(
+            v._apply_symbol_subs(r'let \hat{x} be the estimate'),
+            'let x̂ be the estimate')
+
     # ── script regex ──────────────────────────────────────────────────────────
 
     def test_script_re_single_sup(self):
@@ -2906,6 +2964,39 @@ class TestPresenterMode(unittest.TestCase):
                 win._reset_present_timer()
                 self.assertEqual(win._present_elapsed, 0)
                 self.assertEqual(win._present_timer_label.get_label(), "0:00")
+
+            self._run_in_window(body)
+
+    def test_presenter_nav_refits_each_slide(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                # pretend the presenter zoomed in to work on a slide
+                win.canvas._is_fitted = False
+                win.canvas.scale = 5.0
+                win.canvas.offset_y = -300.0
+                win._nav_page(1)
+                # presentation nav re-fits the new slide (shows it whole/centred)
+                self.assertTrue(win.canvas._needs_fit)
+
+            self._run_in_window(body)
+
+    def test_nav_keeps_zoom_when_not_presenting(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win.canvas._is_fitted = False   # zoomed reading position
+                win.canvas.scale = 5.0
+                win._nav_page(1)
+                # no presenter → keep the zoom, don't force a re-fit
+                self.assertFalse(win.canvas._needs_fit)
 
             self._run_in_window(body)
 

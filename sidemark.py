@@ -937,8 +937,19 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         ch = self.get_height() or 600
         page_h = self.page_height * self.scale
-        lo = min(0.0, ch - page_h)   # top-most scroll (page bottom at viewport bottom)
-        hi = max(0.0, ch - page_h)   # bottom-most scroll (page top at viewport top)
+        if page_h <= ch:
+            # Page shorter than the viewport (zoomed out, or a wide/landscape
+            # page): there's no vertical scroll room, so pin the document's ends
+            # to the centred position rather than letting a fast scroll to the
+            # start/end slam the page against the top or bottom of the window.
+            center = (ch - page_h) / 2
+            if self.current_page_idx <= 0:
+                self.offset_y = min(self.offset_y, center)
+            if self.current_page_idx >= self.n_pages - 1:
+                self.offset_y = max(self.offset_y, center)
+            return
+        lo = ch - page_h   # top-most scroll (page bottom at viewport bottom)
+        hi = 0.0           # bottom-most scroll (page top at viewport top)
         if self.current_page_idx <= 0:
             self.offset_y = min(self.offset_y, hi)
         if self.current_page_idx >= self.n_pages - 1:
@@ -1040,10 +1051,15 @@ class PDFCanvas(Gtk.DrawingArea):
         # reading continues at its top (or bottom when flipping backwards)
         ch = self.get_height() or 600
         self.go_to_page(self.current_page_idx + delta, keep_view=True)
-        if delta > 0:
+        page_h = self.page_height * self.scale
+        if page_h <= ch:
+            # short page: centre it — there's nothing to read past an edge, and
+            # this keeps wide/landscape decks from jumping to the top/bottom
+            self.offset_y = (ch - page_h) / 2
+        elif delta > 0:
             self.offset_y = 8.0
         else:
-            self.offset_y = ch - self.page_height * self.scale - 8.0
+            self.offset_y = ch - page_h - 8.0
         self._schedule_rerender()
         self.queue_draw()
 
@@ -2755,11 +2771,35 @@ _MD_SYMBOLS = {
 }
 _MD_SYMBOL_RE = re.compile(r'\\([A-Za-z]+)')
 
+# LaTeX accents over a base symbol, rendered with Unicode combining marks:
+# \hat{x} → x̂, \bar{x} → x̄, \tilde{x} → x̃, \vec{x} → x⃗ (and \dot / \ddot).
+# The mark follows the base grapheme, so it sits on the first character of the
+# (usually single-character) argument.
+_MD_ACCENTS = {
+    'hat': '̂', 'bar': '̄', 'tilde': '̃', 'vec': '⃗',
+    'dot': '̇', 'ddot': '̈',
+}
+_MD_ACCENT_RE = re.compile(
+    r'\\(' + '|'.join(_MD_ACCENTS) + r')\s*(?:\{([^}]*)\}|(\S))')
+
+
+def _apply_accents(text):
+    def sub(m):
+        mark = _MD_ACCENTS[m.group(1)]
+        base = m.group(2) if m.group(2) is not None else (m.group(3) or '')
+        if not base:
+            return mark
+        return base[0] + mark + base[1:]
+    return _MD_ACCENT_RE.sub(sub, text)
+
 
 def _symbolize(text):
     """Replace LaTeX-style \\commands with their Unicode symbols (display only)."""
-    return _MD_SYMBOL_RE.sub(
+    text = _MD_SYMBOL_RE.sub(
         lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), text)
+    # Accents run after symbol substitution so \hat{\alpha} → α̂ (the inner
+    # \alpha is already α by the time the accent is placed on it).
+    return _apply_accents(text)
 
 
 # Shared inline-Markdown / script regexes (used by the notes editor's TextTag
@@ -5663,7 +5703,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if target == c.current_page_idx:
             return
         self._commit_note()
-        c._flip_page(target - c.current_page_idx)
+        if self._presenter is not None:
+            # While presenting, each slide should show whole and centred — re-fit
+            # the new page rather than carrying a zoomed-in reading position over.
+            c.go_to_page(target)
+        else:
+            c._flip_page(target - c.current_page_idx)
 
     def _on_nav_history(self, can_back):
         """Canvas pushed/popped a link-jump location. The first time a link is

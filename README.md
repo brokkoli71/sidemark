@@ -198,6 +198,7 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 | `\infty` `\approx` `\neq` `\leq` `\geq` | ∞ ≈ ≠ ≤ ≥ |
 | `\in` `\notin` `\subset` `\cup` `\cap` `\emptyset` | ∈ ∉ ⊂ ∪ ∩ ∅ |
 | `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
+| `\hat{x}` `\bar{x}` `\tilde{x}` `\vec{x}` | accents x̂ x̄ x̃ x⃗ (also `\dot` / `\ddot`; braces optional: `\hat x`) |
 
 Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and any Markdown viewer.
 
