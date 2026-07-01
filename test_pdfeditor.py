@@ -2781,24 +2781,26 @@ class TestThumbSelectionClearing(unittest.TestCase):
     def test_empty_sidebar_click_clears_selection(self):
         def body(win):
             self._open(win)
-            # let the listbox allocate so row bounds are real
-            ctx = GLib.MainContext.default()
-            for _ in range(50):
-                ctx.iteration(False)
             rows = self._rows(win)
-            for r in rows[:3]:
-                win._toc_list.select_row(r)
-            # a click far below every row hits empty space → clears
-            win._on_toc_list_pressed(None, 1, 0.0, 1_000_000.0)
-            self.assertEqual(self._selected_pages(win), [])
-            # a click on a real row does not clear
-            for r in rows[:3]:
-                win._toc_list.select_row(r)
-            ok, bounds = rows[0].compute_bounds(win._toc_list)
-            if ok:
-                y = bounds.get_y() + bounds.get_height() / 2
-                win._on_toc_list_pressed(None, 1, 0.0, y)
+            # Which page a y-coordinate hits is driven by get_row_at_y; stub it
+            # so the test doesn't depend on real widget allocation (unreliable
+            # headless in CI). A press that misses every row clears; a press
+            # landing on a row does not.
+            orig = win._toc_list.get_row_at_y
+            try:
+                for r in rows[:3]:
+                    win._toc_list.select_row(r)
+                win._toc_list.get_row_at_y = lambda _y: None
+                win._on_toc_list_pressed(None, 1, 0.0, 1_000_000.0)
+                self.assertEqual(self._selected_pages(win), [])
+
+                for r in rows[:3]:
+                    win._toc_list.select_row(r)
+                win._toc_list.get_row_at_y = lambda _y: rows[0]
+                win._on_toc_list_pressed(None, 1, 0.0, 5.0)
                 self.assertEqual(self._selected_pages(win), [0, 1, 2])
+            finally:
+                win._toc_list.get_row_at_y = orig
 
         self._run_in_window(body)
 
