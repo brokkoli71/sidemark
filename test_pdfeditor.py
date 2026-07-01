@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
                       _export_pdf_with_notes, _parse_anchors, PDFEditorWindow,
-                      DocumentSession, _pdf_needs_ocr)
+                      PDFEditorApp, DocumentSession, _pdf_needs_ocr)
 
 # window tests open files, which records recents — keep that out of the user's
 # real ~/.local/share/sidemark/recent.json (TestRecentFiles patches its own)
@@ -4844,6 +4844,72 @@ class TestDragAndDrop(unittest.TestCase):
         r = self._drop(make, "test.sidemark.dnd.txt")
         self.assertFalse(r["handled"])
         self.assertIsNone(r["path"])
+
+    def test_file_target_declines_tab_drags(self):
+        """A tab dragged between windows advertises AdwTabPage; the file-open
+        target must decline it (so it reaches the tab bar) rather than swallow
+        it and toast 'Drop a PDF…'. A real file drag is still accepted."""
+        errors, result = [], {}
+        app = Adw.Application(application_id="test.sidemark.dnd.tab")
+
+        class _Drop:
+            def __init__(self, fmts):
+                self._fmts = fmts
+
+            def get_formats(self):
+                return self._fmts
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                tab = Gdk.ContentFormats.new_for_gtype(Adw.TabPage.__gtype__)
+                files = Gdk.ContentFormats.new_for_gtype(Gdk.FileList)
+                # a tab dragged from another *instance* only carries this marker
+                root = Gdk.ContentFormats.new(["application/x-rootwindow-drop"])
+                result["tab"] = win._on_drop_accept(None, _Drop(tab))
+                result["file"] = win._on_drop_accept(None, _Drop(files))
+                result["cross"] = win._on_drop_accept(None, _Drop(root))
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+        self.assertFalse(result["tab"])    # tab drag falls through to the tab bar
+        self.assertFalse(result["cross"])  # cross-instance tab drag also declined
+        self.assertTrue(result["file"])    # a real file drag is still accepted
+
+
+class TestSingleInstanceArgs(unittest.TestCase):
+    """The single-instance app parses each launch's arguments (file + --page)
+    in one place; a second launch forwards here."""
+
+    def test_file_only(self):
+        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]), ("a.pdf", 0))
+
+    def test_page_before_or_after_file(self):
+        self.assertEqual(
+            PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]), ("a.pdf", 3))
+        self.assertEqual(
+            PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]), ("a.pdf", 5))
+
+    def test_verbose_and_unknown_flags_ignored(self):
+        self.assertEqual(
+            PDFEditorApp._parse_open_args(["-v", "a.pdf"]), ("a.pdf", 0))
+        self.assertEqual(
+            PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]), ("a.pdf", 0))
+
+    def test_bad_page_value_ignored(self):
+        self.assertEqual(
+            PDFEditorApp._parse_open_args(["--page", "nope", "a.pdf"]),
+            ("a.pdf", 0))
+
+    def test_no_args(self):
+        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0))
 
 
 class TestReorderPages(unittest.TestCase):

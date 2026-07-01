@@ -7061,6 +7061,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         fmts = gdk_drop.get_formats()
         logger.debug("DnD accept: offered formats = %s",
                      fmts.to_string() if fmts else None)
+        # A tab being dragged (within this process it carries AdwTabPage; from
+        # another instance only the "x-rootwindow-drop" marker survives the
+        # process boundary) must not be swallowed by the file-open target — that
+        # would warn "Drop a PDF…". Decline so it falls through to the tab bar.
+        if fmts and (fmts.contain_gtype(Adw.TabPage.__gtype__)
+                     or fmts.contain_mime_type("application/x-rootwindow-drop")):
+            return False
         return True
 
     def _on_drop_motion(self, _target, _drop, _x, _y):
@@ -7889,8 +7896,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         page = self.canvas.current_page_idx
         def do_reload():
+            # Spawn a *standalone* process (SIDEMARK_STANDALONE bypasses the
+            # single instance) so the reload actually re-reads the code from
+            # disk instead of forwarding to this still-running process.
+            env = dict(os.environ, SIDEMARK_STANDALONE="1")
             subprocess.Popen([sys.executable, os.path.abspath(__file__),
-                              self._path, "--page", str(page)])
+                              self._path, "--page", str(page)], env=env)
             self.destroy()
         if self._dirty:
             self._ask_save_then(do_reload)
@@ -8155,12 +8166,16 @@ class PresenterWindow(Adw.Window):
 
 class PDFEditorApp(Adw.Application):
     def __init__(self):
-        super().__init__(
-            application_id="de.hspitz.sidemark",
-            flags=Gio.ApplicationFlags.NON_UNIQUE,
-        )
-        self._initial_file = None
-        self._initial_page = 0
+        # Single instance: every launch is routed to this one process, so all
+        # windows share it and a tab can be dragged between any of them.
+        # HANDLES_COMMAND_LINE lets the primary instance parse each launch's
+        # arguments (a file, --page) and open them in a fresh window.
+        flags = Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+        # Ctrl+R reload sets SIDEMARK_STANDALONE so its fresh-code process runs
+        # independently instead of forwarding to the (old-code) instance.
+        if os.environ.get("SIDEMARK_STANDALONE"):
+            flags |= Gio.ApplicationFlags.NON_UNIQUE
+        super().__init__(application_id="de.hspitz.sidemark", flags=flags)
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -8185,48 +8200,86 @@ class PDFEditorApp(Adw.Application):
         self.quit()
         return GLib.SOURCE_REMOVE
 
+    @staticmethod
+    def _parse_open_args(args):
+        """Pull a file path and --page N out of one launch's arguments (argv
+        without the program name). Unknown flags are ignored."""
+        path, page = None, 0
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--page" and i + 1 < len(args):
+                try:
+                    page = max(0, int(args[i + 1]))
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            if a in ("-v", "--verbose"):
+                i += 1
+                continue
+            if not a.startswith("-") and path is None:
+                path = a
+            i += 1
+        return path, page
+
+    def do_command_line(self, command_line):
+        """Every launch (this process or a forwarded one from a second
+        invocation) lands here in the single primary instance; open the file it
+        names in a new window."""
+        args = command_line.get_arguments()
+        path, page = self._parse_open_args(args[1:])
+        if path and not os.path.isabs(path):
+            cwd = command_line.get_cwd()
+            if cwd:
+                path = os.path.join(cwd, path)
+        # A second launch forwards here and exits immediately; tell its shell
+        # why, so it doesn't just look like the command silently did nothing.
+        if command_line.get_is_remote():
+            what = f"‘{os.path.basename(path)}’" if path else "a new window"
+            command_line.print_literal(
+                f"Sidemark is already running — opened {what} in it.\n")
+        self.open_new_window(path, page)
+        return 0
+
     def do_activate(self):
+        # bare activation (e.g. via D-Bus) with no command line → empty window
+        self.open_new_window()
+
+    def open_new_window(self, path=None, page=0):
+        logger.info("Opening new window: %s", path or "(scratchpad)")
         win = PDFEditorWindow(self)
         win.present()
-        if self._initial_file:
-            win.open_file(self._initial_file)
-            if self._initial_page > 0:
-                win._go_to_page(self._initial_page)
+        if path and os.path.isfile(path):
+            win.open_file(path)
+            if page > 0:
+                win._go_to_page(page)
         else:
+            if path:
+                logger.warning("File not found: %s", path)
             GLib.idle_add(win._open_scratchpad)
-
-    def run_with_file(self, path, page=0):
-        self._initial_file = path
-        self._initial_page = page
-        return self.run([])
+        return win
 
 
 def main():
     args = sys.argv[1:]
     verbose = "--verbose" in args or "-v" in args
-    args = [a for a in args if a not in ("--verbose", "-v")]
     _setup_logging(verbose=verbose)
     try:
         _prune_autosaves()
     except Exception:
         logger.error("autosave pruning failed:\n" + traceback.format_exc())
-    initial_page = 0
-    if "--page" in args:
-        i = args.index("--page")
-        try:
-            initial_page = max(0, int(args[i + 1]))
-            args = args[:i] + args[i + 2:]
-        except (IndexError, ValueError):
-            args = args[:i] + args[i + 1:]
+    # Fail fast on a named file that doesn't exist, before we hand the launch
+    # off to the (possibly already-running) primary instance. Checked here so
+    # the error surfaces on the launching terminal with its own cwd.
+    path, _page = PDFEditorApp._parse_open_args(args)
+    if path and not os.path.isfile(path):
+        print(f"File not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    # Pass the full argv through: a single-instance app forwards it to the
+    # primary, whose do_command_line opens the file in a new window.
     app = PDFEditorApp()
-    if args:
-        path = args[0]
-        if not os.path.isfile(path):
-            print(f"File not found: {path}", file=sys.stderr)
-            sys.exit(1)
-        sys.exit(app.run_with_file(path, page=initial_page))
-    else:
-        sys.exit(app.run([]))
+    sys.exit(app.run(sys.argv))
 
 
 if __name__ == "__main__":
