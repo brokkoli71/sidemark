@@ -72,6 +72,13 @@ def _save_setting(key, value):
     os.replace(tmp, path)
 
 
+def _fmt_clock(secs):
+    """Seconds → m:ss (or h:mm:ss past an hour), for the presentation timer."""
+    h, rem = divmod(int(secs), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def _notes_file_for_pdf(pdf_path):
     """The user-chosen notes file for this PDF, if one was set via the menu;
     otherwise None (callers fall back to notes_path_for)."""
@@ -1166,9 +1173,11 @@ class PDFCanvas(Gtk.DrawingArea):
         btn = gesture.get_current_button()
         logger.debug(f"drag begin btn={btn}")
         if btn in (8, 9):
+            # Page navigation by the mouse side buttons is handled window-wide
+            # (a capture-phase legacy controller), so it also works when the
+            # notes editor has focus; here we just make sure the drag gesture
+            # doesn't turn the press into a stroke.
             self._ignoring = True
-            if self.on_nav_button:
-                self.on_nav_button(1 if btn == 8 else -1)
             return
         if btn == 10:
             # thumb-button pan is driven by _on_motion while held; ignore the
@@ -4182,6 +4191,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             }}
             .drop-before {{ box-shadow: inset 0 3px 0 0 {acc_hex}; }}
             .drop-after  {{ box-shadow: inset 0 -3px 0 0 {acc_hex}; }}
+            .present-bar {{
+                background-color: rgba(0, 0, 0, 0.72);
+                border-radius: 18px;
+                padding: 8px 16px;
+            }}
+            .present-bar separator {{ background: rgba(255, 255, 255, 0.25); }}
+            .present-timer {{
+                color: #ffffff;
+                font-size: 26px;
+                font-feature-settings: "tnum";
+                margin: 0 6px;
+            }}
+            .present-bar button {{
+                color: #ffffff;
+                background: rgba(255, 255, 255, 0.10);
+                border-radius: 12px;
+            }}
+            .present-bar button:hover {{ background: rgba(255, 255, 255, 0.22); }}
+            .present-bar button.present-nav {{
+                min-width: 96px;
+                min-height: 60px;
+                -gtk-icon-size: 34px;
+            }}
         """
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
@@ -4822,8 +4854,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._tab_bar.set_view(self._tab_view)
         self._tab_bar.set_autohide(True)
 
+        # An overlay over the whole tab area floats the presentation control bar
+        # (timer + large prev/next) at the bottom, above whichever tab is active.
+        self._present_overlay = Gtk.Overlay()
+        self._present_overlay.set_child(self._tab_view)
+        self._build_present_bar()
+
         self.toast_overlay = Adw.ToastOverlay()
-        self.toast_overlay.set_child(self._tab_view)
+        self.toast_overlay.set_child(self._present_overlay)
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(header)
@@ -4878,6 +4916,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         mod_ctrl.connect("key-released",
                          lambda c, kv, kc, st: self.canvas._on_modifier_key(c, kv, kc, st, False))
         self.add_controller(mod_ctrl)
+
+        # Mouse side buttons (back/forward, 8/9) flip pages from anywhere in the
+        # window — including while typing in the notes editor. Extra-button
+        # press/release isn't reliably reported through the gesture APIs (see the
+        # canvas thumb-button note), so a capture-phase legacy controller is used.
+        nav_ctrl = Gtk.EventControllerLegacy()
+        nav_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        nav_ctrl.connect("event", self._on_window_button)
+        self.add_controller(nav_ctrl)
+
+    def _on_window_button(self, ctrl, event):
+        if event is None:   # PyGObject occasionally fails to marshal the arg
+            event = ctrl.get_current_event()
+        if event is None or event.get_event_type() != Gdk.EventType.BUTTON_PRESS:
+            return False
+        btn = event.get_button()
+        if btn in (8, 9):
+            self._nav_page(1 if btn == 8 else -1)
+            return True
+        return False
 
     def _build_document_widgets(self, s):
         """Build one document's canvas / notes editor / search bar / sidebar
@@ -6544,6 +6602,79 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         else:
             self._mode_select.set_active(True)
 
+    # ── presentation control bar (timer + large prev/next) ───────────────────
+    def _build_present_bar(self):
+        """A bottom overlay bar on the editor (presenter) window, shown only
+        while presentation mode is active: a timer that can be paused and reset,
+        plus large prev/next page buttons for easy navigation while presenting.
+        It lives here — on the presenter's own screen — not on the projected
+        slide (PresenterWindow stays bare)."""
+        self._present_elapsed = 0
+        self._present_timer_running = True
+        self._present_timer_id = None
+
+        self._present_timer_label = Gtk.Label(label="0:00")
+        self._present_timer_label.add_css_class("present-timer")
+        self._present_pause_btn = Gtk.Button.new_from_icon_name(
+            "media-playback-pause-symbolic")
+        self._present_pause_btn.set_tooltip_text("Pause / resume the timer")
+        self._present_pause_btn.connect(
+            "clicked", lambda *_: self._toggle_present_timer())
+        reset_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        reset_btn.set_tooltip_text("Reset the timer to 0:00")
+        reset_btn.connect("clicked", lambda *_: self._reset_present_timer())
+
+        prev_btn = Gtk.Button.new_from_icon_name("go-previous-symbolic")
+        prev_btn.set_tooltip_text("Previous page")
+        prev_btn.add_css_class("present-nav")
+        prev_btn.connect("clicked", lambda *_: self._nav_page(-1))
+        next_btn = Gtk.Button.new_from_icon_name("go-next-symbolic")
+        next_btn.set_tooltip_text("Next page")
+        next_btn.add_css_class("present-nav")
+        next_btn.connect("clicked", lambda *_: self._nav_page(1))
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        bar.add_css_class("present-bar")
+        for w in (self._present_timer_label, self._present_pause_btn, reset_btn,
+                  Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
+                  prev_btn, next_btn):
+            bar.append(w)
+        bar.set_halign(Gtk.Align.CENTER)
+        bar.set_valign(Gtk.Align.END)
+        bar.set_margin_bottom(24)
+        bar.set_visible(False)
+        self._present_bar = bar
+        self._present_overlay.add_overlay(bar)
+
+    def _show_present_bar(self, shown):
+        self._present_bar.set_visible(shown)
+        if shown:
+            self._reset_present_timer()
+            self._present_timer_running = True
+            self._present_pause_btn.set_icon_name("media-playback-pause-symbolic")
+            if self._present_timer_id is None:
+                self._present_timer_id = GLib.timeout_add_seconds(
+                    1, self._present_tick)
+        elif self._present_timer_id is not None:
+            GLib.source_remove(self._present_timer_id)
+            self._present_timer_id = None
+
+    def _present_tick(self):
+        if self._present_timer_running:
+            self._present_elapsed += 1
+            self._present_timer_label.set_label(_fmt_clock(self._present_elapsed))
+        return True
+
+    def _toggle_present_timer(self):
+        self._present_timer_running = not self._present_timer_running
+        self._present_pause_btn.set_icon_name(
+            "media-playback-pause-symbolic" if self._present_timer_running
+            else "media-playback-start-symbolic")
+
+    def _reset_present_timer(self):
+        self._present_elapsed = 0
+        self._present_timer_label.set_label(_fmt_clock(0))
+
     # ── presenter (second-screen) view ──────────────────────────────────────
     def _on_present_toggled(self, btn):
         if btn.get_active():
@@ -6560,6 +6691,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         pres = PresenterWindow(self.get_application(), self.canvas)
         pres.connect("close-request", self._on_presenter_closed)
+        self._show_present_bar(True)
         self._presenter = pres
         pres.present()
         self._place_presenter(pres)
@@ -6590,10 +6722,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._presenter is not None:
             pres, self._presenter = self._presenter, None
             pres.close()
+        self._show_present_bar(False)
 
     def _on_presenter_closed(self, _win):
         # fired when the presenter closes itself (Esc / window close)
         self._presenter = None
+        self._show_present_bar(False)
         if self._present_btn.get_active():
             self._present_btn.set_active(False)   # untoggle the header button
         return False
@@ -7921,6 +8055,10 @@ class PresenterWindow(Adw.Window):
     the editor's document and stroke dict by reference (re-pointed on every sync,
     so structural edits are picked up) but keeps its own fit-to-page view, so the
     editor can zoom in to work on a slide while the audience still sees it whole.
+
+    Kept deliberately bare: the presentation timer and the large prev/next
+    controls live on the editor window (the presenter's own screen), not here on
+    the projected slide.
     """
 
     def __init__(self, app, src_canvas):

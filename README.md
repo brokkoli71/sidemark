@@ -42,11 +42,11 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### Navigation
 
 - **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Shift+drag` to zoom to region, `Shift+click` to fit page
-- **Page flip** — `PageDown` / `PageUp` or mouse thumb buttons; scrolling past a page edge flips automatically. At the very first and last page, scrolling stops at the boundary instead of drifting into empty space (drag-pan still moves freely)
+- **Page flip** — `PageDown` / `PageUp` or the mouse **back/forward side buttons** (which work anywhere in the window, even while you're typing in the notes editor); scrolling past a page edge flips automatically. At the very first and last page, scrolling stops at the boundary instead of drifting into empty space (drag-pan still moves freely)
 - **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between the PDF's table of contents and page thumbnails; drag a thumbnail to reorder pages, drop a PDF **from a file manager** between thumbnails to insert its pages there, or drag one (or several — `Ctrl+click` thumbnails to add or remove pages from the selection) **out to a file manager or the desktop** to export those pages as a standalone PDF — annotations baked in, and any page's notes appended after it, like macOS Preview. A drop line shows where pages will land, and a confirmation dialog (with a "don't ask again" option) guards reorders and inserts. Hover any sidebar item to see what it does and its shortcuts
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
-- **Presenter view** (`F5`) — mirror the current page on a second screen for presenting: it goes fullscreen on the other monitor (windowed if you only have one), with no header or notes — just the page and its live ink. It follows your page changes and shows strokes as you draw them, but keeps its own fit-to-page view, so you can zoom in to edit a slide while the audience still sees it whole. `Esc` (or `F5` again) closes it
+- **Presenter view** (`F5`) — mirror the current page on a second screen for presenting: it goes fullscreen on the other monitor (windowed if you only have one), with no header or notes — just the page and its live ink. It follows your page changes and shows strokes as you draw them, but keeps its own fit-to-page view, so you can zoom in to edit a slide while the audience still sees it whole. `Esc` (or `F5` again) closes it. While it's active, **your** window (the one with your notes) shows a control bar along the bottom with a **presentation timer** (pause / reset) and **large prev/next buttons** for easy navigation — these stay on your screen, never on the projected slide
 
 ### Files & integration
 
@@ -141,6 +141,7 @@ pip install pymupdf
 |-----|--------|
 | `PageDown` | Next page (keeps current zoom) |
 | `PageUp` | Previous page (keeps current zoom) |
+| Mouse forward / back buttons | Next / previous page — works anywhere in the window, even while editing notes |
 | `Alt+click` | Follow the link under the cursor — a footnote, citation, or cross-reference jumps to its target (URLs open in your browser) |
 | `Alt+Left` | Jump back to where you were before following a link |
 | `Ctrl+Shift+N` | Add blank page after current |
@@ -219,7 +220,7 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 | `Ctrl+W` | Close the current tab (prompts to save unsaved changes; closes the window with the last tab) |
 | `Ctrl+Shift+T` | Reopen the most recently closed tab |
 
-PDF-level shortcuts — `PageUp` / `PageDown` (page flip), `Ctrl+\` (toggle notes), `Ctrl+W` (close tab), `Ctrl+Shift+T` (reopen closed tab) — work no matter which side has focus, so flipping pages while typing notes works as expected.
+PDF-level shortcuts — `PageUp` / `PageDown` (page flip), the mouse back/forward side buttons, `Ctrl+\` (toggle notes), `Ctrl+W` (close tab), `Ctrl+Shift+T` (reopen closed tab) — work no matter which side has focus, so flipping pages while typing notes works as expected.
 
 ## Tested distributions
 

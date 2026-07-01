@@ -2855,6 +2855,143 @@ class TestPresenterMode(unittest.TestCase):
 
         self._run_in_window(body)
 
+    def test_present_bar_shows_only_while_presenting(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                # the timer + big nav buttons live on the editor (presenter)
+                # window, not the projected slide, and only while presenting
+                self.assertFalse(win._present_bar.get_visible())
+                win._present_btn.set_active(True)
+                self.assertTrue(win._present_bar.get_visible())
+                win._present_btn.set_active(False)
+                self.assertFalse(win._present_bar.get_visible())
+
+            self._run_in_window(body)
+
+    def test_present_bar_nav_flips_editor_and_mirror(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win._nav_page(2)   # what the big Next button drives
+                self.assertEqual(win.canvas.current_page_idx, 2)
+                self.assertEqual(win._presenter.canvas.current_page_idx, 2)
+
+            self._run_in_window(body)
+
+    def test_present_timer_pause_and_reset(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win._present_tick(); win._present_tick()
+                self.assertEqual(win._present_elapsed, 2)
+                self.assertEqual(win._present_timer_label.get_label(), "0:02")
+                win._toggle_present_timer()      # pause: ticks stop advancing
+                win._present_tick()
+                self.assertEqual(win._present_elapsed, 2)
+                win._toggle_present_timer()      # resume
+                win._present_tick()
+                self.assertEqual(win._present_elapsed, 3)
+                win._reset_present_timer()
+                self.assertEqual(win._present_elapsed, 0)
+                self.assertEqual(win._present_timer_label.get_label(), "0:00")
+
+            self._run_in_window(body)
+
+    def test_present_timer_restarts_from_zero_each_presentation(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win._present_tick(); win._present_tick()
+                win._present_btn.set_active(False)   # stops the timer
+                win._present_btn.set_active(True)    # fresh run → back to 0:00
+                self.assertEqual(win._present_elapsed, 0)
+                self.assertEqual(win._present_timer_label.get_label(), "0:00")
+
+            self._run_in_window(body)
+
+
+class TestMouseSideButtonNav(unittest.TestCase):
+    """The mouse side buttons (back/forward, 8/9) flip pages from anywhere in
+    the window — handled at the window level so they work even when the notes
+    editor has focus."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.sidebtn")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    class _Ev:
+        def __init__(self, b, t=Gdk.EventType.BUTTON_PRESS):
+            self.b, self.t = b, t
+
+        def get_event_type(self):
+            return self.t
+
+        def get_button(self):
+            return self.b
+
+    def test_side_buttons_flip_pages(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                # focus the notes editor: navigation must still work
+                win._notes_view.grab_focus()
+                self.assertTrue(win._on_window_button(None, self._Ev(8)))
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                self.assertTrue(win._on_window_button(None, self._Ev(9)))
+                self.assertEqual(win.canvas.current_page_idx, 0)
+
+            self._run_in_window(body)
+
+    def test_other_buttons_and_releases_pass_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                # left click is not navigation (must reach the canvas/notes)
+                self.assertFalse(win._on_window_button(None, self._Ev(1)))
+                # a side-button *release* is ignored (press is what navigates)
+                self.assertFalse(win._on_window_button(
+                    None, self._Ev(8, Gdk.EventType.BUTTON_RELEASE)))
+                self.assertEqual(win.canvas.current_page_idx, 0)
+
+            self._run_in_window(body)
+
 
 class TestExport(unittest.TestCase):
     """
