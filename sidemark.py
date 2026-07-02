@@ -3734,6 +3734,12 @@ class MarkdownNotesView(GtkSource.View):
 
         key = Gtk.EventControllerKey()
         key.connect("key-pressed", self._on_key)
+        # capture phase: the text view's built-in input-method controller also
+        # runs at capture and CONSUMES printable keys (brackets, quotes) there —
+        # a bubble-phase handler only ever sees modifier combos. Ours is
+        # prepended, so at capture it runs before the IM; anything we don't
+        # handle (return False) still reaches it and types normally.
+        key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         self.add_controller(key)
 
         # Ctrl+scroll rescales the notes font (mirrors the canvas zoom gesture)

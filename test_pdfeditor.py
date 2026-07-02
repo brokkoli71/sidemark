@@ -1512,6 +1512,20 @@ class TestMarkdownFormatting(unittest.TestCase):
         v._wrap_selection("**")
         self.assertEqual(self._text(buf), "hello")
 
+    def test_key_controller_runs_at_capture_before_the_im(self):
+        # GtkTextView's built-in input-method controller consumes printable
+        # keys (brackets, quotes) in the CAPTURE phase — a bubble-phase
+        # handler never sees them, only modifier combos. Our controller must
+        # therefore be capture-phase and ordered before the built-in one
+        # (added controllers are prepended, so ours comes first in the list).
+        v = self._view()
+        key_phases = [c.get_propagation_phase()
+                      for c in v.observe_controllers()
+                      if isinstance(c, Gtk.EventControllerKey)]
+        self.assertEqual(key_phases[0], Gtk.PropagationPhase.CAPTURE)
+        self.assertEqual(key_phases.count(Gtk.PropagationPhase.CAPTURE), 2,
+                         key_phases)   # ours + the text view's IM controller
+
     def test_bracket_surrounds_selection(self):
         # typing a bracket with text selected surrounds it instead of
         # replacing it; the inner text stays selected so pairs can be stacked
