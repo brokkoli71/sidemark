@@ -2946,6 +2946,50 @@ class TestPresenterMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_next_slide_preview_follows_pages(self):
+        # PowerPoint-style: while presenting, the editor window shows a preview
+        # of the upcoming page; it re-renders on page change and hides on the
+        # last page (nothing is next) and when presenting stops.
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=3)
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertFalse(win._present_preview.get_visible())
+                win._present_btn.set_active(True)
+                self.assertTrue(win._present_preview.get_visible())
+                first = win._present_preview_pic.get_paintable()
+                self.assertIsNotNone(first)
+                self.assertEqual(first.get_width(),
+                                 2 * win.PRESENT_PREVIEW_WIDTH)
+                win._nav_page(1)          # page 1 of 3 — still has a next
+                self.assertTrue(win._present_preview.get_visible())
+                self.assertIsNot(win._present_preview_pic.get_paintable(),
+                                 first)   # re-rendered for the new next page
+                win._nav_page(1)          # last page — nothing is next
+                self.assertFalse(win._present_preview.get_visible())
+                win._nav_page(-1)         # back — preview returns
+                self.assertTrue(win._present_preview.get_visible())
+                win._present_btn.set_active(False)
+                self.assertFalse(win._present_preview.get_visible())
+
+            self._run_in_window(body)
+
+    def test_next_slide_preview_hidden_for_single_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=1)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                # bar shows, but there is no next slide to preview
+                self.assertTrue(win._present_bar.get_visible())
+                self.assertFalse(win._present_preview.get_visible())
+
+            self._run_in_window(body)
+
     def test_present_timer_pause_and_reset(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")

@@ -4254,6 +4254,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 min-height: 60px;
                 -gtk-icon-size: 34px;
             }}
+            .present-preview {{
+                background-color: rgba(0, 0, 0, 0.72);
+                border-radius: 12px;
+                padding: 8px;
+            }}
+            .present-preview-label {{
+                color: rgba(255, 255, 255, 0.85);
+                font-size: 13px;
+            }}
         """
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
@@ -5314,6 +5323,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 else "")
         self._set_file_title(name, s._path or s._notes_path)
         self._update_header_collapse()
+        # the presenter (and so the next-slide preview) is per-document
+        self._update_present_preview()
 
     def _new_tab(self):
         """Create a fresh document session in a new tab and make it active."""
@@ -5687,6 +5698,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._select_thumb(idx)
         if self._presenter is not None:
             self._presenter.sync_page()
+            self._update_present_preview()
 
     def _go_to_page(self, idx):
         self._commit_note()
@@ -6691,18 +6703,74 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._present_bar = bar
         self._present_overlay.add_overlay(bar)
 
+        # Next-slide preview (PowerPoint presenter view style): a small render
+        # of the upcoming page floats in the bottom-right corner of the editor
+        # while presenting, so the presenter always sees what comes next.
+        # Clicking it advances. Hidden on the last page — nothing is next.
+        self._present_preview_pic = Gtk.Picture()
+        self._present_preview_pic.set_can_shrink(True)
+        next_label = Gtk.Label(label="Next slide")
+        next_label.add_css_class("present-preview-label")
+        preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        preview.add_css_class("present-preview")
+        preview.append(next_label)
+        preview.append(self._present_preview_pic)
+        preview.set_halign(Gtk.Align.END)
+        preview.set_valign(Gtk.Align.END)
+        preview.set_margin_end(24)
+        preview.set_margin_bottom(24)
+        preview.set_tooltip_text("Next slide — click to advance")
+        preview.set_visible(False)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self._nav_page(1))
+        preview.add_controller(click)
+        self._present_preview = preview
+        self._present_overlay.add_overlay(preview)
+
     def _show_present_bar(self, shown):
         self._present_bar.set_visible(shown)
         if shown:
+            self._update_present_preview()
             self._reset_present_timer()
             self._present_timer_running = True
             self._present_pause_btn.set_icon_name("media-playback-pause-symbolic")
             if self._present_timer_id is None:
                 self._present_timer_id = GLib.timeout_add_seconds(
                     1, self._present_tick)
-        elif self._present_timer_id is not None:
-            GLib.source_remove(self._present_timer_id)
-            self._present_timer_id = None
+        else:
+            self._present_preview.set_visible(False)
+            if self._present_timer_id is not None:
+                GLib.source_remove(self._present_timer_id)
+                self._present_timer_id = None
+
+    # rendered width of the next-slide preview, in logical px
+    PRESENT_PREVIEW_WIDTH = 240
+
+    def _update_present_preview(self):
+        """Render the page after the current one into the corner preview.
+        Hidden when not presenting or on the last page (nothing is next)."""
+        c = self.canvas
+        nxt = c.current_page_idx + 1
+        if self._presenter is None or not c.document or nxt >= c.n_pages:
+            self._present_preview.set_visible(False)
+            return
+        try:
+            page = c.document[nxt]
+            # render at 2× the display width and let the Picture scale down,
+            # so the preview stays crisp on hidpi screens
+            s = 2 * self.PRESENT_PREVIEW_WIDTH / page.rect.width
+            pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
+            tex = Gdk.MemoryTexture.new(
+                pix.width, pix.height, Gdk.MemoryFormat.R8G8B8,
+                GLib.Bytes.new(pix.samples), pix.stride)
+            self._present_preview_pic.set_paintable(tex)
+            self._present_preview_pic.set_size_request(
+                self.PRESENT_PREVIEW_WIDTH, round(pix.height / pix.width
+                                                  * self.PRESENT_PREVIEW_WIDTH))
+            self._present_preview.set_visible(True)
+        except Exception:
+            logger.error("next-slide preview failed:\n" + traceback.format_exc())
+            self._present_preview.set_visible(False)
 
     def _present_tick(self):
         if self._present_timer_running:
@@ -6736,8 +6804,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         pres = PresenterWindow(self.get_application(), self.canvas)
         pres.connect("close-request", self._on_presenter_closed)
-        self._show_present_bar(True)
         self._presenter = pres
+        self._show_present_bar(True)   # after _presenter: the preview reads it
         pres.present()
         self._place_presenter(pres)
 
