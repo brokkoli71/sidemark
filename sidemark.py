@@ -3793,11 +3793,49 @@ class MarkdownNotesView(GtkSource.View):
                 return True
             return False
         if not ctrl_held and not alt_held:
+            # typing a bracket / quote with text selected surrounds the
+            # selection instead of replacing it (works with either half of a
+            # bracket pair; the selection is kept so pairs can be chained)
+            pair = self._SURROUND_CHARS.get(chr(Gdk.keyval_to_unicode(keyval) or 0))
+            if pair and self.get_buffer().get_has_selection():
+                self._surround_selection(*pair)
+                return True
             # Slash snippets (/date, /time, /now) expand on the trigger key;
             # return False so the space/newline still gets inserted afterwards.
             if keyval in (Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
                 self._expand_snippet()
         return False
+
+    # typing any of these with a selection wraps it in the (open, close) pair
+    _SURROUND_CHARS = {}
+    for _o, _c in (("(", ")"), ("[", "]"), ("{", "}"), ("<", ">")):
+        _SURROUND_CHARS[_o] = (_o, _c)
+        _SURROUND_CHARS[_c] = (_o, _c)
+    for _q in ('"', "'", "`"):
+        _SURROUND_CHARS[_q] = (_q, _q)
+    del _o, _c, _q
+
+    def _surround_selection(self, opener, closer):
+        """Wrap the selection in opener…closer, keeping the inner text
+        selected so further brackets can be stacked around it."""
+        buf = self.get_buffer()
+        s = buf.get_iter_at_mark(buf.get_selection_bound())
+        e = buf.get_iter_at_mark(buf.get_insert())
+        if s.compare(e) > 0:
+            s, e = e, s
+        text = buf.get_text(s, e, False)
+        buf.begin_user_action()
+        try:
+            buf.delete(s, e)
+            ins = buf.get_iter_at_mark(buf.get_insert())
+            buf.insert(ins, opener + text + closer)
+        finally:
+            buf.end_user_action()
+        end = buf.get_iter_at_mark(buf.get_insert())
+        end.backward_chars(len(closer))
+        start = end.copy()
+        start.backward_chars(len(text))
+        buf.select_range(start, end)
 
     # ── slash snippets (/date → today's date) ─────────────────────────────────
 

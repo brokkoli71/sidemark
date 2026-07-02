@@ -1512,6 +1512,44 @@ class TestMarkdownFormatting(unittest.TestCase):
         v._wrap_selection("**")
         self.assertEqual(self._text(buf), "hello")
 
+    def test_bracket_surrounds_selection(self):
+        # typing a bracket with text selected surrounds it instead of
+        # replacing it; the inner text stays selected so pairs can be stacked
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello world", 6, 11)
+        self.assertTrue(v._on_key(None, Gdk.KEY_parenleft, 0, 0))
+        self.assertEqual(self._text(buf), "hello (world)")
+        s, e = buf.get_selection_bounds()
+        self.assertEqual(buf.get_text(s, e, False), "world")
+        self.assertTrue(v._on_key(None, Gdk.KEY_bracketleft, 0, 0))
+        self.assertEqual(self._text(buf), "hello ([world])")
+
+    def test_closing_bracket_and_quote_surround_too(self):
+        v = self._view(); buf = v.get_buffer()
+        self._set(buf, "hello world", 6, 11)
+        self.assertTrue(v._on_key(None, Gdk.KEY_braceright, 0, 0))
+        self.assertEqual(self._text(buf), "hello {world}")
+        v2 = self._view(); buf2 = v2.get_buffer()
+        self._set(buf2, "say hi", 4, 6)
+        self.assertTrue(v2._on_key(None, Gdk.KEY_quotedbl, 0, 0))
+        self.assertEqual(self._text(buf2), 'say "hi"')
+
+    def test_bracket_without_selection_types_normally(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("hello"); buf.place_cursor(buf.get_end_iter())
+        # no selection → not handled, so the bracket is inserted as usual
+        self.assertFalse(v._on_key(None, Gdk.KEY_parenleft, 0, 0))
+        self.assertEqual(self._text(buf), "hello")
+
+    def test_surround_reversed_selection(self):
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("hello world")
+        s = buf.get_start_iter(); s.forward_chars(6)
+        e = buf.get_start_iter(); e.forward_chars(11)
+        buf.select_range(e, s)   # reversed drag
+        self.assertTrue(v._on_key(None, Gdk.KEY_parenleft, 0, 0))
+        self.assertEqual(self._text(buf), "hello (world)")
+
     def test_wrap_right_to_left_drag(self):
         v = self._view(); buf = v.get_buffer()
         buf.set_text("hello world")

@@ -32,7 +32,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Notes
 
-- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum`, `\mapsto` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`). Symbols are rendered for display only — the `.md` file always keeps the source `\commands`, so notes round-trip cleanly through other editors. Zoom the notes font with `Ctrl++` / `Ctrl+-` / `Ctrl+scroll` (`Ctrl+0` resets) — useful for reading your notes while presenting; the size is remembered between sessions
+- **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum`, `\mapsto` …), and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`; typing a bracket or quote with text selected surrounds it). Symbols are rendered for display only — the `.md` file always keeps the source `\commands`, so notes round-trip cleanly through other editors. Zoom the notes font with `Ctrl++` / `Ctrl+-` / `Ctrl+scroll` (`Ctrl+0` resets) — useful for reading your notes while presenting; the size is remembered between sessions
 - **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
 - **Callout boxes** (`Ctrl+Alt+drag`) — anchor plus a box rendered on the PDF at the drag endpoint, with an arrow from the anchor; both the anchor and the box can be dragged to reposition (the arrow re-aims itself); included in exports. The box renders the note's symbols (`\alpha`→α), super/subscripts (`x^2`, `a_{ij}`) and inline Markdown (`**bold**`, `*italic*`, `` `code` ``) — always, regardless of which notes line is selected
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop a box of text directly on the page with no anchor or arrow; edit it in the notes panel (it's a `<!-- textbox:X:Y -->` paragraph in the `.md`), drag it to reposition, and it renders the same symbols / super-subscripts / Markdown as callouts; included in exports
@@ -171,6 +171,7 @@ pip install pymupdf
 | Key | Action |
 |-----|--------|
 | `Ctrl+B` | Bold selection |
+| `(` `[` `{` `"` … | Surround the selection with the bracket / quote pair |
 | `Ctrl+I` | Italic selection |
 | `Ctrl+E` | Inline code selection |
 | `Ctrl+D` | Duplicate the current line (or every line the selection spans) |
