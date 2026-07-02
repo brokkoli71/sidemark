@@ -4348,30 +4348,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             }}
             .drop-before {{ box-shadow: inset 0 3px 0 0 {acc_hex}; }}
             .drop-after  {{ box-shadow: inset 0 -3px 0 0 {acc_hex}; }}
-            .present-bar {{
-                background-color: rgba(0, 0, 0, 0.72);
-                border-radius: 18px;
-                padding: 8px 16px;
-            }}
-            .present-bar separator {{ background: rgba(255, 255, 255, 0.25); }}
-            .present-timer {{
-                color: #ffffff;
-                font-size: 26px;
-                font-feature-settings: "tnum";
-                margin: 0 6px;
-            }}
-            .present-bar button {{
-                color: #ffffff;
-                background: rgba(255, 255, 255, 0.10);
-                border-radius: 12px;
-            }}
-            .present-bar button:hover {{ background: rgba(255, 255, 255, 0.22); }}
-            .present-bar button.present-nav {{
-                min-width: 96px;
-                min-height: 60px;
-                -gtk-icon-size: 34px;
-            }}
         """
+        # (the presentation bar styles live in their own per-window provider —
+        # _scale_present_bar — because they scale with the window size)
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
                    + "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in rgb)) \
@@ -6797,16 +6776,80 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         bar.add_css_class("present-bar")
+        # styled by a per-window provider so it can scale with the window; the
+        # unique class keeps two windows' bars from styling each other
+        self._present_bar_class = f"present-bar-{id(self):x}"
+        bar.add_css_class(self._present_bar_class)
         for w in (self._present_timer_label, self._present_pause_btn, reset_btn,
                   Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
                   prev_btn, next_btn):
             bar.append(w)
         bar.set_halign(Gtk.Align.CENTER)
         bar.set_valign(Gtk.Align.END)
-        bar.set_margin_bottom(24)
         bar.set_visible(False)
         self._present_bar = bar
         self._present_overlay.add_overlay(bar)
+        self._present_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self._present_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self._present_bar_scale = 0.0
+        self._scale_present_bar(1280, 800)
+
+    # baseline window size for the presentation bar (scale factor 1.0)
+    _PRESENT_BAR_BASE = (1280, 800)
+
+    def _scale_present_bar(self, w, h):
+        """Size the presentation bar relative to the window, OSD-styled so it
+        blends with the theme (translucent pill, flat buttons, accent hover)
+        while staying clearly readable over the page."""
+        bw, bh = self._PRESENT_BAR_BASE
+        f = max(0.8, min(2.5, min(w / bw, h / bh)))
+        if abs(f - self._present_bar_scale) < 0.04:
+            return   # ignore resize jitter; only restyle on real changes
+        self._present_bar_scale = f
+        acc_hex = "#{:02x}{:02x}{:02x}".format(
+            *(int(c * 255) for c in self._theme_acc))
+        cls = self._present_bar_class
+        css = f"""
+            .{cls} {{
+                background-color: rgba(15, 15, 18, 0.62);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: {round(34 * f)}px;
+                padding: {round(6 * f)}px {round(16 * f)}px;
+            }}
+            .{cls} separator {{ background: rgba(255, 255, 255, 0.20); }}
+            .{cls} .present-timer {{
+                color: #ffffff;
+                font-size: {round(24 * f)}px;
+                font-feature-settings: "tnum";
+                margin: 0 {round(6 * f)}px;
+            }}
+            .{cls} button {{
+                color: #ffffff;
+                background: transparent;
+                border-radius: {round(26 * f)}px;
+                min-width: {round(40 * f)}px;
+                min-height: {round(40 * f)}px;
+                -gtk-icon-size: {round(16 * f)}px;
+            }}
+            .{cls} button:hover {{ background: alpha({acc_hex}, 0.50); }}
+            .{cls} button:active {{ background: alpha({acc_hex}, 0.75); }}
+            .{cls} button.present-nav {{
+                min-width: {round(88 * f)}px;
+                min-height: {round(52 * f)}px;
+                -gtk-icon-size: {round(30 * f)}px;
+            }}
+        """
+        self._present_css.load_from_data(css.encode())
+        self._present_bar.set_margin_bottom(round(20 * f))
+
+    def do_size_allocate(self, width, height, baseline):
+        Adw.ApplicationWindow.do_size_allocate(self, width, height, baseline)
+        # keep the presentation bar proportional to the window while it shows
+        bar = getattr(self, "_present_bar", None)
+        if bar is not None and bar.get_visible():
+            self._scale_present_bar(width, height)
 
     def _show_present_bar(self, shown):
         self._present_bar.set_visible(shown)
@@ -6814,6 +6857,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # presenting (stack look — PowerPoint-style next-slide preview)
         self.canvas.set_stack_preview(shown)
         if shown:
+            # catch up on any resizing that happened while the bar was hidden
+            if self.get_width() and self.get_height():
+                self._scale_present_bar(self.get_width(), self.get_height())
             self._reset_present_timer()
             self._present_timer_running = True
             self._present_pause_btn.set_icon_name("media-playback-pause-symbolic")

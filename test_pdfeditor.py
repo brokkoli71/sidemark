@@ -3098,6 +3098,34 @@ class TestPresenterMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_present_bar_scales_with_window(self):
+        # the presentation bar's sizes are derived from the window size (via a
+        # per-window CSS provider), clamped so tiny/huge windows stay sane
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                win._scale_present_bar(1280, 800)      # baseline
+                self.assertAlmostEqual(win._present_bar_scale, 1.0)
+                base_margin = win._present_bar.get_margin_bottom()
+                win._scale_present_bar(2560, 1600)     # doubled window
+                self.assertAlmostEqual(win._present_bar_scale, 2.0)
+                self.assertEqual(win._present_bar.get_margin_bottom(),
+                                 2 * base_margin)
+                win._scale_present_bar(320, 200)       # tiny → clamped
+                self.assertAlmostEqual(win._present_bar_scale, 0.8)
+                win._scale_present_bar(9000, 9000)     # huge → clamped
+                self.assertAlmostEqual(win._present_bar_scale, 2.5)
+                # jitter below the threshold is ignored (no restyle churn)
+                win._scale_present_bar(1280, 800)
+                win._scale_present_bar(1300, 810)
+                self.assertAlmostEqual(win._present_bar_scale, 1.0)
+
+            self._run_in_window(body)
+
     def test_present_timer_pause_and_reset(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
