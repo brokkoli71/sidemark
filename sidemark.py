@@ -247,6 +247,21 @@ class PDFCanvas(Gtk.DrawingArea):
         self.surround_color = (0.910, 0.867, 0.824)  # overridden by window with theme color
         self.zoom_accent = (0.52, 0.70, 0.30)        # overridden with theme accent
 
+        # presentation stack preview: the next page peeks out from behind the
+        # current one, down-right, like the next card in a stack (editor canvas
+        # only, while presenting — see set_stack_preview)
+        self.stack_preview = False
+        self._stack_surface = None
+        self._stack_scale = 0.0
+        self._stack_page_size = (0, 0)
+
+        # live mirroring of an in-progress stroke: a view-only mirror canvas
+        # points live_stroke_src at the editor canvas and draws its
+        # current_stroke; the editor calls on_live_draw on every stroke motion
+        # so the mirror redraws while the ink is still being laid down
+        self.live_stroke_src = None
+        self.on_live_draw = None
+
         self.on_page_changed = None    # callback(current_idx, n_pages)
         self.on_page_will_change = None  # callback() before leaving the page (commit notes)
         self.on_nav_button = None     # callback(delta: int) for back/forward buttons
@@ -499,6 +514,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.page_height = self.page.rect.height
         self._page_surface = None
         self._surface_scale = 0.0
+        self._stack_surface = None    # the next page changed too
         self._scroll_past = 0.0
         if self._rerender_id is not None:
             GLib.source_remove(self._rerender_id)
@@ -538,14 +554,34 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── layout ───────────────────────────────────────────────────────────────
 
+    # presentation stack look: the next page is drawn at STACK_NEXT_SCALE × the
+    # current page's scale, behind its right edge (STACK_OVERLAP px under it)
+    # and bottom-anchored to the canvas — mostly visible, clearly behind
+    STACK_NEXT_SCALE = 0.45
+    STACK_OVERLAP = 18
+    STACK_MARGIN = 12
+
     def _fit_page(self, w=None, h=None):
         w = w or self.get_width() or 800
         h = h or self.get_height() or 600
-        if self.page_width and self.page_height:
+        if not (self.page_width and self.page_height):
+            return
+        if self.stack_preview:
+            # reserve room beside the page (width only — vertical fit stays
+            # normal, so portrait pages keep their size and position): the
+            # current page moves left and the smaller next page sits to its
+            # right, barely overlapping, bottom-anchored to the canvas
+            k, o, m = self.STACK_NEXT_SCALE, self.STACK_OVERLAP, self.STACK_MARGIN
+            self.scale = min((w - 2 * m + o) / (self.page_width * (1 + k)),
+                             (h - 2 * m) / self.page_height)
+            foot_w = self.page_width * self.scale * (1 + k) - o
+            self.offset_x = (w - foot_w) / 2
+            self.offset_y = (h - self.page_height * self.scale) / 2
+        else:
             self.scale = min(w / self.page_width, h / self.page_height) * 0.95
             self.offset_x = (w - self.page_width * self.scale) / 2
             self.offset_y = (h - self.page_height * self.scale) / 2
-            self._is_fitted = True
+        self._is_fitted = True
 
     def _on_resize(self, _area, width, height):
         old_w, old_h = self._last_size
@@ -563,21 +599,83 @@ class PDFCanvas(Gtk.DrawingArea):
             self.offset_y = height / 2 - cy_pdf * self.scale
         self.queue_draw()
 
-    def _rerender_now(self):
-        if not self.page:
-            return
+    def _page_to_surface(self, page, logical_scale):
+        """Render a fitz page to a cairo surface at logical_scale × the widget's
+        device scale factor."""
         sf = self.get_scale_factor()
-        logical_scale = min(max(self.scale, 0.5), 4.0)
-        device_scale  = logical_scale * sf
-        pix = self.page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True, annots=False)
+        device_scale = logical_scale * sf
+        pix = page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True, annots=False)
         w, h = pix.width, pix.height
         # fitz RGBA → cairo ARGB32 (BGRA in memory on little-endian): swap R and B channels
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 4).copy()
         arr[:, :, [0, 2]] = arr[:, :, [2, 0]]
         surf = cairo.ImageSurface.create_for_data(arr, cairo.FORMAT_ARGB32, w, h)
         surf.set_device_scale(sf, sf)
-        self._page_surface = surf
+        return surf
+
+    def _rerender_now(self):
+        if not self.page:
+            return
+        logical_scale = min(max(self.scale, 0.5), 4.0)
+        self._page_surface = self._page_to_surface(self.page, logical_scale)
         self._surface_scale = logical_scale
+
+    def set_stack_preview(self, on):
+        """Toggle the next-page-behind-current stack look (presentation mode)."""
+        if on == self.stack_preview:
+            return
+        self.stack_preview = on
+        self._stack_surface = None
+        if self._is_fitted and self.page:
+            self._fit_page()
+            self._schedule_rerender()
+        self.queue_draw()
+
+    def _draw_stack_peek(self, ctx, height):
+        """Draw the next page — smaller and very slightly greyed — behind the
+        current page's right edge, bottom-anchored to the canvas, so the
+        presenter sees what's coming and the pages read as a stack. Its
+        position depends only on the page width (portrait pages don't shift).
+        Only meaningful in the fitted presentation view; skipped on the last
+        page."""
+        nxt = self.current_page_idx + 1
+        if self.document is None or nxt >= self.n_pages:
+            return
+        next_scale = self.scale * self.STACK_NEXT_SCALE
+        logical_scale = min(max(next_scale, 0.2), 4.0)
+        if self._stack_surface is None or self._stack_scale != logical_scale:
+            try:
+                page = self.document[nxt]
+                self._stack_surface = self._page_to_surface(page, logical_scale)
+                self._stack_scale = logical_scale
+                self._stack_page_size = (page.rect.width, page.rect.height)
+            except Exception:
+                logger.error("stack peek render failed:\n" + traceback.format_exc())
+                return
+        # just right of the current page's edge, bottom-anchored to the canvas
+        w = self._stack_page_size[0] * next_scale
+        h = self._stack_page_size[1] * next_scale
+        x = self.offset_x + self.page_width * self.scale - self.STACK_OVERLAP
+        y = height - self.STACK_MARGIN - h
+        ctx.save()
+        ctx.rectangle(x, y, w, h)
+        ctx.set_source_rgb(1, 1, 1)
+        ctx.fill()
+        ctx.translate(x, y)
+        blit_scale = next_scale / self._stack_scale
+        ctx.scale(blit_scale, blit_scale)
+        ctx.set_source_surface(self._stack_surface, 0, 0)
+        ctx.get_source().set_filter(cairo.Filter.BILINEAR)
+        ctx.paint()
+        ctx.restore()
+        # grey it out very slightly + hairline, so it isn't the live slide
+        ctx.set_source_rgba(0.5, 0.5, 0.5, 0.10)
+        ctx.rectangle(x, y, w, h)
+        ctx.fill()
+        ctx.set_source_rgba(0, 0, 0, 0.30)
+        ctx.set_line_width(1)
+        ctx.rectangle(x + 0.5, y + 0.5, w, h)
+        ctx.stroke()
 
     def _schedule_rerender(self):
         if self._rerender_id is not None:
@@ -620,6 +718,10 @@ class PDFCanvas(Gtk.DrawingArea):
         elif self.offset_x == 0 and self.offset_y == 0 and self.scale == 1.0:
             self._fit_page()
 
+        # presenting: the next page shows behind the current one (stack look)
+        if self.stack_preview and self._is_fitted:
+            self._draw_stack_peek(ctx, height)
+
         ctx.set_source_rgb(1, 1, 1)
         ctx.rectangle(self.offset_x, self.offset_y,
                       self.page_width * self.scale, self.page_height * self.scale)
@@ -647,6 +749,15 @@ class PDFCanvas(Gtk.DrawingArea):
                              "color": color,
                              "width": width,
                              "opacity": opacity})
+        # mirror canvas: also draw the editor's stroke still being laid down
+        src = self.live_stroke_src
+        if (src is not None and src.current_stroke
+                and src.current_page_idx == self.current_page_idx):
+            color, width, opacity = src._pen_attrs()
+            to_draw.append({"pts": src.current_stroke,
+                            "color": color,
+                            "width": width,
+                            "opacity": opacity})
 
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
@@ -1453,6 +1564,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.current_stroke.append(pt)
                 # re-arm on every motion → the snap fires once the cursor rests
                 self._arm_straight_timer()
+            if self.on_live_draw:
+                self.on_live_draw()   # mirror the in-progress ink live
         self.queue_draw()
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
@@ -1591,6 +1704,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 if self.on_user_action:
                     self.on_user_action()
             self.current_stroke = []
+            if self.on_live_draw:
+                self.on_live_draw()   # drop the live stroke from the mirror
         self._temp_highlighter = False
         self.queue_draw()
 
@@ -1632,6 +1747,8 @@ class PDFCanvas(Gtk.DrawingArea):
             self._straight_mode = True
             self.current_stroke = [self.current_stroke[0], self.current_stroke[-1]]
             self.queue_draw()
+            if self.on_live_draw:
+                self.on_live_draw()
         return False   # one-shot
 
     def _words_in_rect(self, px0, py0, px1, py1):
@@ -4254,15 +4371,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 min-height: 60px;
                 -gtk-icon-size: 34px;
             }}
-            .present-preview {{
-                background-color: rgba(0, 0, 0, 0.72);
-                border-radius: 12px;
-                padding: 8px;
-            }}
-            .present-preview-label {{
-                color: rgba(255, 255, 255, 0.85);
-                font-size: 13px;
-            }}
         """
         for i, (_, rgb) in enumerate(self._swatch_presets):
             css += f"\n            .pen-swatch-{i} {{ background: " \
@@ -5323,8 +5431,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 else "")
         self._set_file_title(name, s._path or s._notes_path)
         self._update_header_collapse()
-        # the presenter (and so the next-slide preview) is per-document
-        self._update_present_preview()
 
     def _new_tab(self):
         """Create a fresh document session in a new tab and make it active."""
@@ -5698,7 +5804,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._select_thumb(idx)
         if self._presenter is not None:
             self._presenter.sync_page()
-            self._update_present_preview()
 
     def _go_to_page(self, idx):
         self._commit_note()
@@ -6703,74 +6808,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._present_bar = bar
         self._present_overlay.add_overlay(bar)
 
-        # Next-slide preview (PowerPoint presenter view style): a small render
-        # of the upcoming page floats in the bottom-right corner of the editor
-        # while presenting, so the presenter always sees what comes next.
-        # Clicking it advances. Hidden on the last page — nothing is next.
-        self._present_preview_pic = Gtk.Picture()
-        self._present_preview_pic.set_can_shrink(True)
-        next_label = Gtk.Label(label="Next slide")
-        next_label.add_css_class("present-preview-label")
-        preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        preview.add_css_class("present-preview")
-        preview.append(next_label)
-        preview.append(self._present_preview_pic)
-        preview.set_halign(Gtk.Align.END)
-        preview.set_valign(Gtk.Align.END)
-        preview.set_margin_end(24)
-        preview.set_margin_bottom(24)
-        preview.set_tooltip_text("Next slide — click to advance")
-        preview.set_visible(False)
-        click = Gtk.GestureClick()
-        click.connect("released", lambda *_: self._nav_page(1))
-        preview.add_controller(click)
-        self._present_preview = preview
-        self._present_overlay.add_overlay(preview)
-
     def _show_present_bar(self, shown):
         self._present_bar.set_visible(shown)
+        # the editor canvas shows the next page behind the current one while
+        # presenting (stack look — PowerPoint-style next-slide preview)
+        self.canvas.set_stack_preview(shown)
         if shown:
-            self._update_present_preview()
             self._reset_present_timer()
             self._present_timer_running = True
             self._present_pause_btn.set_icon_name("media-playback-pause-symbolic")
             if self._present_timer_id is None:
                 self._present_timer_id = GLib.timeout_add_seconds(
                     1, self._present_tick)
-        else:
-            self._present_preview.set_visible(False)
-            if self._present_timer_id is not None:
-                GLib.source_remove(self._present_timer_id)
-                self._present_timer_id = None
-
-    # rendered width of the next-slide preview, in logical px
-    PRESENT_PREVIEW_WIDTH = 240
-
-    def _update_present_preview(self):
-        """Render the page after the current one into the corner preview.
-        Hidden when not presenting or on the last page (nothing is next)."""
-        c = self.canvas
-        nxt = c.current_page_idx + 1
-        if self._presenter is None or not c.document or nxt >= c.n_pages:
-            self._present_preview.set_visible(False)
-            return
-        try:
-            page = c.document[nxt]
-            # render at 2× the display width and let the Picture scale down,
-            # so the preview stays crisp on hidpi screens
-            s = 2 * self.PRESENT_PREVIEW_WIDTH / page.rect.width
-            pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
-            tex = Gdk.MemoryTexture.new(
-                pix.width, pix.height, Gdk.MemoryFormat.R8G8B8,
-                GLib.Bytes.new(pix.samples), pix.stride)
-            self._present_preview_pic.set_paintable(tex)
-            self._present_preview_pic.set_size_request(
-                self.PRESENT_PREVIEW_WIDTH, round(pix.height / pix.width
-                                                  * self.PRESENT_PREVIEW_WIDTH))
-            self._present_preview.set_visible(True)
-        except Exception:
-            logger.error("next-slide preview failed:\n" + traceback.format_exc())
-            self._present_preview.set_visible(False)
+        elif self._present_timer_id is not None:
+            GLib.source_remove(self._present_timer_id)
+            self._present_timer_id = None
 
     def _present_tick(self):
         if self._present_timer_running:
@@ -6802,7 +6854,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._toast("Open a PDF first")
             self._present_btn.set_active(False)
             return
-        pres = PresenterWindow(self.get_application(), self.canvas)
+        pres = PresenterWindow(self.get_application(), self.canvas,
+                               on_nav=self._nav_page)
         pres.connect("close-request", self._on_presenter_closed)
         self._presenter = pres
         self._show_present_bar(True)   # after _presenter: the preview reads it
@@ -6834,11 +6887,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _close_presenter(self):
         if self._presenter is not None:
             pres, self._presenter = self._presenter, None
+            pres.detach()
             pres.close()
         self._show_present_bar(False)
 
-    def _on_presenter_closed(self, _win):
+    def _on_presenter_closed(self, win):
         # fired when the presenter closes itself (Esc / window close)
+        win.detach()
         self._presenter = None
         self._show_present_bar(False)
         if self._present_btn.get_active():
@@ -8182,16 +8237,23 @@ class PresenterWindow(Adw.Window):
 
     Kept deliberately bare: the presentation timer and the large prev/next
     controls live on the editor window (the presenter's own screen), not here on
-    the projected slide.
+    the projected slide. It still pages when focused, though — click / Space /
+    arrows / PageUp/Down / mouse side buttons all navigate (clicker-friendly),
+    driving the editor via on_nav so both windows stay in step.
     """
 
-    def __init__(self, app, src_canvas):
+    def __init__(self, app, src_canvas, on_nav=None):
         super().__init__(application=app)
         self.set_title("Sidemark — Presenter")
         self._src = src_canvas
+        self._on_nav = on_nav   # callback(delta) — drives the editor's _nav_page
         canvas = PDFCanvas(interactive=False)
         canvas.surround_color = (0.0, 0.0, 0.0)   # black surround for projection
         canvas.zoom_accent = src_canvas.zoom_accent
+        # draw the editor's in-progress stroke too, so ink appears while it's
+        # being laid down (the editor pings us via on_live_draw per motion)
+        canvas.live_stroke_src = src_canvas
+        src_canvas.on_live_draw = canvas.queue_draw
         self.canvas = canvas
         self.set_content(canvas)
         self.sync_page()
@@ -8199,6 +8261,14 @@ class PresenterWindow(Adw.Window):
         key = Gtk.EventControllerKey()
         key.connect("key-pressed", self._on_key)
         self.add_controller(key)
+
+        # While this window has focus (e.g. a clicker driving the projected
+        # screen), it can still page: click advances, the mouse back/forward
+        # side buttons flip like in the editor (8 next, 9 prev).
+        click = Gtk.GestureClick()
+        click.set_button(0)   # 0 = listen to every button
+        click.connect("pressed", self._on_click)
+        canvas.add_controller(click)
 
     def _repoint(self):
         """Re-point the shared document/stroke references at the editor's current
@@ -8225,11 +8295,39 @@ class PresenterWindow(Adw.Window):
         self._repoint()
         self.canvas.queue_draw()
 
+    # presentation-remote style bindings: forward / back / leave
+    _NAV_NEXT_KEYS = (Gdk.KEY_space, Gdk.KEY_Right, Gdk.KEY_Down,
+                      Gdk.KEY_Page_Down, Gdk.KEY_KP_Page_Down, Gdk.KEY_Return)
+    _NAV_PREV_KEYS = (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_BackSpace,
+                      Gdk.KEY_Page_Up, Gdk.KEY_KP_Page_Up)
+
+    def _nav(self, delta):
+        if self._on_nav is not None:
+            self._on_nav(delta)
+
+    def detach(self):
+        """Unhook from the editor canvas (presenter is closing)."""
+        if self._src.on_live_draw == self.canvas.queue_draw:
+            self._src.on_live_draw = None
+
     def _on_key(self, _ctrl, keyval, _keycode, _state):
         if keyval == Gdk.KEY_Escape:
             self.close()
             return True
+        if keyval in self._NAV_NEXT_KEYS:
+            self._nav(1)
+            return True
+        if keyval in self._NAV_PREV_KEYS:
+            self._nav(-1)
+            return True
         return False
+
+    def _on_click(self, gesture, _n_press, _x, _y):
+        button = gesture.get_current_button()
+        if button in (Gdk.BUTTON_PRIMARY, 8):   # click / mouse-forward → next
+            self._nav(1)
+        elif button in (Gdk.BUTTON_SECONDARY, 9):   # right / mouse-back → prev
+            self._nav(-1)
 
 
 class PDFEditorApp(Adw.Application):

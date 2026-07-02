@@ -8,6 +8,7 @@ import sys
 import math
 import tempfile
 import time
+import types
 import unittest
 
 # Keep tests from writing the user's real recently-used.xbel — they run on the
@@ -2946,47 +2947,154 @@ class TestPresenterMode(unittest.TestCase):
 
             self._run_in_window(body)
 
-    def test_next_slide_preview_follows_pages(self):
-        # PowerPoint-style: while presenting, the editor window shows a preview
-        # of the upcoming page; it re-renders on page change and hides on the
-        # last page (nothing is next) and when presenting stops.
+    def test_stack_preview_toggles_and_shrinks_fit(self):
+        # While presenting, the editor canvas shows the pages as a stack: the
+        # current page fits slightly smaller and moves left, reserving width
+        # where the next page shows behind it. Vertical fit stays normal.
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=3, width=842, height=595)   # landscape slides
+
+            def body(win):
+                win._do_open_file(pdf)
+                c = win.canvas
+                self.assertFalse(c.stack_preview)
+                c._fit_page(800, 600)
+                plain_scale = c.scale
+                win._present_btn.set_active(True)
+                self.assertTrue(c.stack_preview)
+                c._fit_page(800, 600)
+                self.assertLess(c.scale, plain_scale)   # zoomed out a bit
+                # the current page's centre moved left of the canvas centre to
+                # make room, but stays vertically centred (the next slide's
+                # spot depends only on the page width, so pages never jump)
+                self.assertLess(c.offset_x + c.page_width * c.scale / 2, 400)
+                self.assertAlmostEqual(
+                    c.offset_y + c.page_height * c.scale / 2, 300, delta=1)
+                win._present_btn.set_active(False)
+                self.assertFalse(c.stack_preview)
+
+            self._run_in_window(body)
+
+    def test_stack_peek_renders_next_page_not_on_last(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
             make_pdf(pdf, n_pages=3)
 
             def body(win):
                 win._do_open_file(pdf)
-                self.assertFalse(win._present_preview.get_visible())
                 win._present_btn.set_active(True)
-                self.assertTrue(win._present_preview.get_visible())
-                first = win._present_preview_pic.get_paintable()
-                self.assertIsNotNone(first)
-                self.assertEqual(first.get_width(),
-                                 2 * win.PRESENT_PREVIEW_WIDTH)
-                win._nav_page(1)          # page 1 of 3 — still has a next
-                self.assertTrue(win._present_preview.get_visible())
-                self.assertIsNot(win._present_preview_pic.get_paintable(),
-                                 first)   # re-rendered for the new next page
-                win._nav_page(1)          # last page — nothing is next
-                self.assertFalse(win._present_preview.get_visible())
-                win._nav_page(-1)         # back — preview returns
-                self.assertTrue(win._present_preview.get_visible())
-                win._present_btn.set_active(False)
-                self.assertFalse(win._present_preview.get_visible())
+                c = win.canvas
+                surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+                c._fit_page(800, 600)
+                c._draw(c, cairo.Context(surf), 800, 600)
+                self.assertIsNotNone(c._stack_surface)   # next page rendered
+                # a point near the bottom-right of the smaller next page (well
+                # clear of the current page) shows its slightly greyed white
+                # paper: a NEUTRAL grey — unlike the warm surround color
+                k = PDFCanvas.STACK_NEXT_SCALE
+                x = int(c.offset_x + c.page_width * c.scale
+                        - PDFCanvas.STACK_OVERLAP
+                        + c._stack_page_size[0] * c.scale * k - 8)
+                y = int(600 - PDFCanvas.STACK_MARGIN - 8)
+                data, stride = surf.get_data(), surf.get_stride()
+                b, g, r = data[y * stride + x * 4: y * stride + x * 4 + 3]
+                self.assertLessEqual(abs(int(r) - int(b)), 4, (r, g, b))
+                self.assertLess(b, 245)         # dimmed, not the live page
+                self.assertGreater(b, 180)
+                # … but on the last page there is nothing behind: the same
+                # point is the (warm) surround color and no surface is made
+                win.canvas.go_to_page(2)
+                c._fit_page(800, 600)
+                surf2 = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+                c._draw(c, cairo.Context(surf2), 800, 600)
+                self.assertIsNone(c._stack_surface)
+                data2 = surf2.get_data()
+                b2, _g2, r2 = data2[y * stride + x * 4: y * stride + x * 4 + 3]
+                self.assertGreater(int(r2) - int(b2), 10)   # warm, not neutral
 
             self._run_in_window(body)
 
-    def test_next_slide_preview_hidden_for_single_page(self):
+    def test_presenter_window_keys_navigate(self):
+        # the projected window pages when focused: Space/arrows/PageUp/Down
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
-            make_pdf(pdf, n_pages=1)
+            make_pdf(pdf, n_pages=4)
 
             def body(win):
                 win._do_open_file(pdf)
                 win._present_btn.set_active(True)
-                # bar shows, but there is no next slide to preview
-                self.assertTrue(win._present_bar.get_visible())
-                self.assertFalse(win._present_preview.get_visible())
+                pres = win._presenter
+                for key, expect in ((Gdk.KEY_space, 1), (Gdk.KEY_Right, 2),
+                                    (Gdk.KEY_Left, 1), (Gdk.KEY_Page_Down, 2),
+                                    (Gdk.KEY_Page_Up, 1), (Gdk.KEY_Up, 0),
+                                    (Gdk.KEY_Down, 1)):
+                    self.assertTrue(pres._on_key(None, key, 0, 0))
+                    self.assertEqual(win.canvas.current_page_idx, expect)
+                    self.assertEqual(pres.canvas.current_page_idx, expect)
+
+            self._run_in_window(body)
+
+    def test_presenter_window_click_navigates(self):
+        # click / mouse-forward advance, right-click / mouse-back go back
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=4)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                pres = win._presenter
+
+                def press(button):
+                    stub = types.SimpleNamespace(get_current_button=lambda: button)
+                    pres._on_click(stub, 1, 0, 0)
+
+                press(1)                  # left click → next
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                press(8)                  # mouse forward → next
+                self.assertEqual(win.canvas.current_page_idx, 2)
+                press(3)                  # right click → previous
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                press(9)                  # mouse back → previous
+                self.assertEqual(win.canvas.current_page_idx, 0)
+                self.assertEqual(pres.canvas.current_page_idx, 0)
+
+            self._run_in_window(body)
+
+    def test_live_stroke_mirrors_while_drawing(self):
+        # in-progress ink (not yet committed) already shows on the projected
+        # slide: the mirror draws the editor's current_stroke and is pinged to
+        # redraw on every stroke motion
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                pres = win._presenter
+                self.assertIs(pres.canvas.live_stroke_src, win.canvas)
+                self.assertEqual(win.canvas.on_live_draw,
+                                 pres.canvas.queue_draw)
+                # a fat in-progress blue stroke across the page (pin the color:
+                # the window may have loaded a user pen color from settings)
+                win.canvas.pen_color = (0.05, 0.05, 0.8)
+                win.canvas.pen_width = 20
+                win.canvas.current_stroke = [(100, 100), (400, 700)]
+                c = pres.canvas
+                c._fit_page(800, 600)
+                c._needs_fit = False
+                surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+                c._draw(c, cairo.Context(surf), 800, 600)
+                x, y = c._pdf_to_screen(250, 400)   # midpoint of the stroke
+                data, stride = surf.get_data(), surf.get_stride()
+                off = int(y) * stride + int(x) * 4
+                b, g, r = data[off:off + 3]
+                self.assertGreater(int(b) - int(r), 80, (r, g, b))  # blue ink
+                # closing the presenter unhooks the live callback
+                win._present_btn.set_active(False)
+                self.assertIsNone(win.canvas.on_live_draw)
 
             self._run_in_window(body)
 
