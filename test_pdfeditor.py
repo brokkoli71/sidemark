@@ -2959,20 +2959,49 @@ class TestPresenterMode(unittest.TestCase):
                 win._do_open_file(pdf)
                 c = win.canvas
                 self.assertFalse(c.stack_preview)
-                c._fit_page(800, 600)
+                c._fit_page(900, 500)    # clearly wide → beside layout
                 plain_scale = c.scale
                 win._present_btn.set_active(True)
                 self.assertTrue(c.stack_preview)
-                c._fit_page(800, 600)
+                c._fit_page(900, 500)
+                self.assertFalse(c._stack_below)
                 self.assertLess(c.scale, plain_scale)   # zoomed out a bit
                 # the current page's centre moved left of the canvas centre to
                 # make room, but stays vertically centred (the next slide's
                 # spot depends only on the page width, so pages never jump)
-                self.assertLess(c.offset_x + c.page_width * c.scale / 2, 400)
+                self.assertLess(c.offset_x + c.page_width * c.scale / 2, 450)
                 self.assertAlmostEqual(
-                    c.offset_y + c.page_height * c.scale / 2, 300, delta=1)
+                    c.offset_y + c.page_height * c.scale / 2, 250, delta=1)
                 win._present_btn.set_active(False)
                 self.assertFalse(c.stack_preview)
+
+            self._run_in_window(body)
+
+    def test_stack_preview_moves_below_on_tall_canvas(self):
+        # a wide notes panel leaves the PDF panel tall and narrow — there the
+        # next slide fits under the current one and wins it more space, so the
+        # layout flips from beside to underneath
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "deck.pdf")
+            make_pdf(pdf, n_pages=3)   # portrait pages
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._present_btn.set_active(True)
+                c = win.canvas
+                c._fit_page(800, 600)              # wide canvas → beside
+                self.assertFalse(c._stack_below)
+                beside_scale_on_tall = min(
+                    (400 - 24 + c.STACK_OVERLAP)
+                    / (c.page_width * (1 + c.STACK_NEXT_SCALE)),
+                    (800 - 24) / c.page_height)
+                c._fit_page(400, 800)              # tall canvas → underneath
+                self.assertTrue(c._stack_below)
+                # the flip bought the current page a larger scale, and it is
+                # horizontally centred (the reserved room is below now)
+                self.assertGreater(c.scale, beside_scale_on_tall)
+                self.assertAlmostEqual(
+                    c.offset_x + c.page_width * c.scale / 2, 200, delta=1)
 
             self._run_in_window(body)
 

@@ -254,6 +254,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._stack_surface = None
         self._stack_scale = 0.0
         self._stack_page_size = (0, 0)
+        self._stack_below = False   # next page under the current one, not beside
 
         # live mirroring of an in-progress stroke: a view-only mirror canvas
         # points live_stroke_src at the editor canvas and draws its
@@ -567,16 +568,27 @@ class PDFCanvas(Gtk.DrawingArea):
         if not (self.page_width and self.page_height):
             return
         if self.stack_preview:
-            # reserve room beside the page (width only — vertical fit stays
-            # normal, so portrait pages keep their size and position): the
-            # current page moves left and the smaller next page sits to its
-            # right, barely overlapping, bottom-anchored to the canvas
+            # reserve room for the smaller next page on ONE side — beside the
+            # page (the other axis fits normally, so pages keep their size and
+            # position between flips) or, when the canvas is tall enough that
+            # it wins the current page more space (e.g. wide notes panel),
+            # underneath it. Pick whichever fit leaves the current page larger.
             k, o, m = self.STACK_NEXT_SCALE, self.STACK_OVERLAP, self.STACK_MARGIN
-            self.scale = min((w - 2 * m + o) / (self.page_width * (1 + k)),
-                             (h - 2 * m) / self.page_height)
-            foot_w = self.page_width * self.scale * (1 + k) - o
-            self.offset_x = (w - foot_w) / 2
-            self.offset_y = (h - self.page_height * self.scale) / 2
+            s_right = min((w - 2 * m + o) / (self.page_width * (1 + k)),
+                          (h - 2 * m) / self.page_height)
+            s_below = min((w - 2 * m) / self.page_width,
+                          (h - 2 * m + o) / (self.page_height * (1 + k)))
+            self._stack_below = s_below > s_right
+            if self._stack_below:
+                self.scale = s_below
+                foot_h = self.page_height * self.scale * (1 + k) - o
+                self.offset_x = (w - self.page_width * self.scale) / 2
+                self.offset_y = (h - foot_h) / 2
+            else:
+                self.scale = s_right
+                foot_w = self.page_width * self.scale * (1 + k) - o
+                self.offset_x = (w - foot_w) / 2
+                self.offset_y = (h - self.page_height * self.scale) / 2
         else:
             self.scale = min(w / self.page_width, h / self.page_height) * 0.95
             self.offset_x = (w - self.page_width * self.scale) / 2
@@ -631,13 +643,14 @@ class PDFCanvas(Gtk.DrawingArea):
             self._schedule_rerender()
         self.queue_draw()
 
-    def _draw_stack_peek(self, ctx, height):
+    def _draw_stack_peek(self, ctx, width, height):
         """Draw the next page — smaller and very slightly greyed — behind the
-        current page's right edge, bottom-anchored to the canvas, so the
-        presenter sees what's coming and the pages read as a stack. Its
-        position depends only on the page width (portrait pages don't shift).
-        Only meaningful in the fitted presentation view; skipped on the last
-        page."""
+        current page's right edge (or its bottom edge, when _fit_page chose
+        the underneath layout), anchored to the canvas on the free axis, so
+        the presenter sees what's coming and the pages read as a stack. Its
+        position depends only on the page's near edge, so pages don't shift
+        between flips. Only meaningful in the fitted presentation view;
+        skipped on the last page."""
         nxt = self.current_page_idx + 1
         if self.document is None or nxt >= self.n_pages:
             return
@@ -652,11 +665,16 @@ class PDFCanvas(Gtk.DrawingArea):
             except Exception:
                 logger.error("stack peek render failed:\n" + traceback.format_exc())
                 return
-        # just right of the current page's edge, bottom-anchored to the canvas
         w = self._stack_page_size[0] * next_scale
         h = self._stack_page_size[1] * next_scale
-        x = self.offset_x + self.page_width * self.scale - self.STACK_OVERLAP
-        y = height - self.STACK_MARGIN - h
+        if self._stack_below:
+            # just under the current page's bottom edge, right-anchored
+            x = width - self.STACK_MARGIN - w
+            y = self.offset_y + self.page_height * self.scale - self.STACK_OVERLAP
+        else:
+            # just right of the current page's edge, bottom-anchored
+            x = self.offset_x + self.page_width * self.scale - self.STACK_OVERLAP
+            y = height - self.STACK_MARGIN - h
         ctx.save()
         ctx.rectangle(x, y, w, h)
         ctx.set_source_rgb(1, 1, 1)
@@ -720,7 +738,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # presenting: the next page shows behind the current one (stack look)
         if self.stack_preview and self._is_fitted:
-            self._draw_stack_peek(ctx, height)
+            self._draw_stack_peek(ctx, width, height)
 
         ctx.set_source_rgb(1, 1, 1)
         ctx.rectangle(self.offset_x, self.offset_y,
