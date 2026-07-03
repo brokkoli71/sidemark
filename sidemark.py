@@ -4318,6 +4318,20 @@ class TextPageView(Gtk.Overlay):
         self.ink.add_controller(drag)
         self._drag = drag
 
+        # Alt+drag draws with the pen even while the text tool is active — a
+        # quick annotation without switching tools. Capture phase on the
+        # overlay sees the press before the TextView; without Alt the gesture
+        # denies itself so clicking and selecting text work untouched.
+        self._alt_saved_tool = None
+        alt = Gtk.GestureDrag()
+        alt.set_button(Gdk.BUTTON_PRIMARY)
+        alt.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        alt.connect("drag-begin", self._on_alt_begin)
+        alt.connect("drag-update", self._on_alt_update)
+        alt.connect("drag-end", self._on_alt_end)
+        self.add_controller(alt)
+        self._alt_drag = alt
+
         # the ink must repaint whenever the sheet scrolls or reflows under it
         self.scroll.get_vadjustment().connect(
             "value-changed", lambda *_: self.ink.queue_draw())
@@ -4371,6 +4385,27 @@ class TextPageView(Gtk.Overlay):
                 for dx, dy in st["pts"]]
 
     # ── drawing gestures ─────────────────────────────────────────────────────
+
+    def _on_alt_begin(self, gesture, x, y):
+        state = gesture.get_current_event_state()
+        if self.tool != "text" or not state & Gdk.ModifierType.ALT_MASK:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._alt_saved_tool = self.tool
+        self.tool = "pen"           # style + erase checks read self.tool
+        self._on_ink_begin(gesture, x, y)
+
+    def _on_alt_update(self, gesture, dx, dy):
+        if self._alt_saved_tool is not None:
+            self._on_ink_update(gesture, dx, dy)
+
+    def _on_alt_end(self, gesture, dx, dy):
+        if self._alt_saved_tool is None:
+            return
+        self._on_ink_end(gesture, dx, dy)
+        self.tool = self._alt_saved_tool
+        self._alt_saved_tool = None
 
     def _on_ink_begin(self, gesture, x, y):
         button = gesture.get_current_button()
@@ -5089,6 +5124,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ctx.arc(8 * s, 10.5 * s, 1.05 * s, 0, 2 * math.pi)
             ctx.fill()
 
+        def _draw_mode_text(_a, ctx, w, h):
+            # an I-beam text cursor: vertical stem with short serifs top/bottom
+            s = w / 16.0
+            ctx.set_source_rgb(*fg)
+            ctx.set_line_width(1.3 * s)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.move_to(5.6 * s, 2.2 * s)
+            ctx.line_to(10.4 * s, 2.2 * s)
+            ctx.move_to(5.6 * s, 13.8 * s)
+            ctx.line_to(10.4 * s, 13.8 * s)
+            ctx.move_to(8 * s, 2.2 * s)
+            ctx.line_to(8 * s, 13.8 * s)
+            ctx.stroke()
+
         def _glyph(fn, size=16):
             d = Gtk.DrawingArea()
             d.set_content_width(size)
@@ -5126,6 +5175,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_select.set_tooltip_text(
             "Select text (Alt+drag · Ctrl+M · long-press for reading-order / rectangular)")
         self._mode_select.set_group(self._mode_pen)
+        # text-first pages swap the PDF select tool for this caret tool: same
+        # "select" mode underneath, but visually an I-beam (the page is text)
+        self._mode_text = Gtk.ToggleButton()
+        self._mode_text.set_child(_glyph(_draw_mode_text))
+        self._mode_text.set_tooltip_text(
+            "Text cursor — click to place the caret and type "
+            "(Alt+drag draws with the pen)")
+        self._mode_text.set_group(self._mode_pen)
+        self._mode_text.set_visible(False)
         self._mode_pan = Gtk.ToggleButton()
         self._mode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._mode_pan.set_tooltip_text(
@@ -5143,7 +5201,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                      (self._mode_eraser, "eraser"), (self._mode_lasso, "lasso"),
                      (self._mode_select, "select"),
                      (self._mode_pan, "pan"), (self._mode_zoom, "zoom"),
-                     (self._mode_anchor, "anchor")):
+                     (self._mode_anchor, "anchor"),
+                     (self._mode_text, "select")):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
 
         self._tools_box = tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -5151,6 +5210,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
                            self._mode_lasso, self._mode_select, self._mode_pan,
                            self._mode_zoom, self._mode_anchor)
+        tools_box.append(self._mode_text)   # leftmost — first tool on a text page
         for b in self._tool_btns:
             tools_box.append(b)
 
@@ -5192,6 +5252,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_select.set_tooltip_text(
             "Select text (Alt+drag · Ctrl+M · long-press for reading-order / rectangular)")
         self._pmode_select.set_group(self._pmode_pen)
+        self._pmode_text = Gtk.ToggleButton()
+        self._pmode_text.set_child(_glyph(_draw_mode_text))
+        self._pmode_text.set_tooltip_text(
+            "Text cursor — click to place the caret and type "
+            "(Alt+drag draws with the pen)")
+        self._pmode_text.set_group(self._pmode_pen)
+        self._pmode_text.set_visible(False)
         self._pmode_pan = Gtk.ToggleButton()
         self._pmode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._pmode_pan.set_tooltip_text(
@@ -5209,13 +5276,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                      (self._pmode_eraser, "eraser"), (self._pmode_lasso, "lasso"),
                      (self._pmode_select, "select"),
                      (self._pmode_pan, "pan"), (self._pmode_zoom, "zoom"),
-                     (self._pmode_anchor, "anchor")):
+                     (self._pmode_anchor, "anchor"),
+                     (self._pmode_text, "select")):
             b.connect("toggled", lambda b, m=m: b.get_active() and self._set_tool_mode(m))
         pmode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pmode_box.add_css_class("linked")
         self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
                             self._pmode_lasso, self._pmode_select, self._pmode_pan,
                             self._pmode_zoom, self._pmode_anchor)
+        pmode_box.append(self._pmode_text)
         for b in self._ptool_btns:
             pmode_box.append(b)
         self._pen_modes_section.append(pmode_box)
@@ -5706,23 +5775,25 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _update_header_for_mode(self):
         """Hide the PDF-only chrome while a text-first page is shown. Pen,
-        highlighter and eraser stay; the select tool doubles as the caret."""
+        highlighter and eraser stay; the PDF select tool swaps for the caret
+        tool (leftmost, so 'just type' reads as the default)."""
         text = bool(self._active_session and self._active_session._text_mode)
         for w in (self._toc_btn, self._nav_box, self._pages_box,
-                  self._mode_lasso, self._mode_pan, self._mode_zoom,
-                  self._mode_anchor, self._present_btn, self._share_btn,
-                  self._notes_toggle,
-                  self._pmode_lasso, self._pmode_pan, self._pmode_zoom,
-                  self._pmode_anchor):
+                  self._mode_lasso, self._mode_select, self._mode_pan,
+                  self._mode_zoom, self._mode_anchor,
+                  self._present_btn, self._share_btn, self._notes_toggle,
+                  self._pmode_lasso, self._pmode_select, self._pmode_pan,
+                  self._pmode_zoom, self._pmode_anchor):
             w.set_visible(not text)
+        self._mode_text.set_visible(text)
+        self._pmode_text.set_visible(text)
+        # leaving a text page with the caret active: hand it to the PDF select
+        # button (same mode underneath, different face)
+        if not text and self._mode_text.get_active():
+            self._set_tool_mode("select")
         # the ☰ menu drops its PDF-only actions (export, OCR, share, notes file)
         for item in self._pdf_menu_items:
             item.set_visible(not text)
-        tip = ("Text — click to place the caret and type" if text else
-               "Select text (Alt+drag · Ctrl+M · long-press for reading-order "
-               "/ rectangular)")
-        self._mode_select.set_tooltip_text(tip)
-        self._pmode_select.set_tooltip_text(tip)
         # cluster widths changed: re-measure the collapse levels and force the
         # current level to re-apply (it also gates presenter/share visibility)
         self._collapse_natural = None
@@ -7080,7 +7151,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         pop.set_child(box)
         self._select_style_radios += [("reading", r_read), ("rect", r_rect)]
         lp = Gtk.GestureLongPress()
-        lp.connect("pressed", lambda g, x, y: pop.popup())
+        lp.connect("pressed", lambda g, x, y: self._tool_style_popup(pop))
         button.add_controller(lp)
 
     def _set_select_style(self, style):
@@ -7113,8 +7184,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         pop.set_child(box)
         self._highlight_style_radios += [("free", r_free), ("text", r_text)]
         lp = Gtk.GestureLongPress()
-        lp.connect("pressed", lambda g, x, y: pop.popup())
+        lp.connect("pressed", lambda g, x, y: self._tool_style_popup(pop))
         button.add_controller(lp)
+
+    def _tool_style_popup(self, pop):
+        """Long-press variant menus (reading-order/rectangular select, free-hand
+        /text highlighter) describe PDF behaviours; on a text-first page the
+        variants don't apply, so the menus stay shut."""
+        if self._active_session and self._active_session._text_mode:
+            return
+        pop.popup()
 
     def _set_highlight_style(self, style):
         """Switch highlighter style (free-hand / text) and sync both radio menus."""
@@ -7149,9 +7228,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # else falls back to the text caret
             if self._text_page is not None:
                 self._text_page.set_tool(mode)
-            idx = self._TOOL_ORDER[mode]
-            for grp in (self._tool_btns, self._ptool_btns):
-                grp[idx].set_active(True)
+            # on a text page "select" is represented by the caret button
+            in_text = bool(self._active_session and self._active_session._text_mode)
+            if mode == "select" and in_text:
+                self._mode_text.set_active(True)
+                self._pmode_text.set_active(True)
+            else:
+                idx = self._TOOL_ORDER[mode]
+                for grp in (self._tool_btns, self._ptool_btns):
+                    grp[idx].set_active(True)
         finally:
             self._syncing_mode = False
         self._sync_pen_popover()
@@ -7161,6 +7246,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Light up the tool button matching the modifiers currently held, so the
         Ctrl/Alt/Shift gestures are discoverable. Purely visual — the selected
         tool and behaviour are untouched."""
+        if self._active_session and self._active_session._text_mode:
+            # on a text page only Alt has a gesture, and it draws with the pen
+            tool = "pen" if tool == "select" else None
         if tool == self._transient_tool:
             return
         self._transient_tool = tool

@@ -7043,8 +7043,8 @@ class TestTextFirstMode(unittest.TestCase):
                 buf = win._notes_view.get_buffer()
                 self.assertIn("first paragraph line", buf.get_text(
                     buf.get_start_iter(), buf.get_end_iter(), True))
-                # text tool (select) is active; clicks reach the text
-                self.assertTrue(win._mode_select.get_active())
+                # the caret tool is preselected; clicks reach the text
+                self.assertTrue(win._mode_text.get_active())
                 self.assertFalse(s._text_page.ink.get_can_target())
 
             self._run_in_window(body)
@@ -7055,11 +7055,14 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 for w in (win._notes_toggle, win._present_btn, win._toc_btn,
                           win._nav_box, win._pages_box, win._mode_anchor,
-                          win._mode_lasso, win._mode_pan, win._mode_zoom):
+                          win._mode_lasso, win._mode_pan, win._mode_zoom,
+                          win._mode_select):
                     self.assertFalse(w.get_visible(), w)
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
-                          win._mode_select):
+                          win._mode_text):
                     self.assertTrue(w.get_visible(), w)
+                # the caret tool leads the tool strip
+                self.assertIs(win._tools_box.get_first_child(), win._mode_text)
                 # the ☰ menu drops its PDF-only actions too
                 for item in win._pdf_menu_items:
                     self.assertFalse(item.get_visible(), item)
@@ -7080,6 +7083,10 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(s._text_page.get_visible())
                 self.assertIs(win._notes_view, s._panel_notes_view)
                 self.assertTrue(win._notes_toggle.get_visible())
+                # the caret tool hands "select" back to the PDF select button
+                self.assertFalse(win._mode_text.get_visible())
+                self.assertTrue(win._mode_select.get_visible())
+                self.assertTrue(win._mode_select.get_active())
                 for item in win._pdf_menu_items:
                     self.assertTrue(item.get_visible(), item)
 
@@ -7265,6 +7272,58 @@ class TestTextFirstMode(unittest.TestCase):
                 # _open_markdown remembers recents — the scratchpad is exempt
                 self.assertNotIn(md, [it.get("path")
                                       for it in sidemark._load_recent()])
+
+            self._run_in_window(body)
+
+    @staticmethod
+    def _fake_drag(alt=True):
+        state = Gdk.ModifierType.ALT_MASK if alt else Gdk.ModifierType(0)
+        return types.SimpleNamespace(
+            get_current_event_state=lambda: state,
+            set_state=lambda s: None,
+            get_current_button=lambda: 1,
+            get_start_point=lambda: (True, 300.0, 100.0))
+
+    def test_alt_drag_draws_with_pen_in_text_tool(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                self._settle()
+                tp = win._active_session._text_page
+                self.assertEqual(tp.tool, "text")
+                g = self._fake_drag(alt=True)
+                tp._on_alt_begin(g, 300.0, 100.0)
+                for i in range(1, 5):
+                    tp._on_alt_update(g, 0.0, i * 3.0)
+                tp._on_alt_end(g, 0.0, 12.0)
+                self.assertEqual(len(tp.strokes), 1)
+                self.assertEqual(tp.tool, "text")   # pen only while held
+                # without Alt the gesture denies itself — no stroke
+                g = self._fake_drag(alt=False)
+                tp._on_alt_begin(g, 300.0, 100.0)
+                tp._on_alt_update(g, 0.0, 3.0)
+                tp._on_alt_end(g, 0.0, 6.0)
+                self.assertEqual(len(tp.strokes), 1)
+
+            self._run_in_window(body)
+
+    def test_tool_style_menus_stay_shut_on_text_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                pop = Gtk.Popover()
+                pop.set_parent(win._mode_hl)
+                self._open_md(win, d)
+                win._tool_style_popup(pop)
+                self.assertFalse(pop.get_visible())
+                # on a PDF the variant menus work as before
+                win._new_tab()
+                win._do_open_file(pdf)
+                win._tool_style_popup(pop)
+                self.assertTrue(pop.get_visible())
+                pop.popdown()
 
             self._run_in_window(body)
 
