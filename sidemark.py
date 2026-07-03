@@ -4873,18 +4873,22 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                    "A blank Markdown page you can write and draw on (Ctrl+Alt+N)")
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
-        _menu_item("Export with notes…",
-                   lambda: (menu_pop.popdown(), self._on_export()),
-                   "Export a PDF with your notes laid out after each page (Ctrl+E)")
-        _menu_item("Add text layer (OCR)",
-                   lambda: (menu_pop.popdown(), self._ocr_current()),
-                   "Run OCR so a scanned document's text becomes selectable and searchable")
-        _menu_item("Share to phone…",
-                   lambda: (menu_pop.popdown(), self._on_share_to_phone()),
-                   "Show a QR code to open this PDF on a phone on the same Wi-Fi")
-        _menu_item("Notes file…",
-                   lambda: (menu_pop.popdown(), self._choose_notes_file()),
-                   "Choose which Markdown file this document's notes are saved to")
+        # PDF-only actions — hidden while a text-first page is active
+        # (see _update_header_for_mode)
+        self._pdf_menu_items = (
+            _menu_item("Export with notes…",
+                       lambda: (menu_pop.popdown(), self._on_export()),
+                       "Export a PDF with your notes laid out after each page (Ctrl+E)"),
+            _menu_item("Add text layer (OCR)",
+                       lambda: (menu_pop.popdown(), self._ocr_current()),
+                       "Run OCR so a scanned document's text becomes selectable and searchable"),
+            _menu_item("Share to phone…",
+                       lambda: (menu_pop.popdown(), self._on_share_to_phone()),
+                       "Show a QR code to open this PDF on a phone on the same Wi-Fi"),
+            _menu_item("Notes file…",
+                       lambda: (menu_pop.popdown(), self._choose_notes_file()),
+                       "Choose which Markdown file this document's notes are saved to"),
+        )
         msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         msep2.set_margin_top(2)
         msep2.set_margin_bottom(2)
@@ -5711,6 +5715,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                   self._pmode_lasso, self._pmode_pan, self._pmode_zoom,
                   self._pmode_anchor):
             w.set_visible(not text)
+        # the ☰ menu drops its PDF-only actions (export, OCR, share, notes file)
+        for item in self._pdf_menu_items:
+            item.set_visible(not text)
         tip = ("Text — click to place the caret and type" if text else
                "Select text (Alt+drag · Ctrl+M · long-press for reading-order "
                "/ rectangular)")

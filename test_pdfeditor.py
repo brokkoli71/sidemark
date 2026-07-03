@@ -7060,6 +7060,9 @@ class TestTextFirstMode(unittest.TestCase):
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
                           win._mode_select):
                     self.assertTrue(w.get_visible(), w)
+                # the ☰ menu drops its PDF-only actions too
+                for item in win._pdf_menu_items:
+                    self.assertFalse(item.get_visible(), item)
 
             self._run_in_window(body)
 
@@ -7077,6 +7080,8 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(s._text_page.get_visible())
                 self.assertIs(win._notes_view, s._panel_notes_view)
                 self.assertTrue(win._notes_toggle.get_visible())
+                for item in win._pdf_menu_items:
+                    self.assertTrue(item.get_visible(), item)
 
             self._run_in_window(body)
 
