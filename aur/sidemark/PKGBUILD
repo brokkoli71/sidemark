@@ -1,6 +1,9 @@
 # Maintainer: Hannes Spitz <h.spitz@outlook.de>
-pkgname=sidemark-git
-pkgver=0.4.0.r0.g4398e33
+# Fixed-release package built from the GitHub release tarball.
+# For the latest master HEAD instead, use sidemark-git (PKGBUILD in the repo root).
+# pkgver + sha256sums are updated by publish.sh on every release.
+pkgname=sidemark
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="PDF viewer and annotator with a live markdown notes sidebar"
 arch=('any')
@@ -24,22 +27,12 @@ optdepends=(
     'qrencode: show a QR code to share the PDF to a phone'
     'jq: recent-files menu for the walker launcher'
 )
-provides=('sidemark')
-conflicts=('sidemark')
-source=("sidemark::git+https://github.com/brokkoli71/sidemark.git")
-sha256sums=('SKIP')
-
-pkgver() {
-    cd "$srcdir/sidemark"
-    # Anchor to the latest release tag: <lasttag>.r<commits-since-tag>.g<hash>
-    # (e.g. 0.2.1.r4.gabc1234). Falls back to the plain commit form if the
-    # clone has no tags.
-    git describe --long --tags 2>/dev/null | sed 's/\([^-]*-g\)/r\1/;s/-/./g' \
-        || printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
-}
+conflicts=('sidemark-git')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgver.tar.gz")
+sha256sums=('44bc27295a7af4741f59576058efddb75ef5d701e29549d318933803e06800b7')
 
 package() {
-    cd "$srcdir/sidemark"
+    cd "$srcdir/$pkgname-$pkgver"
 
     # Main script
     install -Dm755 sidemark.py \

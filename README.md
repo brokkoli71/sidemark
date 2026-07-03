@@ -66,7 +66,8 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### AUR (Arch Linux / Omarchy)
 
 ```bash
-yay -S sidemark-git
+yay -S sidemark        # latest release
+yay -S sidemark-git    # latest development version (master)
 ```
 
 ### install.sh (any Linux)
