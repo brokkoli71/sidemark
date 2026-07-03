@@ -38,7 +38,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop a box of text directly on the page with no anchor or arrow; edit it in the notes panel (it's a `<!-- textbox:X:Y -->` paragraph in the `.md`), drag it to reposition, and it renders the same symbols / super-subscripts / Markdown as callouts; included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — by default each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something (a PDF you never annotate stays clutter-free, and its notes panel opens collapsed). Pick **Notes file…** from the ☰ menu to point a document at a different Markdown file — handy for sharing one notes file across several PDFs; the choice is remembered per PDF
-- **Text-first mode** — open a bare `.md` file (or **New text page** in the ☰ menu, `Ctrl+Alt+N`) and there's no PDF and no panels at all: the window shows one endless A4-width sheet of paper that **is** your note — the full live-Markdown editor — and you can **draw straight onto it** with the same pen, highlighter and eraser as on a PDF. Ink is anchored to the text, so drawings ride along when you edit above them, and it scales with the notes font. The file stays **pure Markdown** (byte-identical round-trip through any editor); ink is stored in a `<name>-ink.json` sidecar and re-matched by line content if the `.md` was edited externally. Pen strokes and typing share one chronological undo (`Ctrl+Z`). Launching Sidemark without a file opens the persistent scratchpad as such a page (`~/.local/share/sidemark/scratchpad.md`)
+- **Text-first mode** — open a bare `.md` file (or **New text page** in the ☰ menu, `Ctrl+Alt+N`) and there's no PDF and no panels at all: the window shows one endless A4-width sheet of paper that **is** your note — the full live-Markdown editor — and you can **draw straight onto it** with the same pen, highlighter and eraser as on a PDF. The leftmost tool is the text cursor (the default — just type); **Alt+drag draws with the pen** without switching tools. Ink is anchored to the text, so drawings ride along when you edit above them, and it scales with the notes font. `Ctrl+scroll` **zooms the whole sheet** — paper, text and ink together (`Ctrl+0` resets). The file stays **pure Markdown** (byte-identical round-trip through any editor); ink is stored in a `<name>-ink.json` sidecar and re-matched by line content if the `.md` was edited externally. Pen strokes and typing share one chronological undo (`Ctrl+Z`). **Export as PDF** in the ☰ menu renders the page — text and ink — into an A4 PDF, page breaks landing between lines. Launching Sidemark without a file opens the persistent scratchpad as such a page (`~/.local/share/sidemark/scratchpad.md`)
 
 ### Navigation
 
@@ -221,6 +221,8 @@ Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and an
 | `Ctrl+O` | Open file (in a new tab) |
 | `Ctrl+N` | New blank PDF (in a new tab) |
 | `Ctrl+Alt+N` | New text page — endless Markdown paper you can draw on |
+| `Alt+Drag` | On a text page: draw with the pen while the text tool is active |
+| `Ctrl+Scroll` | On a text page: zoom the sheet — paper, text and ink together (`Ctrl+0` resets) |
 | `Ctrl+S` | Save (prompts for name if untitled) |
 | `Ctrl+W` | Close the current tab (prompts to save unsaved changes; closes the window with the last tab) |
 | `Ctrl+Shift+T` | Reopen the most recently closed tab |

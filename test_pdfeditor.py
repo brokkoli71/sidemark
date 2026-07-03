@@ -7307,6 +7307,36 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_sheet_zoom_scales_paper_text_and_ink(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                self._settle()
+                tp = self._draw_stroke(win)
+                span = lambda pts: pts[-1][1] - pts[0][1]
+                before = span(tp._stroke_overlay_pts(tp.strokes[0]))
+                tp.set_zoom(2.0)
+                self._settle()
+                # paper, font and ink all doubled
+                self.assertEqual(tp.view.get_size_request()[0],
+                                 tp.PAGE_WIDTH * 2)
+                self.assertAlmostEqual(tp.font_px, tp._base_font_px * 2)
+                self.assertAlmostEqual(
+                    span(tp._stroke_overlay_pts(tp.strokes[0])),
+                    before * 2, delta=1)
+                # clamped range, and 0 resets
+                tp.set_zoom(99)
+                self.assertEqual(tp.zoom, tp.ZOOM_MAX)
+                tp.zoom_step(0)
+                self.assertEqual(tp.zoom, 1.0)
+
+            self._run_in_window(body)
+
+    # NOTE: the PDF export (_write_text_pdf) is exercised by the standalone
+    # smoke script, not here — it needs live compositor frames for a freshly
+    # mapped window, and after hundreds of suite tests weston stops ticking
+    # new windows (the sheet never relayouts and WidgetPaintable stays empty).
+
     def test_tool_style_menus_stay_shut_on_text_page(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "doc.pdf")

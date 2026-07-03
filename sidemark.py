@@ -11,6 +11,7 @@ import logging
 import atexit
 import traceback
 import hashlib
+import io
 import json
 import shutil
 import time
@@ -186,7 +187,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
-from gi.repository import Gtk, Adw, Gdk, GLib, Gio, GObject, GtkSource, Pango, PangoCairo
+from gi.repository import (Gtk, Adw, Gdk, GLib, Gio, GObject, GtkSource,
+                           Pango, PangoCairo, Graphene)
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -4260,11 +4262,15 @@ class TextPageView(Gtk.Overlay):
     PAGE_WIDTH = 794          # ≈ A4 width at 96 dpi
     PAGE_GAP = 30             # surround gap around the sheet
     ERASE_RADIUS = 9          # px hit distance for the eraser
+    MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 56, 48, 96   # inner paper margins
+    ZOOM_MIN, ZOOM_MAX = 0.5, 3.0
 
     def __init__(self, font_px=13):
         super().__init__()
         self.tool = "text"        # text | pen | highlighter | eraser
-        self.font_px = font_px    # current notes font; strokes scale with it
+        self.zoom = 1.0           # sheet zoom: paper, text and ink together
+        self._base_font_px = font_px
+        self.font_px = font_px    # effective (base × zoom); strokes scale with it
         # {"mark", "pts": [(dx, dy), ...], "color", "width", "opacity", "font_px"}
         self.strokes = []
         self.current_stroke = []  # overlay coords while a stroke is in flight
@@ -4284,10 +4290,18 @@ class TextPageView(Gtk.Overlay):
         self.view.set_hexpand(False)
         self.view.set_vexpand(True)
         self.view.set_halign(Gtk.Align.CENTER)
-        self.view.set_left_margin(56)
-        self.view.set_right_margin(56)
-        self.view.set_top_margin(48)
-        self.view.set_bottom_margin(96)
+        self.view.set_left_margin(self.MARGIN_X)
+        self.view.set_right_margin(self.MARGIN_X)
+        self.view.set_top_margin(self.MARGIN_TOP)
+        self.view.set_bottom_margin(self.MARGIN_BOTTOM)
+        # sheet zoom scales the paper and its font together via a provider
+        # scoped to this instance (same pattern as the present-bar CSS)
+        self._zoom_class = f"text-page-{id(self)}"
+        self.view.add_css_class(self._zoom_class)
+        self._zoom_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self._zoom_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         self.view.set_margin_top(self.PAGE_GAP)
         self.view.set_margin_bottom(self.PAGE_GAP)
         self.view.set_margin_start(self.PAGE_GAP)
@@ -4354,7 +4368,34 @@ class TextPageView(Gtk.Overlay):
             self.ink.queue_draw()
 
     def set_font_px(self, px):
-        self.font_px = px
+        self._base_font_px = px
+        self._apply_zoom()
+
+    def set_zoom(self, z):
+        self.zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, z))
+        self._apply_zoom()
+
+    def zoom_step(self, direction):
+        """+1 zoom in, -1 out, 0 reset — wired to the sheet's Ctrl+scroll and
+        Ctrl+= / Ctrl+- / Ctrl+0 (the notes-font gesture on the panel)."""
+        if direction == 0:
+            self.set_zoom(1.0)
+        else:
+            self.set_zoom(self.zoom * (1.1 ** direction))
+
+    def _apply_zoom(self):
+        """Width, margins and font all scale by the same factor, so the text
+        wraps at the same words and the mark-anchored ink stays glued."""
+        z = self.zoom
+        self.font_px = self._base_font_px * z
+        self.view.set_size_request(round(self.PAGE_WIDTH * z), -1)
+        self.view.set_left_margin(round(self.MARGIN_X * z))
+        self.view.set_right_margin(round(self.MARGIN_X * z))
+        self.view.set_top_margin(round(self.MARGIN_TOP * z))
+        self.view.set_bottom_margin(round(self.MARGIN_BOTTOM * z))
+        self._zoom_css.load_from_data(
+            f".{self._zoom_class} {{ font-size: {self.font_px:.1f}px; }}"
+            .encode())
         self.ink.queue_draw()
 
     # ── coordinates ──────────────────────────────────────────────────────────
@@ -4383,6 +4424,36 @@ class TextPageView(Gtk.Overlay):
         f = self.font_px / max(st["font_px"], 1)
         return [self._buffer_to_overlay(r.x + dx * f, r.y + dy * f)
                 for dx, dy in st["pts"]]
+
+    def stroke_view_pts(self, st):
+        """Stroke points in sheet-widget coordinates — scroll-independent, the
+        space a snapshot of the sheet renders in (used by the PDF export)."""
+        buf = self.view.get_buffer()
+        it = buf.get_iter_at_mark(st["mark"])
+        r = self.view.get_iter_location(it)
+        f = self.font_px / max(st["font_px"], 1)
+        return [self.view.buffer_to_window_coords(
+                    Gtk.TextWindowType.WIDGET,
+                    int(r.x + dx * f), int(r.y + dy * f))
+                for dx, dy in st["pts"]]
+
+    def page_break_offsets(self, page_px):
+        """Widget-y boundaries slicing the sheet into export pages of at most
+        page_px, breaking at display-line tops so no text line is cut in half
+        (a single over-tall line falls back to a hard cut)."""
+        h = self.view.get_height()
+        offs = [0.0]
+        while offs[-1] + page_px < h:
+            target = offs[-1] + page_px
+            _bx, by = self.view.window_to_buffer_coords(
+                Gtk.TextWindowType.WIDGET, 0, int(target))
+            _ok, it = self.view.get_iter_at_location(0, by)
+            r = self.view.get_iter_location(it)   # r.y = display-line top
+            _wx, top = self.view.buffer_to_window_coords(
+                Gtk.TextWindowType.WIDGET, 0, r.y)
+            offs.append(float(top) if top > offs[-1] + 1 else target)
+        offs.append(float(h))
+        return offs
 
     # ── drawing gestures ─────────────────────────────────────────────────────
 
@@ -4924,6 +4995,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                        lambda: (menu_pop.popdown(), self._choose_notes_file()),
                        "Choose which Markdown file this document's notes are saved to"),
         )
+        # text-page-only actions — the inverse of the group above
+        self._text_menu_items = (
+            _menu_item("Export as PDF…",
+                       lambda: (menu_pop.popdown(), self._on_export_text_pdf()),
+                       "Render this page — text and ink — into an A4 PDF"),
+        )
+        for item in self._text_menu_items:
+            item.set_visible(False)
         msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         msep2.set_margin_top(2)
         msep2.set_margin_bottom(2)
@@ -5734,7 +5813,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.pen_style = lambda hl, s=s: (
             (s.canvas.hl_color, s.canvas.hl_width, s.canvas.hl_opacity) if hl
             else (s.canvas.pen_color, s.canvas.pen_width, 1.0))
-        tp.view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
+        # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
+        # and margins together), not the persistent notes-font setting
+        tp.view.font_zoom_cb = lambda d: tp.zoom_step(d)
         tp.view.get_buffer().connect(
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
@@ -5794,6 +5875,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # the ☰ menu drops its PDF-only actions (export, OCR, share, notes file)
         for item in self._pdf_menu_items:
             item.set_visible(not text)
+        for item in self._text_menu_items:
+            item.set_visible(text)
         # cluster widths changed: re-measure the collapse levels and force the
         # current level to re-apply (it also gates presenter/share visibility)
         self._collapse_natural = None
@@ -5843,6 +5926,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+O",        "Open file…"),
             ("Ctrl+N",        "New blank PDF"),
             ("Ctrl+Alt+N",    "New text page (write and draw on endless paper)"),
+            ("Text page",     None),
+            ("Alt+Drag",      "Draw with the pen while the text tool is active"),
+            ("Ctrl+Scroll",   "Zoom the sheet (paper, text and ink together)"),
+            ("Ctrl+0",        "Reset the sheet zoom"),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
@@ -8153,6 +8240,112 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._on_save(after=after)
 
         dialog.save(self, None, done)
+
+    def _on_export_text_pdf(self):
+        """Export the text-first page — rendered Markdown plus ink — to PDF."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Export as PDF…")
+        base = (os.path.splitext(os.path.basename(self._notes_path))[0]
+                if self._notes_path else "note")
+        dialog.set_initial_name(base + ".pdf")
+        f = Gtk.FileFilter()
+        f.set_name("PDF files")
+        f.add_pattern("*.pdf")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        dialog.set_filters(store)
+
+        def done(d, result):
+            try:
+                file = d.save_finish(result)
+            except GLib.Error:
+                return   # dialog dismissed by user
+            if not file:
+                return
+            path = file.get_path()
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            try:
+                n = self._write_text_pdf(path)
+            except (OSError, GLib.Error, cairo.Error) as e:
+                logger.exception("Text-page PDF export failed")
+                self._toast(f"Export failed: {e}")
+                return
+            self._toast(f"Exported {n} page{'s' if n != 1 else ''} "
+                        f"→ {os.path.basename(path)}")
+
+        dialog.save(self, None, done)
+
+    def _write_text_pdf(self, out_path):
+        """Write the sheet to an A4 PDF: the rendered page as a 2× raster
+        (crisp text, exactly what's on screen) sliced at display-line
+        boundaries, with the ink drawn on top as vectors. Returns the page
+        count."""
+        tp = self._active_session._text_page
+        view = tp.view
+        w, h = view.get_width(), view.get_height()
+        if w < 1 or h < 1:
+            raise OSError("the page has no layout yet")
+        scale = 2
+        paintable = Gtk.WidgetPaintable.new(view)
+        snapshot = Gtk.Snapshot()
+        paintable.snapshot(snapshot, w * scale, h * scale)
+        node = snapshot.to_node()
+        # a just-presented window may not have produced a frame yet, which
+        # leaves the paintable empty — pump the loop briefly and retry
+        deadline = time.time() + 2.0
+        while node is None and time.time() < deadline:
+            GLib.MainContext.default().iteration(False)
+            time.sleep(0.01)
+            snapshot = Gtk.Snapshot()
+            paintable.snapshot(snapshot, w * scale, h * scale)
+            node = snapshot.to_node()
+        if node is None:
+            raise OSError("nothing to render")
+        renderer = self.get_native().get_renderer()
+        pw, ph = 595.0, 842.0                    # A4 in PDF points
+        page_px = ph / pw * w                    # sheet px per PDF page
+        offs = tp.page_break_offsets(page_px)
+        pt_per_px = pw / w
+        strokes = [(tp.stroke_view_pts(st), st) for st in tp.strokes]
+        surf = cairo.PDFSurface(out_path, pw, ph)
+        ctx = cairo.Context(surf)
+        for y0, y1 in zip(offs, offs[1:]):
+            # white paper first — the last slice is shorter than a full page
+            ctx.set_source_rgb(1, 1, 1)
+            ctx.paint()
+            tex = renderer.render_texture(node, Graphene.Rect().init(
+                0, y0 * scale, w * scale, max((y1 - y0) * scale, 1)))
+            png = tex.save_to_png_bytes()
+            img = cairo.ImageSurface.create_from_png(
+                io.BytesIO(png.get_data()))
+            ctx.save()
+            ctx.scale(pt_per_px / scale, pt_per_px / scale)
+            ctx.set_source_surface(img, 0, 0)
+            ctx.paint()
+            ctx.restore()
+            # ink as vectors, clipped to this page (strokes may span pages)
+            ctx.save()
+            ctx.rectangle(0, 0, pw, ph)
+            ctx.clip()
+            ctx.scale(pt_per_px, pt_per_px)
+            ctx.translate(0, -y0)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            for pts, st in strokes:
+                if len(pts) < 2:
+                    continue
+                f = tp.font_px / max(st["font_px"], 1)
+                ctx.set_source_rgba(*st["color"], st["opacity"])
+                ctx.set_line_width(st["width"] * f)
+                ctx.move_to(*pts[0])
+                for p in pts[1:]:
+                    ctx.line_to(*p)
+                ctx.stroke()
+            ctx.restore()
+            ctx.show_page()
+        surf.finish()
+        return len(offs) - 1
 
     def _on_save_as(self, after=None):
         if self._text_mode:
