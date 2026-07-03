@@ -5,7 +5,8 @@ For each row the script keeps a matching GitHub issue:
   title  = "#<n> <Feature>"
   body   = <Notes> (+ "Resolved in <sha>" when the Commit column is filled)
   labels = "ideas.csv" (provenance marker) + "<feasibility>"
-  state  = closed when Status is Done, otherwise open
+  state  = closed when Status is Done (completed) or Rejected (not planned),
+           otherwise open
 
 The link between a row and its issue is the Issue column, written back after
 creation, so re-runs never duplicate. A per-row Hash lets unchanged rows be
@@ -51,6 +52,10 @@ def feasibility_label(value):
 
 def is_done(row):
     return (row.get("Status") or "").strip().lower() == "done"
+
+
+def is_rejected(row):
+    return (row.get("Status") or "").strip().lower() == "rejected"
 
 
 def build_title(row):
@@ -147,10 +152,11 @@ def update_issue(repo, number, row, idea_map):
 
 
 def sync_state(repo, number, row):
-    want_closed = is_done(row)
+    want_closed = is_done(row) or is_rejected(row)
     state = issue_state(repo, number)
     if want_closed and state == "open":
-        gh("issue", "close", number, "-R", repo)
+        reason = "not planned" if is_rejected(row) else "completed"
+        gh("issue", "close", number, "-R", repo, "--reason", reason)
     elif not want_closed and state == "closed":
         gh("issue", "reopen", number, "-R", repo)
 
