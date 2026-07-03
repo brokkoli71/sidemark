@@ -3986,8 +3986,7 @@ class MarkdownNotesView(GtkSource.View):
         # Auto-expand if the selection sits inside marker…marker
         s, e = self._expand_to_markers(buf, s, e, marker)
 
-        # hidden chars included — same delete+reinsert data-loss guard as in
-        # _surround_selection
+        # hidden chars included — same delete+reinsert data-loss guard as above
         text = buf.get_text(s, e, True)
         m = len(marker)
         # Already wrapped check (single * must not be part of **)
@@ -4239,6 +4238,337 @@ class MarkdownNotesView(GtkSource.View):
                     apply(tag_name, a + 1, b)
 
 
+def _ink_path_for(md_path):
+    """Sidecar holding the freehand ink of a text-first page. The .md itself
+    stays pure Markdown so it round-trips through any other editor."""
+    stem, _ext = os.path.splitext(md_path)
+    return stem + "-ink.json"
+
+
+class TextPageView(Gtk.Overlay):
+    """Text-first mode: an endless A4-width sheet of Markdown you can draw on.
+
+    The sheet is a MarkdownNotesView styled as white paper, centred in the
+    themed surround; ink lives in a transparent DrawingArea overlaid on the
+    scroll area. Each stroke is anchored to a GtkTextMark plus per-point
+    offsets in buffer pixels, so it rides along with its paragraph when text
+    above it is edited. The Markdown file stays pure text; ink round-trips
+    through ink_to_json()/load_ink() into a `<name>-ink.json` sidecar and is
+    re-matched by line hash, so external edits to the .md don't strand the
+    drawings."""
+
+    PAGE_WIDTH = 794          # ≈ A4 width at 96 dpi
+    PAGE_GAP = 30             # surround gap around the sheet
+    ERASE_RADIUS = 9          # px hit distance for the eraser
+
+    def __init__(self, font_px=13):
+        super().__init__()
+        self.tool = "text"        # text | pen | highlighter | eraser
+        self.font_px = font_px    # current notes font; strokes scale with it
+        # {"mark", "pts": [(dx, dy), ...], "color", "width", "opacity", "font_px"}
+        self.strokes = []
+        self.current_stroke = []  # overlay coords while a stroke is in flight
+        self._undo_ops = []       # ("add", [stroke, ...]) | ("erase", [stroke, ...])
+        self._redo_ops = []
+        self._erased_now = []     # strokes removed during the ongoing erase drag
+        self.on_ink_action = None   # a draw/erase gesture finished (undo timeline)
+        self.on_ink_changed = None  # any ink mutation (dirty tracking)
+        # (color, width, opacity) for the given highlighter flag — the window
+        # points this at the shared pen settings so both modes feel identical
+        self.pen_style = lambda highlighter: ((0.05, 0.05, 0.8), 2.0, 1.0)
+
+        # the sheet always reads like paper: white page, dark text, light scheme
+        self.view = MarkdownNotesView("Adwaita")
+        self.view.add_css_class("text-page")
+        self.view.set_size_request(self.PAGE_WIDTH, -1)
+        self.view.set_hexpand(False)
+        self.view.set_vexpand(True)
+        self.view.set_halign(Gtk.Align.CENTER)
+        self.view.set_left_margin(56)
+        self.view.set_right_margin(56)
+        self.view.set_top_margin(48)
+        self.view.set_bottom_margin(96)
+        self.view.set_margin_top(self.PAGE_GAP)
+        self.view.set_margin_bottom(self.PAGE_GAP)
+        self.view.set_margin_start(self.PAGE_GAP)
+        self.view.set_margin_end(self.PAGE_GAP)
+
+        # a Box wrapper keeps the view out of the ScrolledWindow's scrollable
+        # protocol, so it grows to its full content height (endless paper) and
+        # the viewport scrolls the whole sheet, margins included
+        wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        wrapper.append(self.view)
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_hexpand(True)
+        self.scroll.set_vexpand(True)
+        self.scroll.add_css_class("text-surround")
+        self.scroll.set_child(wrapper)
+        self.set_child(self.scroll)
+
+        self.ink = Gtk.DrawingArea()
+        self.ink.set_draw_func(self._draw_ink)
+        self.ink.set_can_target(False)   # clicks reach the text until a pen tool
+        self.add_overlay(self.ink)
+
+        drag = Gtk.GestureDrag()
+        drag.set_button(0)               # pen draws, right button erases
+        drag.connect("drag-begin", self._on_ink_begin)
+        drag.connect("drag-update", self._on_ink_update)
+        drag.connect("drag-end", self._on_ink_end)
+        self.ink.add_controller(drag)
+        self._drag = drag
+
+        # the ink must repaint whenever the sheet scrolls or reflows under it
+        self.scroll.get_vadjustment().connect(
+            "value-changed", lambda *_: self.ink.queue_draw())
+        self.scroll.get_hadjustment().connect(
+            "value-changed", lambda *_: self.ink.queue_draw())
+        self.view.get_buffer().connect(
+            "changed", lambda *_: self.ink.queue_draw())
+
+    # ── tool routing ─────────────────────────────────────────────────────────
+
+    def set_tool(self, tool):
+        """Anything that isn't a drawing tool falls back to text editing."""
+        self.tool = tool if tool in ("pen", "highlighter", "eraser") else "text"
+        inking = self.tool != "text"
+        self.ink.set_can_target(inking)
+        self.ink.set_cursor(
+            Gdk.Cursor.new_from_name("crosshair") if inking else None)
+        if not inking and self.current_stroke:
+            self.current_stroke = []
+            self.ink.queue_draw()
+
+    def set_font_px(self, px):
+        self.font_px = px
+        self.ink.queue_draw()
+
+    # ── coordinates ──────────────────────────────────────────────────────────
+    # three spaces: overlay (the DrawingArea, == viewport), view widget
+    # (scrolls with the sheet) and buffer (stable text-layout pixels). Strokes
+    # are stored in buffer space relative to their anchor mark.
+
+    def _overlay_to_buffer(self, x, y):
+        res = self.ink.translate_coordinates(self.view, x, y)
+        vx, vy = res if res else (x, y)
+        return self.view.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, int(vx), int(vy))
+
+    def _buffer_to_overlay(self, bx, by):
+        vx, vy = self.view.buffer_to_window_coords(
+            Gtk.TextWindowType.WIDGET, int(bx), int(by))
+        res = self.view.translate_coordinates(self.ink, vx, vy)
+        return res if res else (vx, vy)
+
+    def _stroke_overlay_pts(self, st):
+        """Current on-screen positions of a stroke, following its mark and
+        scaling with the notes font relative to when it was drawn."""
+        buf = self.view.get_buffer()
+        it = buf.get_iter_at_mark(st["mark"])
+        r = self.view.get_iter_location(it)
+        f = self.font_px / max(st["font_px"], 1)
+        return [self._buffer_to_overlay(r.x + dx * f, r.y + dy * f)
+                for dx, dy in st["pts"]]
+
+    # ── drawing gestures ─────────────────────────────────────────────────────
+
+    def _on_ink_begin(self, gesture, x, y):
+        button = gesture.get_current_button()
+        self._erased_now = []
+        if self.tool == "eraser" or button == 3:
+            self._erase_at(x, y)
+        else:
+            self.current_stroke = [(x, y)]
+        self.ink.queue_draw()
+
+    def _on_ink_update(self, gesture, dx, dy):
+        ok, sx, sy = gesture.get_start_point()
+        if not ok:
+            return
+        x, y = sx + dx, sy + dy
+        if self.current_stroke:
+            self.current_stroke.append((x, y))
+        else:
+            self._erase_at(x, y)
+        self.ink.queue_draw()
+
+    def _on_ink_end(self, gesture, dx, dy):
+        if self.current_stroke:
+            self._commit_stroke(self.current_stroke)
+            self.current_stroke = []
+        elif self._erased_now:
+            self._undo_ops.append(("erase", self._erased_now))
+            self._redo_ops.clear()
+            self._erased_now = []
+            if self.on_ink_action:
+                self.on_ink_action()
+        self.ink.queue_draw()
+
+    def _commit_stroke(self, pts_overlay):
+        if len(pts_overlay) < 2:
+            return
+        buf_pts = [self._overlay_to_buffer(x, y) for x, y in pts_overlay]
+        # anchor at the first point: a left-gravity mark stays put when text is
+        # typed right at it and rides along with every edit above it
+        buf = self.view.get_buffer()
+        _over_text, it = self.view.get_iter_at_location(*buf_pts[0])
+        mark = buf.create_mark(None, it, True)
+        r = self.view.get_iter_location(it)
+        color, width, opacity = self.pen_style(self.tool == "highlighter")
+        stroke = {
+            "mark": mark,
+            "pts": [(bx - r.x, by - r.y) for bx, by in buf_pts],
+            "color": tuple(color),
+            "width": width,
+            "opacity": opacity,
+            "font_px": self.font_px,
+        }
+        self.strokes.append(stroke)
+        self._undo_ops.append(("add", [stroke]))
+        self._redo_ops.clear()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    def _erase_at(self, x, y):
+        rad2 = self.ERASE_RADIUS ** 2
+        hit = [st for st in self.strokes
+               if any((px - x) ** 2 + (py - y) ** 2 <= rad2
+                      for px, py in self._stroke_overlay_pts(st))]
+        if not hit:
+            return
+        for st in hit:
+            self.strokes.remove(st)      # mark kept so undo can restore it
+        self._erased_now.extend(hit)
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    # ── ink undo (driven by the window's chronological timeline) ─────────────
+
+    def undo_ink(self):
+        if not self._undo_ops:
+            return
+        kind, strokes = self._undo_ops.pop()
+        if kind == "add":
+            for st in strokes:
+                if st in self.strokes:
+                    self.strokes.remove(st)
+        else:
+            self.strokes.extend(strokes)
+        self._redo_ops.append((kind, strokes))
+        if self.on_ink_changed:
+            self.on_ink_changed()
+        self.ink.queue_draw()
+
+    def redo_ink(self):
+        if not self._redo_ops:
+            return
+        kind, strokes = self._redo_ops.pop()
+        if kind == "add":
+            self.strokes.extend(strokes)
+        else:
+            for st in strokes:
+                if st in self.strokes:
+                    self.strokes.remove(st)
+        self._undo_ops.append((kind, strokes))
+        if self.on_ink_changed:
+            self.on_ink_changed()
+        self.ink.queue_draw()
+
+    # ── rendering ────────────────────────────────────────────────────────────
+
+    def _draw_ink(self, _area, ctx, _w, _h):
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        for st in self.strokes:
+            pts = self._stroke_overlay_pts(st)
+            if len(pts) < 2:
+                continue
+            f = self.font_px / max(st["font_px"], 1)
+            ctx.set_source_rgba(*st["color"], st["opacity"])
+            ctx.set_line_width(st["width"] * f)
+            ctx.move_to(*pts[0])
+            for p in pts[1:]:
+                ctx.line_to(*p)
+            ctx.stroke()
+        if len(self.current_stroke) >= 2:
+            color, width, opacity = self.pen_style(self.tool == "highlighter")
+            ctx.set_source_rgba(*color, opacity)
+            ctx.set_line_width(width)
+            ctx.move_to(*self.current_stroke[0])
+            for p in self.current_stroke[1:]:
+                ctx.line_to(*p)
+            ctx.stroke()
+
+    # ── persistence ──────────────────────────────────────────────────────────
+    # Anchors are serialised as (line, char offset, source-line hash). On load
+    # the hash re-matches strokes whose paragraph moved because the .md was
+    # edited outside Sidemark; a stroke whose line vanished entirely still
+    # lands at its old line number, clamped — degraded but never lost.
+
+    @staticmethod
+    def _line_hash(text):
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+
+    def ink_to_json(self):
+        buf = self.view.get_buffer()
+        src_lines = self.view.get_source_text().split("\n")
+        out = []
+        for st in self.strokes:
+            it = buf.get_iter_at_mark(st["mark"])
+            line = it.get_line()
+            src = src_lines[line] if line < len(src_lines) else ""
+            out.append({
+                "line": line,
+                "ch": it.get_line_offset(),
+                "hash": self._line_hash(src),
+                "pts": [[round(dx, 2), round(dy, 2)] for dx, dy in st["pts"]],
+                "color": list(st["color"]),
+                "width": st["width"],
+                "opacity": st["opacity"],
+                "font_px": st["font_px"],
+            })
+        return {"version": 1, "strokes": out}
+
+    def load_ink(self, data):
+        buf = self.view.get_buffer()
+        for st in self.strokes:
+            buf.delete_mark(st["mark"])
+        self.strokes = []
+        self._undo_ops.clear()
+        self._redo_ops.clear()
+        src_lines = self.view.get_source_text().split("\n")
+        hashes = [self._line_hash(t) for t in src_lines]
+        for rec in data.get("strokes", []):
+            line = int(rec.get("line", 0))
+            want = rec.get("hash")
+            if not (0 <= line < len(hashes) and hashes[line] == want):
+                # the paragraph moved: take the matching line nearest the
+                # remembered position, or stay at the clamped old line
+                matches = [i for i, h in enumerate(hashes) if h == want]
+                if matches:
+                    line = min(matches, key=lambda i: abs(i - line))
+                else:
+                    line = max(0, min(line, len(hashes) - 1))
+            ok, ls = buf.get_iter_at_line(line)
+            if not ok:
+                ls = buf.get_end_iter()
+            it = ls.copy()
+            it.forward_chars(min(int(rec.get("ch", 0)),
+                                 it.get_chars_in_line()))
+            mark = buf.create_mark(None, it, True)
+            self.strokes.append({
+                "mark": mark,
+                "pts": [(p[0], p[1]) for p in rec.get("pts", [])],
+                "color": tuple(rec.get("color", (0.05, 0.05, 0.8)))[:3],
+                "width": float(rec.get("width", 2.0)),
+                "opacity": float(rec.get("opacity", 1.0)),
+                "font_px": float(rec.get("font_px", 13)),
+            })
+        self.ink.queue_draw()
+
+
 def _session_prop(name):
     """A per-document attribute that physically lives on the active
     DocumentSession. The window's ~140 methods keep reading/writing self.<name>
@@ -4264,13 +4594,13 @@ class DocumentSession:
         "_note_hits", "_search_matches", "_search_current", "_presenter",
         "_last_anchor_mark", "_link_hint_shown", "_saved_pane_pos", "_pane_anim",
         "_thumb_idle_id", "_current_thumb_row", "_drag_export_dir",
-        "_has_toc", "_toc_thumbs", "_drop_indicator_row",
+        "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
     )
     WIDGETS = (
-        "canvas", "_notes_view", "_notes_box", "_search_revealer",
-        "_search_entry", "_search_label", "_paned", "_toc_list", "_toc_scroll",
-        "_toc_revealer", "_toc_switch", "_toc_seg_outline", "_toc_seg_pages",
-        "content",
+        "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
+        "_search_revealer", "_search_entry", "_search_label", "_paned",
+        "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
+        "_toc_seg_outline", "_toc_seg_pages", "content", "_text_page",
     )
 
     def __init__(self):
@@ -4301,6 +4631,7 @@ class DocumentSession:
         self._has_toc = False
         self._toc_thumbs = False
         self._drop_indicator_row = None
+        self._text_mode = False     # True when the tab shows a text-first page
         self._tab_page = None       # the Adw.TabPage hosting this session
         # widgets are built by the window and assigned through the proxies
         for w in self.WIDGETS:
@@ -4386,11 +4717,27 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         acc_hex = "#{:02x}{:02x}{:02x}".format(*(int(c * 255) for c in acc))
         fg_hex  = theme["foreground"]
         bg_hex  = theme["background"]
+        surround_hex = "#{:02x}{:02x}{:02x}".format(
+            *(int(c * 255) for c in surround))
         css = f"""
             .notes-view {{
                 font-family: monospace;
                 background-color: {bg_hex};
                 color: {fg_hex};
+            }}
+            /* text-first mode: the sheet always reads as white paper (like a
+               PDF page), whatever the theme; the surround takes the theme */
+            .text-page, .text-page text {{
+                background-color: #ffffff;
+                color: #16181c;
+                caret-color: #16181c;
+            }}
+            .text-page {{
+                border-radius: 3px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.30);
+            }}
+            .text-surround, .text-surround > viewport {{
+                background-color: {surround_hex};
             }}
             .shortcut-key {{
                 font-family: monospace;
@@ -4521,6 +4868,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Reopen a recently used file")
         _menu_item("New", lambda: (menu_pop.popdown(), self._on_new_pdf(None)),
                    "Start a new blank document (Ctrl+N)")
+        _menu_item("New text page",
+                   lambda: (menu_pop.popdown(), self._on_new_text_page()),
+                   "A blank Markdown page you can write and draw on (Ctrl+Alt+N)")
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
         _menu_item("Export with notes…",
@@ -4586,7 +4936,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         next_btn.set_tooltip_text("Next page (PageDown)")
         next_btn.connect("clicked", lambda _: self._go_to_page(self.canvas.current_page_idx + 1))
 
-        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._nav_box = nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         nav_box.add_css_class("linked")
         nav_box.append(prev_btn)
         nav_box.append(self._page_label)
@@ -4603,7 +4953,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._del_page_btn.set_tooltip_text("Delete current page (Ctrl+Shift+Delete)")
         self._del_page_btn.connect("clicked", lambda _: self._delete_current_page())
 
-        pages_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._pages_box = pages_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         pages_box.add_css_class("linked")
         pages_box.append(self._add_page_btn)
         pages_box.append(self._del_page_btn)
@@ -5189,6 +5539,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         notes_scroll.set_vexpand(True)
         notes_scroll.set_hexpand(True)
         s._notes_view = MarkdownNotesView(self._src_scheme)
+        # remembered so text-first mode can swap _notes_view to the page's
+        # editor and back — every window method follows _notes_view
+        s._panel_notes_view = s._notes_view
         s._notes_view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
@@ -5297,6 +5650,85 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.content = content
         return s
 
+    # ── text-first mode ───────────────────────────────────────────────────────
+
+    def _ensure_text_page(self, s):
+        """Lazily build the session's text-first page (sheet + ink overlay)."""
+        if s._text_page is not None:
+            return s._text_page
+        tp = TextPageView(font_px=self._notes_font_px)
+        # ink strokes use the same shared pen/highlighter settings as the canvas
+        tp.pen_style = lambda hl, s=s: (
+            (s.canvas.hl_color, s.canvas.hl_width, s.canvas.hl_opacity) if hl
+            else (s.canvas.pen_color, s.canvas.pen_width, 1.0))
+        tp.view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
+        tp.view.get_buffer().connect(
+            "changed", lambda *a: s.win._on_notes_changed(*a))
+        tp.on_ink_action = lambda: s.win._on_ink_action()
+        tp.on_ink_changed = lambda: s.win._mark_dirty()
+        tp.set_visible(False)
+        s.content.append(tp)
+        s._text_page = tp
+        return tp
+
+    def _enter_text_mode(self, s=None):
+        """Switch a session's UI to the text-first page: no sidebars, the sheet
+        is the document. _notes_view is repointed at the sheet's editor, so
+        search, undo, font zoom and note commits keep working unchanged."""
+        s = s or self._active_session
+        tp = self._ensure_text_page(s)
+        s._text_mode = True
+        s._notes_view = tp.view
+        s._paned.set_visible(False)
+        s._toc_revealer.set_reveal_child(False)
+        tp.set_visible(True)
+        if s is self._active_session:
+            self._update_header_for_mode()
+            self._set_tool_mode("select")   # text editing first; pen on demand
+            tp.view.grab_focus()
+
+    def _leave_text_mode(self, s=None):
+        """Back to the PDF layout (a PDF got opened into this tab)."""
+        s = s or self._active_session
+        if not s._text_mode:
+            return
+        s._text_mode = False
+        s._notes_view = s._panel_notes_view
+        if s._text_page is not None:
+            s._text_page.set_visible(False)
+        s._paned.set_visible(True)
+        if s is self._active_session:
+            self._update_header_for_mode()
+
+    def _update_header_for_mode(self):
+        """Hide the PDF-only chrome while a text-first page is shown. Pen,
+        highlighter and eraser stay; the select tool doubles as the caret."""
+        text = bool(self._active_session and self._active_session._text_mode)
+        for w in (self._toc_btn, self._nav_box, self._pages_box,
+                  self._mode_lasso, self._mode_pan, self._mode_zoom,
+                  self._mode_anchor, self._present_btn, self._share_btn,
+                  self._notes_toggle,
+                  self._pmode_lasso, self._pmode_pan, self._pmode_zoom,
+                  self._pmode_anchor):
+            w.set_visible(not text)
+        tip = ("Text — click to place the caret and type" if text else
+               "Select text (Alt+drag · Ctrl+M · long-press for reading-order "
+               "/ rectangular)")
+        self._mode_select.set_tooltip_text(tip)
+        self._pmode_select.set_tooltip_text(tip)
+        # cluster widths changed: re-measure the collapse levels and force the
+        # current level to re-apply (it also gates presenter/share visibility)
+        self._collapse_natural = None
+        self._collapse_level = -1
+        self._update_header_collapse()
+
+    def _on_ink_action(self):
+        """An ink gesture on the text page finished: chronological undo entry."""
+        self._notes_burst_open = False
+        self._burst_base = self._notes_view.get_source_text()
+        self._undo_timeline.append(("ink",))
+        self._redo_timeline.clear()
+
     # ── shortcuts popover ─────────────────────────────────────────────────────
 
     def _build_shortcuts_content(self):
@@ -5332,6 +5764,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("File",          None),
             ("Ctrl+O",        "Open file…"),
             ("Ctrl+N",        "New blank PDF"),
+            ("Ctrl+Alt+N",    "New text page (write and draw on endless paper)"),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
@@ -5479,7 +5912,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 else os.path.basename(s._notes_path) if s._notes_path
                 else "")
         self._set_file_title(name, s._path or s._notes_path)
-        self._update_header_collapse()
+        self._update_header_for_mode()   # also re-measures header collapse
 
     def _new_tab(self):
         """Create a fresh document session in a new tab and make it active."""
@@ -5935,7 +6368,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._close_active_tab()
             return True
         if ctrl_held and keyval == Gdk.KEY_backslash:
-            self._notes_toggle.set_active(not self._notes_toggle.get_active())
+            if not self._text_mode:   # a text page has no notes panel to toggle
+                self._notes_toggle.set_active(not self._notes_toggle.get_active())
             return True
         if not ctrl_held and keyval == Gdk.KEY_Page_Down:
             self._nav_page(1)
@@ -5997,6 +6431,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self.canvas.undo_last()
             self._redo_timeline.append(("canvas",))
             return
+        if op[0] == "ink":
+            if self._text_page is not None:
+                self._text_page.undo_ink()
+            self._redo_timeline.append(("ink",))
+            return
         _, page, before = op
         if page != self.canvas.current_page_idx:
             self._go_to_page(page)
@@ -6012,6 +6451,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if op[0] == "canvas":
             self.canvas.redo_last()
             self._undo_timeline.append(("canvas",))
+            return
+        if op[0] == "ink":
+            if self._text_page is not None:
+                self._text_page.redo_ink()
+            self._undo_timeline.append(("ink",))
             return
         _, page, before, after = op
         self._set_notes_text(page, after)
@@ -6694,6 +7138,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self.canvas.clear_lasso_selection()
             # cursor reflects the active tool (text/grab/crosshair, or default)
             self.canvas.set_cursor(self.canvas._default_cursor())
+            # text-first page: pen/highlighter/eraser ink the sheet, everything
+            # else falls back to the text caret
+            if self._text_page is not None:
+                self._text_page.set_tool(mode)
             idx = self._TOOL_ORDER[mode]
             for grp in (self._tool_btns, self._ptool_btns):
                 grp[idx].set_active(True)
@@ -6726,6 +7174,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _apply_notes_font(self):
         self._notes_font_provider.load_from_data(
             f".notes-view {{ font-size: {self._notes_font_px}px; }}".encode())
+        # text-first ink scales with the font so drawings stay glued to words
+        for s in self._sessions:
+            if s._text_page is not None:
+                s._text_page.set_font_px(self._notes_font_px)
 
     def _change_notes_font(self, direction):
         """direction: +1 bigger, -1 smaller, 0 reset to default. Persisted."""
@@ -6752,8 +7204,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # undo/redo go first (level 2); the rest hold on until it gets tighter
         for b in (self._undo_btn, self._redo_btn, self._undo_sep):
             b.set_visible(level < 2)
-        for b in (self._search_btn, self._present_btn, self._share_btn):
-            b.set_visible(level < 3)
+        # presenter/share are PDF-only chrome: a text-first page keeps them
+        # hidden at every collapse level (see _update_header_for_mode)
+        text = bool(self._active_session and self._active_session._text_mode)
+        self._search_btn.set_visible(level < 3)
+        for b in (self._present_btn, self._share_btn):
+            b.set_visible(level < 3 and not text)
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
     # change doesn't flicker on 1px resize jitter at the boundary
@@ -7431,6 +7887,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _open_pdf(self, path):
+        self._leave_text_mode()
         self._path = path
         self._notes_path = None
         self._active_notes_path = _notes_file_for_pdf(path) or notes_path_for(path)
@@ -7464,23 +7921,39 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if pdf_path:
             self.open_file(pdf_path)
             return
-        # Notes-only mode: no PDF, load markdown directly into notes panel.
+        # Text-first mode: no PDF — the page IS the note. The .md loads into
+        # the sheet's editor; ink comes from the -ink.json sidecar if present.
         self._path = None
         self._notes_path = md_path
         self._set_file_title(os.path.basename(md_path), md_path)
+        # the file is taken verbatim — no page markers, no stripping — so a
+        # save round-trips byte-for-byte through external editors
+        try:
+            with open(md_path, encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+        except OSError:
+            raw = ""
         self.notes_model = NotesModel()
-        self.notes_model.load(md_path)
+        self.notes_model.set(0, raw)
         self._page_label.set_label("—")
-        # Show page 0 notes; canvas stays in "no PDF" placeholder state.
+        self._enter_text_mode()
         buf = self._notes_view.get_buffer()
         buf.begin_irreversible_action()
-        buf.set_text(self.notes_model.get(0))
+        buf.set_text(raw)
         buf.end_irreversible_action()
         self._notes_view.reset_render_state()
+        ink_file = _ink_path_for(md_path)
+        if os.path.exists(ink_file):
+            try:
+                with open(ink_file, encoding="utf-8") as f:
+                    self._text_page.load_ink(json.load(f))
+            except (OSError, ValueError) as e:
+                logger.warning("Could not load ink sidecar %s: %s", ink_file, e)
         self._undo_timeline.clear()
         self._redo_timeline.clear()
         self._notes_burst_open = False
         self._burst_base = self.notes_model.get(0)
+        self._clear_dirty()
         self._remember_recent(md_path)
 
     def _on_new_pdf(self, _btn):
@@ -7503,6 +7976,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._set_file_title("Untitled")
         self._clear_dirty()
 
+    def _on_new_text_page(self):
+        """A fresh untitled text-first page (☰ New text page / Ctrl+Alt+N).
+        No file exists yet — the save-as dialog names the .md on first save."""
+        if not self._session_is_pristine(self._active_session):
+            self._new_tab()
+        self._path = None
+        self._notes_path = None
+        self._is_untitled = True
+        self.notes_model = NotesModel()
+        self._page_label.set_label("—")
+        self._enter_text_mode()
+        buf = self._notes_view.get_buffer()
+        buf.begin_irreversible_action()
+        buf.set_text("")
+        buf.end_irreversible_action()
+        self._notes_view.reset_render_state()
+        self._undo_timeline.clear()
+        self._redo_timeline.clear()
+        self._notes_burst_open = False
+        self._burst_base = ""
+        self._set_file_title("Untitled note")
+        self._clear_dirty()
+
     def _open_scratchpad(self):
         """Open (or create) the persistent scratchpad at ~/.local/share/sidemark/scratchpad.pdf."""
         data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
@@ -7516,7 +8012,54 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._set_file_title("Scratchpad", path)
         self._clear_dirty()
 
+    def _save_text_ink(self):
+        """Write the text-first page's ink sidecar next to its .md. Lazy like
+        the notes file: only once there is ink (or a sidecar already exists,
+        so erasing every stroke still persists)."""
+        if not self._text_mode or not self._notes_path:
+            return
+        tp = self._active_session._text_page
+        if tp is None:
+            return
+        ink_file = _ink_path_for(self._notes_path)
+        if tp.strokes or os.path.exists(ink_file):
+            with open(ink_file, "w", encoding="utf-8") as f:
+                json.dump(tp.ink_to_json(), f)
+
+    def _on_save_as_md(self, after=None):
+        """Name an untitled text-first page (its ink sidecar follows along)."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Save note as…")
+        dialog.set_initial_name("note.md")
+        f = Gtk.FileFilter()
+        f.set_name("Markdown files")
+        f.add_pattern("*.md")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(f)
+        dialog.set_filters(store)
+
+        def done(d, result):
+            try:
+                file = d.save_finish(result)
+            except GLib.Error:
+                return   # dialog dismissed by user
+            if not file:
+                return
+            path = file.get_path()
+            if not path.lower().endswith((".md", ".markdown")):
+                path += ".md"
+            self._notes_path = path
+            self._is_untitled = False
+            self._set_file_title(os.path.basename(path), path)
+            self._remember_recent(path)
+            self._on_save(after=after)
+
+        dialog.save(self, None, done)
+
     def _on_save_as(self, after=None):
+        if self._text_mode:
+            self._on_save_as_md(after=after)
+            return
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Save PDF as…")
         default_name = os.path.basename(self._path) if self._path else "notes.pdf"
@@ -8103,7 +8646,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Save; if `after` is given it runs only on a successful save
         (for untitled files that means after the save-as dialog completed)."""
         if self._is_untitled:
-            self._on_save_as(after=after)
+            if self._text_mode:
+                self._on_save_as_md(after=after)
+            else:
+                self._on_save_as(after=after)
             return
         notes_file = self._current_notes_path()
         if not self._path and not notes_file:
@@ -8115,9 +8661,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # lazy-create: don't bring an empty sidecar into existence just
             # because the PDF was saved — only write notes once there's content
             # (or the file already exists, so edits/clears still persist)
-            if notes_file and (self.notes_model.has_content()
-                               or os.path.exists(notes_file)):
+            if self._text_mode:
+                # text-first page: the .md is the document, written verbatim —
+                # no page markers, so it stays pure Markdown
+                if notes_file:
+                    tmp_file = notes_file + ".tmp"
+                    with open(tmp_file, "w", encoding="utf-8") as f:
+                        f.write(self.notes_model.get(0))
+                    os.replace(tmp_file, notes_file)
+            elif notes_file and (self.notes_model.has_content()
+                                 or os.path.exists(notes_file)):
                 self.notes_model.save(notes_file)
+            self._save_text_ink()
             self._clear_dirty()
             toast = Adw.Toast.new("Saved")
             toast.set_timeout(2)
@@ -8171,7 +8726,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self._on_open(None)
                 return True
             if keyval == Gdk.KEY_n and not (state & Gdk.ModifierType.SHIFT_MASK):
-                self._on_new_pdf(None)
+                if state & Gdk.ModifierType.ALT_MASK:
+                    self._on_new_text_page()
+                else:
+                    self._on_new_pdf(None)
                 return True
             if keyval == Gdk.KEY_c:
                 if self.canvas._selected_words and not self._notes_view.has_focus():

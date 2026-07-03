@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import sidemark
 from sidemark import (PDFCanvas, NotesModel, notes_path_for,
                       _export_pdf_with_notes, _parse_anchors, PDFEditorWindow,
-                      PDFEditorApp, DocumentSession, _pdf_needs_ocr)
+                      PDFEditorApp, DocumentSession, _pdf_needs_ocr,
+                      _ink_path_for)
 
 # window tests open files, which records recents — keep that out of the user's
 # real ~/.local/share/sidemark/recent.json (TestRecentFiles patches its own)
@@ -6977,6 +6978,264 @@ class TestOCR(unittest.TestCase):
             self.assertEqual(out["path"], pdf)                 # save target unchanged
             self.assertEqual(out["notes_path"], out["notes_path_before"])
             self.assertTrue(out["dirty"])
+
+
+class TestTextFirstMode(unittest.TestCase):
+    """#61 — text-first mode: a bare .md opens as an endless A4-width page
+    with no sidebars; ink anchors to the text through GtkTextMarks and lives
+    in a `<name>-ink.json` sidecar so the .md stays pure Markdown."""
+
+    MD = "# Title\n\nfirst paragraph line\n\nsecond paragraph line\n"
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.textfirst")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    @staticmethod
+    def _settle(ms=400):
+        """Pump the loop so layout runs — iter locations and overlay
+        coordinates need an allocated, laid-out text view."""
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline:
+            ctx.iteration(False)
+
+    def _open_md(self, win, d, text=None):
+        md = os.path.join(d, "note.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write(self.MD if text is None else text)
+        win._do_open_file(md)
+        self._settle()
+        return md
+
+    def _draw_stroke(self, win, y=100.0):
+        tp = win._active_session._text_page
+        win._set_tool_mode("pen")
+        tp._commit_stroke([(300.0, y + i * 3) for i in range(5)])
+        return tp
+
+    def test_bare_md_opens_as_text_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                s = win._active_session
+                self.assertTrue(s._text_mode)
+                self.assertFalse(s._paned.get_visible())
+                self.assertTrue(s._text_page.get_visible())
+                # the sheet's editor IS the notes view now
+                self.assertIs(win._notes_view, s._text_page.view)
+                buf = win._notes_view.get_buffer()
+                self.assertIn("first paragraph line", buf.get_text(
+                    buf.get_start_iter(), buf.get_end_iter(), True))
+                # text tool (select) is active; clicks reach the text
+                self.assertTrue(win._mode_select.get_active())
+                self.assertFalse(s._text_page.ink.get_can_target())
+
+            self._run_in_window(body)
+
+    def test_pdf_only_chrome_is_hidden(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                for w in (win._notes_toggle, win._present_btn, win._toc_btn,
+                          win._nav_box, win._pages_box, win._mode_anchor,
+                          win._mode_lasso, win._mode_pan, win._mode_zoom):
+                    self.assertFalse(w.get_visible(), w)
+                for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
+                          win._mode_select):
+                    self.assertTrue(w.get_visible(), w)
+
+            self._run_in_window(body)
+
+    def test_opening_a_pdf_restores_the_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                self._open_md(win, d)
+                win._do_open_file(pdf)
+                s = win._active_session
+                self.assertFalse(s._text_mode)
+                self.assertTrue(s._paned.get_visible())
+                self.assertFalse(s._text_page.get_visible())
+                self.assertIs(win._notes_view, s._panel_notes_view)
+                self.assertTrue(win._notes_toggle.get_visible())
+
+            self._run_in_window(body)
+
+    def test_new_text_page_is_untitled(self):
+        def body(win):
+            win._on_new_text_page()
+            s = win._active_session
+            self.assertTrue(s._text_mode)
+            self.assertTrue(s._is_untitled)
+            self.assertIsNone(s._notes_path)
+            buf = win._notes_view.get_buffer()
+            self.assertEqual(buf.get_char_count(), 0)
+            self.assertFalse(win._dirty)
+
+        self._run_in_window(body)
+
+    def test_pen_tool_targets_the_ink_overlay(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                for mode in ("pen", "highlighter", "eraser"):
+                    win._set_tool_mode(mode)
+                    self.assertTrue(tp.ink.get_can_target(), mode)
+                    self.assertEqual(tp.tool, mode)
+                win._set_tool_mode("select")
+                self.assertFalse(tp.ink.get_can_target())
+                self.assertEqual(tp.tool, "text")
+
+            self._run_in_window(body)
+
+    def test_stroke_anchors_to_text_and_reflows(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(win)
+                self.assertEqual(len(tp.strokes), 1)
+                before = tp._stroke_overlay_pts(tp.strokes[0])
+                # two lines above → the anchor mark rides down with the text
+                buf = win._notes_view.get_buffer()
+                buf.insert(buf.get_start_iter(), "intro one\nintro two\n")
+                self._settle()
+                after = tp._stroke_overlay_pts(tp.strokes[0])
+                self.assertGreater(after[0][1] - before[0][1], 10)
+                self.assertAlmostEqual(after[0][0], before[0][0], delta=1)
+
+            self._run_in_window(body)
+
+    def test_ink_joins_the_chronological_undo(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(win)
+                buf = win._notes_view.get_buffer()
+                buf.insert(buf.get_start_iter(), "typed later\n")
+                self._settle(150)
+                win._global_undo()          # newest first: the typing burst
+                text = buf.get_text(buf.get_start_iter(),
+                                    buf.get_end_iter(), True)
+                self.assertNotIn("typed later", text)
+                self.assertEqual(len(tp.strokes), 1)
+                win._global_undo()          # then the stroke
+                self.assertEqual(len(tp.strokes), 0)
+                win._global_redo()
+                self.assertEqual(len(tp.strokes), 1)
+
+            self._run_in_window(body)
+
+    def test_eraser_removes_and_undo_restores(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(win)
+                win._set_tool_mode("eraser")
+                px, py = tp._stroke_overlay_pts(tp.strokes[0])[0]
+                fake = types.SimpleNamespace(get_current_button=lambda: 1)
+                tp._on_ink_begin(fake, px, py)
+                tp._on_ink_end(fake, 0, 0)
+                self.assertEqual(len(tp.strokes), 0)
+                win._global_undo()
+                self.assertEqual(len(tp.strokes), 1)
+
+            self._run_in_window(body)
+
+    def test_save_keeps_md_pure_and_writes_sidecar(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                md = self._open_md(win, d)
+                self._draw_stroke(win)
+                win._on_save(None)
+                with open(md, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), self.MD)   # byte-identical
+                ink = _ink_path_for(md)
+                self.assertTrue(os.path.exists(ink))
+                import json
+                with open(ink, encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(len(data["strokes"]), 1)
+                rec = data["strokes"][0]
+                self.assertEqual(len(rec["hash"]), 8)
+                self.assertFalse(win._dirty)
+
+            self._run_in_window(body)
+
+    def test_no_sidecar_without_ink(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                md = self._open_md(win, d)
+                buf = win._notes_view.get_buffer()
+                buf.insert(buf.get_end_iter(), "more text\n")
+                win._on_save(None)
+                self.assertFalse(os.path.exists(_ink_path_for(md)))
+
+            self._run_in_window(body)
+
+    def test_ink_reloads_on_the_same_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                md = self._open_md(win, d)
+                self._draw_stroke(win)
+                win._on_save(None)
+                import json
+                with open(_ink_path_for(md), encoding="utf-8") as f:
+                    rec = json.load(f)["strokes"][0]
+                win._new_tab()
+                win._do_open_file(md)
+                self._settle()
+                tp = win._active_session._text_page
+                self.assertEqual(len(tp.strokes), 1)
+                it = tp.view.get_buffer().get_iter_at_mark(
+                    tp.strokes[0]["mark"])
+                self.assertEqual(it.get_line(), rec["line"])
+
+            self._run_in_window(body)
+
+    def test_hash_rematch_heals_external_edits(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                md = self._open_md(win, d)
+                self._draw_stroke(win)
+                win._on_save(None)
+                import json
+                with open(_ink_path_for(md), encoding="utf-8") as f:
+                    rec = json.load(f)["strokes"][0]
+                # another editor prepends a line: the stored index is stale,
+                # the line hash finds the paragraph at its new position
+                with open(md, encoding="utf-8") as f:
+                    content = f.read()
+                with open(md, "w", encoding="utf-8") as f:
+                    f.write("externally added heading\n" + content)
+                win._new_tab()
+                win._do_open_file(md)
+                self._settle()
+                tp = win._active_session._text_page
+                it = tp.view.get_buffer().get_iter_at_mark(
+                    tp.strokes[0]["mark"])
+                self.assertEqual(it.get_line(), rec["line"] + 1)
+
+            self._run_in_window(body)
 
 
 if __name__ == "__main__":
