@@ -1526,6 +1526,32 @@ class TestMarkdownFormatting(unittest.TestCase):
         self.assertEqual(key_phases.count(Gtk.PropagationPhase.CAPTURE), 2,
                          key_phases)   # ours + the text view's IM controller
 
+    def test_source_text_keeps_hidden_markers(self):
+        # regression: rendered lines keep their markdown markers (#, **, `)
+        # in the buffer under an invisible tag; get_source_text must include
+        # them, else every save silently stripped the formatting (data loss)
+        v = self._view(); buf = v.get_buffer()
+        src = "# Title\n\n**bold** and `code`\nplain"
+        buf.set_text(src)
+        buf.place_cursor(buf.get_end_iter())   # cursor away from those lines
+        v._rehighlight()                       # render: markers go invisible
+        self.assertEqual(v.get_source_text(), src)
+
+    def test_surround_keeps_hidden_markers(self):
+        # surrounding a selection that spans a rendered line re-inserts the
+        # text — the invisible ** markers must survive the delete+reinsert
+        v = self._view(); buf = v.get_buffer()
+        buf.set_text("**bold** word\nother")
+        buf.place_cursor(buf.get_end_iter())
+        v._rehighlight()
+        s = buf.get_start_iter()
+        e = buf.get_iter_at_line(0)[1]
+        e.forward_to_line_end()
+        buf.select_range(s, e)
+        v._surround_selection("(", ")")
+        self.assertEqual(v.get_source_text().split("\n")[0],
+                         "(**bold** word)")
+
     def test_bracket_surrounds_selection(self):
         # typing a bracket with text selected surrounds it instead of
         # replacing it; the inner text stays selected so pairs can be stacked

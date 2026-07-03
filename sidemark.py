@@ -3829,7 +3829,10 @@ class MarkdownNotesView(GtkSource.View):
         e = buf.get_iter_at_mark(buf.get_insert())
         if s.compare(e) > 0:
             s, e = e, s
-        text = buf.get_text(s, e, False)
+        # include hidden chars: the selection may span markers an already-
+        # rendered line keeps under an invisible tag — delete+reinsert below
+        # would otherwise strip them from the text
+        text = buf.get_text(s, e, True)
         buf.begin_user_action()
         try:
             buf.delete(s, e)
@@ -3983,7 +3986,9 @@ class MarkdownNotesView(GtkSource.View):
         # Auto-expand if the selection sits inside marker…marker
         s, e = self._expand_to_markers(buf, s, e, marker)
 
-        text = buf.get_text(s, e, False)
+        # hidden chars included — same delete+reinsert data-loss guard as in
+        # _surround_selection
+        text = buf.get_text(s, e, True)
         m = len(marker)
         # Already wrapped check (single * must not be part of **)
         already = (
@@ -4080,7 +4085,10 @@ class MarkdownNotesView(GtkSource.View):
             le = ls.copy()
             if not le.ends_line():
                 le.forward_to_line_end()
-            cur = buf.get_text(ls, le, False)
+            # include_hidden_chars=True: rendered lines carry their markdown
+            # markers (#, **, `) under an invisible tag — excluding them here
+            # silently stripped the markers from every saved note (data loss)
+            cur = buf.get_text(ls, le, True)
             orig = self._line_originals.get(ln)
             # only trust the stored source if it still renders to this line
             if orig is not None and _symbolize(orig) == cur:
@@ -4145,7 +4153,7 @@ class MarkdownNotesView(GtkSource.View):
         le = ls.copy()
         if not le.ends_line():
             le.forward_to_line_end()
-        if buf.get_text(ls, le, False) != original:
+        if buf.get_text(ls, le, True) != original:
             self._buf_replace_line(buf, ln, original)
 
     def _rehighlight(self):
