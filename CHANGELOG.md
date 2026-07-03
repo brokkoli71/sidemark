@@ -1,4 +1,37 @@
-## [0.3.0] - 2026-06-22 — Reaching Out
+## [0.4.0] - 2026-07-03 — Text-First Mode
+
+### 🚀 Features
+
+- *(share)* Live phone view that follows along, in a non-modal window
+- *(share)* Render anchors, callouts and text boxes in the live phone view
+- *(notes)* Zoomable notes-panel font for reading presenter notes
+- *(present)* Presentation timer + large nav bar, and window-wide side-button paging
+- *(notes)* LaTeX accents, centred short pages, and presenter re-fit
+- *(app)* Single instance so tabs can be dragged between any windows
+- *(present)* Next-slide preview on the presenter's window
+- *(present)* Next-slide stack view, presenter-window controls, live ink
+- *(present)* OSD-style presentation bar that scales with the window
+- *(present)* Tuck the next slide underneath when the canvas is tall
+- *(notes)* Typing a bracket surrounds the selection instead of replacing it
+- *(text)* Text-first mode — an endless Markdown page you can draw on
+- *(text)* Hide PDF-only menu actions on a text page
+
+### 🐛 Bug Fixes
+
+- *(notes)* Make bracket-surround work with real keystrokes
+- *(notes)* Keep hidden markdown markers when saving rendered lines
+- *(ideas)* Repair broken CSV quoting in row #87
+- *(ci)* Run install.sh non-interactively
+
+### 🧪 Testing
+
+- *(thumbnails)* Make empty-sidebar-click test deterministic
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to 0.3.0.r0.ge90f98e
+- *(ideas)* Sync issue numbers for #61, #69, #77-87
+## [0.3.0] - 2026-06-22
 
 ### 🚀 Features
 
