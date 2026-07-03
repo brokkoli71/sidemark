@@ -7242,6 +7242,32 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_scratchpad_opens_as_a_text_page(self):
+        """An empty launch opens the persistent scratchpad as a text-first
+        page (scratchpad.md), and the scratchpad stays out of recents."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                old_home = os.environ.get("HOME", "")
+                os.environ["HOME"] = d
+                try:
+                    win._open_scratchpad()
+                    self._settle(200)
+                finally:
+                    os.environ["HOME"] = old_home
+                md = os.path.join(d, ".local", "share", "sidemark",
+                                  "scratchpad.md")
+                self.assertTrue(os.path.exists(md))
+                s = win._active_session
+                self.assertTrue(s._text_mode)
+                self.assertIsNone(s._path)
+                self.assertEqual(s._notes_path, md)
+                self.assertFalse(win._dirty)
+                # _open_markdown remembers recents — the scratchpad is exempt
+                self.assertNotIn(md, [it.get("path")
+                                      for it in sidemark._load_recent()])
+
+            self._run_in_window(body)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

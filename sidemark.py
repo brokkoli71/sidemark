@@ -7699,8 +7699,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _remember_recent(self, path):
         path = os.path.abspath(path)
         # the scratchpad and unsaved blanks are noise in a recents list
-        if path == os.path.join(os.path.expanduser("~"), ".local", "share",
-                                "sidemark", "scratchpad.pdf"):
+        data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
+        if path in (os.path.join(data_dir, "scratchpad.md"),
+                    os.path.join(data_dir, "scratchpad.pdf")):
             return
         if os.path.basename(path).startswith("sidemark_blank_"):
             return
@@ -8007,14 +8008,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._clear_dirty()
 
     def _open_scratchpad(self):
-        """Open (or create) the persistent scratchpad at ~/.local/share/sidemark/scratchpad.pdf."""
+        """Open (or create) the persistent scratchpad — a text-first page at
+        ~/.local/share/sidemark/scratchpad.md (ink in scratchpad-ink.json).
+        Earlier versions used a scratchpad.pdf there; it stays on disk and can
+        still be opened like any other PDF."""
         data_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "sidemark")
         os.makedirs(data_dir, exist_ok=True)
-        path = os.path.join(data_dir, "scratchpad.pdf")
+        path = os.path.join(data_dir, "scratchpad.md")
         if not os.path.exists(path):
-            surf = cairo.PDFSurface(path, 595, 842)
-            cairo.Context(surf).show_page()
-            surf.finish()
+            with open(path, "w", encoding="utf-8"):
+                pass
         self._do_open_file(path)
         self._set_file_title("Scratchpad", path)
         self._clear_dirty()

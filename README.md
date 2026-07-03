@@ -1,13 +1,13 @@
 # Sidemark
 
-[![AUR version](https://img.shields.io/aur/version/sidemark-git)](https://aur.archlinux.org/packages/sidemark-git)
+[![AUR version](https://img.shields.io/aur/version/sidemark)](https://aur.archlinux.org/packages/sidemark)
 [![CI](https://github.com/brokkoli71/sidemark/actions/workflows/ci.yml/badge.svg)](https://github.com/brokkoli71/sidemark/actions/workflows/ci.yml)
 
 Sidemark is a lightweight PDF annotator for Linux with a live Markdown notes panel. Open a PDF — lecture slides, papers, or any document — draw directly on it, and write structured notes beside it.
 
 ![Screenshot](screenshot.png)
 
-> If Sidemark is useful to you, please ⭐ [star it on GitHub](https://github.com/brokkoli71/sidemark) and 🗳️ [vote for it on the AUR](https://aur.archlinux.org/packages/sidemark-git) — it's the main way other people discover the project.
+> If Sidemark is useful to you, please ⭐ [star it on GitHub](https://github.com/brokkoli71/sidemark) and 🗳️ [vote for it on the AUR](https://aur.archlinux.org/packages/sidemark) — it's the main way other people discover the project.
 
 ## Why Sidemark
 
@@ -38,7 +38,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop a box of text directly on the page with no anchor or arrow; edit it in the notes panel (it's a `<!-- textbox:X:Y -->` paragraph in the `.md`), drag it to reposition, and it renders the same symbols / super-subscripts / Markdown as callouts; included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — by default each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something (a PDF you never annotate stays clutter-free, and its notes panel opens collapsed). Pick **Notes file…** from the ☰ menu to point a document at a different Markdown file — handy for sharing one notes file across several PDFs; the choice is remembered per PDF
-- **Text-first mode** — open a bare `.md` file (or **New text page** in the ☰ menu, `Ctrl+Alt+N`) and there's no PDF and no panels at all: the window shows one endless A4-width sheet of paper that **is** your note — the full live-Markdown editor — and you can **draw straight onto it** with the same pen, highlighter and eraser as on a PDF. Ink is anchored to the text, so drawings ride along when you edit above them, and it scales with the notes font. The file stays **pure Markdown** (byte-identical round-trip through any editor); ink is stored in a `<name>-ink.json` sidecar and re-matched by line content if the `.md` was edited externally. Pen strokes and typing share one chronological undo (`Ctrl+Z`)
+- **Text-first mode** — open a bare `.md` file (or **New text page** in the ☰ menu, `Ctrl+Alt+N`) and there's no PDF and no panels at all: the window shows one endless A4-width sheet of paper that **is** your note — the full live-Markdown editor — and you can **draw straight onto it** with the same pen, highlighter and eraser as on a PDF. Ink is anchored to the text, so drawings ride along when you edit above them, and it scales with the notes font. The file stays **pure Markdown** (byte-identical round-trip through any editor); ink is stored in a `<name>-ink.json` sidecar and re-matched by line content if the `.md` was edited externally. Pen strokes and typing share one chronological undo (`Ctrl+Z`). Launching Sidemark without a file opens the persistent scratchpad as such a page (`~/.local/share/sidemark/scratchpad.md`)
 
 ### Navigation
 
