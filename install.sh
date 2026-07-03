@@ -160,7 +160,7 @@ _has_missing() {
 
 if _has_missing; then
     echo ""
-    if [[ $_YES -eq 1 ]]; then
+    if [[ $_YES -eq 1 || ! -t 0 ]]; then   # -y, or no terminal to prompt on (CI, curl|bash)
         _ans="Y"
     else
         read -rp "  Install missing packages automatically? [Y/n] " _ans
@@ -255,7 +255,7 @@ else
     _DO_OCR=0
     if [[ $_OCR -eq 1 ]]; then
         _DO_OCR=1
-    elif [[ $_YES -eq 1 ]]; then
+    elif [[ $_YES -eq 1 || ! -t 0 ]]; then   # -y, or no terminal to prompt on (CI, curl|bash)
         warn "OCR support (ocrmypdf) not installed — re-run with --with-ocr to add it."
     else
         read -rp "  Install optional OCR support (ocrmypdf, for scanned PDFs)? [y/N] " _ans

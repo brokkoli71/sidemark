@@ -70,7 +70,7 @@ jobs:
           pip install pymupdf
 
       - name: Run install.sh
-        run: GDK_BACKEND=offscreen ./install.sh
+        run: GDK_BACKEND=offscreen ./install.sh -y
 
       - name: Verify installed files
         run: |
