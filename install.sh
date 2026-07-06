@@ -294,9 +294,11 @@ for size in 16 32 48 64 128 256; do
     mkdir -p "$ICON_BASE/${size}x${size}/apps"
 done
 
-# Main script
+# Main script + the Deck presentation editor module it lazy-imports
 install -m 755 "$SCRIPT_DIR/sidemark.py" "$INSTALL_DIR/sidemark.py"
 ok "sidemark.py  →  $INSTALL_DIR/"
+install -m 644 "$SCRIPT_DIR/deck.py" "$INSTALL_DIR/deck.py"
+ok "deck.py      →  $INSTALL_DIR/"
 
 # Wrapper so 'sidemark' works from any shell / Exec line
 cat > "$BIN_DIR/sidemark" <<EOF

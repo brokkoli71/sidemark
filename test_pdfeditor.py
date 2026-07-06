@@ -5177,27 +5177,41 @@ class TestSingleInstanceArgs(unittest.TestCase):
     in one place; a second launch forwards here."""
 
     def test_file_only(self):
-        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]), ("a.pdf", 0))
+        self.assertEqual(PDFEditorApp._parse_open_args(["a.pdf"]),
+                         ("a.pdf", 0, False))
 
     def test_page_before_or_after_file(self):
         self.assertEqual(
-            PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]), ("a.pdf", 3))
+            PDFEditorApp._parse_open_args(["--page", "3", "a.pdf"]),
+            ("a.pdf", 3, False))
         self.assertEqual(
-            PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]), ("a.pdf", 5))
+            PDFEditorApp._parse_open_args(["a.pdf", "--page", "5"]),
+            ("a.pdf", 5, False))
 
     def test_verbose_and_unknown_flags_ignored(self):
         self.assertEqual(
-            PDFEditorApp._parse_open_args(["-v", "a.pdf"]), ("a.pdf", 0))
+            PDFEditorApp._parse_open_args(["-v", "a.pdf"]),
+            ("a.pdf", 0, False))
         self.assertEqual(
-            PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]), ("a.pdf", 0))
+            PDFEditorApp._parse_open_args(["--frobnicate", "a.pdf"]),
+            ("a.pdf", 0, False))
 
     def test_bad_page_value_ignored(self):
         self.assertEqual(
             PDFEditorApp._parse_open_args(["--page", "nope", "a.pdf"]),
-            ("a.pdf", 0))
+            ("a.pdf", 0, False))
 
     def test_no_args(self):
-        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0))
+        self.assertEqual(PDFEditorApp._parse_open_args([]), (None, 0, False))
+
+    def test_presentation_flag(self):
+        self.assertEqual(PDFEditorApp._parse_open_args(["--presentation"]),
+                         (None, 0, True))
+        self.assertEqual(PDFEditorApp._parse_open_args(["--deck"]),
+                         (None, 0, True))
+        self.assertEqual(
+            PDFEditorApp._parse_open_args(["--presentation", "a.smdeck"]),
+            ("a.smdeck", 0, True))
 
 
 class TestReorderPages(unittest.TestCase):
@@ -7055,11 +7069,11 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 for w in (win._notes_toggle, win._present_btn, win._toc_btn,
                           win._nav_box, win._pages_box, win._mode_anchor,
-                          win._mode_lasso, win._mode_pan, win._mode_zoom,
+                          win._mode_lasso, win._mode_zoom,
                           win._mode_select):
                     self.assertFalse(w.get_visible(), w)
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
-                          win._mode_text):
+                          win._mode_text, win._mode_pan):
                     self.assertTrue(w.get_visible(), w)
                 # the caret tool leads the tool strip
                 self.assertIs(win._tools_box.get_first_child(), win._mode_text)
@@ -7292,17 +7306,17 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = win._active_session._text_page
                 self.assertEqual(tp.tool, "text")
                 g = self._fake_drag(alt=True)
-                tp._on_alt_begin(g, 300.0, 100.0)
+                tp._on_capture_begin(g, 300.0, 100.0)
                 for i in range(1, 5):
-                    tp._on_alt_update(g, 0.0, i * 3.0)
-                tp._on_alt_end(g, 0.0, 12.0)
+                    tp._on_capture_update(g, 0.0, i * 3.0)
+                tp._on_capture_end(g, 0.0, 12.0)
                 self.assertEqual(len(tp.strokes), 1)
                 self.assertEqual(tp.tool, "text")   # pen only while held
                 # without Alt the gesture denies itself — no stroke
                 g = self._fake_drag(alt=False)
-                tp._on_alt_begin(g, 300.0, 100.0)
-                tp._on_alt_update(g, 0.0, 3.0)
-                tp._on_alt_end(g, 0.0, 6.0)
+                tp._on_capture_begin(g, 300.0, 100.0)
+                tp._on_capture_update(g, 0.0, 3.0)
+                tp._on_capture_end(g, 0.0, 6.0)
                 self.assertEqual(len(tp.strokes), 1)
 
             self._run_in_window(body)
@@ -7332,6 +7346,71 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_pan_gestures_scroll_the_sheet(self):
+        """Middle-drag, Ctrl+drag, the pan tool and the thumb button (btn 10)
+        pan the sheet like the PDF canvas — the adjustments are configured by
+        hand so the test doesn't depend on compositor-driven relayout."""
+        def drag(button, state=0):
+            return types.SimpleNamespace(
+                get_current_button=lambda: button,
+                get_current_event_state=lambda: Gdk.ModifierType(state),
+                set_state=lambda s: None)
+
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                self._settle()
+                tp = win._active_session._text_page
+                v = tp.scroll.get_vadjustment()
+                h = tp.scroll.get_hadjustment()
+                v.configure(200, 0, 2000, 10, 100, 500)
+                h.configure(50, 0, 1000, 10, 100, 300)
+                # middle-drag pans both axes
+                g = drag(2)
+                tp._on_capture_begin(g, 300.0, 100.0)
+                tp._on_capture_update(g, 10.0, 30.0)
+                tp._on_capture_end(g, 10.0, 30.0)
+                self.assertAlmostEqual(v.get_value(), 170.0)
+                self.assertAlmostEqual(h.get_value(), 40.0)
+                # Ctrl+drag pans
+                g = drag(1, int(Gdk.ModifierType.CONTROL_MASK))
+                tp._on_capture_begin(g, 300.0, 100.0)
+                tp._on_capture_update(g, 0.0, -20.0)
+                tp._on_capture_end(g, 0.0, -20.0)
+                self.assertAlmostEqual(v.get_value(), 190.0)
+                # the pan tool is on the bar and makes plain drags pan
+                self.assertTrue(win._mode_pan.get_visible())
+                win._set_tool_mode("pan")
+                self.assertTrue(tp.pan_tool)
+                g = drag(1)
+                tp._on_capture_begin(g, 300.0, 100.0)
+                tp._on_capture_update(g, 0.0, 40.0)
+                tp._on_capture_end(g, 0.0, 40.0)
+                self.assertAlmostEqual(v.get_value(), 150.0)
+                win._set_tool_mode("select")
+                # a plain drag with the text tool does NOT pan
+                g = drag(1)
+                tp._on_capture_begin(g, 300.0, 100.0)
+                tp._on_capture_update(g, 0.0, 40.0)
+                tp._on_capture_end(g, 0.0, 40.0)
+                self.assertAlmostEqual(v.get_value(), 150.0)
+                # thumb button (btn 10): hold to pan, release stops
+                press = types.SimpleNamespace(
+                    get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
+                    get_button=lambda: 10)
+                release = types.SimpleNamespace(
+                    get_event_type=lambda: Gdk.EventType.BUTTON_RELEASE,
+                    get_button=lambda: 10)
+                tp._on_motion(None, 400.0, 300.0)
+                tp._on_thumb_event(None, press)
+                tp._on_motion(None, 400.0, 250.0)
+                self.assertAlmostEqual(v.get_value(), 200.0)
+                tp._on_thumb_event(None, release)
+                tp._on_motion(None, 400.0, 200.0)
+                self.assertAlmostEqual(v.get_value(), 200.0)
+
+            self._run_in_window(body)
+
     # NOTE: the PDF export (_write_text_pdf) is exercised by the standalone
     # smoke script, not here — it needs live compositor frames for a freshly
     # mapped window, and after hundreds of suite tests weston stops ticking
@@ -7354,6 +7433,318 @@ class TestTextFirstMode(unittest.TestCase):
                 win._tool_style_popup(pop)
                 self.assertTrue(pop.get_visible())
                 pop.popdown()
+
+            self._run_in_window(body)
+
+
+class TestDeckMode(unittest.TestCase):
+    """Sidemark Deck — presentation editor: a .smdeck is 16:9 slides of
+    textboxes and images, edited in deck.py's DeckView and saved as JSON."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.deck")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    @staticmethod
+    def _settle(ms=400):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline:
+            ctx.iteration(False)
+
+    @staticmethod
+    def _deck():
+        return sidemark._deck_module()
+
+    @staticmethod
+    def _png_bytes(w=10, h=6):
+        import io as _io
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        ctx = cairo.Context(surf)
+        ctx.set_source_rgb(1, 0, 0)
+        ctx.paint()
+        buf = _io.BytesIO()
+        surf.write_to_png(buf)
+        return buf.getvalue()
+
+    # ── model ────────────────────────────────────────────────────────────
+
+    def test_model_roundtrip(self):
+        deck = self._deck()
+        m = deck.DeckModel()
+        self.assertEqual(m.slides[0]["layout"], "title")
+        self.assertFalse(m.has_content())
+        m.slides[0]["objects"][0]["text"] = "My talk"
+        m.slides.append(deck.new_slide("content"))
+        self.assertTrue(m.has_content())
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.smdeck")
+            m.save(p)
+            m2 = deck.DeckModel.load(p)
+        self.assertEqual(len(m2.slides), 2)
+        self.assertEqual(m2.slides[0]["objects"][0]["text"], "My talk")
+        self.assertEqual(m2.slides[1]["layout"], "content")
+
+    def test_model_rejects_foreign_json(self):
+        deck = self._deck()
+        with self.assertRaises(ValueError):
+            deck.DeckModel.from_json({"format": "not-a-deck"})
+
+    def test_runtime_caches_not_serialized(self):
+        deck = self._deck()
+        m = deck.DeckModel()
+        m.slides[0]["objects"][0]["_surface"] = object()
+        data = m.to_json()
+        self.assertNotIn("_surface", data["slides"][0]["objects"][0])
+
+    def test_layouts(self):
+        deck = self._deck()
+        self.assertEqual(len(deck.LAYOUTS["title"]()), 2)   # title + subtitle
+        self.assertEqual(len(deck.LAYOUTS["content"]()), 2)  # heading + body
+        self.assertEqual(deck.LAYOUTS["blank"](), [])
+        # title slide: big bold centered title above a subtitle
+        title, sub = deck.LAYOUTS["title"]()
+        self.assertEqual(title["weight"], "bold")
+        self.assertEqual(title["align"], "center")
+        self.assertGreater(title["size"], sub["size"])
+        self.assertLess(title["y"], sub["y"])
+        # content slide: heading on top, textbox underneath
+        head, body = deck.LAYOUTS["content"]()
+        self.assertLess(head["y"] + head["h"], body["y"])
+
+    def test_export_pdf(self):
+        deck = self._deck()
+        m = deck.DeckModel()
+        m.slides[0]["objects"][0]["text"] = "Export me"
+        m.slides.append(deck.new_slide("blank"))
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "out.pdf")
+            deck.export_pdf(m, pdf)
+            doc = fitz.open(pdf)
+            self.assertEqual(len(doc), 2)
+            # 16:9 pages, text exported as vector text (searchable)
+            r = doc[0].rect
+            self.assertAlmostEqual(r.width / r.height, 16 / 9, places=2)
+            self.assertIn("Export me", doc[0].get_text())
+            # empty placeholders are not exported
+            self.assertNotIn("Click to add", doc[0].get_text())
+            doc.close()
+
+    # ── window integration ───────────────────────────────────────────────
+
+    def test_new_presentation_enters_deck_mode(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            s = win._active_session
+            self.assertTrue(s._deck_mode)
+            self.assertTrue(s._is_untitled)
+            self.assertFalse(s._paned.get_visible())
+            self.assertTrue(s._deck_view.get_visible())
+            # a fresh deck starts with one title slide (two placeholders)
+            self.assertEqual(len(s._deck_view.model.slides), 1)
+            self.assertEqual(s._deck_view.model.slides[0]["layout"], "title")
+            # PDF chrome and ink tools are gone; the deck brings its own bar
+            for w in (win._notes_toggle, win._present_btn, win._toc_btn,
+                      win._nav_box, win._pages_box, win._tools_box,
+                      win._pen_btn):
+                self.assertFalse(w.get_visible(), w)
+            for item in win._pdf_menu_items:
+                self.assertFalse(item.get_visible(), item)
+            for item in win._deck_menu_items:
+                self.assertTrue(item.get_visible(), item)
+
+        self._run_in_window(body)
+
+    def test_smdeck_open_and_save_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                win._on_new_presentation()
+                self._settle()
+                dv = win._deck_view
+                dv.model.slides[0]["objects"][0]["text"] = "Roundtrip"
+                path = os.path.join(d, "talk.smdeck")
+                dv.save(path)
+                win._deck_path = path
+                win._is_untitled = False
+                # open it into a fresh tab and check everything came back
+                win._new_tab()
+                win._do_open_file(path)
+                self._settle()
+                s = win._active_session
+                self.assertTrue(s._deck_mode)
+                self.assertEqual(s._deck_path, path)
+                self.assertEqual(
+                    s._deck_view.model.slides[0]["objects"][0]["text"],
+                    "Roundtrip")
+                self.assertFalse(s._dirty)
+
+            self._run_in_window(body)
+
+    def test_opening_a_pdf_restores_the_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._on_new_presentation()
+                self._settle()
+                win._do_open_file(pdf)
+                s = win._active_session
+                self.assertFalse(s._deck_mode)
+                self.assertIsNone(s._deck_path)
+                self.assertTrue(s._paned.get_visible())
+                self.assertFalse(s._deck_view.get_visible())
+                self.assertTrue(win._tools_box.get_visible())
+                self.assertTrue(win._pen_btn.get_visible())
+
+            self._run_in_window(body)
+
+    def test_add_delete_slide_and_undo(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.add_slide("content")
+            self.assertEqual(len(dv.model.slides), 2)
+            self.assertEqual(dv.current, 1)
+            self.assertTrue(win._dirty)
+            dv.delete_slide()
+            self.assertEqual(len(dv.model.slides), 1)
+            # undo brings the slide back, then removes it again via redo —
+            # routed through the window's global undo (Ctrl+Z path)
+            win._global_undo()
+            self.assertEqual(len(dv.model.slides), 2)
+            win._global_redo()
+            self.assertEqual(len(dv.model.slides), 1)
+            # the last slide can't be deleted
+            win._global_undo()   # restore to 2
+            dv.delete_slide()
+            dv.delete_slide()
+            self.assertEqual(len(dv.model.slides), 1)
+
+        self._run_in_window(body)
+
+    def test_move_resize_with_undo(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            obj = dv.model.slides[0]["objects"][0]
+            x0, y0, w0 = obj["x"], obj["y"], obj["w"]
+            # move: drag from the object's center by (large, snap-proof) deltas
+            _, _, scale = dv._slide_rect()
+            sx, sy, _ = dv._slide_rect()
+            cx = sx + (obj["x"] + obj["w"] / 2) * scale
+            cy = sy + (obj["y"] + obj["h"] / 2) * scale
+            dv._on_drag_begin(None, cx, cy)
+            self.assertIs(dv.selected, obj)
+            dv._on_drag_update(None, 40 * scale, 25 * scale)
+            dv._on_drag_end(None, 40 * scale, 25 * scale)
+            self.assertAlmostEqual(obj["x"], x0 + 40, delta=sidemark._deck_module().SNAP_PX)
+            self.assertAlmostEqual(obj["y"], y0 + 25, delta=sidemark._deck_module().SNAP_PX)
+            # resize via the south-east handle
+            hx = sx + (obj["x"] + obj["w"]) * scale
+            hy = sy + (obj["y"] + obj["h"]) * scale
+            dv._on_drag_begin(None, hx, hy)
+            dv._on_drag_update(None, 30 * scale, 0.0)
+            dv._on_drag_end(None, 30 * scale, 0.0)
+            self.assertAlmostEqual(obj["w"], w0 + 30, delta=0.5)
+            # two undos restore the original geometry
+            win._global_undo()
+            self.assertAlmostEqual(obj["w"], w0, delta=0.5)
+            win._global_undo()
+            self.assertAlmostEqual(obj["x"], x0, delta=0.5)
+            self.assertAlmostEqual(obj["y"], y0, delta=0.5)
+
+        self._run_in_window(body)
+
+    def test_snap_to_slide_center(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            deck = self._deck()
+            obj = dv.model.slides[0]["objects"][0]
+            centered_x = deck.SLIDE_W / 2 - obj["w"] / 2
+            nx, _ = dv._snap_move(obj, centered_x + deck.SNAP_PX - 1, obj["y"])
+            self.assertEqual(nx, centered_x)          # snapped
+            self.assertTrue(dv._guides)               # and a guide line shows
+            nx, _ = dv._snap_move(obj, centered_x + deck.SNAP_PX + 5, obj["y"])
+            self.assertEqual(nx, centered_x + deck.SNAP_PX + 5)   # out of range
+
+        self._run_in_window(body)
+
+    def test_image_add_and_undo(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.add_image_bytes(self._png_bytes(), 10, 6)
+            objs = dv.model.slides[0]["objects"]
+            img = objs[-1]
+            self.assertEqual(img["type"], "image")
+            # aspect ratio preserved on insert
+            self.assertAlmostEqual(img["w"] / img["h"], 10 / 6, places=2)
+            self.assertTrue(win._dirty)
+            win._global_undo()
+            self.assertNotIn(img, dv.model.slides[0]["objects"])
+            win._global_redo()
+            self.assertIn(img, dv.model.slides[0]["objects"])
+
+        self._run_in_window(body)
+
+    def test_textbox_style_undo(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            obj = dv.model.slides[0]["objects"][0]
+            dv.selected = obj
+            dv._sync_toolbar()
+            dv._size_spin.set_value(100)         # user bumps the font size
+            self.assertEqual(obj["size"], 100)
+            win._global_undo()
+            self.assertEqual(obj["size"], 72)
+
+        self._run_in_window(body)
+
+    def test_deck_tab_is_not_pristine(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            self.assertFalse(win._session_is_pristine(win._active_session))
+
+        self._run_in_window(body)
+
+    def test_dropped_image_lands_on_slide(self):
+        with tempfile.TemporaryDirectory() as d:
+            png = os.path.join(d, "pic.png")
+            with open(png, "wb") as f:
+                f.write(self._png_bytes())
+
+            def body(win):
+                win._on_new_presentation()
+                self._settle()
+                self.assertTrue(win._open_dropped([png]))
+                objs = win._deck_view.model.slides[0]["objects"]
+                self.assertEqual(objs[-1]["type"], "image")
 
             self._run_in_window(body)
 

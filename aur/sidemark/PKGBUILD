@@ -34,9 +34,11 @@ sha256sums=('44bc27295a7af4741f59576058efddb75ef5d701e29549d318933803e06800b7')
 package() {
     cd "$srcdir/$pkgname-$pkgver"
 
-    # Main script
+    # Main script + the Deck presentation editor module it lazy-imports
     install -Dm755 sidemark.py \
         "$pkgdir/usr/share/sidemark/sidemark.py"
+    install -Dm644 deck.py \
+        "$pkgdir/usr/share/sidemark/deck.py"
 
     # Wrapper in PATH
     install -dm755 "$pkgdir/usr/bin"
