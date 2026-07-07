@@ -7467,5 +7467,75 @@ class TestInstanceId(unittest.TestCase):
         self.assertEqual(self.sm._application_id(), self.sm.BASE_APP_ID)
 
 
+class TestOpenTargetReuse(unittest.TestCase):
+    """Feature A: a launched file lands as a tab in the window you were last
+    using instead of spawning a new window, so opening several files doesn't
+    litter the desktop; SIDEMARK_NEW_WINDOW forces the old new-window behavior."""
+
+    def setUp(self):
+        from sidemark import PDFEditorApp
+        self._App = PDFEditorApp
+        self._saved = {k: os.environ.get(k)
+                       for k in ("SIDEMARK_STANDALONE", "SIDEMARK_NEW_WINDOW")}
+        # NON_UNIQUE so the test app is always primary and never forwards to a
+        # real running Sidemark; drop any inherited new-window override.
+        os.environ["SIDEMARK_STANDALONE"] = "1"
+        os.environ.pop("SIDEMARK_NEW_WINDOW", None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _editor_windows(self, app):
+        from sidemark import PDFEditorWindow
+        return [w for w in app.get_windows()
+                if isinstance(w, PDFEditorWindow)]
+
+    def _drive(self, body):
+        errors = []
+        app = self._App()
+
+        def once():
+            try:
+                body(app)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                app.quit()
+            return False
+
+        GLib.idle_add(once)
+        app.run([])            # HANDLES_COMMAND_LINE → one scratchpad window
+        if errors:
+            raise errors[0]
+
+    def test_file_reuses_active_window(self):
+        def body(app):
+            wins = self._editor_windows(app)
+            self.assertEqual(len(wins), 1)      # the launch's scratchpad window
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "a.pdf"); make_pdf(pdf, n_pages=2)
+                reused = app._open_target(pdf, 0)
+                self.assertTrue(reused)
+                self.assertEqual(len(self._editor_windows(app)), 1)   # no new one
+                self.assertEqual(
+                    os.path.basename(wins[0]._active_session._path), "a.pdf")
+        self._drive(body)
+
+    def test_env_forces_new_window(self):
+        def body(app):
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "b.pdf"); make_pdf(pdf, n_pages=1)
+                os.environ["SIDEMARK_NEW_WINDOW"] = "1"
+                n = len(self._editor_windows(app))
+                reused = app._open_target(pdf, 0)
+                self.assertFalse(reused)
+                self.assertEqual(len(self._editor_windows(app)), n + 1)
+        self._drive(body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

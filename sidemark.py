@@ -9438,25 +9438,61 @@ class PDFEditorApp(Adw.Application):
     def do_command_line(self, command_line):
         """Every launch (this process or a forwarded one from a second
         invocation) lands here in the single primary instance; open the file it
-        names in a new window."""
+        names — as a tab in the window you were last using, or a new window."""
         args = command_line.get_arguments()
         path, page = self._parse_open_args(args[1:])
         if path and not os.path.isabs(path):
             cwd = command_line.get_cwd()
             if cwd:
                 path = os.path.join(cwd, path)
+        reused = self._open_target(path, page)
         # A second launch forwards here and exits immediately; tell its shell
         # why, so it doesn't just look like the command silently did nothing.
         if command_line.get_is_remote():
-            what = f"‘{os.path.basename(path)}’" if path else "a new window"
-            command_line.print_literal(
-                f"Sidemark is already running — opened {what} in it.\n")
-        self.open_new_window(path, page)
+            if not path:
+                msg = "opened a new window."
+            elif reused:
+                msg = f"opened ‘{os.path.basename(path)}’ in the current window."
+            else:
+                msg = f"opened ‘{os.path.basename(path)}’ in a new window."
+            command_line.print_literal(f"Sidemark is already running — {msg}\n")
         return 0
 
     def do_activate(self):
         # bare activation (e.g. via D-Bus) with no command line → empty window
         self.open_new_window()
+
+    def _reuse_target(self):
+        """The window a launched file should land in: the most recently focused
+        editor window (what you're looking at now), else any open one. None when
+        no editor window is open yet, or when SIDEMARK_NEW_WINDOW forces a fresh
+        one. get_active_window() tracks focus order, which is the closest a
+        Wayland client can get to 'the window on my current screen'."""
+        if os.environ.get("SIDEMARK_NEW_WINDOW"):
+            return None
+        win = self.get_active_window()
+        if isinstance(win, PDFEditorWindow):
+            return win
+        for w in self.get_windows():
+            if isinstance(w, PDFEditorWindow):
+                return w
+        return None
+
+    def _open_target(self, path, page):
+        """Open `path` following the window policy: a real file lands as a tab
+        in the reuse target when one exists (so opening several files doesn't
+        litter the desktop with windows); everything else opens a new window.
+        Returns True if an existing window was reused."""
+        if path and os.path.isfile(path):
+            win = self._reuse_target()
+            if win is not None:
+                win.open_file_in_tab(path)
+                if page > 0:
+                    win._go_to_page(page)
+                win.present()      # raise it so the new tab is in front
+                return True
+        self.open_new_window(path, page)
+        return False
 
     def open_new_window(self, path=None, page=0):
         logger.info("Opening new window: %s", path or "(scratchpad)")
