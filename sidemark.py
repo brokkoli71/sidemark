@@ -2861,6 +2861,166 @@ def _extract_pptx_notes(pptx_path):
     return notes
 
 
+def _extract_pptx_theme(pptx_path):
+    """Parse a .pptx's design into a plain 'design' dict for
+    deck.build_imported_theme, so slides added to an imported deck match the
+    original. Best-effort — returns None on any problem (the deck then keeps
+    Sidemark's default theme).
+
+    A .pptx spreads its look across a few OOXML parts. The first slide master
+    (ppt/slideMasters/…) maps the abstract colour slots (bg1/tx1/accent1…) via
+    <p:clrMap>, holds the page background and the title/body placeholder
+    geometry; its theme part (ppt/theme/themeN.xml) resolves those slots to real
+    RGB (<a:clrScheme>) and names the heading/body fonts (<a:fontScheme>). We
+    read that first master + theme. Geometry is returned as 0..1 slide fractions
+    (EMU / the presentation's <p:sldSz>), so this stays free of deck units — the
+    same zip/rels walk as _extract_pptx_notes. Design keys (all optional): name,
+    bg, text, accent (each an (r,g,b) 0..1), heading_font, body_font,
+    title_rect, body_rect (each an (x,y,w,h) fraction)."""
+    import zipfile
+    import posixpath
+    from xml.etree import ElementTree as ET
+
+    A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+    R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    SYS = {"windowText": (0, 0, 0), "window": (1, 1, 1)}
+
+    def _resolve(target, base_dir):
+        return (target.lstrip("/") if target.startswith("/")
+                else posixpath.normpath(posixpath.join(base_dir, target)))
+
+    def _rels(z, part):
+        """[(id, type, resolved-target)] for a part's .rels (empty if none)."""
+        d, b = posixpath.split(part)
+        rels_part = posixpath.join(d, "_rels", b + ".rels")
+        try:
+            root = ET.fromstring(z.read(rels_part))
+        except (KeyError, ET.ParseError):
+            return []
+        return [(r.get("Id"), r.get("Type", ""),
+                 _resolve(r.get("Target", ""), d))
+                for r in root.findall(f"{REL}Relationship")]
+
+    def _hex_rgb(h):
+        h = (h or "").lstrip("#")
+        if len(h) != 6:
+            return None
+        try:
+            return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        except ValueError:
+            return None
+
+    def _color_of(container):
+        """A direct srgbClr/sysClr colour under `container` (no scheme ref)."""
+        srgb = container.find(f"{A}srgbClr")
+        if srgb is not None:
+            return _hex_rgb(srgb.get("val"))
+        sysc = container.find(f"{A}sysClr")
+        if sysc is not None:
+            return _hex_rgb(sysc.get("lastClr")) or SYS.get(sysc.get("val"))
+        return None
+
+    try:
+        with zipfile.ZipFile(pptx_path) as z:
+            names = set(z.namelist())
+            pres = ET.fromstring(z.read("ppt/presentation.xml"))
+            sldsz = pres.find(f"{P}sldSz")
+            sw = int((sldsz is not None and sldsz.get("cx")) or 12192000)
+            sh = int((sldsz is not None and sldsz.get("cy")) or 6858000)
+            mlst = pres.find(f"{P}sldMasterIdLst")
+            mid = mlst.find(f"{P}sldMasterId") if mlst is not None else None
+            if mid is None:
+                return None
+            mrid = mid.get(f"{R}id")
+            pres_rels = _rels(z, "ppt/presentation.xml")
+            master_part = next((t for i, _ty, t in pres_rels if i == mrid), None)
+            if not master_part or master_part not in names:
+                return None
+            master = ET.fromstring(z.read(master_part))
+            theme_part = next((t for _i, ty, t in _rels(z, master_part)
+                               if ty.endswith("/theme")), None)
+            theme = (ET.fromstring(z.read(theme_part))
+                     if theme_part and theme_part in names else None)
+
+            # scheme colours (dk1, lt1, accent1 …) from the theme part
+            scheme = {}
+            if theme is not None:
+                cs = theme.find(f".//{A}clrScheme")
+                for child in (cs if cs is not None else []):
+                    rgb = _color_of(child)
+                    if rgb:
+                        scheme[child.tag[len(A):]] = rgb
+
+            # the master maps slot names (bg1/tx1/…) onto scheme colours
+            clrmap = {}
+            cm = master.find(f"{P}clrMap")
+            if cm is not None:
+                clrmap = dict(cm.attrib)
+
+            def slot(name):
+                return scheme.get(clrmap.get(name, name))
+
+            def fill_color(elem):
+                sc = elem.find(f"{A}schemeClr")
+                if sc is not None and sc.get("val"):
+                    return slot(sc.get("val"))
+                return _color_of(elem)
+
+            # page background: master <p:bg> solid fill or bgRef (else default)
+            bg = None
+            bgel = master.find(f"{P}cSld/{P}bg")
+            if bgel is not None:
+                bgpr = bgel.find(f"{P}bgPr")
+                if bgpr is not None:
+                    sf = bgpr.find(f"{A}solidFill")
+                    bg = fill_color(sf) if sf is not None else None
+                else:
+                    bgref = bgel.find(f"{P}bgRef")
+                    bg = fill_color(bgref) if bgref is not None else None
+
+            # fonts: major (headings) / minor (body) Latin typeface
+            def font(which):
+                grp = (theme.find(f".//{A}fontScheme/{A}{which}Font")
+                       if theme is not None else None)
+                latin = grp.find(f"{A}latin") if grp is not None else None
+                tf = latin.get("typeface") if latin is not None else None
+                return tf or None
+
+            # title / body placeholder geometry from the master (EMU → fraction)
+            def rect_of(sp):
+                xfrm = sp.find(f"{P}spPr/{A}xfrm")
+                off = xfrm.find(f"{A}off") if xfrm is not None else None
+                ext = xfrm.find(f"{A}ext") if xfrm is not None else None
+                if off is None or ext is None:
+                    return None
+                try:
+                    return (int(off.get("x")) / sw, int(off.get("y")) / sh,
+                            int(ext.get("cx")) / sw, int(ext.get("cy")) / sh)
+                except (TypeError, ValueError):
+                    return None
+
+            title_rect = body_rect = None
+            sptree = master.find(f"{P}cSld/{P}spTree")
+            for sp in (sptree.findall(f"{P}sp") if sptree is not None else []):
+                ph = sp.find(f"{P}nvSpPr/{P}nvPr/{P}ph")
+                if ph is None:
+                    continue
+                t = ph.get("type", "body")
+                if t in ("title", "ctrTitle") and title_rect is None:
+                    title_rect = rect_of(sp)
+                elif t in ("body", "subTitle") and body_rect is None:
+                    body_rect = rect_of(sp)
+
+            return {"name": theme.get("name") if theme is not None else None,
+                    "bg": bg, "text": slot("tx1"), "accent": slot("accent1"),
+                    "heading_font": font("major"), "body_font": font("minor"),
+                    "title_rect": title_rect, "body_rect": body_rect}
+    except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError, ValueError):
+        return None
+
+
 def _pdf_needs_ocr(path, sample=10):
     """Heuristic: does this PDF look like a scan with no searchable text?
 
@@ -4845,7 +5005,7 @@ class _DeckThumbnails(_ThumbnailProvider):
 
     def render(self, i):
         return _deck_module().render_slide_texture(
-            self.model.slides[i], self.win.THUMB_WIDTH)
+            self.model.slides[i], self.win.THUMB_WIDTH, self.model.theme)
 
     def activate(self, i):
         self.dv.set_current(i)
@@ -6183,12 +6343,67 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._deck_align_btns[align] = b
             bar.append(b)
 
+        bar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        # theme picker: swap the whole deck's look between the built-in themes
+        # (no colour-editing UI — themes are authored in deck.py / imported).
+        # The popover is filled on first open so the header doesn't import the
+        # deck module for plain PDF/notes sessions.
+        theme_btn = Gtk.MenuButton()
+        # a labelled dropdown showing the current theme name — far easier to
+        # find than an icon (and an icon reads as one more tool button)
+        theme_btn.set_label("Theme")
+        theme_btn.set_tooltip_text("Slide theme — restyle the whole deck")
+        self._deck_theme_btn = theme_btn
+        theme_pop = Gtk.Popover()
+        theme_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        theme_pop.set_child(theme_box)
+        theme_pop.connect("map", lambda _p: self._populate_theme_menu(theme_box,
+                                                                       theme_pop))
+        theme_btn.set_popover(theme_pop)
+        bar.append(theme_btn)
+
         self._deck_slide_label = Gtk.Label(label="1 / 1")
         self._deck_slide_label.add_css_class("dim-label")
         self._deck_slide_label.set_margin_start(6)
         bar.append(self._deck_slide_label)
         bar.set_visible(False)   # _update_header_for_mode shows it in deck mode
         return bar
+
+    def _populate_theme_menu(self, box, pop):
+        """Fill (or refresh) the theme popover with one row per built-in theme,
+        a checkmark on the deck's current theme."""
+        child = box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            box.remove(child)
+            child = nxt
+        if self._deck_view is None:
+            return
+        current = self._deck_view.theme_name()
+        for theme in _deck_module().THEMES:
+            row = Gtk.Button()
+            row.add_css_class("flat")
+            rb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            check = Gtk.Image.new_from_icon_name("object-select-symbolic")
+            check.set_opacity(1.0 if theme["name"] == current else 0.0)
+            rb.append(check)
+            rb.append(Gtk.Label(label=theme["name"], xalign=0, hexpand=True))
+            row.set_child(rb)
+            row.connect("clicked", lambda _b, t=theme: (
+                pop.popdown(), self._set_deck_theme(t)))
+            box.append(row)
+
+    def _set_deck_theme(self, theme):
+        if self._deck_view is not None:
+            self._deck_view.set_theme(theme)
+            self._refresh_deck_theme_label()
+
+    def _refresh_deck_theme_label(self):
+        """Show the active theme's name on the picker button (set on theme
+        change and when the deck cluster syncs)."""
+        btn = getattr(self, "_deck_theme_btn", None)
+        if btn is not None and self._deck_view is not None:
+            btn.set_label(self._deck_view.theme_name() or "Theme")
 
     def _on_deck_style_changed(self, _w):
         if (self._syncing_deck_cluster or not self._deck_mode
@@ -6204,6 +6419,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Reflect the deck selection's style in the cluster (no feedback)."""
         if s is not self._active_session or s._deck_view is None:
             return
+        self._refresh_deck_theme_label()   # also fires on theme change / undo
         self._syncing_deck_cluster = True
         is_text, size, bold, align = s._deck_view.selection_style()
         for w in (self._deck_size_spin, self._deck_bold_btn,
@@ -9360,9 +9576,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 # them); pull them so they can ride into the deck's slides.
                 slide_notes = _extract_pptx_notes(pptx_path)
                 images = self._rasterize_pdf_slides(pdf_path, slide_notes)
+                # a synthesized theme so slides added later match the original's
+                # background/fonts/colours (best-effort; None keeps the default)
+                design = _extract_pptx_theme(pptx_path)
                 title = base + " (imported)"
                 GLib.idle_add(lambda: (toast.dismiss(),
-                                       self._open_imported_deck(images, title)) and None)
+                    self._open_imported_deck(images, title, design)) and None)
             except FileNotFoundError:
                 GLib.idle_add(lambda: (toast.dismiss(),
                     self._show_error("Import failed",
@@ -9403,11 +9622,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             fitz.TOOLS.mupdf_display_errors(prev)
         return images
 
-    def _open_imported_deck(self, images, title):
+    def _open_imported_deck(self, images, title, design=None):
         """Mount an in-memory deck built from imported slide pictures as a fresh,
-        untitled deck (saved as .smdeck on first Ctrl+S)."""
+        untitled deck (saved as .smdeck on first Ctrl+S). `design` (from
+        _extract_pptx_theme) becomes the deck's theme so new slides match."""
         deck_mod = _deck_module()
-        model = deck_mod.deck_from_images(images)
+        theme = deck_mod.build_imported_theme(design) if design else None
+        model = deck_mod.deck_from_images(images, theme)
         self._open_deck_model(model, title)
         n = len(model.slides)
         self._toast(f"Imported {n} slide{'s' if n != 1 else ''}")

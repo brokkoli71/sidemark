@@ -104,18 +104,28 @@ PyMuPDF (`fitz`), cairo, numpy; LibreOffice headless is an *optional* backend
 
 ## Current state (2026-07)
 
-On the `deck` branch, all pushed. Shipped since v2: PPTX→deck import
-(image + speaker notes, ideas.csv row 98) and the deck presenter's
-next-slide preview + a fix for the present button being hidden when
-launching straight into `--presentation` (row 101, HEAD `4320e46`).
+On the `deck` branch. Shipped since v2: PPTX→deck import (image + speaker
+notes, row 98), the deck presenter's next-slide preview + present-button
+fix (row 101), and **Phase 2 — deck themes**:
+- *Part 1, native themes (row 102):* `DeckModel.theme` in the `.smdeck`
+  (`FORMAT_VERSION` 2, v1 back-compat via `deck._normalize_theme`), textboxes
+  carry a `role` (title/subtitle/body), `render_slide(cr, slide, theme, …)`
+  reads bg/fonts/colors, two built-in themes (`Classic`, `Midnight`) in
+  `deck.THEMES`, and a theme-picker menu-button in `_build_deck_bar` calling
+  `DeckView.set_theme` (undoable). No colour-editing UI by design.
+- *Part 2, PPTX theme import (row 103):* `_extract_pptx_theme` (sidemark.py,
+  OOXML parse → unit-free "design" dict, reuses the `_extract_pptx_notes`
+  zip/rels walk) + `deck.build_imported_theme` (design → theme with
+  fallbacks/contrast-guard/geometry). Colours resolve theme `clrScheme`
+  through the master's `<p:clrMap>`; fonts from `fontScheme`; title/body
+  geometry from the master placeholders (EMU→fraction). Imported decks now
+  carry a theme so added slides match. This clrMap+scheme+placeholder chain is
+  the machinery structured PPTX text import (row 99) will reuse.
 
-**Next up: Phase 2 — deck themes + PowerPoint theme import** (a per-deck
-theme: background/fonts/colors/placeholder-layout geometry, so new slides
-match an imported deck; this also builds the OOXML placeholder-chain
-machinery that structured PPTX text import (row 99) needs). Then: Cairo
-smart-arts, build-step animations, Claude-generated LaTeX/TikZ figures.
-Roadmap detail + the deck v2/import design rationale live in the plan
-`~/.claude/plans/linked-launching-allen.md`.
+**Next up:** Cairo smart-arts, build-step animations, Claude-generated
+LaTeX/TikZ figures (roadmap in `~/.claude/plans/linked-launching-allen.md`).
+Nearer-term follow-ups: structured PPTX text import (row 99, now unblocked by
+the placeholder machinery) and deck-bar collapse polish (row 100).
 
 Open cosmetic polish: ideas.csv row 100 (row 100 follow-up #2's
 present-button half is now fixed; the deck bar still doesn't fold, it

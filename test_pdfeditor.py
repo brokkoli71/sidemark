@@ -98,6 +98,65 @@ def make_pptx(path, slide_notes):
             z.writestr(f"ppt/notesSlides/notesSlide{i + 1}.xml", notes_xml(text))
 
 
+def make_themed_pptx(path, name="Test Theme", bg_slot="bg1",
+                     dk1="000000", lt1="FFFFFF", accent1="2E75B6",
+                     major="Georgia", minor="Verdana", with_master=True):
+    """A minimal .pptx carrying just enough design (theme + slide master) to
+    exercise _extract_pptx_theme without LibreOffice or python-pptx: a colour
+    scheme, a font scheme, a clrMap, a solid master background and title/body
+    placeholders with EMU geometry. `with_master=False` omits the master (to
+    test the None fallback)."""
+    import zipfile
+    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(path, "w") as z:
+        master_id = ('<p:sldMasterIdLst><p:sldMasterId r:id="rIdM"/>'
+                     '</p:sldMasterIdLst>') if with_master else ''
+        z.writestr("ppt/presentation.xml",
+                   f'<p:presentation xmlns:p="{P}" xmlns:r="{R}">{master_id}'
+                   f'<p:sldSz cx="12192000" cy="6858000"/></p:presentation>')
+        z.writestr("ppt/_rels/presentation.xml.rels",
+                   f'<Relationships xmlns="{REL}"><Relationship Id="rIdM" '
+                   f'Type="{R}/slideMaster" '
+                   f'Target="slideMasters/slideMaster1.xml"/></Relationships>')
+        if not with_master:
+            return
+        z.writestr(
+            "ppt/slideMasters/slideMaster1.xml",
+            f'<p:sldMaster xmlns:p="{P}" xmlns:a="{A}"><p:cSld>'
+            f'<p:bg><p:bgPr><a:solidFill><a:schemeClr val="{bg_slot}"/>'
+            f'</a:solidFill></p:bgPr></p:bg><p:spTree>'
+            f'<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>'
+            f'<p:spPr><a:xfrm><a:off x="838200" y="365760"/>'
+            f'<a:ext cx="10515600" cy="1325563"/></a:xfrm></p:spPr></p:sp>'
+            f'<p:sp><p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>'
+            f'<p:spPr><a:xfrm><a:off x="838200" y="1825625"/>'
+            f'<a:ext cx="10515600" cy="4351338"/></a:xfrm></p:spPr></p:sp>'
+            f'</p:spTree></p:cSld>'
+            f'<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" '
+            f'accent1="accent1"/></p:sldMaster>')
+        z.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels",
+                   f'<Relationships xmlns="{REL}"><Relationship Id="rIdT" '
+                   f'Type="{R}/theme" Target="../theme/theme1.xml"/>'
+                   f'</Relationships>')
+        z.writestr(
+            "ppt/theme/theme1.xml",
+            f'<a:theme xmlns:a="{A}" name="{name}"><a:themeElements>'
+            f'<a:clrScheme name="s">'
+            f'<a:dk1><a:srgbClr val="{dk1}"/></a:dk1>'
+            f'<a:lt1><a:srgbClr val="{lt1}"/></a:lt1>'
+            f'<a:dk2><a:srgbClr val="1F3864"/></a:dk2>'
+            f'<a:lt2><a:srgbClr val="EEEEEE"/></a:lt2>'
+            f'<a:accent1><a:srgbClr val="{accent1}"/></a:accent1>'
+            f'</a:clrScheme>'
+            f'<a:fontScheme name="s">'
+            f'<a:majorFont><a:latin typeface="{major}"/></a:majorFont>'
+            f'<a:minorFont><a:latin typeface="{minor}"/></a:minorFont>'
+            f'</a:fontScheme></a:themeElements></a:theme>')
+
+
 def make_linked_pdf(path, n_pages=3):
     """A PDF whose page 0 carries an internal GOTO link (like a footnote /
     citation reference) pointing low on page 1."""
@@ -6692,6 +6751,51 @@ class TestPptxNotes(unittest.TestCase):
         self.assertEqual(out["width"], PDFEditorWindow.PPTX_IMPORT_WIDTH)
         self.assertTrue(out["is_png"])
 
+    # ── theme import (_extract_pptx_theme → deck.build_imported_theme) ─────
+
+    def test_extract_theme_colors_fonts_and_geometry(self):
+        from sidemark import _extract_pptx_theme
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.pptx")
+            make_themed_pptx(p, name="Corporate", dk1="102030",
+                             accent1="2E75B6", major="Georgia", minor="Verdana")
+            g = _extract_pptx_theme(p)
+        self.assertEqual(g["name"], "Corporate")
+        self.assertEqual(g["bg"], (1.0, 1.0, 1.0))       # bg1→lt1→FFFFFF
+        self.assertEqual(g["text"], (16/255, 32/255, 48/255))   # tx1→dk1
+        self.assertEqual(g["accent"], (46/255, 117/255, 182/255))
+        self.assertEqual((g["heading_font"], g["body_font"]),
+                         ("Georgia", "Verdana"))
+        # EMU geometry → 0..1 slide fractions
+        self.assertAlmostEqual(g["title_rect"][0], 838200 / 12192000)
+        self.assertAlmostEqual(g["body_rect"][1], 1825625 / 6858000)
+
+    def test_extract_theme_none_on_non_pptx(self):
+        from sidemark import _extract_pptx_theme
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "bad.pptx")
+            with open(p, "wb") as f:
+                f.write(b"not a zip")
+            self.assertIsNone(_extract_pptx_theme(p))
+
+    def test_extract_theme_none_without_master(self):
+        from sidemark import _extract_pptx_theme
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "nomaster.pptx")
+            make_themed_pptx(p, with_master=False)
+            self.assertIsNone(_extract_pptx_theme(p))
+
+    def test_import_theme_end_to_end_sets_deck_theme(self):
+        import deck
+        from sidemark import _extract_pptx_theme
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.pptx")
+            make_themed_pptx(p, name="Corporate", major="Georgia")
+            theme = deck.build_imported_theme(_extract_pptx_theme(p))
+        model = deck.deck_from_images([(_png_bytes(16, 9), 16, 9, "")], theme)
+        self.assertEqual(model.theme["name"], "Corporate")
+        self.assertEqual(model.theme["heading_font"], "Georgia")
+
 
 class TestMultiTab(unittest.TestCase):
     """Opening several PDFs as tabs in one window (idea #51): a DocumentSession
@@ -7560,18 +7664,129 @@ class TestDeckMode(unittest.TestCase):
 
     def test_layouts(self):
         deck = self._deck()
-        self.assertEqual(len(deck.LAYOUTS["title"]()), 2)   # title + subtitle
-        self.assertEqual(len(deck.LAYOUTS["content"]()), 2)  # heading + body
-        self.assertEqual(deck.LAYOUTS["blank"](), [])
-        # title slide: big bold centered title above a subtitle
-        title, sub = deck.LAYOUTS["title"]()
+        # new_slide materializes a theme's layout geometry into real textboxes
+        title, sub = deck.new_slide("title")["objects"]
+        self.assertEqual(len(deck.new_slide("content")["objects"]), 2)
+        self.assertEqual(deck.new_slide("blank")["objects"], [])
+        # title slide: big bold centered title above a subtitle, tagged by role
+        self.assertEqual(title["role"], "title")
+        self.assertEqual(sub["role"], "subtitle")
         self.assertEqual(title["weight"], "bold")
         self.assertEqual(title["align"], "center")
         self.assertGreater(title["size"], sub["size"])
         self.assertLess(title["y"], sub["y"])
-        # content slide: heading on top, textbox underneath
-        head, body = deck.LAYOUTS["content"]()
+        # content slide: heading on top, body textbox underneath
+        head, body = deck.new_slide("content")["objects"]
+        self.assertEqual((head["role"], body["role"]), ("title", "body"))
         self.assertLess(head["y"] + head["h"], body["y"])
+
+    # ── themes ───────────────────────────────────────────────────────────
+
+    def test_default_theme_and_lookup(self):
+        deck = self._deck()
+        m = deck.DeckModel()
+        self.assertEqual(m.theme["name"], deck.THEMES[0]["name"])
+        self.assertIs(deck.theme_by_name(deck.THEMES[0]["name"]), deck.THEMES[0])
+        self.assertIsNone(deck.theme_by_name("no-such-theme"))
+        # every built-in theme is complete enough to render
+        for t in deck.THEMES:
+            for key in ("bg", "accent", "title_color", "body_color",
+                        "heading_font", "body_font"):
+                self.assertIn(key, t)
+
+    def test_theme_roundtrips_through_smdeck(self):
+        deck = self._deck()
+        m = deck.DeckModel(theme=deck.theme_by_name("Midnight"))
+        self.assertEqual(m.to_json()["version"], 2)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.smdeck")
+            m.save(p)
+            m2 = deck.DeckModel.load(p)
+        self.assertEqual(m2.theme["name"], "Midnight")
+        self.assertEqual(m2.theme["bg"], deck.theme_by_name("Midnight")["bg"])
+
+    def test_v1_deck_loads_with_default_theme(self):
+        deck = self._deck()
+        # a pre-theme (version 1) file: no theme key, textboxes lack a role
+        v1 = {"format": "smdeck", "version": 1,
+              "slides": [{"layout": "content", "objects": [
+                  {"type": "textbox", "x": 1, "y": 1, "w": 9, "h": 9,
+                   "size": 20, "text": "hi"}]}]}
+        m = deck.DeckModel.from_json(v1)
+        self.assertEqual(m.theme["name"], deck.DEFAULT_THEME["name"])
+        self.assertEqual(m.slides[0]["objects"][0]["role"], "body")
+
+    def test_set_theme_is_undoable(self):
+        deck = self._deck()
+        dv = deck.DeckView()
+        midnight = deck.theme_by_name("Midnight")
+        dv.set_theme(midnight)
+        self.assertEqual(dv.theme_name(), "Midnight")
+        dv.undo()
+        self.assertEqual(dv.theme_name(), deck.DEFAULT_THEME["name"])
+        dv.redo()
+        self.assertEqual(dv.theme_name(), "Midnight")
+        # new slides come out in the active theme's layouts (still themed)
+        dv.add_slide("title")
+        self.assertEqual(dv._slide()["objects"][0]["role"], "title")
+
+    def test_theme_drives_render_background(self):
+        deck = self._deck()
+        # render the same blank slide under two themes; the top-left pixel (page
+        # background) must differ, proving the theme reaches render_slide
+        def bg_pixel(theme):
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 32, 18)
+            cr = cairo.Context(surf)
+            cr.scale(32 / deck.SLIDE_W, 18 / deck.SLIDE_H)
+            deck.render_slide(cr, deck.new_slide("blank"), theme)
+            surf.flush()
+            return bytes(surf.get_data()[:4])
+        self.assertNotEqual(bg_pixel(deck.theme_by_name("Classic")),
+                            bg_pixel(deck.theme_by_name("Midnight")))
+
+    # ── imported theme assembly (deck.build_imported_theme) ───────────────
+
+    def test_build_imported_theme_fills_defaults(self):
+        deck = self._deck()
+        d = deck.DEFAULT_THEME
+        t = deck.build_imported_theme({})           # nothing parsed
+        self.assertEqual(t["bg"], d["bg"])
+        self.assertEqual(t["accent"], d["accent"])
+        self.assertEqual(t["heading_font"], d["heading_font"])
+        self.assertEqual(t["name"], "Imported")
+
+    def test_build_imported_theme_keeps_text_legible(self):
+        deck = self._deck()
+        # a dark background with the theme's dark tx1 → text flipped to light
+        t = deck.build_imported_theme({"bg": (0.09, 0.11, 0.18),
+                                       "text": (0.0, 0.0, 0.0)})
+        self.assertGreater(sum(t["title_color"]) / 3, 0.5)   # now light
+        # a light background keeps dark text as-is
+        t2 = deck.build_imported_theme({"bg": (1, 1, 1),
+                                        "text": (0.05, 0.05, 0.05)})
+        self.assertLess(sum(t2["title_color"]) / 3, 0.5)
+
+    def test_build_imported_theme_applies_geometry(self):
+        deck = self._deck()
+        # a title placeholder at 10%/20% of a 1280×720 slide, 50%×30%
+        t = deck.build_imported_theme({"title_rect": (0.1, 0.2, 0.5, 0.3)})
+        title = next(o for o in t["layouts"]["content"] if o["role"] == "title")
+        self.assertAlmostEqual(title["x"], 0.1 * deck.SLIDE_W)
+        self.assertAlmostEqual(title["y"], 0.2 * deck.SLIDE_H)
+        self.assertAlmostEqual(title["w"], 0.5 * deck.SLIDE_W)
+
+    def test_deck_from_images_applies_theme(self):
+        deck = self._deck()
+        theme = deck.build_imported_theme({"name": "Brand",
+                                           "bg": (0.2, 0.2, 0.3)})
+        model = deck.deck_from_images(
+            [(self._png_bytes(), 10, 6, "")], theme)
+        self.assertEqual(model.theme["name"], "Brand")
+        # slides added to the imported deck inherit the imported theme
+        dv = deck.DeckView()
+        dv.model = model
+        dv.add_slide("content")
+        self.assertEqual(dv.theme_name(), "Brand")
 
     def test_export_pdf(self):
         deck = self._deck()

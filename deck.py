@@ -15,6 +15,7 @@ is plain JSON, so decks diff, sync and round-trip like any other Sidemark
 file."""
 
 import base64
+import copy
 import io
 import json
 import logging
@@ -36,7 +37,7 @@ notes_to_markup = None            # set to sidemark._notes_to_pango_markup
 
 SLIDE_W, SLIDE_H = 1280, 720      # logical slide coordinates (16:9)
 EXPORT_SCALE = 0.75               # 1280×720 logical → 960×540 pt (13.33″×7.5″)
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2                # 2 added the per-deck theme (v1 loads → default)
 SNAP_PX = 6                       # snap distance in logical units
 HANDLE_PX = 8                     # resize-handle size in screen pixels
 MIN_OBJ = 40                      # objects can't shrink below this (logical)
@@ -47,33 +48,153 @@ ACCENT = (0.20, 0.51, 0.89)       # selection / guides / placeholder tint
 
 # ── document model ──────────────────────────────────────────────────────────
 
-def _textbox(x, y, w, h, size, weight="normal", align="left", placeholder=""):
+def _textbox(x, y, w, h, size, weight="normal", align="left", placeholder="",
+             role="body"):
     return {"type": "textbox", "x": x, "y": y, "w": w, "h": h, "text": "",
             "size": size, "weight": weight, "align": align,
-            "placeholder": placeholder}
+            "role": role, "placeholder": placeholder}
 
 
-# The standard quick-start layouts ("new slide" menu). Placeholders are plain
-# textboxes — click to type; geometry lives here so a future theme can restyle.
-LAYOUTS = {
-    "title": lambda: [
-        _textbox(140, 250, 1000, 130, 72, "bold", "center", "Click to add title"),
-        _textbox(240, 410, 800, 70, 32, "normal", "center", "Click to add subtitle"),
+# ── theme ───────────────────────────────────────────────────────────────────
+# A theme is the deck's look: page background, fonts, text colors, an accent,
+# and the placeholder geometry each named layout produces. Built-in themes are
+# authored below; PPTX import will synthesize one from the file's theme +
+# master/layout geometry (follow-up). The active theme lives in the .smdeck
+# (DeckModel.theme) so a deck round-trips its design, and render_slide reads it
+# for the background/fonts/colors. Colors are (r, g, b) floats in 0..1.
+#
+# A textbox carries a `role` ("title" | "subtitle" | "body") so the theme can
+# give headings a different font/color than body text without the box storing
+# either itself — restyling a deck is then just swapping the theme.
+
+def _ph(role, x, y, w, h, size, weight="normal", align="left", placeholder=""):
+    """One layout placeholder — geometry + text style + the semantic role that
+    picks the theme's font & color when rendered."""
+    return {"role": role, "x": x, "y": y, "w": w, "h": h, "size": size,
+            "weight": weight, "align": align, "placeholder": placeholder}
+
+
+# The quick-start layouts as placeholder geometry. Shared by every built-in
+# theme; a theme (e.g. one imported from a .pptx) may ship its own `layouts`.
+_BASE_LAYOUTS = {
+    "title": [
+        _ph("title", 140, 250, 1000, 130, 72, "bold", "center",
+            "Click to add title"),
+        _ph("subtitle", 240, 410, 800, 70, 32, "normal", "center",
+            "Click to add subtitle"),
     ],
-    "content": lambda: [
-        _textbox(60, 40, 1160, 90, 48, "bold", "left", "Click to add heading"),
-        _textbox(60, 170, 1160, 500, 28, "normal", "left", "Click to add text"),
+    "content": [
+        _ph("title", 60, 40, 1160, 90, 48, "bold", "left",
+            "Click to add heading"),
+        _ph("body", 60, 170, 1160, 500, 28, "normal", "left",
+            "Click to add text"),
     ],
-    "blank": lambda: [],
+    "blank": [],
 }
 LAYOUT_LABELS = (("title", "Title slide"),
                  ("content", "Heading + text"),
                  ("blank", "Blank"))
 
 
-def new_slide(layout="content"):
-    return {"layout": layout, "objects": LAYOUTS[layout](), "ink": [],
-            "notes": ""}
+def _theme(name, bg, accent, title_color, body_color,
+           heading_font="Sans", body_font="Sans", layouts=None):
+    return {"name": name, "bg": list(bg), "accent": list(accent),
+            "title_color": list(title_color), "body_color": list(body_color),
+            "heading_font": heading_font, "body_font": body_font,
+            "layouts": layouts if layouts is not None else _BASE_LAYOUTS}
+
+
+# Built-in themes; THEMES[0] is the default new-deck look. Kept deliberately
+# few and hand-tuned — the user picks one (no colour-editing UI); PPTX import
+# contributes a synthesized theme per imported deck.
+THEMES = [
+    _theme("Classic", bg=(1, 1, 1), accent=(0.20, 0.51, 0.89),
+           title_color=(0.10, 0.10, 0.12), body_color=(0.10, 0.10, 0.12)),
+    # A polished dark theme: deep indigo page, soft sky-blue headings, warm-grey
+    # body — easy on projectors and reads as "designed", not default.
+    _theme("Midnight", bg=(0.067, 0.086, 0.149), accent=(0.42, 0.70, 1.0),
+           title_color=(0.60, 0.80, 1.0), body_color=(0.85, 0.88, 0.94)),
+]
+DEFAULT_THEME = THEMES[0]
+
+
+def theme_by_name(name):
+    for t in THEMES:
+        if t["name"] == name:
+            return t
+    return None
+
+
+def _css_rgb(color):
+    r, g, b = (max(0, min(255, round(c * 255))) for c in color[:3])
+    return f"rgb({r},{g},{b})"
+
+
+def _relative_luminance(c):
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def _contrast_text(bg, text):
+    """Keep imported text legible: if it barely contrasts with the background
+    (an imported dark background with the theme's dark tx1, say), swap it for
+    near-white or near-black instead."""
+    if abs(_relative_luminance(bg) - _relative_luminance(text)) >= 0.35:
+        return text
+    return (0.96, 0.97, 1.0) if _relative_luminance(bg) < 0.5 else (0.10, 0.10, 0.12)
+
+
+def _apply_rect(placeholders, role, frac):
+    """Override a layout placeholder's geometry from a (0..1) slide-fraction
+    rect parsed out of a .pptx master/layout."""
+    if not frac:
+        return
+    fx, fy, fw, fh = frac
+    for ph in placeholders:
+        if ph["role"] == role:
+            ph["x"], ph["y"] = fx * SLIDE_W, fy * SLIDE_H
+            ph["w"], ph["h"] = fw * SLIDE_W, fh * SLIDE_H
+
+
+def build_imported_theme(design):
+    """Assemble a full deck theme from a .pptx's parsed *design* (produced by
+    sidemark's `_extract_pptx_theme`), so slides added to an imported deck match
+    the original. Every piece is optional and falls back to the default look;
+    text colour is nudged for contrast, and the title/body placeholder rects
+    (given as 0..1 slide fractions) override the content layout's geometry."""
+    d = DEFAULT_THEME
+    bg = design.get("bg") or d["bg"]
+    text = _contrast_text(bg, design.get("text") or d["title_color"])
+    layouts = copy.deepcopy(_BASE_LAYOUTS)
+    _apply_rect(layouts["content"], "title", design.get("title_rect"))
+    _apply_rect(layouts["content"], "body", design.get("body_rect"))
+    return {"name": design.get("name") or "Imported",
+            "bg": list(bg), "accent": list(design.get("accent") or d["accent"]),
+            "title_color": list(text), "body_color": list(text),
+            "heading_font": design.get("heading_font") or d["heading_font"],
+            "body_font": design.get("body_font") or d["body_font"],
+            "layouts": layouts}
+
+
+def _normalize_theme(data):
+    """A loaded/partial theme dict backfilled with the default's keys, so v1
+    files (no theme) and forward-compatible partials both render. `None` →
+    the default theme."""
+    if not data:
+        return DEFAULT_THEME
+    theme = dict(DEFAULT_THEME)
+    theme.update(data)
+    theme.setdefault("layouts", _BASE_LAYOUTS)
+    return theme
+
+
+def new_slide(layout="content", theme=None):
+    theme = theme or DEFAULT_THEME
+    specs = theme.get("layouts", _BASE_LAYOUTS).get(layout, [])
+    objs = [_textbox(p["x"], p["y"], p["w"], p["h"], p["size"],
+                     p.get("weight", "normal"), p.get("align", "left"),
+                     p.get("placeholder", ""), p.get("role", "body"))
+            for p in specs]
+    return {"layout": layout, "objects": objs, "ink": [], "notes": ""}
 
 
 def _clean(obj):
@@ -84,12 +205,14 @@ def _clean(obj):
 class DeckModel:
     """The slides and their objects, (de)serialized as .smdeck JSON."""
 
-    def __init__(self):
-        self.slides = [new_slide("title")]
+    def __init__(self, theme=None):
+        self.theme = theme or DEFAULT_THEME
+        self.slides = [new_slide("title", self.theme)]
 
     def to_json(self):
         return {"format": "smdeck", "version": FORMAT_VERSION,
                 "slide_size": [SLIDE_W, SLIDE_H],
+                "theme": self.theme,
                 "slides": [{"layout": s.get("layout", "blank"),
                             "notes": s.get("notes", ""),
                             "ink": s.get("ink", []),
@@ -101,11 +224,15 @@ class DeckModel:
         if data.get("format") != "smdeck":
             raise ValueError("not a Sidemark Deck file")
         m = cls()
-        m.slides = data.get("slides") or [new_slide("title")]
+        m.theme = _normalize_theme(data.get("theme"))   # v1 (no theme) → default
+        m.slides = data.get("slides") or [new_slide("title", m.theme)]
         for s in m.slides:
             s.setdefault("objects", [])
             s.setdefault("ink", [])
             s.setdefault("notes", "")
+            for o in s["objects"]:      # v1 textboxes predate the theme role
+                if o.get("type") == "textbox":
+                    o.setdefault("role", "body")
         return m
 
     def save(self, path):
@@ -136,7 +263,7 @@ def _fit_rect(iw, ih):
     return (SLIDE_W - w) / 2, (SLIDE_H - h) / 2, w, h
 
 
-def deck_from_images(images):
+def deck_from_images(images, theme=None):
     """Build a DeckModel from rendered slide pictures — the PPTX→deck import.
 
     `images` is a list of (png_bytes, iw, ih, notes): one entry per source
@@ -145,8 +272,10 @@ def deck_from_images(images):
     speaker notes, so the imported deck looks pixel-identical to the original
     while staying a real, editable/reorderable/presentable Sidemark deck. The
     original text is a picture here — structured text extraction is a separate
-    follow-up (see ideas.csv). An empty list yields a one-slide starter deck."""
-    m = DeckModel()
+    follow-up (see ideas.csv). `theme` (from `build_imported_theme`) styles any
+    slides you add later so they match the import. An empty list yields a
+    one-slide starter deck."""
+    m = DeckModel(theme)
     slides = []
     for png, iw, ih, notes in images:
         x, y, w, h = _fit_rect(iw, ih)
@@ -154,7 +283,7 @@ def deck_from_images(images):
                "data": base64.b64encode(png).decode("ascii")}
         slides.append({"layout": "blank", "objects": [obj], "ink": [],
                        "notes": notes or ""})
-    m.slides = slides or [new_slide("title")]
+    m.slides = slides or [new_slide("title", m.theme)]
     return m
 
 
@@ -174,10 +303,15 @@ def _image_surface(obj):
     return surf
 
 
-def _text_layout(cr, obj):
+def _is_heading(obj):
+    return obj.get("role", "body") in ("title", "subtitle")
+
+
+def _text_layout(cr, obj, theme):
     layout = PangoCairo.create_layout(cr)
     desc = Pango.FontDescription()
-    desc.set_family("Sans")
+    desc.set_family(theme["heading_font"] if _is_heading(obj)
+                    else theme["body_font"])
     desc.set_weight(Pango.Weight.BOLD if obj.get("weight") == "bold"
                     else Pango.Weight.NORMAL)
     desc.set_absolute_size(obj["size"] * Pango.SCALE)
@@ -205,10 +339,12 @@ def _draw_ink_stroke(cr, stroke):
     cr.stroke()
 
 
-def render_slide(cr, slide, show_placeholders=False, skip=None):
+def render_slide(cr, slide, theme=None, show_placeholders=False, skip=None):
     """Draw one slide in logical coordinates (0,0)-(SLIDE_W,SLIDE_H).
+    `theme` supplies background/fonts/colors (defaults to the classic look).
     `skip` suppresses one object (its inline editor is showing instead)."""
-    cr.set_source_rgb(1, 1, 1)
+    theme = theme or DEFAULT_THEME
+    cr.set_source_rgb(*theme["bg"])
     cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
     cr.fill()
     for obj in slide["objects"]:
@@ -229,16 +365,17 @@ def render_slide(cr, slide, show_placeholders=False, skip=None):
                 continue
             cr.save()
             cr.translate(obj["x"], obj["y"])
-            layout = _text_layout(cr, obj)
+            layout = _text_layout(cr, obj, theme)
             if text:
-                cr.set_source_rgb(0.1, 0.1, 0.12)
+                cr.set_source_rgb(*(theme["title_color"] if _is_heading(obj)
+                                    else theme["body_color"]))
                 # render inline math / Markdown like sidemark's callouts do
                 if notes_to_markup is not None:
                     layout.set_markup(notes_to_markup(text))
                 else:
                     layout.set_text(text)
             else:
-                cr.set_source_rgba(*ACCENT, 0.55)
+                cr.set_source_rgba(*theme["accent"], 0.55)
                 layout.set_text(obj.get("placeholder", ""))
             PangoCairo.show_layout(cr, layout)
             cr.restore()
@@ -246,14 +383,14 @@ def render_slide(cr, slide, show_placeholders=False, skip=None):
         _draw_ink_stroke(cr, stroke)
 
 
-def render_slide_texture(slide, width):
+def render_slide_texture(slide, width, theme=None):
     """Render a slide into a Gdk.Texture of the given pixel width — used by
     the window's thumbnail sidebar."""
     height = max(1, round(width * SLIDE_H / SLIDE_W))
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
     cr = cairo.Context(surf)
     cr.scale(width / SLIDE_W, height / SLIDE_H)
-    render_slide(cr, slide, show_placeholders=True)
+    render_slide(cr, slide, theme, show_placeholders=True)
     surf.flush()
     return Gdk.MemoryTexture.new(
         width, height, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
@@ -267,7 +404,7 @@ def export_pdf(model, path):
     for slide in model.slides:
         cr.save()
         cr.scale(EXPORT_SCALE, EXPORT_SCALE)
-        render_slide(cr, slide)
+        render_slide(cr, slide, model.theme)
         cr.restore()
         surface.show_page()
     surface.finish()
@@ -416,7 +553,7 @@ class DeckView(Gtk.Box):
     def add_slide(self, layout="content"):
         self._commit_editor()
         idx = self.current + 1
-        self.model.slides.insert(idx, new_slide(layout))
+        self.model.slides.insert(idx, new_slide(layout, self.model.theme))
         self._push(("add_slide", idx))
         self._slides_changed()
         self.set_current(idx)
@@ -456,6 +593,22 @@ class DeckView(Gtk.Box):
         if self.on_slide_switched:
             self.on_slide_switched()
         self._changed()
+
+    def set_theme(self, theme):
+        """Restyle the whole deck (the header's theme picker calls this).
+        Only the look changes — existing boxes keep their geometry/role; new
+        slides then come out in the new theme's layouts. Undoable as one step."""
+        if not theme or theme is self.model.theme:
+            return
+        self._commit_editor()
+        self._push(("set_theme", self.model.theme))
+        self.model.theme = theme
+        self._slides_changed()     # thumbnails re-render with the new look
+        self._selection_changed()  # picker reflects the current theme
+        self._changed()
+
+    def theme_name(self):
+        return self.model.theme.get("name", "")
 
     def add_textbox(self):
         obj = _textbox(340, 300, 600, 120, 28, placeholder="Click to add text")
@@ -632,6 +785,11 @@ class DeckView(Gtk.Box):
             self.model.slides.insert(frm, slide)
             self.current = frm
             return ("move_slide", to, frm)
+        if kind == "set_theme":                # inverse: swap the theme back
+            _, prev = op
+            now = self.model.theme
+            self.model.theme = prev
+            return ("set_theme", now)
         if kind == "ink_add":                  # inverse: lift the stroke off
             _, slide_idx, stroke = op
             self._goto(slide_idx)
@@ -732,8 +890,8 @@ class DeckView(Gtk.Box):
         cr.scale(scale, scale)
         cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
         cr.clip()
-        render_slide(cr, self._slide(), show_placeholders=True,
-                     skip=self._editing)
+        render_slide(cr, self._slide(), self.model.theme,
+                     show_placeholders=True, skip=self._editing)
         # snap guides while dragging
         cr.set_source_rgba(*ACCENT, 0.9)
         cr.set_line_width(1 / scale)
@@ -785,7 +943,7 @@ class DeckView(Gtk.Box):
         cr.scale(ps, ps)
         cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
         cr.clip()
-        render_slide(cr, nxt, show_placeholders=True)
+        render_slide(cr, nxt, self.model.theme, show_placeholders=True)
         cr.restore()
         cr.set_source_rgba(0.5, 0.5, 0.55, 0.28)          # dim veil (reads as secondary)
         cr.rectangle(px, py, SLIDE_W * ps, SLIDE_H * ps)
@@ -1058,10 +1216,16 @@ class DeckView(Gtk.Box):
         cls = f"deck-editor-{id(self)}"
         tv.add_css_class(cls)
         weight = 700 if obj.get("weight") == "bold" else 400
+        # match the theme so inline editing looks exactly like the rendered box
+        theme = self.model.theme
+        bg = _css_rgb(theme["bg"])
+        fg = _css_rgb(theme["title_color"] if _is_heading(obj)
+                      else theme["body_color"])
+        family = theme["heading_font"] if _is_heading(obj) else theme["body_font"]
         self._editor_css.load_from_string(
-            f".{cls}, .{cls} text {{ background-color: white; color: #1a1a1f;"
+            f".{cls}, .{cls} text {{ background-color: {bg}; color: {fg};"
             f" font-size: {max(obj['size'] * scale, 6):.1f}px;"
-            f" font-weight: {weight}; font-family: Sans; caret-color: #1a1a1f; }}")
+            f" font-weight: {weight}; font-family: {family}; caret-color: {fg}; }}")
         tv.set_size_request(int(obj["w"] * scale), int(obj["h"] * scale))
         self._fixed.put(tv, x + obj["x"] * scale, y + obj["y"] * scale)
         self._fixed.set_visible(True)
@@ -1173,7 +1337,7 @@ class DeckPresenterWindow(Adw.Window):
         cr.scale(scale, scale)
         cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
         cr.clip()
-        render_slide(cr, slide)          # no placeholders on the projector
+        render_slide(cr, slide, dv.model.theme)   # no placeholders on the projector
         if dv.current_stroke and dv._stroke_style:
             color, width, opacity = dv._stroke_style
             _draw_ink_stroke(cr, {"pts": dv.current_stroke, "color": color,
