@@ -5,6 +5,7 @@ Run with:  /usr/bin/python3 test_pdfeditor.py
 """
 import os
 import sys
+import io
 import math
 import tempfile
 import time
@@ -6563,8 +6564,21 @@ class TestNotesSidebarAnimation(unittest.TestCase):
             raise errors[0]
 
 
+def _png_bytes(w, h, rgb=(1, 1, 1)):
+    """A solid-color PNG of the given pixel size (a stand-in for a rendered
+    slide page) as bytes — no file needed."""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    cr = cairo.Context(surf)
+    cr.set_source_rgb(*rgb)
+    cr.paint()
+    buf = io.BytesIO()
+    surf.write_to_png(buf)
+    return buf.getvalue()
+
+
 class TestPptxNotes(unittest.TestCase):
-    """Importing a PowerPoint deck pulls its speaker notes into the sidebar."""
+    """Importing a PowerPoint deck: each page becomes an editable slide picture
+    and the .pptx's speaker notes ride along into the notes panel."""
 
     def test_extract_in_slide_order_skips_empty_and_placeholders(self):
         from sidemark import _extract_pptx_notes
@@ -6587,23 +6601,82 @@ class TestPptxNotes(unittest.TestCase):
                 f.write(b"not a zip")
             self.assertEqual(_extract_pptx_notes(p), {})
 
-    def test_apply_pptx_notes_populates_sidebar(self):
+    def test_deck_from_images_fits_slides_and_carries_notes(self):
+        import deck
+        images = [
+            (_png_bytes(1600, 900), 1600, 900, "intro notes"),   # 16:9
+            (_png_bytes(1600, 1200), 1600, 1200, ""),            # 4:3
+        ]
+        model = deck.deck_from_images(images)
+        self.assertEqual(len(model.slides), 2)
+        # each slide is one full-bleed image object + its notes
+        s0, s1 = model.slides
+        self.assertEqual([o["type"] for o in s0["objects"]], ["image"])
+        self.assertEqual(s0["notes"], "intro notes")
+        self.assertEqual(s1["notes"], "")
+        # 16:9 page fills the whole slide; 4:3 page is letterboxed (side margins)
+        img0, img1 = s0["objects"][0], s1["objects"][0]
+        self.assertAlmostEqual(img0["w"], deck.SLIDE_W)
+        self.assertAlmostEqual(img0["h"], deck.SLIDE_H)
+        self.assertAlmostEqual(img0["x"], 0)
+        self.assertLess(img1["w"], deck.SLIDE_W)             # narrower than slide
+        self.assertGreater(img1["x"], 0)                     # centered
+        self.assertAlmostEqual(img1["h"], deck.SLIDE_H)      # fit to height
+        # round-trips as a real .smdeck
+        self.assertEqual(model.to_json()["format"], "smdeck")
+
+    def test_deck_from_images_empty_yields_starter_deck(self):
+        import deck
+        model = deck.deck_from_images([])
+        self.assertEqual(len(model.slides), 1)
+
+    def test_open_imported_deck_mounts_editable_deck(self):
         errors, out = [], {}
-        app = Adw.Application(application_id="test.sidemark.pptxnotes")
+        app = Adw.Application(application_id="test.sidemark.pptximport")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a); win.present()
+                images = [(_png_bytes(1600, 900), 1600, 900, "intro notes"),
+                          (_png_bytes(1600, 900), 1600, 900, "")]
+                win._open_imported_deck(images, "talk (imported)")
+                out["deck_mode"] = win._deck_mode
+                out["slides"] = len(win._deck_view.model.slides)
+                out["dirty"] = win._dirty            # untitled import saves on Ctrl+S
+                out["untitled"] = win._is_untitled
+                out["visible"] = win._notes_view.get_buffer().get_text(
+                    *win._notes_view.get_buffer().get_bounds(), False)
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+        self.assertTrue(out["deck_mode"])
+        self.assertEqual(out["slides"], 2)
+        self.assertTrue(out["dirty"])
+        self.assertTrue(out["untitled"])
+        self.assertIn("intro notes", out["visible"])     # slide 1 notes shown
+
+    def test_rasterize_pdf_slides_carries_page_notes(self):
+        errors, out = [], {}
+        app = Adw.Application(application_id="test.sidemark.pptxraster")
 
         def on_activate(a):
             try:
                 with tempfile.TemporaryDirectory() as d:
                     pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf, n_pages=3)
                     win = PDFEditorWindow(a); win.present()
-                    win.open_file_in_tab(pdf)
-                    win._apply_pptx_notes({0: "intro notes", 2: "outro notes"})
-                    out["p0"] = win.notes_model.get(0)
-                    out["p1"] = win.notes_model.get(1)
-                    out["p2"] = win.notes_model.get(2)
-                    out["dirty"] = win._dirty
-                    out["visible"] = win._notes_view.get_buffer().get_text(
-                        *win._notes_view.get_buffer().get_bounds(), False)
+                    imgs = win._rasterize_pdf_slides(
+                        pdf, {0: "first", 2: "third"})
+                    out["n"] = len(imgs)
+                    out["notes"] = [im[3] for im in imgs]
+                    out["width"] = imgs[0][1]
+                    out["is_png"] = imgs[0][0][:8] == b"\x89PNG\r\n\x1a\n"
             except Exception:
                 import traceback
                 errors.append(traceback.format_exc())
@@ -6614,38 +6687,10 @@ class TestPptxNotes(unittest.TestCase):
         app.run([])
         if errors:
             raise AssertionError(errors[0])
-        self.assertEqual(out["p0"], "intro notes")
-        self.assertEqual(out["p1"], "")                  # untouched
-        self.assertEqual(out["p2"], "outro notes")
-        self.assertTrue(out["dirty"])
-        self.assertIn("intro notes", out["visible"])     # page 0 shown
-
-    def test_apply_pptx_notes_ignores_out_of_range_slides(self):
-        errors, out = [], {}
-        app = Adw.Application(application_id="test.sidemark.pptxnotes2")
-
-        def on_activate(a):
-            try:
-                with tempfile.TemporaryDirectory() as d:
-                    pdf = os.path.join(d, "deck.pdf"); make_pdf(pdf, n_pages=1)
-                    win = PDFEditorWindow(a); win.present()
-                    win.open_file_in_tab(pdf)
-                    # only 1 page; slide index 5 must be dropped, not crash
-                    win._apply_pptx_notes({0: "ok", 5: "too far"})
-                    out["p0"] = win.notes_model.get(0)
-                    out["has5"] = 5 in win.notes_model._notes
-            except Exception:
-                import traceback
-                errors.append(traceback.format_exc())
-            finally:
-                GLib.timeout_add(50, lambda: a.quit() or False)
-
-        app.connect("activate", on_activate)
-        app.run([])
-        if errors:
-            raise AssertionError(errors[0])
-        self.assertEqual(out["p0"], "ok")
-        self.assertFalse(out["has5"])
+        self.assertEqual(out["n"], 3)
+        self.assertEqual(out["notes"], ["first", "", "third"])
+        self.assertEqual(out["width"], PDFEditorWindow.PPTX_IMPORT_WIDTH)
+        self.assertTrue(out["is_png"])
 
 
 class TestMultiTab(unittest.TestCase):

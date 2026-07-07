@@ -8884,9 +8884,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         except (OSError, ValueError, KeyError) as e:
             self._show_error("Could not open presentation", str(e))
             return
+        self._open_deck_model(model, os.path.basename(path), path=path)
+        self._remember_recent(path)
+        self._maybe_offer_deck_recovery(path)
+
+    def _open_deck_model(self, model, title, path=None):
+        """Mount a DeckModel into this tab. With `path` it is a saved .smdeck
+        (titled, clean); without one it is an in-memory deck — e.g. a PPTX
+        import — that opens untitled and dirty so its first save prompts for a
+        .smdeck name."""
         self._path = None
         self._notes_path = None
-        self._is_untitled = False
+        self._is_untitled = path is None
         self.notes_model = NotesModel()
         self._page_label.set_label("—")
         self._enter_deck_mode()
@@ -8897,12 +8906,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._undo_timeline.clear()
         self._redo_timeline.clear()
         self._restore_note()
-        self._set_file_title(os.path.basename(path), path)
+        self._set_file_title(title, path)
         # open with the notes panel only when the deck carries speaker notes
         self._set_notes_shown(any(s.get("notes") for s in model.slides))
-        self._clear_dirty()
-        self._remember_recent(path)
-        self._maybe_offer_deck_recovery(path)
+        if path is None:
+            self._mark_dirty()
+        else:
+            self._clear_dirty()
 
     def _save_deck(self):
         self._deck_view.save(self._deck_path)
@@ -9309,8 +9319,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
+    # Render each converted PDF page this wide (px) before embedding it as a
+    # slide picture — comfortably crisp on a 1080p projector without bloating
+    # the .smdeck (a 16:9 page lands ~1600×900).
+    PPTX_IMPORT_WIDTH = 1600
+
     def _convert_pptx_then_open(self, pptx_path):
-        toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
+        """Import a PowerPoint file as an editable Sidemark Deck: LibreOffice
+        renders it to PDF, each page is rasterized to a full-bleed slide picture,
+        and the .pptx's speaker notes ride along in the notes panel. The slides
+        are images (original text isn't editable as text — a deliberate MVP; see
+        ideas.csv), but the deck is otherwise fully real: reorder, annotate with
+        ink/text boxes, present with F5, export back to PDF."""
+        toast = Adw.Toast.new(f"Importing {os.path.basename(pptx_path)}…")
         toast.set_timeout(0)
         self.toast_overlay.add_toast(toast)
         out_dir = tempfile.mkdtemp(prefix="sidemark-")
@@ -9324,41 +9345,51 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     check=True, capture_output=True,
                 )
                 pdf_path = os.path.join(out_dir, base + ".pdf")
-                # Slide notes live in the .pptx (the PDF doesn't carry them);
-                # pull them so they can land in the notes sidebar.
+                # Slide notes live in the .pptx (the rendered PDF doesn't carry
+                # them); pull them so they can ride into the deck's slides.
                 slide_notes = _extract_pptx_notes(pptx_path)
-                GLib.idle_add(lambda: (toast.dismiss(), self.open_file(pdf_path),
-                                       self._apply_pptx_notes(slide_notes)) and None)
+                images = self._rasterize_pdf_slides(pdf_path, slide_notes)
+                title = base + " (imported)"
+                GLib.idle_add(lambda: (toast.dismiss(),
+                                       self._open_imported_deck(images, title)) and None)
             except FileNotFoundError:
                 GLib.idle_add(lambda: (toast.dismiss(),
-                    self._show_error("Conversion failed",
+                    self._show_error("Import failed",
                         "LibreOffice not found. Install it with:\n  pacman -S libreoffice-still")) and None)
             except subprocess.CalledProcessError as e:
                 msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
                 GLib.idle_add(lambda: (toast.dismiss(),
-                    self._show_error("Conversion failed", msg)) and None)
+                    self._show_error("Import failed", msg)) and None)
+            except Exception as e:
+                logger.exception("pptx import failed")
+                GLib.idle_add(lambda: (toast.dismiss(),
+                    self._show_error("Import failed", str(e))) and None)
+            finally:
+                shutil.rmtree(out_dir, ignore_errors=True)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _apply_pptx_notes(self, slide_notes):
-        """Drop a converted deck's speaker notes into the notes sidebar, one
-        slide → one page. The deck just opened, so notes_model is fresh; mark the
-        document dirty so the notes are saved on first save."""
-        if not slide_notes:
-            return
-        n = self.canvas.n_pages
-        applied = 0
-        for idx, text in slide_notes.items():
-            if 0 <= idx < n:
-                self.notes_model.set(idx, text)
-                applied += 1
-        if not applied:
-            return
-        self._restore_note()              # refresh the visible page's note
-        self._set_notes_shown(True)
-        self._mark_dirty()
-        self._toast(f"Imported speaker notes from {applied} "
-                    f"slide{'s' if applied != 1 else ''}")
+    def _rasterize_pdf_slides(self, pdf_path, slide_notes):
+        """Render every page of the converted PDF to a PNG for `deck_from_images`,
+        returning [(png_bytes, w, h, notes)] in page order. Runs off the main
+        thread; touches only PyMuPDF, so it needs no GTK."""
+        images = []
+        with fitz.open(pdf_path) as doc:
+            for i, page in enumerate(doc):
+                zoom = self.PPTX_IMPORT_WIDTH / max(page.rect.width, 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                images.append((pix.tobytes("png"), pix.width, pix.height,
+                               slide_notes.get(i, "")))
+        return images
+
+    def _open_imported_deck(self, images, title):
+        """Mount an in-memory deck built from imported slide pictures as a fresh,
+        untitled deck (saved as .smdeck on first Ctrl+S)."""
+        deck_mod = _deck_module()
+        model = deck_mod.deck_from_images(images)
+        self._open_deck_model(model, title)
+        n = len(model.slides)
+        self._toast(f"Imported {n} slide{'s' if n != 1 else ''}")
 
     # ── OCR (optional: needs the external 'ocrmypdf' tool) ──────────────────────
     def _maybe_offer_ocr(self, path):

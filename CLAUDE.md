@@ -26,7 +26,14 @@ PyMuPDF (`fitz`), cairo, numpy; LibreOffice headless is an *optional* backend
 - `TextPageView` — text-first mode: endless A4 Markdown sheet you can draw on.
 - `deck.py`: `DeckModel` (slides as dicts, JSON I/O), `DeckView` (slide canvas
   ONLY — the window supplies all chrome), `DeckPresenterWindow`,
-  `render_slide()` (shared by canvas/thumbnails/presenter/PDF export).
+  `render_slide()` (shared by canvas/thumbnails/presenter/PDF export),
+  `deck_from_images()` (PPTX import: builds a deck of full-bleed slide pictures).
+- **PPTX import**: opening a `.pptx` imports it as an *editable deck* (not a
+  flat PDF). `_convert_pptx_then_open` → LibreOffice pptx→pdf →
+  `_rasterize_pdf_slides` (PyMuPDF, `PPTX_IMPORT_WIDTH`px PNG per page) →
+  `deck_from_images` + `_extract_pptx_notes` → `_open_deck_model(model, title,
+  path=None)` mounts it untitled+dirty. Slides are pictures (text not
+  editable-as-text — MVP; structured import is ideas.csv row 99).
 - `DocumentSession` — one open document (one tab). The window
   (`PDFEditorWindow`) owns an `Adw.TabView` of sessions and **proxies the
   active session's attributes onto itself** via `_session_prop` — window code
@@ -97,8 +104,12 @@ PyMuPDF (`fitz`), cairo, numpy; LibreOffice headless is an *optional* backend
 
 ## Current state (2026-07)
 
-Deck v2 (unified window UI) is implemented on the `deck` branch; see
-`notes/deck-v2-handoff.md` for the exact resume point and next steps.
-Roadmap: PPTX→deck import, themes + PowerPoint theme import, Cairo smart-arts,
-build-step animations, Claude-generated LaTeX/TikZ figures (plan:
-`~/.claude/plans/linked-launching-allen.md`).
+On the `deck` branch: Deck v2 (unified window UI) is committed+pushed
+(`e72ccee`); PPTX→deck import (image + speaker notes) is committed
+(ideas.csv row 98). **Next up: Phase 2 — deck themes + PowerPoint theme
+import** (background/fonts/colors/placeholder-layout geometry so new slides
+match an imported deck; unblocks structured PPTX text import, row 99). Then:
+Cairo smart-arts, build-step animations, Claude-generated LaTeX/TikZ figures.
+Roadmap detail + the deck v2 design rationale live in the plan
+`~/.claude/plans/linked-launching-allen.md`. Open cosmetic polish: ideas.csv
+row 100.

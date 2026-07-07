@@ -126,6 +126,38 @@ class DeckModel:
                        for o in self.slides[0]["objects"]))
 
 
+def _fit_rect(iw, ih):
+    """Rect (x, y, w, h) that fits an iw×ih image into the 16:9 slide,
+    centered and letterboxed — a 16:9 source fills it exactly, a 4:3 source
+    keeps side margins. Preserves the source aspect ratio."""
+    iw, ih = max(iw, 1), max(ih, 1)
+    scale = min(SLIDE_W / iw, SLIDE_H / ih)
+    w, h = iw * scale, ih * scale
+    return (SLIDE_W - w) / 2, (SLIDE_H - h) / 2, w, h
+
+
+def deck_from_images(images):
+    """Build a DeckModel from rendered slide pictures — the PPTX→deck import.
+
+    `images` is a list of (png_bytes, iw, ih, notes): one entry per source
+    slide, its page already rasterized to PNG. Each becomes a blank deck slide
+    holding that single full-bleed image (fit into the 16:9 page) plus its
+    speaker notes, so the imported deck looks pixel-identical to the original
+    while staying a real, editable/reorderable/presentable Sidemark deck. The
+    original text is a picture here — structured text extraction is a separate
+    follow-up (see ideas.csv). An empty list yields a one-slide starter deck."""
+    m = DeckModel()
+    slides = []
+    for png, iw, ih, notes in images:
+        x, y, w, h = _fit_rect(iw, ih)
+        obj = {"type": "image", "x": x, "y": y, "w": w, "h": h,
+               "data": base64.b64encode(png).decode("ascii")}
+        slides.append({"layout": "blank", "objects": [obj], "ink": [],
+                       "notes": notes or ""})
+    m.slides = slides or [new_slide("title")]
+    return m
+
+
 # ── rendering (shared by canvas, sidebar thumbnails, presenter and export) ──
 
 def _image_surface(obj):
