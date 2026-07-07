@@ -2,13 +2,19 @@
 
 Loaded lazily by sidemark.py (☰ New presentation, Ctrl+Alt+P, or the
 --presentation / --deck CLI flag). This module owns the slide document model,
-the editing canvas (select, move, resize, inline text editing, images,
-alignment snapping) and PDF export. Slides are fixed 16:9 pages of
-1280×720 logical units; a .smdeck file is plain JSON, so decks diff, sync and
-round-trip like any other Sidemark file."""
+the editing canvas (select, move, resize, inline text editing, images, ink,
+alignment snapping), the second-screen presenter window and PDF export.
+
+Deck mode is one mode of Sidemark's unified window: the window supplies all
+chrome — header tools, the deck cluster (new slide / add text / style), the
+thumbnail sidebar and the notes panel — and routes it here through plain
+callbacks (`on_changed`, `on_slides_changed`, `on_slide_switched`,
+`on_selection_changed`, `on_before_slide_switch`). DeckView is only the slide
+canvas. Slides are fixed 16:9 pages of 1280×720 logical units; a .smdeck file
+is plain JSON, so decks diff, sync and round-trip like any other Sidemark
+file."""
 
 import base64
-import copy
 import io
 import json
 import logging
@@ -20,9 +26,13 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, Gdk, GLib, Gio, Pango, PangoCairo
 import cairo
 
-# sidemark points this at its session logger right after the lazy import, so
-# deck messages land in the same session log
+# sidemark points these at its own machinery right after the lazy import:
+# the session logger (so deck messages land in the same log) and the notes
+# markup renderer (\alpha→α, x^2 superscripts, **bold** …) so deck textboxes
+# render math exactly like callouts do. The fallbacks keep this module
+# importable on its own.
 logger = logging.getLogger(__name__)
+notes_to_markup = None            # set to sidemark._notes_to_pango_markup
 
 SLIDE_W, SLIDE_H = 1280, 720      # logical slide coordinates (16:9)
 EXPORT_SCALE = 0.75               # 1280×720 logical → 960×540 pt (13.33″×7.5″)
@@ -30,7 +40,7 @@ FORMAT_VERSION = 1
 SNAP_PX = 6                       # snap distance in logical units
 HANDLE_PX = 8                     # resize-handle size in screen pixels
 MIN_OBJ = 40                      # objects can't shrink below this (logical)
-THUMB_W, THUMB_H = 168, 94
+ERASE_RADIUS = 9                  # eraser hit distance in screen pixels
 
 ACCENT = (0.20, 0.51, 0.89)       # selection / guides / placeholder tint
 
@@ -62,7 +72,8 @@ LAYOUT_LABELS = (("title", "Title slide"),
 
 
 def new_slide(layout="content"):
-    return {"layout": layout, "objects": LAYOUTS[layout](), "notes": ""}
+    return {"layout": layout, "objects": LAYOUTS[layout](), "ink": [],
+            "notes": ""}
 
 
 def _clean(obj):
@@ -81,6 +92,7 @@ class DeckModel:
                 "slide_size": [SLIDE_W, SLIDE_H],
                 "slides": [{"layout": s.get("layout", "blank"),
                             "notes": s.get("notes", ""),
+                            "ink": s.get("ink", []),
                             "objects": [_clean(o) for o in s["objects"]]}
                            for s in self.slides]}
 
@@ -92,6 +104,7 @@ class DeckModel:
         m.slides = data.get("slides") or [new_slide("title")]
         for s in m.slides:
             s.setdefault("objects", [])
+            s.setdefault("ink", [])
             s.setdefault("notes", "")
         return m
 
@@ -107,12 +120,13 @@ class DeckModel:
             return cls.from_json(json.load(f))
 
     def has_content(self):
-        return len(self.slides) > 1 or any(
-            o.get("text") or o["type"] != "textbox"
-            for o in self.slides[0]["objects"])
+        return (len(self.slides) > 1 or bool(self.slides[0].get("ink"))
+                or bool(self.slides[0].get("notes"))
+                or any(o.get("text") or o["type"] != "textbox"
+                       for o in self.slides[0]["objects"]))
 
 
-# ── rendering (shared by canvas, thumbnails and PDF export) ─────────────────
+# ── rendering (shared by canvas, sidebar thumbnails, presenter and export) ──
 
 def _image_surface(obj):
     """Decode (and cache) an image object's PNG payload as a cairo surface."""
@@ -144,6 +158,21 @@ def _text_layout(cr, obj):
     return layout
 
 
+def _draw_ink_stroke(cr, stroke):
+    pts = stroke.get("pts", [])
+    if len(pts) < 2:
+        return
+    r, g, b = stroke.get("color", (0.05, 0.05, 0.8))
+    cr.set_source_rgba(r, g, b, stroke.get("opacity", 1.0))
+    cr.set_line_width(stroke.get("width", 2.0))
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(*pts[0])
+    for p in pts[1:]:
+        cr.line_to(*p)
+    cr.stroke()
+
+
 def render_slide(cr, slide, show_placeholders=False, skip=None):
     """Draw one slide in logical coordinates (0,0)-(SLIDE_W,SLIDE_H).
     `skip` suppresses one object (its inline editor is showing instead)."""
@@ -171,12 +200,32 @@ def render_slide(cr, slide, show_placeholders=False, skip=None):
             layout = _text_layout(cr, obj)
             if text:
                 cr.set_source_rgb(0.1, 0.1, 0.12)
-                layout.set_text(text)
+                # render inline math / Markdown like sidemark's callouts do
+                if notes_to_markup is not None:
+                    layout.set_markup(notes_to_markup(text))
+                else:
+                    layout.set_text(text)
             else:
                 cr.set_source_rgba(*ACCENT, 0.55)
                 layout.set_text(obj.get("placeholder", ""))
             PangoCairo.show_layout(cr, layout)
             cr.restore()
+    for stroke in slide.get("ink", []):
+        _draw_ink_stroke(cr, stroke)
+
+
+def render_slide_texture(slide, width):
+    """Render a slide into a Gdk.Texture of the given pixel width — used by
+    the window's thumbnail sidebar."""
+    height = max(1, round(width * SLIDE_H / SLIDE_W))
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    cr = cairo.Context(surf)
+    cr.scale(width / SLIDE_W, height / SLIDE_H)
+    render_slide(cr, slide, show_placeholders=True)
+    surf.flush()
+    return Gdk.MemoryTexture.new(
+        width, height, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+        GLib.Bytes.new(surf.get_data()), surf.get_stride())
 
 
 def export_pdf(model, path):
@@ -195,14 +244,17 @@ def export_pdf(model, path):
 # ── the editor widget ───────────────────────────────────────────────────────
 
 class DeckView(Gtk.Box):
-    """The Deck editor: a thumbnail strip, a toolbar and the slide canvas.
+    """The Deck slide canvas — no chrome of its own; the window provides the
+    header tools, deck cluster, thumbnail sidebar and notes panel and drives
+    this view through its public methods and callbacks.
 
     All geometry is kept in logical slide units; the canvas fits the current
     slide into its allocation and converts pointer coordinates back. Editing
     a textbox swaps in a real Gtk.TextView positioned over the box (the canvas
-    skips drawing that object meanwhile). Every mutation lands on one undo
-    stack (`undo()`/`redo()` — the window delegates Ctrl+Z/Y here in deck
-    mode) and fires `on_changed` for dirty tracking."""
+    skips drawing that object meanwhile). Ink shares the window's pen settings
+    via `pen_style`. Every mutation lands on one undo stack (`undo()`/`redo()`
+    — the window delegates Ctrl+Z/Y here in deck mode) and fires `on_changed`
+    for dirty tracking."""
 
     MARGIN = 24               # surround gap around the slide, screen px
 
@@ -211,21 +263,25 @@ class DeckView(Gtk.Box):
         self.model = DeckModel()
         self.current = 0          # index of the slide being edited
         self.selected = None      # the selected object (dict) or None
-        self.on_changed = None    # any mutation (window: dirty + presenter)
-        self.on_slide_switched = None
+        # window hooks (all optional):
+        self.on_changed = None            # any mutation (dirty tracking)
+        self.on_slides_changed = None     # slide count/order changed (sidebar)
+        self.on_slide_switched = None     # current changed (sidebar marker …)
+        self.on_before_slide_switch = None  # about to switch (commit notes)
+        self.on_selection_changed = None  # selection changed (style cluster)
+        self.on_live_draw = None          # per-motion ping mid-stroke
         self._undo_stack = []
         self._redo_stack = []
         self._guides = []         # [(x1,y1,x2,y2), …] active snap guides
-        self._drag = None         # ("move"|"resize-<h>", obj, before, sx, sy)
+        self._drag = None         # ("move"|"resize-<h>", obj, before)
         self._editing = None      # textbox currently in the inline editor
         self._editor = None       # the Gtk.TextView overlay child
-        self._syncing_toolbar = False
-
-        self._build_thumbs()
-        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        right.set_hexpand(True)
-        right.set_vexpand(True)
-        self._build_toolbar(right)
+        # ── ink (pen / highlighter / eraser share the window's pen settings) ──
+        self.tool = "select"      # select | pen | highlighter | eraser
+        self.pen_style = lambda hl: ((0.05, 0.05, 0.8), 2.0, 1.0)
+        self.current_stroke = []  # logical points of the in-flight stroke
+        self._stroke_style = None  # (color, width, opacity) of that stroke
+        self._erased_now = []     # [(idx, stroke), …] removed in this gesture
 
         self.canvas = Gtk.DrawingArea()
         self.canvas.set_hexpand(True)
@@ -240,8 +296,7 @@ class DeckView(Gtk.Box):
         self._fixed.set_vexpand(True)
         self._overlay.add_overlay(self._fixed)
         self._fixed.set_visible(False)
-        right.append(self._overlay)
-        self.append(right)
+        self.append(self._overlay)
 
         click = Gtk.GestureClick()
         click.set_button(1)
@@ -253,6 +308,13 @@ class DeckView(Gtk.Box):
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end", self._on_drag_end)
         self.canvas.add_controller(drag)
+        # right-drag erases while an ink tool is active (like on a PDF page)
+        erase = Gtk.GestureDrag()
+        erase.set_button(3)
+        erase.connect("drag-begin", self._on_erase_begin)
+        erase.connect("drag-update", self._on_erase_update)
+        erase.connect("drag-end", self._on_erase_end)
+        self.canvas.add_controller(erase)
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self._on_key)
         self.canvas.add_controller(keys)
@@ -263,183 +325,7 @@ class DeckView(Gtk.Box):
             Gdk.Display.get_default(), self._editor_css,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
 
-    # ── thumbnail strip ──────────────────────────────────────────────────
-
-    def _build_thumbs(self):
-        self._thumb_list = Gtk.ListBox()
-        self._thumb_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self._thumb_list.connect("row-selected", self._on_thumb_selected)
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_size_request(THUMB_W + 28, -1)
-        scroll.set_child(self._thumb_list)
-        self.append(scroll)
-        self._rebuild_thumbs()
-
-    def _rebuild_thumbs(self):
-        while (row := self._thumb_list.get_row_at_index(0)) is not None:
-            self._thumb_list.remove(row)
-        for i, slide in enumerate(self.model.slides):
-            area = Gtk.DrawingArea()
-            area.set_content_width(THUMB_W)
-            area.set_content_height(THUMB_H)
-            area.set_margin_top(6)
-            area.set_margin_bottom(6)
-            area.set_margin_start(8)
-            area.set_margin_end(8)
-            area.set_draw_func(self._draw_thumb, i)
-            row = Gtk.ListBoxRow()
-            row.set_child(area)
-            self._thumb_list.append(row)
-        row = self._thumb_list.get_row_at_index(self.current)
-        if row:
-            self._thumb_list.select_row(row)
-
-    def _draw_thumb(self, _area, cr, w, h, idx):
-        if idx >= len(self.model.slides):
-            return
-        cr.save()
-        cr.scale(w / SLIDE_W, h / SLIDE_H)
-        render_slide(cr, self.model.slides[idx], show_placeholders=True)
-        cr.restore()
-        cr.set_source_rgba(0, 0, 0, 0.25)
-        cr.rectangle(0.5, 0.5, w - 1, h - 1)
-        cr.set_line_width(1)
-        cr.stroke()
-
-    def _refresh_thumbs(self):
-        i = 0
-        while (row := self._thumb_list.get_row_at_index(i)) is not None:
-            row.get_child().queue_draw()
-            i += 1
-
-    def _on_thumb_selected(self, _list, row):
-        if row is None:
-            return
-        idx = row.get_index()
-        if idx != self.current and 0 <= idx < len(self.model.slides):
-            self._commit_editor()
-            self.current = idx
-            self.selected = None
-            self.canvas.queue_draw()
-            self._update_slide_label()
-            self._sync_toolbar()
-            if self.on_slide_switched:
-                self.on_slide_switched()
-
-    # ── toolbar ──────────────────────────────────────────────────────────
-
-    def _build_toolbar(self, parent):
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        bar.add_css_class("toolbar")
-        for m in ("set_margin_top", "set_margin_bottom",
-                  "set_margin_start", "set_margin_end"):
-            getattr(bar, m)(6)
-
-        new_btn = Gtk.MenuButton()
-        new_btn.set_icon_name("list-add-symbolic")
-        new_btn.set_tooltip_text("New slide")
-        pop = Gtk.Popover()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        for key, label in LAYOUT_LABELS:
-            b = Gtk.Button()
-            b.add_css_class("flat")
-            b.set_child(Gtk.Label(label=label, xalign=0))
-            b.connect("clicked", lambda _b, k=key: (pop.popdown(),
-                                                    self.add_slide(k)))
-            box.append(b)
-        pop.set_child(box)
-        new_btn.set_popover(pop)
-        bar.append(new_btn)
-
-        del_btn = Gtk.Button()
-        del_btn.set_icon_name("user-trash-symbolic")
-        del_btn.set_tooltip_text("Delete slide")
-        del_btn.connect("clicked", lambda _b: self.delete_slide())
-        bar.append(del_btn)
-        bar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-
-        text_btn = Gtk.Button()
-        text_btn.set_icon_name("insert-text-symbolic")
-        text_btn.set_tooltip_text("Add text box")
-        text_btn.connect("clicked", lambda _b: self.add_textbox())
-        bar.append(text_btn)
-        img_btn = Gtk.Button()
-        img_btn.set_icon_name("insert-image-symbolic")
-        img_btn.set_tooltip_text("Add image… (or paste / drop one)")
-        img_btn.connect("clicked", lambda _b: self._pick_image())
-        bar.append(img_btn)
-        bar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-
-        # style controls apply to the selected textbox
-        self._size_spin = Gtk.SpinButton.new_with_range(8, 200, 2)
-        self._size_spin.set_tooltip_text("Font size")
-        self._size_spin.connect("value-changed", self._on_style_changed)
-        bar.append(self._size_spin)
-        self._bold_btn = Gtk.ToggleButton()
-        self._bold_btn.set_icon_name("format-text-bold-symbolic")
-        self._bold_btn.set_tooltip_text("Bold")
-        self._bold_btn.connect("toggled", self._on_style_changed)
-        bar.append(self._bold_btn)
-        self._align_btns = {}
-        group = None
-        for align, icon in (("left", "format-justify-left-symbolic"),
-                            ("center", "format-justify-center-symbolic"),
-                            ("right", "format-justify-right-symbolic")):
-            b = Gtk.ToggleButton()
-            b.set_icon_name(icon)
-            b.set_tooltip_text(f"Align {align}")
-            if group:
-                b.set_group(group)
-            group = group or b
-            b.connect("toggled", self._on_style_changed)
-            self._align_btns[align] = b
-            bar.append(b)
-
-        spacer = Gtk.Box()
-        spacer.set_hexpand(True)
-        bar.append(spacer)
-        self._slide_label = Gtk.Label(label="1 / 1")
-        self._slide_label.add_css_class("dim-label")
-        bar.append(self._slide_label)
-        parent.append(bar)
-        parent.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
-        self._sync_toolbar()
-
-    def _update_slide_label(self):
-        self._slide_label.set_label(
-            f"{self.current + 1} / {len(self.model.slides)}")
-
-    def _sync_toolbar(self):
-        """Reflect the selected textbox's style in the controls (no feedback)."""
-        self._syncing_toolbar = True
-        obj = self.selected
-        is_text = bool(obj) and obj["type"] == "textbox"
-        for w in (self._size_spin, self._bold_btn, *self._align_btns.values()):
-            w.set_sensitive(is_text)
-        if is_text:
-            self._size_spin.set_value(obj["size"])
-            self._bold_btn.set_active(obj.get("weight") == "bold")
-            self._align_btns.get(obj.get("align", "left"),
-                                 self._align_btns["left"]).set_active(True)
-        self._syncing_toolbar = False
-
-    def _on_style_changed(self, _w):
-        obj = self.selected
-        if self._syncing_toolbar or not obj or obj["type"] != "textbox":
-            return
-        before = _clean(obj)
-        obj["size"] = int(self._size_spin.get_value())
-        obj["weight"] = "bold" if self._bold_btn.get_active() else "normal"
-        for align, b in self._align_btns.items():
-            if b.get_active():
-                obj["align"] = align
-        if _clean(obj) != before:
-            self._push(("modify", self.current,
-                        self._slide()["objects"].index(obj), before))
-            self._changed()
-
-    # ── model mutations (all undoable) ───────────────────────────────────
+    # ── change plumbing ──────────────────────────────────────────────────
 
     def _slide(self):
         return self.model.slides[self.current]
@@ -450,32 +336,83 @@ class DeckView(Gtk.Box):
 
     def _changed(self):
         self.canvas.queue_draw()
-        self._refresh_thumbs()
         if self.on_changed:
             self.on_changed()
+
+    def _slides_changed(self):
+        """Slide count or order changed — the sidebar must rebuild."""
+        if self.on_slides_changed:
+            self.on_slides_changed()
+
+    def _selection_changed(self):
+        if self.on_selection_changed:
+            self.on_selection_changed()
+
+    # ── slide navigation (window sidebar / presenter / PageUp+Down) ──────
+
+    def set_current(self, idx):
+        if idx == self.current or not (0 <= idx < len(self.model.slides)):
+            return
+        self._commit_editor()
+        if self.on_before_slide_switch:
+            self.on_before_slide_switch()   # commit speaker notes first
+        self.current = idx
+        self.selected = None
+        self._selection_changed()
+        self.canvas.queue_draw()
+        if self.on_slide_switched:
+            self.on_slide_switched()
+
+    def next_slide(self):
+        self.set_current(self.current + 1)
+
+    def prev_slide(self):
+        self.set_current(self.current - 1)
+
+    # ── model mutations (all undoable) ───────────────────────────────────
 
     def add_slide(self, layout="content"):
         self._commit_editor()
         idx = self.current + 1
         self.model.slides.insert(idx, new_slide(layout))
         self._push(("add_slide", idx))
-        self.current = idx
-        self.selected = None
-        self._rebuild_thumbs()
-        self._update_slide_label()
+        self._slides_changed()
+        self.set_current(idx)
         self._changed()
 
     def delete_slide(self):
         if len(self.model.slides) <= 1:
             return
         self._commit_editor()
+        if self.on_before_slide_switch:
+            self.on_before_slide_switch()   # notes travel with the slide
         idx = self.current
         slide = self.model.slides.pop(idx)
         self._push(("remove_slide", idx, slide))
         self.current = min(idx, len(self.model.slides) - 1)
         self.selected = None
-        self._rebuild_thumbs()
-        self._update_slide_label()
+        self._slides_changed()
+        self._selection_changed()
+        if self.on_slide_switched:
+            self.on_slide_switched()
+        self._changed()
+
+    def move_slide(self, frm, to):
+        """Reorder (sidebar drag): move the slide at `frm` before index `to`."""
+        n = len(self.model.slides)
+        if not (0 <= frm < n):
+            return
+        to = max(0, min(to, n - 1))
+        if frm == to:
+            return
+        self._commit_editor()
+        slide = self.model.slides.pop(frm)
+        self.model.slides.insert(to, slide)
+        self._push(("move_slide", frm, to))
+        self.current = to
+        self._slides_changed()
+        if self.on_slide_switched:
+            self.on_slide_switched()
         self._changed()
 
     def add_textbox(self):
@@ -483,7 +420,7 @@ class DeckView(Gtk.Box):
         self._slide()["objects"].append(obj)
         self._push(("add", self.current, obj))
         self.selected = obj
-        self._sync_toolbar()
+        self._selection_changed()
         self._changed()
         self.start_edit(obj)
 
@@ -500,7 +437,7 @@ class DeckView(Gtk.Box):
         self._slide()["objects"].append(obj)
         self._push(("add", self.current, obj))
         self.selected = obj
-        self._sync_toolbar()
+        self._selection_changed()
         self._changed()
 
     def add_image_file(self, path):
@@ -524,10 +461,35 @@ class DeckView(Gtk.Box):
             objs.pop(idx)
             self._push(("remove", self.current, idx, obj))
         self.selected = None
-        self._sync_toolbar()
+        self._selection_changed()
         self._changed()
 
-    def _pick_image(self):
+    def apply_style(self, size=None, bold=None, align=None):
+        """Style the selected textbox (the window's deck cluster calls this)."""
+        obj = self.selected
+        if not obj or obj["type"] != "textbox":
+            return
+        before = _clean(obj)
+        if size is not None:
+            obj["size"] = int(size)
+        if bold is not None:
+            obj["weight"] = "bold" if bold else "normal"
+        if align is not None:
+            obj["align"] = align
+        if _clean(obj) != before:
+            self._push(("modify", self.current,
+                        self._slide()["objects"].index(obj), before))
+            self._changed()
+
+    def selection_style(self):
+        """(is_textbox, size, bold, align) of the selection, for the cluster."""
+        obj = self.selected
+        if not obj or obj["type"] != "textbox":
+            return (False, 0, False, "left")
+        return (True, obj["size"], obj.get("weight") == "bold",
+                obj.get("align", "left"))
+
+    def pick_image(self):
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Add image…")
         f = Gtk.FileFilter()
@@ -569,19 +531,20 @@ class DeckView(Gtk.Box):
         self._commit_editor()
         op = self._undo_stack.pop()
         self._redo_stack.append(self._apply(op))
-        self._rebuild_thumbs()
-        self._update_slide_label()
-        self._sync_toolbar()
-        self._changed()
+        self._after_history()
 
     def redo(self):
         if not self._redo_stack:
             return
         op = self._redo_stack.pop()
         self._undo_stack.append(self._apply(op))
-        self._rebuild_thumbs()
-        self._update_slide_label()
-        self._sync_toolbar()
+        self._after_history()
+
+    def _after_history(self):
+        self._slides_changed()
+        self._selection_changed()
+        if self.on_slide_switched:
+            self.on_slide_switched()
         self._changed()
 
     def _apply(self, op):
@@ -621,6 +584,39 @@ class DeckView(Gtk.Box):
             self.current = idx
             self.selected = None
             return ("add_slide", idx)
+        if kind == "move_slide":               # inverse: move it back
+            _, frm, to = op
+            slide = self.model.slides.pop(to)
+            self.model.slides.insert(frm, slide)
+            self.current = frm
+            return ("move_slide", to, frm)
+        if kind == "ink_add":                  # inverse: lift the stroke off
+            _, slide_idx, stroke = op
+            self._goto(slide_idx)
+            ink = self.model.slides[slide_idx]["ink"]
+            idx = ink.index(stroke)
+            ink.pop(idx)
+            return ("ink_remove", slide_idx, idx, stroke)
+        if kind == "ink_remove":               # inverse: lay it back down
+            _, slide_idx, idx, stroke = op
+            self._goto(slide_idx)
+            self.model.slides[slide_idx]["ink"].insert(idx, stroke)
+            return ("ink_add", slide_idx, stroke)
+        if kind == "ink_erase":                # inverse: restore the erased set
+            _, slide_idx, pairs = op
+            self._goto(slide_idx)
+            ink = self.model.slides[slide_idx]["ink"]
+            for idx, stroke in reversed(pairs):
+                ink.insert(min(idx, len(ink)), stroke)
+            return ("ink_unerase", slide_idx, pairs)
+        if kind == "ink_unerase":              # inverse: erase them again
+            _, slide_idx, pairs = op
+            self._goto(slide_idx)
+            ink = self.model.slides[slide_idx]["ink"]
+            for _, stroke in pairs:
+                if stroke in ink:
+                    ink.remove(stroke)
+            return ("ink_erase", slide_idx, pairs)
         raise ValueError(f"unknown deck op {kind!r}")
 
     def _goto(self, idx):
@@ -663,6 +659,11 @@ class DeckView(Gtk.Box):
             cr.line_to(x2, y2)
         cr.stroke()
         cr.set_dash([])
+        # the in-flight stroke rides on top until it's committed
+        if self.current_stroke and self._stroke_style:
+            color, width, opacity = self._stroke_style
+            _draw_ink_stroke(cr, {"pts": self.current_stroke, "color": color,
+                                  "width": width, "opacity": opacity})
         cr.restore()
         # selection box + handles (drawn unscaled so handles keep their size)
         obj = self.selected
@@ -717,6 +718,8 @@ class DeckView(Gtk.Box):
 
     def _on_click(self, _g, n_press, px, py):
         self.canvas.grab_focus()
+        if self.tool != "select":
+            return
         if n_press == 2:
             obj = self._hit_object(*self._to_slide(px, py))
             if obj is not None and obj["type"] == "textbox":
@@ -724,6 +727,12 @@ class DeckView(Gtk.Box):
 
     def _on_drag_begin(self, _g, px, py):
         self._commit_editor()
+        if self.tool in ("pen", "highlighter"):
+            self._ink_begin(px, py)
+            return
+        if self.tool == "eraser":
+            self._erase_begin(px, py)
+            return
         handle = self._hit_handle(px, py)
         if handle:
             obj = self.selected
@@ -732,11 +741,17 @@ class DeckView(Gtk.Box):
         obj = self._hit_object(*self._to_slide(px, py))
         if obj is not self.selected:
             self.selected = obj
-            self._sync_toolbar()
+            self._selection_changed()
             self.canvas.queue_draw()
         self._drag = ("move", obj, _clean(obj)) if obj else None
 
     def _on_drag_update(self, g, dx, dy):
+        if self.tool in ("pen", "highlighter"):
+            self._ink_motion(dx, dy)
+            return
+        if self.tool == "eraser":
+            self._erase_motion(dx, dy)
+            return
         if not self._drag:
             return
         mode, obj, before = self._drag
@@ -751,6 +766,12 @@ class DeckView(Gtk.Box):
         self.canvas.queue_draw()
 
     def _on_drag_end(self, _g, dx, dy):
+        if self.tool in ("pen", "highlighter"):
+            self._ink_commit()
+            return
+        if self.tool == "eraser":
+            self._erase_commit()
+            return
         self._guides = []
         if not self._drag:
             self.canvas.queue_draw()
@@ -805,6 +826,95 @@ class DeckView(Gtk.Box):
             self._guides.append((0, best[0], SLIDE_W, best[0]))
         return nx, ny
 
+    # ── ink (pen / highlighter / eraser) ─────────────────────────────────
+
+    def set_tool(self, mode):
+        """Window's tool switch: pen / highlighter / eraser ink the slide,
+        anything else is the object-select arrow."""
+        if mode not in ("pen", "highlighter", "eraser"):
+            mode = "select"
+        if mode == self.tool:
+            return
+        self._commit_editor()
+        self.tool = mode
+        if mode != "select":
+            self.selected = None
+            self._selection_changed()
+        cursor = {"pen": "crosshair", "highlighter": "crosshair",
+                  "eraser": "cell"}.get(mode, "default")
+        self.canvas.set_cursor(Gdk.Cursor.new_from_name(cursor))
+        self.canvas.queue_draw()
+
+    def _ink_begin(self, px, py):
+        color, width, opacity = self.pen_style(self.tool == "highlighter")
+        self._stroke_style = (tuple(color), float(width), float(opacity))
+        self._ink_start = (px, py)
+        self.current_stroke = [list(self._to_slide(px, py))]
+
+    def _ink_motion(self, dx, dy):
+        if not self.current_stroke:
+            return
+        px, py = self._ink_start
+        self.current_stroke.append(list(self._to_slide(px + dx, py + dy)))
+        self.canvas.queue_draw()
+        if self.on_live_draw:
+            self.on_live_draw()
+
+    def _ink_commit(self):
+        pts, self.current_stroke = self.current_stroke, []
+        if len(pts) >= 2 and self._stroke_style is not None:
+            color, width, opacity = self._stroke_style
+            stroke = {"pts": pts, "color": list(color),
+                      "width": width, "opacity": opacity}
+            self._slide()["ink"].append(stroke)
+            self._push(("ink_add", self.current, stroke))
+            self._changed()
+        else:
+            self.canvas.queue_draw()
+        if self.on_live_draw:
+            self.on_live_draw()
+
+    def _erase_begin(self, px, py):
+        self._erased_now = []
+        self._erase_start = (px, py)
+        self._erase_at(*self._to_slide(px, py))
+
+    def _erase_motion(self, dx, dy):
+        px, py = self._erase_start
+        self._erase_at(*self._to_slide(px + dx, py + dy))
+
+    def _erase_commit(self):
+        if self._erased_now:
+            self._push(("ink_erase", self.current, list(self._erased_now)))
+            self._erased_now = []
+            self._changed()
+
+    def _erase_at(self, sx, sy):
+        """Remove every stroke with a point within the eraser radius."""
+        _, _, scale = self._slide_rect()
+        r2 = (ERASE_RADIUS / scale) ** 2
+        ink = self._slide()["ink"]
+        for i in range(len(ink) - 1, -1, -1):
+            if any((px - sx) ** 2 + (py - sy) ** 2 <= r2
+                   for px, py in ink[i].get("pts", [])):
+                self._erased_now.append((i, ink.pop(i)))
+        self.canvas.queue_draw()
+        if self.on_live_draw:
+            self.on_live_draw()
+
+    # right-drag erases whenever an ink tool is active (mirrors the PDF canvas)
+    def _on_erase_begin(self, _g, px, py):
+        if self.tool != "select":
+            self._erase_begin(px, py)
+
+    def _on_erase_update(self, _g, dx, dy):
+        if self.tool != "select" and hasattr(self, "_erase_start"):
+            self._erase_motion(dx, dy)
+
+    def _on_erase_end(self, _g, dx, dy):
+        if self.tool != "select":
+            self._erase_commit()
+
     # ── keyboard ─────────────────────────────────────────────────────────
 
     def _on_key(self, _c, keyval, _code, state):
@@ -814,7 +924,7 @@ class DeckView(Gtk.Box):
         if keyval == Gdk.KEY_Escape:
             if self.selected:
                 self.selected = None
-                self._sync_toolbar()
+                self._selection_changed()
                 self.canvas.queue_draw()
                 return True
         if (state & Gdk.ModifierType.CONTROL_MASK
@@ -828,7 +938,7 @@ class DeckView(Gtk.Box):
     def start_edit(self, obj):
         self._commit_editor()
         self.selected = obj
-        self._sync_toolbar()
+        self._selection_changed()
         self._editing = obj
         x, y, scale = self._slide_rect()
         tv = Gtk.TextView()
@@ -888,29 +998,24 @@ class DeckView(Gtk.Box):
 
     # ── document plumbing (called by the window) ─────────────────────────
 
-    def load(self, path):
-        self._commit_editor()
-        self.model = DeckModel.load(path)
+    def _reset_view(self):
         self.current = 0
         self.selected = None
         self._undo_stack.clear()
         self._redo_stack.clear()
-        self._rebuild_thumbs()
-        self._update_slide_label()
-        self._sync_toolbar()
+        self._slides_changed()
+        self._selection_changed()
         self.canvas.queue_draw()
+
+    def load(self, path):
+        self._commit_editor()
+        self.model = DeckModel.load(path)
+        self._reset_view()
 
     def reset(self):
         self._commit_editor()
         self.model = DeckModel()
-        self.current = 0
-        self.selected = None
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self._rebuild_thumbs()
-        self._update_slide_label()
-        self._sync_toolbar()
-        self.canvas.queue_draw()
+        self._reset_view()
 
     def save(self, path):
         self._commit_editor()
@@ -919,3 +1024,88 @@ class DeckView(Gtk.Box):
     def export_pdf(self, path):
         self._commit_editor()
         export_pdf(self.model, path)
+
+
+# ── second-screen presenter ─────────────────────────────────────────────────
+
+class DeckPresenterWindow(Adw.Window):
+    """A view-only mirror of the deck for a projector: fullscreen black
+    surround, the current slide fit whole, live ink while a stroke is still
+    being drawn. Kept deliberately bare, like the PDF PresenterWindow — the
+    presentation timer and big prev/next controls live on the editor window.
+    It still pages when focused (clicker-friendly): click / Space / arrows /
+    PageUp+Down advance and go back; Esc or F5 closes."""
+
+    def __init__(self, app, deck_view, on_nav=None):
+        super().__init__(application=app)
+        self.set_title("Sidemark — Presenter")
+        self._dv = deck_view
+        self._on_nav = on_nav   # callback(delta) — drives the editor's nav
+        area = Gtk.DrawingArea()
+        area.set_draw_func(self._draw)
+        self.canvas = area
+        self.set_content(area)
+        deck_view.on_live_draw = area.queue_draw
+
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_key)
+        self.add_controller(key)
+        click = Gtk.GestureClick()
+        click.set_button(0)   # 0 = listen to every button
+        click.connect("pressed", self._on_click)
+        area.add_controller(click)
+
+    def _draw(self, _a, cr, w, h):
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
+        dv = self._dv
+        slide = dv.model.slides[dv.current]
+        scale = min(w / SLIDE_W, h / SLIDE_H)
+        cr.translate((w - SLIDE_W * scale) / 2, (h - SLIDE_H * scale) / 2)
+        cr.scale(scale, scale)
+        cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
+        cr.clip()
+        render_slide(cr, slide)          # no placeholders on the projector
+        if dv.current_stroke and dv._stroke_style:
+            color, width, opacity = dv._stroke_style
+            _draw_ink_stroke(cr, {"pts": dv.current_stroke, "color": color,
+                                  "width": width, "opacity": opacity})
+
+    def sync_page(self):
+        self.canvas.queue_draw()
+
+    def refresh(self):
+        self.canvas.queue_draw()
+
+    def detach(self):
+        """Stop receiving the deck's live-draw pings (window is closing)."""
+        if self._dv.on_live_draw == self.canvas.queue_draw:
+            self._dv.on_live_draw = None
+
+    def _nav(self, delta):
+        if self._on_nav is not None:
+            self._on_nav(delta)
+        else:
+            self._dv.set_current(self._dv.current + delta)
+
+    def _on_key(self, _c, keyval, _code, _state):
+        if keyval in (Gdk.KEY_Escape, Gdk.KEY_F5):
+            self.close()
+            return True
+        if keyval in (Gdk.KEY_space, Gdk.KEY_Right, Gdk.KEY_Down,
+                      Gdk.KEY_Page_Down):
+            self._nav(1)
+            return True
+        if keyval in (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_Page_Up):
+            self._nav(-1)
+            return True
+        return False
+
+    def _on_click(self, gesture, _n, _x, _y):
+        # click / side button 8 advance; right-click / side button 9 go back
+        # (same bindings as the PDF presenter)
+        button = gesture.get_current_button()
+        if button in (1, 8):
+            self._nav(1)
+        elif button in (3, 9):
+            self._nav(-1)

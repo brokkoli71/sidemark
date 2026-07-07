@@ -43,13 +43,17 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Presentations (Sidemark Deck)
 
-- **New presentation** (☰ menu, `Ctrl+Alt+P`, or `sidemark --presentation`) opens the Deck editor: fixed 16:9 slides on a canvas, with a thumbnail strip for switching slides and a toolbar of its own — the deck is saved as a single plain-JSON **`.smdeck`** file that diffs and syncs like any text file
+- **New presentation** (☰ menu, `Ctrl+Alt+P`, or `sidemark --presentation`) turns the same Sidemark window into a slide editor: fixed 16:9 slides on the canvas, the familiar tools in the header bar, and the deck saved as a single plain-JSON **`.smdeck`** file that diffs and syncs like any text file
 - **Quick-start layouts** — new slides offer a **title slide** (centered title + subtitle), a **content slide** (heading with a textbox underneath), or a blank one; placeholders are ordinary text boxes — click to type
-- **Text boxes** — double-click to edit in place, drag to move, resize by the corner/edge handles; font size, bold and left/center/right alignment from the toolbar
-- **Images** — paste from the clipboard (`Ctrl+V`), drop a file onto the slide, or pick one via the toolbar; inserted at their aspect ratio, then move/resize freely
+- **Text boxes** — double-click to edit in place, drag to move, resize by the corner/edge handles; font size, bold and left/center/right alignment from the header bar. Text renders the same inline math and Markdown as notes: `\alpha`→α, `x^2` superscripts, `**bold**`, `*italic*`, `` `code` `` — including in the exported PDF
+- **Images** — paste from the clipboard (`Ctrl+V`), drop a file onto the slide, or pick one via the header bar; inserted at their aspect ratio, then move/resize freely
+- **Draw on slides** — the same pen, highlighter and eraser as on a PDF (shared color/width settings); right-drag erases, and ink is saved in the `.smdeck` and shows in exports and the presenter
 - **Alignment snapping** — while dragging, objects snap to the slide center and to other objects' edges and centers, with dashed guide lines showing what you're aligned to — the fastest route to tidy slides
-- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — every edit (move, resize, type, style, add/delete slide) is one chronological undo step
-- **Export as PDF** (☰ menu) renders the deck into a 16:9 PDF, one page per slide, text staying real vector text — open that PDF right back in Sidemark to present it with ink and presenter view
+- **Slide thumbnails in the sidebar** (`Ctrl+T`) — the same sidebar as PDF pages: click a slide to jump to it, drag to reorder (one `Ctrl+Z` undoes a move)
+- **Speaker notes** — the notes panel (Ctrl+\\) edits per-slide speaker notes, with the full live-Markdown editor; notes are stored inside the `.smdeck`, travel with slides when you reorder, and are there to read while presenting
+- **Present** (`F5`) — the presenter view mirrors the current slide fullscreen on a second screen with live ink, exactly like presenting a PDF: click/`Space`/arrows navigate (clicker-friendly), your window keeps the presentation timer and big prev/next buttons
+- **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — every edit (move, resize, type, style, ink, add/delete/move slide) is one chronological undo step; unsaved decks are autosaved and offered for recovery on reopen
+- **Export as PDF** (☰ menu) renders the deck into a 16:9 PDF, one page per slide, text staying real vector text — open that PDF right back in Sidemark to annotate it or share it to a phone
 
 ### Navigation
 

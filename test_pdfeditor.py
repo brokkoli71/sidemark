@@ -7555,16 +7555,26 @@ class TestDeckMode(unittest.TestCase):
             s = win._active_session
             self.assertTrue(s._deck_mode)
             self.assertTrue(s._is_untitled)
-            self.assertFalse(s._paned.get_visible())
+            # the paned stays: the notes panel edits per-slide speaker notes
+            self.assertTrue(s._paned.get_visible())
             self.assertTrue(s._deck_view.get_visible())
             # a fresh deck starts with one title slide (two placeholders)
             self.assertEqual(len(s._deck_view.model.slides), 1)
             self.assertEqual(s._deck_view.model.slides[0]["layout"], "title")
-            # PDF chrome and ink tools are gone; the deck brings its own bar
-            for w in (win._notes_toggle, win._present_btn, win._toc_btn,
-                      win._nav_box, win._pages_box, win._tools_box,
-                      win._pen_btn):
+            # PDF-only chrome is gone…
+            for w in (win._nav_box, win._pages_box,
+                      win._share_btn, win._mode_lasso, win._mode_zoom,
+                      win._mode_anchor, win._mode_pan, win._mode_text):
                 self.assertFalse(w.get_visible(), w)
+            # …but the shared tools stay: select arrow + ink + pen settings,
+            # presenter, notes toggle, sidebar, deck cluster — the deck is a
+            # mode of the same unified UI
+            for w in (win._tools_box, win._pen_btn, win._present_btn,
+                      win._notes_toggle, win._toc_btn, win._deck_bar,
+                      win._mode_select, win._mode_pen, win._mode_hl,
+                      win._mode_eraser):
+                self.assertTrue(w.get_visible(), w)
+            self.assertTrue(win._mode_select.get_active())
             for item in win._pdf_menu_items:
                 self.assertFalse(item.get_visible(), item)
             for item in win._deck_menu_items:
@@ -7717,8 +7727,9 @@ class TestDeckMode(unittest.TestCase):
             dv = win._deck_view
             obj = dv.model.slides[0]["objects"][0]
             dv.selected = obj
-            dv._sync_toolbar()
-            dv._size_spin.set_value(100)         # user bumps the font size
+            dv._selection_changed()              # header cluster picks it up
+            self.assertTrue(win._deck_size_spin.get_sensitive())
+            win._deck_size_spin.set_value(100)   # user bumps the font size
             self.assertEqual(obj["size"], 100)
             win._global_undo()
             self.assertEqual(obj["size"], 72)
@@ -7730,6 +7741,210 @@ class TestDeckMode(unittest.TestCase):
             win._on_new_presentation()
             self._settle()
             self.assertFalse(win._session_is_pristine(win._active_session))
+
+        self._run_in_window(body)
+
+    # ── unified-UI deck mode (v2): ink, notes, sidebar, presenter ────────
+
+    def _draw_stroke(self, win, x0=200.0, y0=200.0):
+        """Draw a short pen stroke on the deck canvas via the drag pipeline."""
+        dv = win._deck_view
+        win._set_tool_mode("pen")
+        dv._on_drag_begin(None, x0, y0)
+        for i in range(1, 6):
+            dv._on_drag_update(None, i * 8.0, i * 5.0)
+        dv._on_drag_end(None, 40.0, 25.0)
+        return dv._slide()["ink"]
+
+    def test_ink_draw_erase_undo(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            ink = self._draw_stroke(win)
+            self.assertEqual(len(ink), 1)
+            self.assertGreaterEqual(len(ink[0]["pts"]), 2)
+            self.assertTrue(win._dirty)
+            # stroke undo goes through the window's Ctrl+Z path
+            win._global_undo()
+            self.assertEqual(len(dv._slide()["ink"]), 0)
+            win._global_redo()
+            self.assertEqual(len(dv._slide()["ink"]), 1)
+            # the eraser lifts the stroke off (drag across its start point)
+            win._set_tool_mode("eraser")
+            dv._on_drag_begin(None, 200.0, 200.0)
+            dv._on_drag_end(None, 0.0, 0.0)
+            self.assertEqual(len(dv._slide()["ink"]), 0)
+            win._global_undo()   # un-erase
+            self.assertEqual(len(dv._slide()["ink"]), 1)
+
+        self._run_in_window(body)
+
+    def test_ink_roundtrips_through_smdeck(self):
+        deck = self._deck()
+        m = deck.DeckModel()
+        m.slides[0]["ink"].append(
+            {"pts": [[10, 10], [50, 50]], "color": [1, 0, 0],
+             "width": 3.0, "opacity": 1.0})
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.smdeck")
+            m.save(p)
+            m2 = deck.DeckModel.load(p)
+        self.assertEqual(m2.slides[0]["ink"][0]["pts"], [[10, 10], [50, 50]])
+
+    def test_speaker_notes_in_notes_panel(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                win._on_new_presentation()
+                self._settle()
+                dv = win._deck_view
+                buf = win._notes_view.get_buffer()
+                buf.set_text("notes for slide 1")
+                dv.add_slide("content")       # switch commits slide 1's notes
+                self.assertEqual(dv.model.slides[0]["notes"],
+                                 "notes for slide 1")
+                buf.set_text("notes for slide 2")
+                path = os.path.join(d, "talk.smdeck")
+                win._deck_path = path
+                win._is_untitled = False
+                win._on_save()                # commits the current slide too
+                self.assertEqual(dv.model.slides[1]["notes"],
+                                 "notes for slide 2")
+                # reopen: notes restore per slide, panel opens (has notes)
+                win._new_tab()
+                win._do_open_file(path)
+                self._settle()
+                dv2 = win._deck_view
+                self.assertEqual(dv2.model.slides[0]["notes"],
+                                 "notes for slide 1")
+                text = win._notes_view.get_buffer()
+                self.assertEqual(
+                    text.get_text(text.get_start_iter(), text.get_end_iter(),
+                                  True),
+                    "notes for slide 1")
+                dv2.set_current(1)
+                text = win._notes_view.get_buffer()
+                self.assertEqual(
+                    text.get_text(text.get_start_iter(), text.get_end_iter(),
+                                  True),
+                    "notes for slide 2")
+
+            self._run_in_window(body)
+
+    def test_sidebar_shows_slides_and_reorders(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.model.slides[0]["objects"][0]["text"] = "first"
+            dv.add_slide("blank")
+            win._toc_btn.set_active(True)     # Ctrl+T
+            self._settle()
+            self.assertTrue(win._toc_revealer.get_reveal_child())
+            # one row per slide, provider is the deck's (no export/insert)
+            rows = []
+            i = 0
+            while (row := win._toc_list.get_row_at_index(i)) is not None:
+                rows.append(row)
+                i += 1
+            self.assertEqual(len(rows), 2)
+            p = win._thumb_provider
+            self.assertFalse(p.can_export)
+            self.assertFalse(p.can_insert_files)
+            self.assertFalse(p.confirm_reorder)
+            self.assertEqual(
+                win._toc_list.get_selection_mode(), Gtk.SelectionMode.NONE)
+            # reorder through the generic gap path: no confirmation dialog
+            win._reorder_to_gap(0, 2)         # move slide 1 behind slide 2
+            self.assertEqual(
+                dv.model.slides[1]["objects"][0].get("text"), "first")
+            win._global_undo()                # a slide move is one Ctrl+Z away
+            self.assertEqual(
+                dv.model.slides[0]["objects"][0].get("text"), "first")
+            # clicking a row activates the slide
+            win._thumb_provider.activate(1)
+            self.assertEqual(dv.current, 1)
+
+        self._run_in_window(body)
+
+    def test_math_markup_renders_in_export(self):
+        deck = self._deck()
+        # the markup hook is wired by sidemark's lazy import
+        self.assertIsNotNone(deck.notes_to_markup)
+        m = deck.DeckModel()
+        m.slides[0]["objects"][0]["text"] = r"\alpha x^2 **bold**"
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "out.pdf")
+            deck.export_pdf(m, pdf)
+            doc = fitz.open(pdf)
+            text = doc[0].get_text()
+            doc.close()
+        self.assertIn("α", text)               # \alpha became the glyph
+        self.assertNotIn("alpha", text)
+        self.assertNotIn("**", text)           # markdown markers dropped
+        self.assertIn("bold", text)
+
+    def test_presenter_opens_for_deck(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.add_slide("content")
+            dv.set_current(0)
+            win._present_btn.set_active(True)   # F5
+            self._settle(200)
+            deck = self._deck()
+            self.assertIsInstance(win._presenter, deck.DeckPresenterWindow)
+            self.assertTrue(win._present_bar.get_visible())
+            # navigation from either side stays in step
+            win._nav_page(1)
+            self.assertEqual(dv.current, 1)
+            win._presenter._nav(-1)
+            self.assertEqual(dv.current, 0)
+            win._present_btn.set_active(False)
+            self.assertIsNone(win._presenter)
+
+        self._run_in_window(body)
+
+    def test_deck_autosave_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                win._on_new_presentation()
+                self._settle()
+                dv = win._deck_view
+                path = os.path.join(d, "talk.smdeck")
+                dv.save(path)
+                win._deck_path = path
+                win._is_untitled = False
+                dv.model.slides[0]["objects"][0]["text"] = "unsaved"
+                win._mark_dirty()
+                s = win._active_session
+                win._write_deck_autosave_for(s)
+                snap_dir = sidemark._autosave_dir_for(path)
+                snap = os.path.join(snap_dir, "deck.smdeck")
+                self.assertTrue(os.path.exists(snap))
+                deck = self._deck()
+                m = deck.DeckModel.load(snap)
+                self.assertEqual(m.slides[0]["objects"][0]["text"], "unsaved")
+                # saving discards the snapshot (changes are on disk now)
+                win._on_save()
+                self.assertFalse(os.path.exists(snap))
+
+            self._run_in_window(body)
+
+    def test_pageupdown_flips_slides(self):
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.add_slide("blank")
+            dv.set_current(0)
+            win._nav_page(1)
+            self.assertEqual(dv.current, 1)
+            win._nav_page(-1)
+            self.assertEqual(dv.current, 0)
+            win._nav_page(-1)                 # clamped at the first slide
+            self.assertEqual(dv.current, 0)
 
         self._run_in_window(body)
 
