@@ -207,6 +207,18 @@ Inside an inline `` `code` `` span nothing above is applied — the text renders
 
 Stored as plain text in the `.md` sidecar — renders cleanly in Obsidian and any Markdown viewer.
 
+### Links (notes)
+
+Wiki-style `[[…]]` links in the notes jump to another slide — in the same deck or a different document — which is handy for pointing "this builds on that earlier slide." They render as a styled link (brackets hidden); **Ctrl+click** follows one:
+
+| Syntax | Follows to |
+|--------|-----------|
+| `[[#page=12]]` or `[[#12]]` | page 12 of the current document |
+| `[[lecture2.pdf]]` | opens `lecture2.pdf` (in a tab) |
+| `[[lecture2.pdf#page=5]]` or `[[lecture2.pdf#5]]` | opens `lecture2.pdf` at page 5 |
+
+Paths are relative to the current document. The link target is kept verbatim (never symbol-substituted), and the `.md` keeps the plain `[[…]]` text, so it round-trips through Obsidian (which uses the same wiki-link syntax). The existing `![[name.pdf]]` embed marker is left alone.
+
 ### Search
 
 | Key | Action |

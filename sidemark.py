@@ -2930,38 +2930,56 @@ def _apply_accents(text):
     return _MD_ACCENT_RE.sub(sub, text)
 
 
-# Inline `code` spans are literal: nothing inside them is re-rendered — no
-# LaTeX symbol substitution, no super/subscripts, no bold/italic — matching how
-# a Markdown viewer treats code. _split_code_spans chops a line into
-# (segment, is_code) runs so the display transforms below skip the code ones.
+# Two kinds of span render verbatim — no LaTeX symbols, super/subscripts or
+# bold/italic inside them: inline `code` (like any Markdown viewer) and
+# [[wiki links]] (a link target must never be mangled). _MD_LINK_RE's negative
+# lookbehind leaves the ![[embed]] line NotesModel writes alone. _split_markup
+# chops a line into (segment, kind) runs — kind is 'text', 'code' or 'link' —
+# so the display transforms below can treat each appropriately.
 _MD_CODE_SPAN_RE = re.compile(r'`[^`\n]+?`')
+_MD_LINK_RE = re.compile(r'(?<!\!)\[\[([^\[\]\n]+?)\]\]')
+_MD_SPAN_RE = re.compile(_MD_CODE_SPAN_RE.pattern + '|' + _MD_LINK_RE.pattern)
 
 
-def _split_code_spans(text):
-    """Split text into (segment, is_code) runs, is_code True for `code` spans
-    (backticks included). A line with no code spans yields one (text, False)."""
+def _split_markup(text):
+    """Split text into (segment, kind) runs — kind in {'text','code','link'}.
+    A line with no code/link spans yields a single ('...', 'text')."""
     out, i = [], 0
-    for m in _MD_CODE_SPAN_RE.finditer(text):
+    for m in _MD_SPAN_RE.finditer(text):
         if m.start() > i:
-            out.append((text[i:m.start()], False))
-        out.append((m.group(0), True))
+            out.append((text[i:m.start()], 'text'))
+        out.append((m.group(0), 'code' if m.group(0)[0] == '`' else 'link'))
         i = m.end()
     if i < len(text) or not out:
-        out.append((text[i:], False))
+        out.append((text[i:], 'text'))
     return out
+
+
+def _parse_note_link(inner):
+    """A [[target]] body → {'path', 'page', 'label'}. Forms:
+    `#page=N` / `#N` (same document), `file.pdf`, `file.pdf#page=N` / `#N`.
+    `path` is None for a same-document link; `page` is 1-based or None."""
+    inner = inner.strip()
+    path, frag = (inner.split('#', 1) + [''])[:2] if '#' in inner else (inner, '')
+    page = None
+    if frag:
+        mm = re.fullmatch(r'(?:page=)?(\d+)', frag.strip())
+        if mm:
+            page = int(mm.group(1))
+    return {"path": path.strip() or None, "page": page, "label": inner}
 
 
 def _symbolize(text):
     """Replace LaTeX-style \\commands with their Unicode symbols (display only),
-    leaving the contents of `code` spans untouched."""
+    leaving the contents of `code` spans and [[wiki links]] untouched."""
     def sub_seg(seg):
         seg = _MD_SYMBOL_RE.sub(
             lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), seg)
         # Accents run after symbol substitution so \hat{\alpha} → α̂ (the inner
         # \alpha is already α by the time the accent is placed on it).
         return _apply_accents(seg)
-    return "".join(seg if is_code else sub_seg(seg)
-                   for seg, is_code in _split_code_spans(text))
+    return "".join(sub_seg(seg) if kind == 'text' else seg
+                   for seg, kind in _split_markup(text))
 
 
 # Shared inline-Markdown / script regexes (used by the notes editor's TextTag
@@ -2992,9 +3010,13 @@ def _notes_to_pango_markup(text):
         return f"<tt>{m.group(3)}</tt>"
 
     parts = []
-    for seg, is_code in _split_code_spans(text):
-        if is_code:                      # `code` → verbatim monospace
+    for seg, kind in _split_markup(text):
+        if kind == 'code':               # `code` → verbatim monospace
             parts.append(f"<tt>{GLib.markup_escape_text(seg[1:-1])}</tt>")
+            continue
+        if kind == 'link':               # [[link]] → underlined label (verbatim)
+            label = _parse_note_link(seg[2:-2])["label"]
+            parts.append(f"<u>{GLib.markup_escape_text(label)}</u>")
             continue
         # symbols first, then escape, then scripts, then bold/italic. The
         # segment has no backticks, so _inline only ever sees bold/italic here.
@@ -3754,6 +3776,8 @@ class MarkdownNotesView(GtkSource.View):
             "hide":        tag("hide",        invisible=True),
             "superscript": tag("superscript", rise=4000,  scale=0.65),
             "subscript":   tag("subscript",   rise=-2000, scale=0.65),
+            "link":        tag("link",        underline=1,   # Pango.Underline.SINGLE
+                               foreground="#78aeff" if is_dark else "#1a5fb4"),
         }
 
         self._cursor_line = 0
@@ -3783,8 +3807,18 @@ class MarkdownNotesView(GtkSource.View):
         scroll.connect("scroll", self._on_scroll)
         self.add_controller(scroll)
 
+        # Ctrl+click follows a [[wiki link]]; hover over one shows a hand cursor
+        click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
+        click.connect("released", self._on_link_click)
+        self.add_controller(click)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_link_motion)
+        self.add_controller(motion)
+
         # set by the window: called with +1 / -1 / 0 to grow / shrink / reset
         self.font_zoom_cb = None
+        # set by the window: called with a _parse_note_link() dict to navigate
+        self.on_follow_link = None
 
     # ── formatting shortcuts ──────────────────────────────────────────────────
 
@@ -3795,6 +3829,44 @@ class MarkdownNotesView(GtkSource.View):
                 self.font_zoom_cb(-1 if dy > 0 else 1)
             return True
         return False
+
+    # ── [[wiki links]] ────────────────────────────────────────────────────────
+
+    def _link_target_at(self, wx, wy):
+        """The _parse_note_link() dict for the [[link]] under widget coords
+        (wx, wy), or None. Re-parses the line, so it works whether or not the
+        brackets are hidden by the render pass."""
+        bx, by = self.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, int(wx), int(wy))
+        over, it = self.get_iter_at_location(bx, by)
+        if not over or not it.has_tag(self._t["link"]):
+            return None
+        buf = self.get_buffer()
+        ok, ls = buf.get_iter_at_line(it.get_line())
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        text = buf.get_text(ls, le, False)
+        off = it.get_line_offset()
+        for m in _MD_LINK_RE.finditer(text):
+            if m.start() <= off < m.end():
+                return _parse_note_link(m.group(1))
+        return None
+
+    def _on_link_click(self, gesture, _n_press, x, y):
+        # Ctrl+click follows the link; a plain click edits as usual
+        ev = gesture.get_current_event()
+        if not ev or not (ev.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK):
+            return
+        link = self._link_target_at(x, y)
+        if link and self.on_follow_link:
+            self.on_follow_link(link)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _on_link_motion(self, _motion, x, y):
+        over = self._link_target_at(x, y) is not None
+        self.set_cursor(Gdk.Cursor.new_from_name(
+            "pointer" if over else "text", None))
 
     def _on_key(self, ctrl, keyval, keycode, state):
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
@@ -4225,13 +4297,22 @@ class MarkdownNotesView(GtkSource.View):
     def _highlight_line(self, buf, ls, ln, text):
         on_cursor = (ln == self._cursor_line)
 
-        # `code` spans render verbatim: bold/italic and super/subscript inside
-        # them are left as literal text (a Markdown viewer treats code the same).
+        # `code` spans and [[wiki links]] render verbatim: bold/italic and
+        # super/subscript inside them stay literal (a Markdown viewer, and a
+        # link target, treat them the same).
         code_ranges = [(m.start(), m.end())
                        for m in _MD_CODE_SPAN_RE.finditer(text)]
+        link_ranges = [(m.start(), m.end())
+                       for m in _MD_LINK_RE.finditer(text)
+                       if not any(cs <= m.start() and m.end() <= ce
+                                  for cs, ce in code_ranges)]
 
         def in_code(a, b):
             return any(cs <= a and b <= ce for cs, ce in code_ranges)
+
+        def protected(a, b):
+            return any(cs <= a and b <= ce
+                       for cs, ce in code_ranges + link_ranges)
 
         def at(n):
             it = ls.copy(); it.forward_chars(n); return it
@@ -4251,11 +4332,20 @@ class MarkdownNotesView(GtkSource.View):
             hide(0, m.end())
             return
 
+        # [[wiki links]] → styled + clickable; brackets hidden off cursor line
+        for m in _MD_LINK_RE.finditer(text):
+            a, b = m.start(), m.end()
+            if in_code(a, b):
+                continue                     # [[..]] inside `code` is literal
+            apply("link", a + 2, b - 2)
+            hide(a, a + 2)                   # [[
+            hide(b - 2, b)                   # ]]
+
         # Inline: bold / italic / code (combined regex handles priority)
         for m in self._INLINE.finditer(text):
             a, b = m.start(), m.end()
-            if m.group(3) is None and in_code(a, b):
-                continue                     # bold/italic inside `code` stays literal
+            if m.group(3) is None and protected(a, b):
+                continue                     # bold/italic inside `code`/[[link]] literal
             if m.group(1) is not None:       # **bold**
                 apply("bold", a + 2, b - 2)
                 hide(a, a + 2)
@@ -4273,8 +4363,8 @@ class MarkdownNotesView(GtkSource.View):
         if not on_cursor:
             for m in self._SCRIPT_RE.finditer(text):
                 a, b = m.start(), m.end()
-                if in_code(a, b):
-                    continue                 # ^/_ inside `code` stays literal
+                if protected(a, b):
+                    continue                 # ^/_ inside `code`/[[link]] stays literal
                 tag_name = "superscript" if m.group(1) == '^' else "subscript"
                 if m.group(2) is not None:   # braced: ^{content}
                     apply("hide", a, a + 2)  # hide ^{ or _{
@@ -5740,6 +5830,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # editor and back — every window method follows _notes_view
         s._panel_notes_view = s._notes_view
         s._notes_view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
+        s._notes_view.on_follow_link = lambda link: s.win._follow_note_link(link)
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
@@ -5861,6 +5952,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
         # and margins together), not the persistent notes-font setting
         tp.view.font_zoom_cb = lambda d: tp.zoom_step(d)
+        tp.view.on_follow_link = lambda link: s.win._follow_note_link(link)
         tp.view.get_buffer().connect(
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
@@ -6500,6 +6592,33 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _go_to_page(self, idx):
         self._commit_note()
         self.canvas.go_to_page(idx)
+
+    def _follow_note_link(self, link):
+        """Navigate a [[wiki link]] clicked in the notes (Ctrl+click). A same-
+        document link (`[[#page=N]]`) jumps the page; a link naming a file opens
+        it in a tab (at `#page=N` when given), reusing the current tab if that
+        file is already the open document."""
+        path, page = link.get("path"), link.get("page")
+
+        def jump(idx):
+            if idx is not None and self.canvas.document:
+                self._go_to_page(max(0, idx - 1))   # links are 1-based
+
+        if not path:
+            jump(page)
+            return
+        base = os.path.dirname(
+            self._path or self._active_notes_path or self._notes_path or "")
+        full = path if os.path.isabs(path) else os.path.normpath(
+            os.path.join(base, path))
+        if not os.path.isfile(full):
+            self._toast(f"Link target not found: {path}")
+            return
+        if self._path and os.path.samefile(full, self._path):
+            jump(page)          # link into the document we're already showing
+            return
+        self.open_file_in_tab(full)
+        jump(page)
 
     def _nav_page(self, delta):
         """Relative page navigation (PageUp/Down, mouse back/forward): zoomed

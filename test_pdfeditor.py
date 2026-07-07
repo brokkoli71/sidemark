@@ -1982,6 +1982,12 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertEqual(_symbolize(r'`\alpha` and \beta'), '`\\alpha` and β')
         self.assertEqual(_symbolize(r'`\hat{x}`'), r'`\hat{x}`')
 
+    def test_symbolize_skips_wiki_link(self):
+        from sidemark import _symbolize
+        # a link target must never have its \commands turned into glyphs
+        self.assertEqual(_symbolize(r'[[a\beta.pdf]] then \beta'),
+                         '[[a\\beta.pdf]] then β')
+
     def test_code_span_command_not_substituted_in_buffer(self):
         v, buf = self._render_line0(r'`\sum` here')
         # the \sum inside backticks survives; nothing outside to substitute
@@ -2010,6 +2016,47 @@ class TestLatexFormatting(unittest.TestCase):
         for off in range(1, 9):
             it = buf.get_iter_at_line(0)[1]; it.forward_chars(off)
             self.assertFalse(it.has_tag(v._t["bold"]), off)
+
+    # ── [[wiki links]] render clickable, brackets hidden, verbatim inside ─────
+    def test_wiki_link_tag_applied_and_brackets_hidden(self):
+        v, buf = self._render_line0('[[a_b.pdf]]')
+        # '[' '[' 'a' '_' 'b' ... : inner is tagged 'link', the [[ is hidden
+        inner = buf.get_iter_at_line(0)[1]; inner.forward_chars(2)   # 'a'
+        self.assertTrue(inner.has_tag(v._t["link"]))
+        bracket = buf.get_iter_at_line(0)[1]                          # '['
+        self.assertTrue(bracket.has_tag(v._t["hide"]))
+
+    def test_wiki_link_suppresses_subscript(self):
+        v, buf = self._render_line0('[[a_b.pdf]]')
+        it = buf.get_iter_at_line(0)[1]; it.forward_chars(4)          # 'b' after _
+        self.assertFalse(it.has_tag(v._t["subscript"]))
+
+    def test_embed_marker_is_not_linkified(self):
+        v, buf = self._render_line0('![[deck.pdf]]')
+        it = buf.get_iter_at_line(0)[1]; it.forward_chars(3)          # inside [[
+        self.assertFalse(it.has_tag(v._t["link"]))
+
+
+class TestNoteLinkParse(unittest.TestCase):
+    def _p(self, s):
+        from sidemark import _parse_note_link
+        return _parse_note_link(s)
+
+    def test_same_document_page(self):
+        self.assertEqual(self._p('#page=12'), {"path": None, "page": 12,
+                                               "label": "#page=12"})
+        self.assertEqual(self._p('#5')["page"], 5)
+
+    def test_file_only(self):
+        self.assertEqual(self._p('deck.pdf'),
+                         {"path": "deck.pdf", "page": None, "label": "deck.pdf"})
+
+    def test_file_and_page(self):
+        got = self._p('sub/l2.pdf#page=3')
+        self.assertEqual((got["path"], got["page"]), ("sub/l2.pdf", 3))
+
+    def test_bad_fragment_has_no_page(self):
+        self.assertIsNone(self._p('a.pdf#nope')["page"])
 
 
 class TestCalloutMarkup(unittest.TestCase):
@@ -2059,6 +2106,18 @@ class TestCalloutMarkup(unittest.TestCase):
         self.assertEqual(
             self._markup(r'\alpha `x_1` x^2'),
             'α <tt>x_1</tt> x<sup>2</sup>')
+
+    def test_wiki_link_renders_underlined_and_verbatim(self):
+        # a [[link]] shows as an underlined label with nothing else applied
+        self.assertEqual(self._markup('see [[#page=12]]'),
+                         'see <u>#page=12</u>')
+        self.assertEqual(self._markup('[[my_file.pdf]]'),
+                         '<u>my_file.pdf</u>')      # the _ is NOT a subscript
+        self.assertTrue(self._parses(self._markup(r'[[a\beta.pdf#page=3]]')))
+
+    def test_embed_line_is_not_a_link(self):
+        # the ![[name.pdf]] embed marker must not be treated as a wiki link
+        self.assertEqual(self._markup('![[deck.pdf]]'), '![[deck.pdf]]')
 
 
 # ── export ────────────────────────────────────────────────────────────────────
@@ -7535,6 +7594,65 @@ class TestOpenTargetReuse(unittest.TestCase):
                 self.assertFalse(reused)
                 self.assertEqual(len(self._editor_windows(app)), n + 1)
         self._drive(body)
+
+
+class TestFollowNoteLink(unittest.TestCase):
+    """Feature B: Ctrl+clicking a [[wiki link]] in the notes navigates —
+    same-document links jump the page, file links open a tab at the page."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.notelink")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_same_document_page_jump(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "a.pdf"); make_pdf(pdf, n_pages=5)
+                win._do_open_file(pdf)
+                win._follow_note_link(
+                    {"path": None, "page": 3, "label": "#page=3"})
+                self.assertEqual(win.canvas.current_page_idx, 2)   # 1-based → 0
+        self._run_in_window(body)
+
+    def test_cross_document_opens_tab_at_page(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=2)
+                b = os.path.join(d, "b.pdf"); make_pdf(b, n_pages=4)
+                win._do_open_file(a)
+                win._follow_note_link(
+                    {"path": "b.pdf", "page": 2, "label": "b.pdf#page=2"})
+                self.assertEqual(
+                    os.path.basename(win._active_session._path), "b.pdf")
+                self.assertEqual(win.canvas.current_page_idx, 1)
+        self._run_in_window(body)
+
+    def test_missing_target_is_ignored(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=1)
+                win._do_open_file(a)
+                win._follow_note_link(
+                    {"path": "nope.pdf", "page": None, "label": "nope.pdf"})
+                # no exception, still on the original document
+                self.assertEqual(
+                    os.path.basename(win._active_session._path), "a.pdf")
+        self._run_in_window(body)
 
 
 if __name__ == "__main__":
