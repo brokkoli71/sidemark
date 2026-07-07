@@ -104,12 +104,19 @@ PyMuPDF (`fitz`), cairo, numpy; LibreOffice headless is an *optional* backend
 
 ## Current state (2026-07)
 
-On the `deck` branch: Deck v2 (unified window UI) is committed+pushed
-(`e72ccee`); PPTX→deck import (image + speaker notes) is committed
-(ideas.csv row 98). **Next up: Phase 2 — deck themes + PowerPoint theme
-import** (background/fonts/colors/placeholder-layout geometry so new slides
-match an imported deck; unblocks structured PPTX text import, row 99). Then:
-Cairo smart-arts, build-step animations, Claude-generated LaTeX/TikZ figures.
-Roadmap detail + the deck v2 design rationale live in the plan
-`~/.claude/plans/linked-launching-allen.md`. Open cosmetic polish: ideas.csv
-row 100.
+On the `deck` branch, all pushed. Shipped since v2: PPTX→deck import
+(image + speaker notes, ideas.csv row 98) and the deck presenter's
+next-slide preview + a fix for the present button being hidden when
+launching straight into `--presentation` (row 101, HEAD `4320e46`).
+
+**Next up: Phase 2 — deck themes + PowerPoint theme import** (a per-deck
+theme: background/fonts/colors/placeholder-layout geometry, so new slides
+match an imported deck; this also builds the OOXML placeholder-chain
+machinery that structured PPTX text import (row 99) needs). Then: Cairo
+smart-arts, build-step animations, Claude-generated LaTeX/TikZ figures.
+Roadmap detail + the deck v2/import design rationale live in the plan
+`~/.claude/plans/linked-launching-allen.md`.
+
+Open cosmetic polish: ideas.csv row 100 (row 100 follow-up #2's
+present-button half is now fixed; the deck bar still doesn't fold, it
+scrolls).
