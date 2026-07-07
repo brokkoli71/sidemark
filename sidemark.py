@@ -9373,13 +9373,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Render every page of the converted PDF to a PNG for `deck_from_images`,
         returning [(png_bytes, w, h, notes)] in page order. Runs off the main
         thread; touches only PyMuPDF, so it needs no GTK."""
+        # LibreOffice writes a tagged (accessibility) structure tree that MuPDF
+        # dislikes — rendering each page prints a harmless "No common ancestor in
+        # structure tree" to stderr per page. The pixmaps are correct, so mute
+        # MuPDF's stderr chatter for the duration and restore it afterwards.
+        prev = fitz.TOOLS.mupdf_display_errors()   # read (setter returns the new value)
+        fitz.TOOLS.mupdf_display_errors(False)
         images = []
-        with fitz.open(pdf_path) as doc:
-            for i, page in enumerate(doc):
-                zoom = self.PPTX_IMPORT_WIDTH / max(page.rect.width, 1)
-                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-                images.append((pix.tobytes("png"), pix.width, pix.height,
-                               slide_notes.get(i, "")))
+        try:
+            with fitz.open(pdf_path) as doc:
+                for i, page in enumerate(doc):
+                    zoom = self.PPTX_IMPORT_WIDTH / max(page.rect.width, 1)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                          alpha=False)
+                    images.append((pix.tobytes("png"), pix.width, pix.height,
+                                   slide_notes.get(i, "")))
+        finally:
+            fitz.TOOLS.mupdf_display_errors(prev)
         return images
 
     def _open_imported_deck(self, images, title):
