@@ -41,9 +41,11 @@ pkgver() {
 package() {
     cd "$srcdir/sidemark"
 
-    # Main script
+    # Main script + the Deck presentation editor module it lazy-imports
     install -Dm755 sidemark.py \
         "$pkgdir/usr/share/sidemark/sidemark.py"
+    install -Dm644 deck.py \
+        "$pkgdir/usr/share/sidemark/deck.py"
 
     # Wrapper in PATH
     install -dm755 "$pkgdir/usr/bin"

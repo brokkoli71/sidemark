@@ -104,13 +104,16 @@ Usage:
   sidemark [OPTIONS] [FILE]
 
 Arguments:
-  FILE                  PDF, PowerPoint (.pptx), or Markdown/text file to open.
-                        Any other file opens as text in the notes panel.
+  FILE                  PDF, PowerPoint (.pptx), Markdown/text, or Sidemark
+                        Deck (.smdeck) file to open. Any other file opens as
+                        text in the notes panel.
 
 Options:
   -h, --help            Show this help message and exit.
   -v, --verbose         Enable verbose (debug-level) logging.
       --page N          Open FILE at page N (0-based page index).
+      --presentation    Start with a new presentation (Sidemark Deck);
+                        --deck is an alias.
       --list-recent     Print recent files as "name<TAB>path" and exit
                         (for launcher integrations); no window is shown.
 
@@ -118,6 +121,8 @@ Examples:
   sidemark lecture.pdf
   sidemark --page 5 lecture.pdf
   sidemark notes.md
+  sidemark --presentation
+  sidemark talk.smdeck
 """
 
 # Fast paths handled before any GTK import: print and exit straight away.
@@ -4268,6 +4273,7 @@ class TextPageView(Gtk.Overlay):
     def __init__(self, font_px=13):
         super().__init__()
         self.tool = "text"        # text | pen | highlighter | eraser
+        self.pan_tool = False     # pan rides on top: tool stays "text"
         self.zoom = 1.0           # sheet zoom: paper, text and ink together
         self._base_font_px = font_px
         self.font_px = font_px    # effective (base × zoom); strokes scale with it
@@ -4332,19 +4338,34 @@ class TextPageView(Gtk.Overlay):
         self.ink.add_controller(drag)
         self._drag = drag
 
-        # Alt+drag draws with the pen even while the text tool is active — a
-        # quick annotation without switching tools. Capture phase on the
-        # overlay sees the press before the TextView; without Alt the gesture
-        # denies itself so clicking and selecting text work untouched.
+        # One capture-phase drag on the overlay routes the modifier gestures,
+        # mirroring the PDF canvas: Alt+drag draws with the pen, and Ctrl+drag
+        # / middle-drag / the pan tool scroll the sheet. It sees the press
+        # before the TextView and denies itself for anything else, so clicking
+        # and selecting text work untouched.
         self._alt_saved_tool = None
-        alt = Gtk.GestureDrag()
-        alt.set_button(Gdk.BUTTON_PRIMARY)
-        alt.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        alt.connect("drag-begin", self._on_alt_begin)
-        alt.connect("drag-update", self._on_alt_update)
-        alt.connect("drag-end", self._on_alt_end)
-        self.add_controller(alt)
-        self._alt_drag = alt
+        self._pan_start = None
+        cap = Gtk.GestureDrag()
+        cap.set_button(0)
+        cap.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        cap.connect("drag-begin", self._on_capture_begin)
+        cap.connect("drag-update", self._on_capture_update)
+        cap.connect("drag-end", self._on_capture_end)
+        self.add_controller(cap)
+        self._capture_drag = cap
+
+        # MX Master thumb button (btn 10): hold to pan — same legacy-event
+        # approach as the canvas (gesture APIs drop button-10 sequences)
+        self._thumb_panning = False
+        self._thumb_origin = (0.0, 0.0)
+        self._thumb_start = (0.0, 0.0)
+        self._mouse_pos = (0.0, 0.0)
+        thumb = Gtk.EventControllerLegacy()
+        thumb.connect("event", self._on_thumb_event)
+        self.add_controller(thumb)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        self.add_controller(motion)
 
         # the ink must repaint whenever the sheet scrolls or reflows under it
         self.scroll.get_vadjustment().connect(
@@ -4357,12 +4378,17 @@ class TextPageView(Gtk.Overlay):
     # ── tool routing ─────────────────────────────────────────────────────────
 
     def set_tool(self, tool):
-        """Anything that isn't a drawing tool falls back to text editing."""
+        """Drawing tools ink the sheet; pan drags it; anything else falls
+        back to text editing."""
+        self.pan_tool = (tool == "pan")
         self.tool = tool if tool in ("pen", "highlighter", "eraser") else "text"
         inking = self.tool != "text"
         self.ink.set_can_target(inking)
         self.ink.set_cursor(
             Gdk.Cursor.new_from_name("crosshair") if inking else None)
+        # with the pan tool the caret makes no sense — show a grab hand
+        self.view.set_cursor(Gdk.Cursor.new_from_name(
+            "grab" if self.pan_tool else "text"))
         if not inking and self.current_stroke:
             self.current_stroke = []
             self.ink.queue_draw()
@@ -4457,26 +4483,71 @@ class TextPageView(Gtk.Overlay):
 
     # ── drawing gestures ─────────────────────────────────────────────────────
 
-    def _on_alt_begin(self, gesture, x, y):
-        state = gesture.get_current_event_state()
-        if self.tool != "text" or not state & Gdk.ModifierType.ALT_MASK:
-            gesture.set_state(Gtk.EventSequenceState.DENIED)
-            return
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        self._alt_saved_tool = self.tool
-        self.tool = "pen"           # style + erase checks read self.tool
-        self._on_ink_begin(gesture, x, y)
+    def _pan_by(self, dx, dy):
+        """Scroll the sheet so the content follows the pointer."""
+        h, v = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        sh, sv = self._pan_start
+        h.set_value(sh - dx)
+        v.set_value(sv - dy)
 
-    def _on_alt_update(self, gesture, dx, dy):
-        if self._alt_saved_tool is not None:
+    def _on_capture_begin(self, gesture, x, y):
+        btn = gesture.get_current_button()
+        state = gesture.get_current_event_state()
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        # middle-drag / Ctrl+drag / the pan tool: scroll the sheet
+        if btn == 2 or (btn == 1 and (ctrl or self.pan_tool)):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._pan_start = (self.scroll.get_hadjustment().get_value(),
+                               self.scroll.get_vadjustment().get_value())
+            return
+        # Alt+drag with the text tool: draw with the pen while held
+        if (btn == 1 and self.tool == "text"
+                and state & Gdk.ModifierType.ALT_MASK):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._alt_saved_tool = self.tool
+            self.tool = "pen"       # style + erase checks read self.tool
+            self._on_ink_begin(gesture, x, y)
+            return
+        gesture.set_state(Gtk.EventSequenceState.DENIED)
+
+    def _on_capture_update(self, gesture, dx, dy):
+        if self._pan_start is not None:
+            self._pan_by(dx, dy)
+        elif self._alt_saved_tool is not None:
             self._on_ink_update(gesture, dx, dy)
 
-    def _on_alt_end(self, gesture, dx, dy):
+    def _on_capture_end(self, gesture, dx, dy):
+        if self._pan_start is not None:
+            self._pan_start = None
+            return
         if self._alt_saved_tool is None:
             return
         self._on_ink_end(gesture, dx, dy)
         self.tool = self._alt_saved_tool
         self._alt_saved_tool = None
+
+    def _on_thumb_event(self, ctrl, event):
+        if event is None:   # PyGObject sometimes fails to marshal the arg
+            event = ctrl.get_current_event()
+        if event is None:
+            return False
+        t = event.get_event_type()
+        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
+            self._thumb_panning = True
+            self._thumb_origin = self._mouse_pos
+            self._thumb_start = (self.scroll.get_hadjustment().get_value(),
+                                 self.scroll.get_vadjustment().get_value())
+        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
+            self._thumb_panning = False
+        return False
+
+    def _on_motion(self, _ctrl, x, y):
+        if self._thumb_panning:
+            ox, oy = self._thumb_origin
+            sh, sv = self._thumb_start
+            self.scroll.get_hadjustment().set_value(sh - (x - ox))
+            self.scroll.get_vadjustment().set_value(sv - (y - oy))
+        self._mouse_pos = (x, y)
 
     def _on_ink_begin(self, gesture, x, y):
         button = gesture.get_current_button()
@@ -4675,6 +4746,134 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
 
+class _ThumbnailProvider:
+    """What the sidebar's generic thumbnail builder needs from a mode.
+
+    The sidebar *shell* — Ctrl+T toggle, revealer, rows, current marker,
+    lazy rendering, drag-to-reorder — is one shared code path; a provider
+    supplies the mode's content and semantics. Features written against this
+    interface reach every mode that implements the hook; inherently mode-bound
+    behaviors are gated by the capability flags instead of mode checks:
+    `can_export` (drag rows out as files + Ctrl+click multi-select),
+    `can_insert_files` (drop a PDF between rows inserts its pages),
+    `confirm_reorder` (guard reorders behind the confirmation dialog)."""
+
+    can_export = False
+    can_insert_files = False
+    confirm_reorder = False
+    noun = "page"                     # for tooltips / toasts
+
+    def count(self):
+        raise NotImplementedError
+
+    def thumb_size(self, i):
+        """(width, height) the i-th thumbnail will occupy, pre-render."""
+        raise NotImplementedError
+
+    def render(self, i):
+        """Gdk.Texture for the i-th item (called lazily from an idle)."""
+        raise NotImplementedError
+
+    def activate(self, i):
+        """Row clicked: show item i in the editor."""
+        raise NotImplementedError
+
+    def reorder(self, src, dst):
+        """Move item src so it lands at index dst."""
+        raise NotImplementedError
+
+    def invalidated(self):
+        """True when the underlying document was swapped out — pending lazy
+        renders must stop."""
+        return False
+
+
+class _PdfThumbnails(_ThumbnailProvider):
+    can_export = True
+    can_insert_files = True
+    confirm_reorder = True
+
+    def __init__(self, win):
+        self.win = win
+        self.doc = win.canvas.document
+
+    def count(self):
+        return len(self.doc)
+
+    def thumb_size(self, i):
+        rect = self.doc[i].rect
+        scale = (self.win.THUMB_WIDTH / rect.width) if rect.width else 0.2
+        return self.win.THUMB_WIDTH, int(rect.height * scale)
+
+    def render(self, i):
+        page = self.doc[i]
+        s = self.win.THUMB_WIDTH / page.rect.width
+        pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
+        return Gdk.MemoryTexture.new(
+            pix.width, pix.height, Gdk.MemoryFormat.R8G8B8,
+            GLib.Bytes.new(pix.samples), pix.stride)
+
+    def activate(self, i):
+        self.win._go_to_page(i)
+        self.win.canvas.grab_focus()
+
+    def reorder(self, src, dst):
+        self.win._do_reorder(src, dst)
+
+    def tooltip(self, i):
+        return (f"Page {i + 1} — click to open (PageUp/PageDown to flip), "
+                "Ctrl+click to select, drag to reorder or export")
+
+    def invalidated(self):
+        return self.win.canvas.document is not self.doc
+
+
+class _DeckThumbnails(_ThumbnailProvider):
+    noun = "slide"
+
+    def __init__(self, win):
+        self.win = win
+        self.dv = win._deck_view
+        self.model = win._deck_view.model
+
+    def count(self):
+        return len(self.model.slides)
+
+    def thumb_size(self, i):
+        w = self.win.THUMB_WIDTH
+        return w, round(w * 9 / 16)
+
+    def render(self, i):
+        return _deck_module().render_slide_texture(
+            self.model.slides[i], self.win.THUMB_WIDTH)
+
+    def activate(self, i):
+        self.dv.set_current(i)
+        self.dv.canvas.grab_focus()
+
+    def reorder(self, src, dst):
+        self.dv.move_slide(src, dst)   # one Ctrl+Z away — no confirmation
+
+    def tooltip(self, i):
+        return f"Slide {i + 1} — click to open, drag to reorder"
+
+    def invalidated(self):
+        return (not self.win._deck_mode
+                or self.win._deck_view is not self.dv
+                or self.dv.model is not self.model)
+
+
+def _deck_module():
+    """Lazy import of the Deck presentation editor (deck.py beside this file).
+    Deferred so plain PDF/notes sessions never pay for it."""
+    import deck as _deck
+    _deck.logger = logger
+    # deck textboxes render inline math / Markdown with the same machinery as
+    # callouts (\alpha→α, x^2 superscripts, **bold**, *italic*, `code`)
+    _deck.notes_to_markup = _notes_to_pango_markup
+    return _deck
+
+
 def _session_prop(name):
     """A per-document attribute that physically lives on the active
     DocumentSession. The window's ~140 methods keep reading/writing self.<name>
@@ -4689,7 +4888,37 @@ class DocumentSession:
     """One open document — its canvas, notes editor, sidebar, search bar and all
     the per-document state. The window owns an Adw.TabView of these and proxies
     the active one's attributes onto itself via _session_prop, so multiple PDFs
-    can be open as tabs without rewriting every method to thread a session."""
+    can be open as tabs without rewriting every method to thread a session.
+
+    A session shows one of three document types — the window is one unified UI
+    and `doc_mode` picks which set of tools it wears:
+      "pdf"  — the PDF canvas with the notes panel beside it
+      "text" — a text-first page (endless Markdown sheet with ink)
+      "deck" — a slide deck (the Deck presentation editor)
+    `_text_mode`/`_deck_mode` are compatibility views over doc_mode — the
+    window's many call sites keep reading/writing the booleans unchanged."""
+
+    @property
+    def _text_mode(self):
+        return self.doc_mode == "text"
+
+    @_text_mode.setter
+    def _text_mode(self, on):
+        if on:
+            self.doc_mode = "text"
+        elif self.doc_mode == "text":
+            self.doc_mode = "pdf"
+
+    @property
+    def _deck_mode(self):
+        return self.doc_mode == "deck"
+
+    @_deck_mode.setter
+    def _deck_mode(self, on):
+        if on:
+            self.doc_mode = "deck"
+        elif self.doc_mode == "deck":
+            self.doc_mode = "pdf"
 
     # names proxied onto PDFEditorWindow via _session_prop — keep in sync with
     # the property declarations in the window class body.
@@ -4701,12 +4930,14 @@ class DocumentSession:
         "_last_anchor_mark", "_link_hint_shown", "_saved_pane_pos", "_pane_anim",
         "_thumb_idle_id", "_current_thumb_row", "_drag_export_dir",
         "_has_toc", "_toc_thumbs", "_drop_indicator_row", "_text_mode",
+        "_deck_mode", "_deck_path",
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
         "_search_revealer", "_search_entry", "_search_label", "_paned",
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
         "_toc_seg_outline", "_toc_seg_pages", "content", "_text_page",
+        "_deck_view", "_canvas_box",
     )
 
     def __init__(self):
@@ -4737,7 +4968,9 @@ class DocumentSession:
         self._has_toc = False
         self._toc_thumbs = False
         self._drop_indicator_row = None
-        self._text_mode = False     # True when the tab shows a text-first page
+        self.doc_mode = "pdf"       # pdf | text | deck (see class docstring)
+        self._deck_path = None      # the .smdeck path (kept off _path so the
+                                    # PDF autosave/save paths never touch it)
         self._tab_page = None       # the Adw.TabPage hosting this session
         # widgets are built by the window and assigned through the proxies
         for w in self.WIDGETS:
@@ -4816,6 +5049,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         GLib.timeout_add_seconds(60, self._autosave_tick)
         self._transient_tool = None    # window-level: highlights a shared tool button
+        self._alt_pen_restore = None   # text page: tool to restore when Alt lets go
         self._ocr_seen = set()         # PDFs we've already offered to OCR this session
         self._ocr_hint_shown = False   # one-time "install ocrmypdf" hint
 
@@ -4977,6 +5211,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _menu_item("New text page",
                    lambda: (menu_pop.popdown(), self._on_new_text_page()),
                    "A blank Markdown page you can write and draw on (Ctrl+Alt+N)")
+        _menu_item("New presentation",
+                   lambda: (menu_pop.popdown(), self._on_new_presentation()),
+                   "Create a slide deck — 16:9 slides with text boxes and "
+                   "images (Ctrl+Alt+P)")
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
         # PDF-only actions — hidden while a text-first page is active
@@ -5002,6 +5240,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                        "Render this page — text and ink — into an A4 PDF"),
         )
         for item in self._text_menu_items:
+            item.set_visible(False)
+        # deck-only actions — shown while a presentation is active
+        self._deck_menu_items = (
+            _menu_item("Export as PDF…",
+                       lambda: (menu_pop.popdown(), self._on_export_deck_pdf()),
+                       "Render the slides into a 16:9 PDF, one page per slide"),
+        )
+        for item in self._deck_menu_items:
             item.set_visible(False)
         msep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         msep2.set_margin_top(2)
@@ -5030,6 +5276,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._has_toc = False
         self._toc_thumbs = False
         self._thumb_idle_id = None
+        self._thumb_provider = None      # the mode's _ThumbnailProvider
         self._current_thumb_row = None   # row carrying the .current-page CSS marker
         self._drop_indicator_row = None  # row carrying the drop-gap CSS marker
         self._drag_export_dir = None   # lazily created temp dir for drag-exported pages
@@ -5460,6 +5707,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pen_btn.set_tooltip_text("Pen settings (colour, width, smoothing)")
         self._pen_btn.set_popover(popover)
 
+        # ── deck cluster: slide + object tools, shown only in deck mode ───────
+        # (routes to the active session's DeckView; see _MODE_CHROME)
+        self._deck_bar = self._build_deck_bar()
+
         # ── undo / redo ────────────────────────────────────────────────────────
         self._undo_btn = Gtk.Button()
         self._undo_btn.set_icon_name("edit-undo-symbolic")
@@ -5507,8 +5758,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._undo_sep = vsep()
         self._header_start = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         for w in (menu_btn, vsep(), self._toc_btn, nav_box, pages_box, vsep(),
-                  tools_box, self._pen_btn, self._undo_sep, self._undo_btn,
-                  self._redo_btn):
+                  tools_box, self._pen_btn, self._deck_bar, self._undo_sep,
+                  self._undo_btn, self._redo_btn):
             self._header_start.append(w)
 
         self._header_end = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -5746,6 +5997,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # ── split pane ────────────────────────────────────────────────────────
         s._saved_pane_pos = 800
         s._pane_anim = None   # running notes show/hide animation
+        s._canvas_box = canvas_box   # deck mode swaps the deck view in here
         s._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         s._paned.set_start_child(canvas_box)
         s._paned.set_resize_start_child(True)
@@ -5830,6 +6082,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         is the document. _notes_view is repointed at the sheet's editor, so
         search, undo, font zoom and note commits keep working unchanged."""
         s = s or self._active_session
+        self._leave_deck_mode(s)
         tp = self._ensure_text_page(s)
         s._text_mode = True
         s._notes_view = tp.view
@@ -5854,29 +6107,226 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if s is self._active_session:
             self._update_header_for_mode()
 
+    # ── deck (presentation) mode ─────────────────────────────────────────────
+
+    # keep in sync with deck.LAYOUT_LABELS (duplicated here so the header can
+    # be built without importing the deck module)
+    _DECK_LAYOUTS = (("title", "Title slide"),
+                     ("content", "Heading + text"),
+                     ("blank", "Blank"))
+
+    def _build_deck_bar(self):
+        """The deck mode's extra header tools: slide ops, object insertion and
+        textbox styling. One cluster per window — it always drives the active
+        session's DeckView."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self._syncing_deck_cluster = False
+
+        new_btn = Gtk.MenuButton()
+        new_btn.set_icon_name("list-add-symbolic")
+        new_btn.set_tooltip_text("New slide")
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for key, label in self._DECK_LAYOUTS:
+            b = Gtk.Button()
+            b.add_css_class("flat")
+            b.set_child(Gtk.Label(label=label, xalign=0))
+            b.connect("clicked", lambda _b, k=key: (
+                pop.popdown(), self._deck_view.add_slide(k)))
+            box.append(b)
+        pop.set_child(box)
+        new_btn.set_popover(pop)
+        bar.append(new_btn)
+
+        del_btn = Gtk.Button()
+        del_btn.set_icon_name("user-trash-symbolic")
+        del_btn.set_tooltip_text("Delete slide")
+        del_btn.connect("clicked", lambda _b: self._deck_view.delete_slide())
+        bar.append(del_btn)
+        sep1 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        bar.append(sep1)
+
+        text_btn = Gtk.Button()
+        text_btn.set_icon_name("insert-text-symbolic")
+        text_btn.set_tooltip_text("Add text box")
+        text_btn.connect("clicked", lambda _b: self._deck_view.add_textbox())
+        bar.append(text_btn)
+        img_btn = Gtk.Button()
+        img_btn.set_icon_name("insert-image-symbolic")
+        img_btn.set_tooltip_text("Add image… (or paste / drop one)")
+        img_btn.connect("clicked", lambda _b: self._deck_view.pick_image())
+        bar.append(img_btn)
+        bar.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        # style controls apply to the selected textbox
+        self._deck_size_spin = Gtk.SpinButton.new_with_range(8, 200, 2)
+        self._deck_size_spin.set_tooltip_text("Font size")
+        self._deck_size_spin.connect("value-changed", self._on_deck_style_changed)
+        bar.append(self._deck_size_spin)
+        self._deck_bold_btn = Gtk.ToggleButton()
+        self._deck_bold_btn.set_icon_name("format-text-bold-symbolic")
+        self._deck_bold_btn.set_tooltip_text("Bold")
+        self._deck_bold_btn.connect("toggled", self._on_deck_style_changed)
+        bar.append(self._deck_bold_btn)
+        self._deck_align_btns = {}
+        group = None
+        for align, icon in (("left", "format-justify-left-symbolic"),
+                            ("center", "format-justify-center-symbolic"),
+                            ("right", "format-justify-right-symbolic")):
+            b = Gtk.ToggleButton()
+            b.set_icon_name(icon)
+            b.set_tooltip_text(f"Align {align}")
+            if group:
+                b.set_group(group)
+            group = group or b
+            b.connect("toggled", self._on_deck_style_changed)
+            self._deck_align_btns[align] = b
+            bar.append(b)
+
+        self._deck_slide_label = Gtk.Label(label="1 / 1")
+        self._deck_slide_label.add_css_class("dim-label")
+        self._deck_slide_label.set_margin_start(6)
+        bar.append(self._deck_slide_label)
+        bar.set_visible(False)   # _update_header_for_mode shows it in deck mode
+        return bar
+
+    def _on_deck_style_changed(self, _w):
+        if (self._syncing_deck_cluster or not self._deck_mode
+                or self._deck_view is None):
+            return
+        align = next((a for a, b in self._deck_align_btns.items()
+                      if b.get_active()), None)
+        self._deck_view.apply_style(size=self._deck_size_spin.get_value(),
+                                    bold=self._deck_bold_btn.get_active(),
+                                    align=align)
+
+    def _sync_deck_cluster(self, s):
+        """Reflect the deck selection's style in the cluster (no feedback)."""
+        if s is not self._active_session or s._deck_view is None:
+            return
+        self._syncing_deck_cluster = True
+        is_text, size, bold, align = s._deck_view.selection_style()
+        for w in (self._deck_size_spin, self._deck_bold_btn,
+                  *self._deck_align_btns.values()):
+            w.set_sensitive(is_text)
+        if is_text:
+            self._deck_size_spin.set_value(size)
+            self._deck_bold_btn.set_active(bold)
+            self._deck_align_btns.get(
+                align, self._deck_align_btns["left"]).set_active(True)
+        self._syncing_deck_cluster = False
+        dv = s._deck_view
+        self._deck_slide_label.set_label(
+            f"{dv.current + 1} / {len(dv.model.slides)}")
+
+    def _ensure_deck_view(self, s):
+        """Lazily build the session's Deck editor (the slide canvas)."""
+        if s._deck_view is not None:
+            return s._deck_view
+        dv = _deck_module().DeckView()
+        dv.on_changed = lambda: s.win._on_deck_changed(s)
+        # deck ink strokes use the same shared pen/highlighter settings as the
+        # PDF canvas and the text page
+        dv.pen_style = lambda hl, s=s: (
+            (s.canvas.hl_color, s.canvas.hl_width, s.canvas.hl_opacity) if hl
+            else (s.canvas.pen_color, s.canvas.pen_width, 1.0))
+        dv.on_slide_switched = lambda: s.win._on_deck_slide_switched(s)
+        dv.on_before_slide_switch = lambda: s.win._commit_note_for(s)
+        dv.on_slides_changed = lambda: s.win._on_deck_slides_changed(s)
+        dv.on_selection_changed = lambda: s.win._sync_deck_cluster(s)
+        dv.set_visible(False)
+        # into the paned's canvas side, so the notes panel (speaker notes)
+        # keeps working beside the slides exactly like beside a PDF page
+        s._canvas_box.append(dv)
+        s._deck_view = dv
+        return dv
+
+    def _on_deck_changed(self, s):
+        """Any deck mutation: dirty tracking + refresh the slide thumbnails
+        (in-place redraw; structural changes go through _on_deck_slides_changed)."""
+        self._mark_dirty()
+        if (s is self._active_session and s._deck_mode
+                and self._toc_revealer.get_reveal_child()):
+            self._refresh_thumb_images()
+
+    def _on_deck_slides_changed(self, s):
+        """Slide count or order changed: rebuild the sidebar rows and the
+        slide counter."""
+        if s is not self._active_session:
+            return
+        if self._toc_revealer.get_reveal_child():
+            self._populate_toc()
+        self._sync_deck_cluster(s)
+
+    def _on_deck_slide_switched(self, s):
+        """The deck moved to another slide: restore its speaker notes and keep
+        the sidebar marker and the presenter in step (mirrors a PDF page flip)."""
+        if s is not self._active_session:
+            return
+        self._restore_note()
+        self._sync_deck_cluster(s)
+        if self._toc_revealer.get_reveal_child():
+            self._select_thumb(self._deck_view.current)
+        if s._presenter is not None:
+            s._presenter.sync_page()
+
+    def _enter_deck_mode(self, s=None):
+        """Switch a session's UI to the Deck editor: same window chrome, the
+        deck's set of tools (see _MODE_CHROME). The notes panel stays — it
+        edits the current slide's speaker notes."""
+        s = s or self._active_session
+        self._leave_text_mode(s)
+        dv = self._ensure_deck_view(s)
+        s._deck_mode = True
+        s._paned.set_visible(True)
+        s.canvas.set_visible(False)   # the deck view takes the canvas side
+        s._toc_revealer.set_reveal_child(False)
+        dv.set_visible(True)
+        if s is self._active_session:
+            self._update_header_for_mode()
+            self._set_tool_mode("select")
+            self._sync_deck_cluster(s)
+            dv.canvas.grab_focus()
+
+    def _leave_deck_mode(self, s=None):
+        """Back to the PDF layout (another document got opened into this tab)."""
+        s = s or self._active_session
+        if not s._deck_mode:
+            return
+        s._deck_mode = False
+        s._deck_path = None
+        if s._deck_view is not None:
+            s._deck_view.set_visible(False)
+        s.canvas.set_visible(True)
+        s._paned.set_visible(True)
+        if s is self._active_session:
+            self._update_header_for_mode()
+
     def _update_header_for_mode(self):
         """Hide the PDF-only chrome while a text-first page is shown. Pen,
         highlighter and eraser stay; the PDF select tool swaps for the caret
         tool (leftmost, so 'just type' reads as the default)."""
-        text = bool(self._active_session and self._active_session._text_mode)
-        for w in (self._toc_btn, self._nav_box, self._pages_box,
-                  self._mode_lasso, self._mode_select, self._mode_pan,
-                  self._mode_zoom, self._mode_anchor,
-                  self._present_btn, self._share_btn, self._notes_toggle,
-                  self._pmode_lasso, self._pmode_select, self._pmode_pan,
-                  self._pmode_zoom, self._pmode_anchor):
-            w.set_visible(not text)
-        self._mode_text.set_visible(text)
-        self._pmode_text.set_visible(text)
-        # leaving a text page with the caret active: hand it to the PDF select
+        mode = (self._active_session.doc_mode if self._active_session
+                else "pdf")
+        for name, modes in self._MODE_CHROME.items():
+            vis = mode in modes
+            getattr(self, name).set_visible(vis)
+            if name.startswith("_mode_"):
+                # each tool button has a twin inside the pen popover (shown
+                # when the bar collapses) — keep it in step
+                twin = getattr(self, "_pmode_" + name[len("_mode_"):], None)
+                if twin is not None:
+                    twin.set_visible(vis)
+        # leaving a text page with the caret active: hand it to the select
         # button (same mode underneath, different face)
-        if not text and self._mode_text.get_active():
+        if mode != "text" and self._mode_text.get_active():
             self._set_tool_mode("select")
-        # the ☰ menu drops its PDF-only actions (export, OCR, share, notes file)
-        for item in self._pdf_menu_items:
-            item.set_visible(not text)
-        for item in self._text_menu_items:
-            item.set_visible(text)
+        # the ☰ menu shows only the active mode's actions
+        for m, items in (("pdf", self._pdf_menu_items),
+                         ("text", self._text_menu_items),
+                         ("deck", self._deck_menu_items)):
+            for item in items:
+                item.set_visible(mode == m)
         # cluster widths changed: re-measure the collapse levels and force the
         # current level to re-apply (it also gates presenter/share visibility)
         self._collapse_natural = None
@@ -5926,10 +6376,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+O",        "Open file…"),
             ("Ctrl+N",        "New blank PDF"),
             ("Ctrl+Alt+N",    "New text page (write and draw on endless paper)"),
+            ("Ctrl+Alt+P",    "New presentation (16:9 slides, saved as .smdeck)"),
             ("Text page",     None),
             ("Alt+Drag",      "Draw with the pen while the text tool is active"),
             ("Ctrl+Scroll",   "Zoom the sheet (paper, text and ink together)"),
             ("Ctrl+0",        "Reset the sheet zoom"),
+            ("Ctrl+Drag",     "Pan the sheet (also middle-drag, thumb button)"),
             ("Ctrl+F",        "Search text in PDF"),
             ("Ctrl+S",        "Save"),
             ("Ctrl+Shift+S",  "Save as…"),
@@ -6093,6 +6545,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """True for an untitled, unmodified, empty scratchpad tab — safe to reuse
         for the next open instead of leaving it behind as an empty tab."""
         return (s._path is None and s._notes_path is None
+                and not s._deck_mode
                 and not s._dirty and not s.notes_model.has_content())
 
     def open_file_in_tab(self, path):
@@ -6314,12 +6767,76 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _autosave_tick(self):
         # snapshot every dirty tab, not just the active one
         for s in self._sessions:
-            if s._dirty and s._path:
-                try:
+            try:
+                if s._dirty and s._path:
                     self._write_autosave_for(s)
-                except Exception:
-                    logger.error("autosave failed:\n" + traceback.format_exc())
+                elif s._dirty and s._deck_mode and s._deck_path:
+                    self._write_deck_autosave_for(s)
+            except Exception:
+                logger.error("autosave failed:\n" + traceback.format_exc())
         return True   # keep the timer running
+
+    def _write_deck_autosave_for(self, s):
+        d = _autosave_dir_for(s._deck_path)
+        os.makedirs(d, exist_ok=True)
+        self._commit_note_for(s)   # speaker notes live inside the model
+        s._deck_view.model.save(os.path.join(d, "deck.smdeck"))
+        meta = {"path": os.path.abspath(s._deck_path), "saved_at": time.time()}
+        tmp = os.path.join(d, "meta.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp, os.path.join(d, "meta.json"))
+        logger.info(f"autosave: deck snapshot written for {s._deck_path}")
+
+    def _maybe_offer_deck_recovery(self, path):
+        """Offer to restore an autosave snapshot newer than the .smdeck itself
+        (Sidemark closed with unsaved deck changes)."""
+        d = _autosave_dir_for(path)
+        snap = os.path.join(d, "deck.smdeck")
+        meta_path = os.path.join(d, "meta.json")
+        if not (os.path.exists(snap) and os.path.exists(meta_path)):
+            return
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            return
+        if meta.get("path") != os.path.abspath(path):
+            return   # hash collision or moved file — don't recover blindly
+        saved_at = meta.get("saved_at", 0)
+        try:
+            if os.path.getmtime(path) >= saved_at:
+                return   # the file was saved/modified after the snapshot
+        except OSError:
+            pass
+        when = time.strftime("%H:%M on %Y-%m-%d", time.localtime(saved_at))
+        dlg = Adw.AlertDialog.new(
+            "Recover unsaved changes?",
+            f"Sidemark closed with unsaved changes for this presentation "
+            f"(autosaved at {when}).")
+        dlg.add_response("later", "Not now")
+        dlg.add_response("discard", "Discard them")
+        dlg.add_response("recover", "Recover")
+        dlg.set_response_appearance("recover",
+                                    Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("recover")
+        dlg.set_close_response("later")
+
+        def on_response(_d, response):
+            if response == "recover":
+                try:
+                    model = _deck_module().DeckModel.load(snap)
+                except (OSError, ValueError) as e:
+                    self._show_error("Could not recover snapshot", str(e))
+                    return
+                self._deck_view.model = model
+                self._deck_view._reset_view()
+                self._restore_note()
+                self._mark_dirty()   # recovered ≠ saved: Ctrl+S writes it back
+            elif response == "discard":
+                _discard_autosave(path)
+        dlg.connect("response", on_response)
+        dlg.present(self)
 
     def _write_autosave(self):
         self._write_autosave_for(self._active_session)
@@ -6460,6 +6977,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Relative page navigation (PageUp/Down, mouse back/forward): zoomed
         views keep their zoom and align to the new page's top/bottom, fitted
         views re-fit — same behavior as scroll-past-edge flips."""
+        if self._deck_mode:
+            if self._deck_view is not None:
+                # set_current commits the slide's speaker notes on the way out
+                self._deck_view.set_current(self._deck_view.current + delta)
+            return
         c = self.canvas
         if not c.document:
             return
@@ -6486,6 +7008,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._commit_note_for(self._active_session)
 
     def _commit_note_for(self, s):
+        if s._deck_mode:
+            # deck: the notes panel edits the current slide's speaker notes,
+            # stored inside the .smdeck (no sidecar)
+            if s._deck_view is not None:
+                slide = s._deck_view.model.slides[s._deck_view.current]
+                slide["notes"] = s._notes_view.get_source_text()
+            return
         if not s._path and not s._notes_path and not s._is_untitled:
             return
         text = s._notes_view.get_source_text()
@@ -6493,7 +7022,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _restore_note(self):
         self._suppress_dirty = True
-        text = self.notes_model.get(self.canvas.current_page_idx)
+        if self._deck_mode and self._deck_view is not None:
+            dv = self._deck_view
+            text = dv.model.slides[dv.current].get("notes", "")
+        else:
+            text = self.notes_model.get(self.canvas.current_page_idx)
         self._last_anchor_mark = None   # set_text would strand the mark at offset 0
         buf = self._notes_view.get_buffer()
         # Programmatic page loads must not enter the undo history — otherwise
@@ -6589,6 +7122,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _global_undo(self):
         """Undo the most recent user action — a stroke, an erase gesture, or a
         typing burst — in chronological order across canvas and notes."""
+        if self._deck_mode and self._deck_view is not None:
+            # typing in the speaker-notes panel undoes locally (the source
+            # view's own history); everything else is the deck's timeline
+            if self._notes_view.has_focus():
+                self._notes_view.get_buffer().undo()
+                return
+            self._deck_view.undo()   # the deck owns its whole timeline
+            return
         if not self._undo_timeline:
             return
         op = self._undo_timeline.pop()
@@ -6610,6 +7151,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _global_redo(self):
         """Re-apply the most recently undone action (Ctrl+Y / Ctrl+Shift+Z)."""
+        if self._deck_mode and self._deck_view is not None:
+            if self._notes_view.has_focus():
+                self._notes_view.get_buffer().redo()
+                return
+            self._deck_view.redo()
+            return
         if not self._redo_timeline:
             return
         op = self._redo_timeline.pop()
@@ -6758,27 +7305,37 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # ── outline (TOC) sidebar ─────────────────────────────────────────────────
 
     def _on_toc_toggled(self, btn):
-        if btn.get_active() and not self.canvas.document:
+        if btn.get_active() and not self.canvas.document and not self._deck_mode:
             btn.set_active(False)   # bounce; re-fires toggled with False
             toast = Adw.Toast.new("No document open")
             toast.set_timeout(2)
             self.toast_overlay.add_toast(toast)
             return
         self._toc_revealer.set_reveal_child(btn.get_active())
+        if btn.get_active() and self._deck_mode:
+            # deck thumbnails are built lazily: only while the sidebar shows
+            self._populate_toc()
+            return
         if btn.get_active() and self._toc_thumbs:
             self._select_thumb(self.canvas.current_page_idx)
 
     def _on_toc_row_activated(self, _list, row):
         page = getattr(row, "toc_page", None)
-        if page is not None:
-            # a plain click (no Ctrl/Shift) collapses any multi-page selection to
-            # just this page; Ctrl/Shift keep extending it for drag-export
-            if (self._toc_thumbs
+        if page is None:
+            return
+        p = self._thumb_provider
+        if self._toc_thumbs and p is not None:
+            # a plain click (no Ctrl/Shift) collapses any multi-item selection
+            # to just this row; Ctrl/Shift keep extending it for drag-export
+            if (p.can_export
                     and not (self.canvas._ctrl_held or self.canvas._shift_held)):
                 self._toc_list.unselect_all()
                 self._toc_list.select_row(row)
-            self._go_to_page(page)
-            self.canvas.grab_focus()
+            p.activate(page)
+            return
+        # outline (TOC) rows always target the PDF canvas
+        self._go_to_page(page)
+        self.canvas.grab_focus()
 
     def _on_toc_list_pressed(self, _gesture, _n, _x, y):
         # a click that misses every row (empty space below the thumbnails)
@@ -6798,6 +7355,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._thumb_idle_id = None
         while (child := self._toc_list.get_first_child()) is not None:
             self._toc_list.remove(child)
+        self._thumb_provider = None
+        if self._deck_mode and self._deck_view is not None:
+            # deck: no outline — the sidebar is always slide thumbnails
+            self._has_toc = False
+            self._toc_thumbs = True
+            self._toc_switch.set_visible(False)
+            self._toc_btn.set_tooltip_text("Toggle slide thumbnails (Ctrl+T)")
+            self._build_thumb_rows(_DeckThumbnails(self))
+            if self._toc_revealer.get_reveal_child():
+                self._select_thumb(self._deck_view.current)
+            return
         toc = []
         if self.canvas.document:
             try:
@@ -6852,20 +7420,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     THUMB_WIDTH = 96
 
     def _populate_thumbnails(self):
-        """Fill the outline sidebar with page thumbnails, rendered lazily so
-        opening a large document stays instant."""
-        doc = self.canvas.document
-        # MULTIPLE so several pages can be selected and dragged out together;
-        # the current-page indicator is a CSS class (.current-page), not the
-        # listbox selection, so the two never fight (see _select_thumb).
-        self._toc_list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        """Fill the outline sidebar with page thumbnails (PDF mode)."""
+        self._build_thumb_rows(_PdfThumbnails(self))
+
+    def _build_thumb_rows(self, provider):
+        """Generic sidebar thumbnails: rows, numbers, tooltips, DnD and a lazy
+        render queue — the mode's provider supplies content and semantics
+        (see _ThumbnailProvider)."""
+        self._thumb_provider = provider
+        # MULTIPLE so several items can be selected and dragged out together
+        # (export-capable modes); the current indicator is a CSS class
+        # (.current-page), not the listbox selection, so the two never fight.
+        self._toc_list.set_selection_mode(
+            Gtk.SelectionMode.MULTIPLE if provider.can_export
+            else Gtk.SelectionMode.NONE)
+        self._toc_scroll.set_size_request(self.THUMB_WIDTH + 32, -1)
         self._current_thumb_row = None
         pictures = []
-        for i in range(len(doc)):
-            rect = doc[i].rect
+        for i in range(provider.count()):
             pic = Gtk.Picture()
-            scale = self.THUMB_WIDTH / rect.width if rect.width else 0.2
-            pic.set_size_request(self.THUMB_WIDTH, int(rect.height * scale))
+            pic.set_size_request(*provider.thumb_size(i))
             num = Gtk.Label(label=str(i + 1))
             num.add_css_class("dim-label")
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -6878,9 +7452,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.set_child(box)
             row.toc_page = i
-            row.set_tooltip_text(
-                f"Page {i + 1} — click to open (PageUp/PageDown to flip), "
-                "Ctrl+click to select, drag to reorder or export")
+            row.thumb_pic = pic   # in-place refresh (_refresh_thumb_images)
+            row.set_tooltip_text(provider.tooltip(i))
             self._add_thumb_dnd(row, i)
             self._toc_list.append(row)
             pictures.append(pic)
@@ -6888,19 +7461,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         queue = list(enumerate(pictures))
 
         def render_next():
-            # a new document invalidates the queue
-            if not queue or self.canvas.document is not doc:
+            # a swapped-out document invalidates the queue
+            if not queue or provider.invalidated():
                 self._thumb_idle_id = None
                 return False
             i, pic = queue.pop(0)
             try:
-                page = doc[i]
-                s = self.THUMB_WIDTH / page.rect.width
-                pix = page.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
-                tex = Gdk.MemoryTexture.new(
-                    pix.width, pix.height, Gdk.MemoryFormat.R8G8B8,
-                    GLib.Bytes.new(pix.samples), pix.stride)
-                pic.set_paintable(tex)
+                pic.set_paintable(provider.render(i))
             except Exception:
                 logger.error("thumbnail render failed:\n" + traceback.format_exc())
             if not queue:
@@ -6910,6 +7477,22 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         self._thumb_idle_id = GLib.idle_add(render_next)
 
+    def _refresh_thumb_images(self):
+        """Re-render every thumbnail in place (content edits, not structure)."""
+        p = self._thumb_provider
+        if p is None or p.invalidated():
+            return
+        i = 0
+        while (row := self._toc_list.get_row_at_index(i)) is not None:
+            pic = getattr(row, "thumb_pic", None)
+            if pic is not None and i < p.count():
+                try:
+                    pic.set_paintable(p.render(i))
+                except Exception:
+                    logger.error("thumbnail refresh failed:\n"
+                                 + traceback.format_exc())
+            i += 1
+
     def _add_thumb_dnd(self, row, idx):
         """Make a thumbnail row draggable and a drop target. Dropping a thumbnail
         onto another reorders the pages (intra-app MOVE, int payload); dropping a
@@ -6917,9 +7500,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         async because Wayland file managers transfer through the portal, which a
         synchronous DropTarget can't read at drop time); dragging a thumbnail out
         exports it as a standalone PDF (COPY, a GdkFileList like macOS Preview).
-        A drop-gap indicator shows where the page(s) will land."""
+        A drop-gap indicator shows where the page(s) will land. The export and
+        file-insert behaviors attach only when the provider has the matching
+        capability (PDF pages yes, deck slides no)."""
+        p = self._thumb_provider
         src = Gtk.DragSource()
-        src.set_actions(Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
+        src.set_actions(Gdk.DragAction.MOVE
+                        | (Gdk.DragAction.COPY if p.can_export else 0))
         src.connect("prepare", self._on_thumb_drag_prepare, idx)
         row.add_controller(src)
 
@@ -6930,27 +7517,33 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         reorder.connect("drop", self._on_thumb_reorder_drop, idx)
         row.add_controller(reorder)
 
-        # external PDF file insert: async target (portal-safe). Internal reorder
-        # drags also carry a FileList (the drag-out export), so _accept rejects
-        # anything offering the int reorder payload — those go to the target above.
-        finsert = Gtk.DropTargetAsync.new(
-            Gdk.ContentFormats.new_for_gtype(Gdk.FileList), Gdk.DragAction.COPY)
-        finsert.connect("accept", self._on_thumb_file_accept)
-        finsert.connect("drag-enter", self._on_thumb_file_motion, idx)
-        finsert.connect("drag-motion", self._on_thumb_file_motion, idx)
-        finsert.connect("drag-leave", lambda _t, _d: self._clear_drop_indicator())
-        finsert.connect("drop", self._on_thumb_file_drop, idx)
-        row.add_controller(finsert)
+        if p.can_insert_files:
+            # external PDF file insert: async target (portal-safe). Internal
+            # reorder drags also carry a FileList (the drag-out export), so
+            # _accept rejects anything offering the int reorder payload — those
+            # go to the target above.
+            finsert = Gtk.DropTargetAsync.new(
+                Gdk.ContentFormats.new_for_gtype(Gdk.FileList),
+                Gdk.DragAction.COPY)
+            finsert.connect("accept", self._on_thumb_file_accept)
+            finsert.connect("drag-enter", self._on_thumb_file_motion, idx)
+            finsert.connect("drag-motion", self._on_thumb_file_motion, idx)
+            finsert.connect("drag-leave",
+                            lambda _t, _d: self._clear_drop_indicator())
+            finsert.connect("drop", self._on_thumb_file_drop, idx)
+            row.add_controller(finsert)
 
-        # Ctrl+click toggles this page in/out of the multi-page export selection
-        # (file-manager / Preview behaviour). Handled in the capture phase and
-        # claimed so neither the row's DragSource nor GtkListBox's own selection
-        # also acts on it — otherwise a stationary Ctrl+click can be swallowed by
-        # the drag source and never deselect. Plain/Shift clicks fall through.
-        ctrl_click = Gtk.GestureClick()
-        ctrl_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        ctrl_click.connect("pressed", self._on_thumb_ctrl_pressed, row)
-        row.add_controller(ctrl_click)
+        if p.can_export:
+            # Ctrl+click toggles this page in/out of the multi-page export
+            # selection (file-manager / Preview behaviour). Handled in the
+            # capture phase and claimed so neither the row's DragSource nor
+            # GtkListBox's own selection also acts on it — otherwise a
+            # stationary Ctrl+click can be swallowed by the drag source and
+            # never deselect. Plain/Shift clicks fall through.
+            ctrl_click = Gtk.GestureClick()
+            ctrl_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            ctrl_click.connect("pressed", self._on_thumb_ctrl_pressed, row)
+            row.add_controller(ctrl_click)
 
     def _on_thumb_ctrl_pressed(self, gesture, _n_press, _x, _y, row):
         state = gesture.get_current_event_state()
@@ -7010,11 +7603,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _reorder_to_gap(self, src, gap):
         dst = self._gap_to_dst(src, gap)
-        if dst == src or not self.canvas.document:
+        p = self._thumb_provider
+        if dst == src or p is None or p.invalidated():
             return
-        self._confirm_page_change(
-            f"Move page {src + 1} to position {dst + 1}?",
-            lambda: self._do_reorder(src, dst))
+        if p.confirm_reorder:
+            self._confirm_page_change(
+                f"Move {p.noun} {src + 1} to position {dst + 1}?",
+                lambda: p.reorder(src, dst))
+        else:
+            p.reorder(src, dst)
 
     def _do_reorder(self, src, dst):
         self._move_page(src, dst)
@@ -7135,6 +7732,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # reorder uses only the grabbed page; export uses the whole selection
         # when the grabbed row is part of it (macOS Finder / Preview behaviour)
         reorder = Gdk.ContentProvider.new_for_value(GObject.Value(int, idx))
+        p = self._thumb_provider
+        if p is None or not p.can_export:
+            return reorder
         try:
             gfile = self._export_pages_tempfile(self._drag_export_indices(idx))
         except Exception:
@@ -7214,6 +7814,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             adj = self._toc_scroll.get_vadjustment()
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
+
+    # One unified window, three document types: which header chrome each mode
+    # shows (see DocumentSession.doc_mode). Tool buttons ("_mode_*") apply to
+    # their popover twins ("_pmode_*") automatically in _update_header_for_mode.
+    _MODE_CHROME = {
+        "_toc_btn":      ("pdf", "deck"),
+        "_nav_box":      ("pdf",),
+        "_pages_box":    ("pdf",),
+        "_share_btn":    ("pdf",),
+        "_notes_toggle": ("pdf", "deck"),   # deck: speaker notes
+        "_present_btn":  ("pdf", "deck"),
+        "_deck_bar":     ("deck",),
+        "_mode_text":    ("text",),
+        "_mode_pen":     ("pdf", "text", "deck"),
+        "_mode_hl":      ("pdf", "text", "deck"),
+        "_mode_eraser":  ("pdf", "text", "deck"),
+        "_mode_lasso":   ("pdf",),
+        "_mode_select":  ("pdf", "deck"),   # deck: the object-select arrow
+        "_mode_pan":     ("pdf", "text"),
+        "_mode_zoom":    ("pdf",),
+        "_mode_anchor":  ("pdf",),
+        "_pen_btn":      ("pdf", "text", "deck"),
+    }
 
     _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "lasso": 3,
                    "select": 4, "pan": 5, "zoom": 6, "anchor": 7}
@@ -7315,6 +7938,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # else falls back to the text caret
             if self._text_page is not None:
                 self._text_page.set_tool(mode)
+            # deck: the same ink tools draw on the slide; "select" is the
+            # object arrow (move/resize/edit)
+            if self._deck_view is not None:
+                self._deck_view.set_tool(mode)
             # on a text page "select" is represented by the caret button
             in_text = bool(self._active_session and self._active_session._text_mode)
             if mode == "select" and in_text:
@@ -7334,8 +7961,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         Ctrl/Alt/Shift gestures are discoverable. Purely visual — the selected
         tool and behaviour are untouched."""
         if self._active_session and self._active_session._text_mode:
-            # on a text page only Alt has a gesture, and it draws with the pen
-            tool = "pen" if tool == "select" else None
+            # on a text page Alt draws with the pen and Ctrl pans; the other
+            # modifier gestures don't apply
+            tool = {"select": "pen", "pan": "pan"}.get(tool)
+            # Alt doesn't just hint here — it holds the pen for real (so
+            # left-drag draws, right-drag erases) and lets go with the key
+            if tool == "pen":
+                if (self._alt_pen_restore is None
+                        and self.canvas.tool == "select"):
+                    self._alt_pen_restore = "select"
+                    self._set_tool_mode("pen")
+            elif self._alt_pen_restore is not None:
+                self._restore_after_alt_pen()
         if tool == self._transient_tool:
             return
         self._transient_tool = tool
@@ -7346,6 +7983,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             idx = self._TOOL_ORDER[tool]
             for grp in (self._tool_btns, self._ptool_btns):
                 grp[idx].add_css_class("tool-transient")
+
+    def _restore_after_alt_pen(self):
+        """Hand the tool back to the caret once Alt is released — deferred
+        while an ink gesture is still in flight so the stroke isn't lost."""
+        tp = self._text_page
+        if tp is not None and (tp._drag.is_active() or tp.current_stroke
+                               or tp._erased_now):
+            GLib.timeout_add(
+                60, lambda: bool(self._restore_after_alt_pen()) and False)
+            return
+        if self._alt_pen_restore is not None:
+            mode, self._alt_pen_restore = self._alt_pen_restore, None
+            self._set_tool_mode(mode)
 
     # ── notes-panel font size ────────────────────────────────────────────────
     _NOTES_FONT_DEFAULT = 13
@@ -7386,12 +8036,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # undo/redo go first (level 2); the rest hold on until it gets tighter
         for b in (self._undo_btn, self._redo_btn, self._undo_sep):
             b.set_visible(level < 2)
-        # presenter/share are PDF-only chrome: a text-first page keeps them
-        # hidden at every collapse level (see _update_header_for_mode)
-        text = bool(self._active_session and self._active_session._text_mode)
-        self._search_btn.set_visible(level < 3)
-        for b in (self._present_btn, self._share_btn):
-            b.set_visible(level < 3 and not text)
+        # presenter/share/search stay within what the mode allows (the chrome
+        # table in _update_header_for_mode) at every collapse level
+        mode = (self._active_session.doc_mode if self._active_session
+                else "pdf")
+        self._search_btn.set_visible(level < 3 and mode != "deck")
+        self._present_btn.set_visible(
+            level < 3 and mode in self._MODE_CHROME["_present_btn"])
+        self._share_btn.set_visible(
+            level < 3 and mode in self._MODE_CHROME["_share_btn"])
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
     # change doesn't flicker on 1px resize jitter at the boundary
@@ -7411,14 +8064,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _calibrate_header(self):
         """Record each collapse level's real content width (both clusters), once,
-        from the actual widgets — so the breakpoints are derived, not guessed."""
+        from the actual widgets — so the breakpoints are derived, not guessed.
+
+        The deck bar is excluded from the measurement: it lives in the scrollable
+        start cluster and can scroll on a narrow window, so it must NOT inflate
+        the breakpoints — otherwise deck mode (whose bar is wide) would be forced
+        to max collapse and hide the presenter / search / share buttons in the
+        end cluster (e.g. launching straight into `--presentation`)."""
         saved = self._collapse_level
+        deck_bar_vis = self._deck_bar.get_visible()
+        self._deck_bar.set_visible(False)
         nat = {}
         for lvl in (3, 2, 1, 0):
             self._apply_collapse_level(lvl)
             s = self._header_start.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             e = self._header_end.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             nat[lvl] = s + e
+        self._deck_bar.set_visible(deck_bar_vis)
         self._collapse_natural = nat
         if saved >= 0:
             self._apply_collapse_level(saved)
@@ -7561,9 +8223,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _show_present_bar(self, shown):
         self._present_bar.set_visible(shown)
-        # the editor canvas shows the next page behind the current one while
-        # presenting (stack look — PowerPoint-style next-slide preview)
-        self.canvas.set_stack_preview(shown)
+        # the editor canvas shows the next page/slide behind or below the current
+        # one while presenting (stack look — PowerPoint-style next-slide preview)
+        if self._deck_mode:
+            if self._deck_view is not None:
+                self._deck_view.set_stack_preview(shown)
+        else:
+            self.canvas.set_stack_preview(shown)
         if shown:
             # catch up on any resizing that happened while the bar was hidden
             if self.get_width() and self.get_height():
@@ -7604,12 +8270,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _open_presenter(self):
         if self._presenter is not None:
             return
-        if not self.canvas.document:
+        if self._deck_mode:
+            if self._deck_view is None:
+                self._present_btn.set_active(False)
+                return
+            pres = _deck_module().DeckPresenterWindow(
+                self.get_application(), self._deck_view, on_nav=self._nav_page)
+        elif not self.canvas.document:
             self._toast("Open a PDF first")
             self._present_btn.set_active(False)
             return
-        pres = PresenterWindow(self.get_application(), self.canvas,
-                               on_nav=self._nav_page)
+        else:
+            pres = PresenterWindow(self.get_application(), self.canvas,
+                                   on_nav=self._nav_page)
         pres.connect("close-request", self._on_presenter_closed)
         self._presenter = pres
         self._show_present_bar(True)   # after _presenter: the preview reads it
@@ -7932,7 +8605,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             row.connect("clicked", _make_open(path))
             box.append(row)
 
-    SUPPORTED_DND = (".pdf", ".pptx", ".md")
+    SUPPORTED_DND = (".pdf", ".pptx", ".md", ".smdeck")
+    IMAGE_DND = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg")
 
     def _on_drop_accept(self, _target, gdk_drop):
         # fires repeatedly during hover; keep at debug to avoid log spam
@@ -7990,8 +8664,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         return [p for p in paths if p]
 
     def _open_dropped(self, paths):
-        """Open the first supported path; toast and return False otherwise."""
+        """Open the first supported path; toast and return False otherwise.
+        On a deck, a dropped image lands on the current slide instead."""
         logger.info("DnD: candidate paths = %s", paths)
+        if self._deck_mode and self._deck_view is not None:
+            added = False
+            for path in paths:
+                if path.lower().endswith(self.IMAGE_DND):
+                    added = self._deck_view.add_image_file(path) or added
+            if added:
+                return True
         for path in paths:
             if path.lower().endswith(self.SUPPORTED_DND):
                 logger.info("DnD: opening %s", path)
@@ -8015,6 +8697,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _do_open_file(self, path):
         if path.lower().endswith(".pptx"):
             self._convert_pptx_then_open(path)
+            return
+        if path.lower().endswith(".smdeck"):
+            self._open_deck(path)
             return
         if path.lower().endswith((".md", ".markdown")):
             self._open_markdown(path)
@@ -8071,6 +8756,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _open_pdf(self, path):
         self._leave_text_mode()
+        self._leave_deck_mode()
         self._path = path
         self._notes_path = None
         self._active_notes_path = _notes_file_for_pdf(path) or notes_path_for(path)
@@ -8181,6 +8867,142 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._burst_base = ""
         self._set_file_title("Untitled note")
         self._clear_dirty()
+
+    def _on_new_presentation(self):
+        """A fresh untitled slide deck (☰ New presentation / Ctrl+Alt+P).
+        No file exists yet — the save-as dialog names the .smdeck on first save."""
+        if not self._session_is_pristine(self._active_session):
+            self._new_tab()
+        self._path = None
+        self._notes_path = None
+        self._is_untitled = True
+        self.notes_model = NotesModel()
+        self._page_label.set_label("—")
+        self._enter_deck_mode()
+        self._deck_view.reset()
+        self._restore_note()          # empty speaker notes for slide 1
+        self._undo_timeline.clear()
+        self._redo_timeline.clear()
+        self._set_file_title("Untitled presentation")
+        self._set_notes_shown(False)  # panel springs open on Ctrl+\
+        self._clear_dirty()
+
+    def _open_deck(self, path):
+        """Open a .smdeck presentation into this tab."""
+        try:
+            deck_mod = _deck_module()
+            model = deck_mod.DeckModel.load(path)
+        except (OSError, ValueError, KeyError) as e:
+            self._show_error("Could not open presentation", str(e))
+            return
+        self._open_deck_model(model, os.path.basename(path), path=path)
+        self._remember_recent(path)
+        self._maybe_offer_deck_recovery(path)
+
+    def _open_deck_model(self, model, title, path=None):
+        """Mount a DeckModel into this tab. With `path` it is a saved .smdeck
+        (titled, clean); without one it is an in-memory deck — e.g. a PPTX
+        import — that opens untitled and dirty so its first save prompts for a
+        .smdeck name."""
+        self._path = None
+        self._notes_path = None
+        self._is_untitled = path is None
+        self.notes_model = NotesModel()
+        self._page_label.set_label("—")
+        self._enter_deck_mode()
+        self._deck_view.reset()
+        self._deck_view.model = model
+        self._deck_view._reset_view()
+        self._deck_path = path
+        self._undo_timeline.clear()
+        self._redo_timeline.clear()
+        self._restore_note()
+        self._set_file_title(title, path)
+        # open with the notes panel only when the deck carries speaker notes
+        self._set_notes_shown(any(s.get("notes") for s in model.slides))
+        if path is None:
+            self._mark_dirty()
+        else:
+            self._clear_dirty()
+
+    def _save_deck(self):
+        self._deck_view.save(self._deck_path)
+
+    def _on_save_as_deck(self, after=None):
+        """Name an untitled presentation."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Save presentation as…")
+        dialog.set_initial_name("presentation.smdeck")
+        f = Gtk.FileFilter()
+        f.set_name("Sidemark Deck files")
+        f.add_pattern("*.smdeck")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(f)
+        dialog.set_filters(filters)
+        folder = self._current_dir_gfile()
+        if folder:
+            dialog.set_initial_folder(folder)
+
+        def done(dlg, result):
+            try:
+                file = dlg.save_finish(result)
+            except GLib.Error:
+                return
+            if not file or not file.get_path():
+                return
+            path = file.get_path()
+            if not path.endswith(".smdeck"):
+                path += ".smdeck"
+            try:
+                self._commit_note()
+                self._deck_view.save(path)
+            except OSError as e:
+                self._show_error("Save failed", str(e))
+                return
+            self._deck_path = path
+            self._is_untitled = False
+            self._set_file_title(os.path.basename(path), path)
+            self._clear_dirty()
+            self._remember_recent(path)
+            toast = Adw.Toast.new("Saved")
+            toast.set_timeout(2)
+            self.toast_overlay.add_toast(toast)
+            if after:
+                after()
+        dialog.save(self, None, done)
+
+    def _on_export_deck_pdf(self):
+        """Render the deck's slides into a 16:9 PDF (☰ Export as PDF…)."""
+        if not self._deck_mode or self._deck_view is None:
+            return
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Export as PDF…")
+        base = (os.path.splitext(os.path.basename(self._deck_path))[0]
+                if self._deck_path else "presentation")
+        dialog.set_initial_name(base + ".pdf")
+        folder = self._current_dir_gfile()
+        if folder:
+            dialog.set_initial_folder(folder)
+
+        def done(dlg, result):
+            try:
+                file = dlg.save_finish(result)
+            except GLib.Error:
+                return
+            if not file or not file.get_path():
+                return
+            path = file.get_path()
+            if not path.endswith(".pdf"):
+                path += ".pdf"
+            try:
+                self._deck_view.export_pdf(path)
+            except Exception as e:
+                self._show_error("Export failed", str(e))
+                return
+            toast = Adw.Toast.new(f"Exported {os.path.basename(path)}")
+            toast.set_timeout(3)
+            self.toast_overlay.add_toast(toast)
+        dialog.save(self, None, done)
 
     def _open_scratchpad(self):
         """Open (or create) the persistent scratchpad — a text-first page at
@@ -8508,8 +9330,19 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
+    # Render each converted PDF page this wide (px) before embedding it as a
+    # slide picture — comfortably crisp on a 1080p projector without bloating
+    # the .smdeck (a 16:9 page lands ~1600×900).
+    PPTX_IMPORT_WIDTH = 1600
+
     def _convert_pptx_then_open(self, pptx_path):
-        toast = Adw.Toast.new(f"Converting {os.path.basename(pptx_path)}…")
+        """Import a PowerPoint file as an editable Sidemark Deck: LibreOffice
+        renders it to PDF, each page is rasterized to a full-bleed slide picture,
+        and the .pptx's speaker notes ride along in the notes panel. The slides
+        are images (original text isn't editable as text — a deliberate MVP; see
+        ideas.csv), but the deck is otherwise fully real: reorder, annotate with
+        ink/text boxes, present with F5, export back to PDF."""
+        toast = Adw.Toast.new(f"Importing {os.path.basename(pptx_path)}…")
         toast.set_timeout(0)
         self.toast_overlay.add_toast(toast)
         out_dir = tempfile.mkdtemp(prefix="sidemark-")
@@ -8523,41 +9356,61 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     check=True, capture_output=True,
                 )
                 pdf_path = os.path.join(out_dir, base + ".pdf")
-                # Slide notes live in the .pptx (the PDF doesn't carry them);
-                # pull them so they can land in the notes sidebar.
+                # Slide notes live in the .pptx (the rendered PDF doesn't carry
+                # them); pull them so they can ride into the deck's slides.
                 slide_notes = _extract_pptx_notes(pptx_path)
-                GLib.idle_add(lambda: (toast.dismiss(), self.open_file(pdf_path),
-                                       self._apply_pptx_notes(slide_notes)) and None)
+                images = self._rasterize_pdf_slides(pdf_path, slide_notes)
+                title = base + " (imported)"
+                GLib.idle_add(lambda: (toast.dismiss(),
+                                       self._open_imported_deck(images, title)) and None)
             except FileNotFoundError:
                 GLib.idle_add(lambda: (toast.dismiss(),
-                    self._show_error("Conversion failed",
+                    self._show_error("Import failed",
                         "LibreOffice not found. Install it with:\n  pacman -S libreoffice-still")) and None)
             except subprocess.CalledProcessError as e:
                 msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
                 GLib.idle_add(lambda: (toast.dismiss(),
-                    self._show_error("Conversion failed", msg)) and None)
+                    self._show_error("Import failed", msg)) and None)
+            except Exception as e:
+                logger.exception("pptx import failed")
+                GLib.idle_add(lambda: (toast.dismiss(),
+                    self._show_error("Import failed", str(e))) and None)
+            finally:
+                shutil.rmtree(out_dir, ignore_errors=True)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _apply_pptx_notes(self, slide_notes):
-        """Drop a converted deck's speaker notes into the notes sidebar, one
-        slide → one page. The deck just opened, so notes_model is fresh; mark the
-        document dirty so the notes are saved on first save."""
-        if not slide_notes:
-            return
-        n = self.canvas.n_pages
-        applied = 0
-        for idx, text in slide_notes.items():
-            if 0 <= idx < n:
-                self.notes_model.set(idx, text)
-                applied += 1
-        if not applied:
-            return
-        self._restore_note()              # refresh the visible page's note
-        self._set_notes_shown(True)
-        self._mark_dirty()
-        self._toast(f"Imported speaker notes from {applied} "
-                    f"slide{'s' if applied != 1 else ''}")
+    def _rasterize_pdf_slides(self, pdf_path, slide_notes):
+        """Render every page of the converted PDF to a PNG for `deck_from_images`,
+        returning [(png_bytes, w, h, notes)] in page order. Runs off the main
+        thread; touches only PyMuPDF, so it needs no GTK."""
+        # LibreOffice writes a tagged (accessibility) structure tree that MuPDF
+        # dislikes — rendering each page prints a harmless "No common ancestor in
+        # structure tree" to stderr per page. The pixmaps are correct, so mute
+        # MuPDF's stderr chatter for the duration and restore it afterwards.
+        prev = fitz.TOOLS.mupdf_display_errors()   # read (setter returns the new value)
+        fitz.TOOLS.mupdf_display_errors(False)
+        images = []
+        try:
+            with fitz.open(pdf_path) as doc:
+                for i, page in enumerate(doc):
+                    zoom = self.PPTX_IMPORT_WIDTH / max(page.rect.width, 1)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                          alpha=False)
+                    images.append((pix.tobytes("png"), pix.width, pix.height,
+                                   slide_notes.get(i, "")))
+        finally:
+            fitz.TOOLS.mupdf_display_errors(prev)
+        return images
+
+    def _open_imported_deck(self, images, title):
+        """Mount an in-memory deck built from imported slide pictures as a fresh,
+        untitled deck (saved as .smdeck on first Ctrl+S)."""
+        deck_mod = _deck_module()
+        model = deck_mod.deck_from_images(images)
+        self._open_deck_model(model, title)
+        n = len(model.slides)
+        self._toast(f"Imported {n} slide{'s' if n != 1 else ''}")
 
     # ── OCR (optional: needs the external 'ocrmypdf' tool) ──────────────────────
     def _maybe_offer_ocr(self, path):
@@ -8892,7 +9745,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _current_dir_gfile(self):
         """The folder of the currently open file, so file dialogs start there."""
-        cur = self._path if (self._path and not self._is_untitled) else self._notes_path
+        cur = (self._path if (self._path and not self._is_untitled)
+               else self._notes_path or self._deck_path)
         if cur:
             folder = os.path.dirname(os.path.abspath(cur))
             if os.path.isdir(folder):
@@ -8902,8 +9756,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_open(self, _btn):
         dialog = Gtk.FileDialog.new()
         docs = Gtk.FileFilter()
-        docs.set_name("Documents (PDF, PPTX, Markdown, text)")
-        for pat in ("*.pdf", "*.pptx", "*.md", "*.markdown", "*.txt"):
+        docs.set_name("Documents (PDF, PPTX, Markdown, text, Deck)")
+        for pat in ("*.pdf", "*.pptx", "*.md", "*.markdown", "*.txt",
+                    "*.smdeck"):
             docs.add_pattern(pat)
         any_file = Gtk.FileFilter()
         any_file.set_name("All files")
@@ -8936,6 +9791,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_save(self, _btn=None, after=None):
         """Save; if `after` is given it runs only on a successful save
         (for untitled files that means after the save-as dialog completed)."""
+        if self._deck_mode:
+            self._commit_note()   # speaker notes live inside the .smdeck
+            if self._is_untitled or not self._deck_path:
+                self._on_save_as_deck(after=after)
+                return
+            try:
+                self._save_deck()
+                self._clear_dirty()
+                toast = Adw.Toast.new("Saved")
+                toast.set_timeout(2)
+                self.toast_overlay.add_toast(toast)
+            except OSError as e:
+                self._show_error("Save failed", str(e))
+                return
+            _discard_autosave(self._deck_path)   # changes are on disk now
+            if after:
+                after()
+            return
         if self._is_untitled:
             if self._text_mode:
                 self._on_save_as_md(after=after)
@@ -9021,6 +9894,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     self._on_new_text_page()
                 else:
                     self._on_new_pdf(None)
+                return True
+            if keyval == Gdk.KEY_p and state & Gdk.ModifierType.ALT_MASK:
+                self._on_new_presentation()
                 return True
             if keyval == Gdk.KEY_c:
                 if self.canvas._selected_words and not self._notes_view.has_focus():
@@ -9333,9 +10209,9 @@ class PDFEditorApp(Adw.Application):
 
     @staticmethod
     def _parse_open_args(args):
-        """Pull a file path and --page N out of one launch's arguments (argv
-        without the program name). Unknown flags are ignored."""
-        path, page = None, 0
+        """Pull a file path, --page N and --presentation out of one launch's
+        arguments (argv without the program name). Unknown flags are ignored."""
+        path, page, deck = None, 0, False
         i = 0
         while i < len(args):
             a = args[i]
@@ -9346,20 +10222,24 @@ class PDFEditorApp(Adw.Application):
                     pass
                 i += 2
                 continue
+            if a in ("--presentation", "--deck"):
+                deck = True
+                i += 1
+                continue
             if a in ("-v", "--verbose"):
                 i += 1
                 continue
             if not a.startswith("-") and path is None:
                 path = a
             i += 1
-        return path, page
+        return path, page, deck
 
     def do_command_line(self, command_line):
         """Every launch (this process or a forwarded one from a second
         invocation) lands here in the single primary instance; open the file it
         names in a new window."""
         args = command_line.get_arguments()
-        path, page = self._parse_open_args(args[1:])
+        path, page, deck = self._parse_open_args(args[1:])
         if path and not os.path.isabs(path):
             cwd = command_line.get_cwd()
             if cwd:
@@ -9367,24 +10247,28 @@ class PDFEditorApp(Adw.Application):
         # A second launch forwards here and exits immediately; tell its shell
         # why, so it doesn't just look like the command silently did nothing.
         if command_line.get_is_remote():
-            what = f"‘{os.path.basename(path)}’" if path else "a new window"
+            what = (f"‘{os.path.basename(path)}’" if path
+                    else "a new presentation" if deck else "a new window")
             command_line.print_literal(
                 f"Sidemark is already running — opened {what} in it.\n")
-        self.open_new_window(path, page)
+        self.open_new_window(path, page, deck)
         return 0
 
     def do_activate(self):
         # bare activation (e.g. via D-Bus) with no command line → empty window
         self.open_new_window()
 
-    def open_new_window(self, path=None, page=0):
-        logger.info("Opening new window: %s", path or "(scratchpad)")
+    def open_new_window(self, path=None, page=0, deck=False):
+        logger.info("Opening new window: %s",
+                    path or ("(new presentation)" if deck else "(scratchpad)"))
         win = PDFEditorWindow(self)
         win.present()
         if path and os.path.isfile(path):
             win.open_file(path)
             if page > 0:
                 win._go_to_page(page)
+        elif deck:
+            GLib.idle_add(win._on_new_presentation)
         else:
             if path:
                 logger.warning("File not found: %s", path)
@@ -9403,7 +10287,7 @@ def main():
     # Fail fast on a named file that doesn't exist, before we hand the launch
     # off to the (possibly already-running) primary instance. Checked here so
     # the error surfaces on the launching terminal with its own cwd.
-    path, _page = PDFEditorApp._parse_open_args(args)
+    path, _page, _deck = PDFEditorApp._parse_open_args(args)
     if path and not os.path.isfile(path):
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
