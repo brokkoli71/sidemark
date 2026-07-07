@@ -8064,14 +8064,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _calibrate_header(self):
         """Record each collapse level's real content width (both clusters), once,
-        from the actual widgets — so the breakpoints are derived, not guessed."""
+        from the actual widgets — so the breakpoints are derived, not guessed.
+
+        The deck bar is excluded from the measurement: it lives in the scrollable
+        start cluster and can scroll on a narrow window, so it must NOT inflate
+        the breakpoints — otherwise deck mode (whose bar is wide) would be forced
+        to max collapse and hide the presenter / search / share buttons in the
+        end cluster (e.g. launching straight into `--presentation`)."""
         saved = self._collapse_level
+        deck_bar_vis = self._deck_bar.get_visible()
+        self._deck_bar.set_visible(False)
         nat = {}
         for lvl in (3, 2, 1, 0):
             self._apply_collapse_level(lvl)
             s = self._header_start.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             e = self._header_end.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             nat[lvl] = s + e
+        self._deck_bar.set_visible(deck_bar_vis)
         self._collapse_natural = nat
         if saved >= 0:
             self._apply_collapse_level(saved)
@@ -8214,10 +8223,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _show_present_bar(self, shown):
         self._present_bar.set_visible(shown)
-        # the editor canvas shows the next page behind the current one while
-        # presenting (stack look — PowerPoint-style next-slide preview); the
-        # deck editor has no PDF canvas to stack, so the bar/timer stand alone
-        if not self._deck_mode:
+        # the editor canvas shows the next page/slide behind or below the current
+        # one while presenting (stack look — PowerPoint-style next-slide preview)
+        if self._deck_mode:
+            if self._deck_view is not None:
+                self._deck_view.set_stack_preview(shown)
+        else:
             self.canvas.set_stack_preview(shown)
         if shown:
             # catch up on any resizing that happened while the bar was hidden

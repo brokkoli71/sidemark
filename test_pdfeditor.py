@@ -7951,6 +7951,74 @@ class TestDeckMode(unittest.TestCase):
 
         self._run_in_window(body)
 
+    def test_present_shows_next_slide_preview(self):
+        # presenting a deck turns on the next-slide preview: the current slide
+        # shrinks to make room, and space stays reserved on the last slide so
+        # the slide size never jumps as you flip
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.add_slide("content")            # 2 slides now
+            dv.set_current(0)
+            self._settle(100)
+            plain = dv._slide_rect()[2]
+            win._present_btn.set_active(True)   # F5 → present bar → stack preview
+            self._settle(100)
+            self.assertTrue(dv._stack_preview)
+            presenting = dv._slide_rect()[2]
+            self.assertLess(presenting, plain)              # current slide shrank
+            # last slide: nothing to preview, but the reserved space keeps the
+            # current slide the same size (no jump)
+            dv.set_current(1)
+            self.assertFalse(dv._has_next())
+            self.assertEqual(dv._slide_rect()[2], presenting)
+            win._present_btn.set_active(False)
+            self.assertFalse(dv._stack_preview)
+            self.assertGreater(dv._slide_rect()[2], presenting)  # grows back
+
+        self._run_in_window(body)
+
+    def test_stack_layout_places_preview_below_or_beside(self):
+        # pure layout math: a roughly-square canvas puts the 16:9 preview below
+        # the current slide; a very wide, short canvas puts it to the right
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            dv = win._deck_view
+            dv.add_slide("content")
+            slide_h = self._deck().SLIDE_H
+            cur, prev = dv._stack_layout(900, 800)       # squarish → below
+            self.assertTrue(dv._stack_below)
+            self.assertGreater(prev[1], cur[1] + slide_h * cur[2])  # preview below
+            self.assertLess(prev[2], cur[2])                        # and smaller
+            cur_r, prev_r = dv._stack_layout(2400, 500)  # wide/short → beside
+            self.assertFalse(dv._stack_below)
+            self.assertGreater(prev_r[0], cur_r[0])                 # preview to the right
+
+        self._run_in_window(body)
+
+    def test_deck_bar_does_not_hide_presenter_button(self):
+        # regression: the wide deck bar lives in the scrollable start cluster, so
+        # it must NOT inflate the header collapse breakpoints — otherwise deck
+        # mode is forced to max collapse and the presenter/search/share buttons
+        # never appear (the "no present button when launching --presentation" bug)
+        def body(win):
+            win._on_new_presentation()
+            self._settle()
+            # calibration ignores the deck bar: the breakpoints are identical
+            # whether it is shown or hidden
+            win._collapse_natural = None
+            win._calibrate_header()
+            nat_shown = dict(win._collapse_natural)
+            win._deck_bar.set_visible(False)
+            win._collapse_natural = None
+            win._calibrate_header()
+            nat_hidden = dict(win._collapse_natural)
+            self.assertEqual(nat_shown, nat_hidden)
+
+        self._run_in_window(body)
+
     def test_deck_autosave_snapshot(self):
         with tempfile.TemporaryDirectory() as d:
             def body(win):

@@ -52,7 +52,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Alignment snapping** — while dragging, objects snap to the slide center and to other objects' edges and centers, with dashed guide lines showing what you're aligned to — the fastest route to tidy slides
 - **Slide thumbnails in the sidebar** (`Ctrl+T`) — the same sidebar as PDF pages: click a slide to jump to it, drag to reorder (one `Ctrl+Z` undoes a move)
 - **Speaker notes** — the notes panel (Ctrl+\\) edits per-slide speaker notes, with the full live-Markdown editor; notes are stored inside the `.smdeck`, travel with slides when you reorder, and are there to read while presenting
-- **Present** (`F5`) — the presenter view mirrors the current slide fullscreen on a second screen with live ink, exactly like presenting a PDF: click/`Space`/arrows navigate (clicker-friendly), your window keeps the presentation timer and big prev/next buttons
+- **Present** (`F5`) — the presenter view mirrors the current slide fullscreen on a second screen with live ink, exactly like presenting a PDF: click/`Space`/arrows navigate (clicker-friendly), and **your** window becomes a presenter console — the current slide shrinks to show the **next slide as a preview** beside or below it (whichever fits the 16:9 slides better), plus the presentation timer and big prev/next buttons
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — every edit (move, resize, type, style, ink, add/delete/move slide) is one chronological undo step; unsaved decks are autosaved and offered for recovery on reopen
 - **Export as PDF** (☰ menu) renders the deck into a 16:9 PDF, one page per slide, text staying real vector text — open that PDF right back in Sidemark to annotate it or share it to a phone
 

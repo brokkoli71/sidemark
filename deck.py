@@ -290,6 +290,14 @@ class DeckView(Gtk.Box):
 
     MARGIN = 24               # surround gap around the slide, screen px
 
+    # presentation stack look: while presenting, the operator's canvas shrinks
+    # the current slide and shows the NEXT slide as a smaller, dimmed preview so
+    # you see what's coming (like the PDF presenter's next-page peek). Slides are
+    # 16:9, so the preview normally lands below; a very wide/short canvas puts it
+    # to the right instead — whichever leaves the current slide larger.
+    STACK_NEXT_SCALE = 0.42   # preview size relative to the current slide
+    STACK_GAP = 16            # screen-px gap between current slide and preview
+
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         self.model = DeckModel()
@@ -314,6 +322,8 @@ class DeckView(Gtk.Box):
         self.current_stroke = []  # logical points of the in-flight stroke
         self._stroke_style = None  # (color, width, opacity) of that stroke
         self._erased_now = []     # [(idx, stroke), …] removed in this gesture
+        self._stack_preview = False  # next-slide preview (presentation mode)
+        self._stack_below = True     # last chosen preview placement (below/right)
 
         self.canvas = Gtk.DrawingArea()
         self.canvas.set_hexpand(True)
@@ -657,10 +667,52 @@ class DeckView(Gtk.Box):
 
     # ── canvas drawing ───────────────────────────────────────────────────
 
+    def set_stack_preview(self, on):
+        """Toggle the next-slide preview (presentation mode). The window turns
+        this on/off with the present bar; the current slide shrinks to make room
+        so it keeps a stable size across flips (space is reserved even on the
+        last slide, where no preview is drawn)."""
+        on = bool(on)
+        if on == self._stack_preview:
+            return
+        self._commit_editor()     # editor geometry would be stale under the new layout
+        self._stack_preview = on
+        self.canvas.queue_draw()
+
+    def _has_next(self):
+        return self.current + 1 < len(self.model.slides)
+
+    def _stack_layout(self, w, h):
+        """Current-slide and next-slide rects ((x, y, scale) each) for the
+        presentation stack: the current slide as large as fits with room for the
+        preview beside or below it, whichever keeps the current slide bigger.
+        Also records the chosen placement in `_stack_below`."""
+        k, gap, m = self.STACK_NEXT_SCALE, self.STACK_GAP, self.MARGIN
+        aw, ah = max(w - 2 * m, 1), max(h - 2 * m, 1)
+        s_below = min(aw / SLIDE_W, (ah - gap) / (SLIDE_H * (1 + k)))
+        s_right = min((aw - gap) / (SLIDE_W * (1 + k)), ah / SLIDE_H)
+        self._stack_below = s_below >= s_right
+        s = max(s_below if self._stack_below else s_right, 0.05)
+        cw, ch = SLIDE_W * s, SLIDE_H * s
+        pw, ph = cw * k, ch * k
+        if self._stack_below:
+            total_h = ch + gap + ph
+            cx, cy = (w - cw) / 2, (h - total_h) / 2
+            prev = ((w - pw) / 2, cy + ch + gap, s * k)   # centered under current
+        else:
+            total_w = cw + gap + pw
+            cx, cy = (w - total_w) / 2, (h - ch) / 2
+            prev = (cx + cw + gap, cy + ch - ph, s * k)   # bottom-aligned beside
+        return (cx, cy, s), prev
+
     def _slide_rect(self):
-        """The slide's screen rectangle (x, y, scale) inside the canvas."""
+        """The current slide's screen rectangle (x, y, scale) inside the canvas.
+        In presentation mode it shrinks to leave room for the next-slide preview."""
         w = self.canvas.get_width()
         h = self.canvas.get_height()
+        if self._stack_preview:
+            cur, _ = self._stack_layout(w, h)
+            return cur
         scale = max(min((w - 2 * self.MARGIN) / SLIDE_W,
                         (h - 2 * self.MARGIN) / SLIDE_H), 0.05)
         return ((w - SLIDE_W * scale) / 2, (h - SLIDE_H * scale) / 2, scale)
@@ -714,6 +766,30 @@ class DeckView(Gtk.Box):
             cr.set_source_rgba(*ACCENT, 1)
             cr.set_line_width(1)
             cr.stroke()
+        self._draw_stack_peek(cr, w, h)
+
+    def _draw_stack_peek(self, cr, w, h):
+        """Draw the next slide — smaller and slightly dimmed — beside or below
+        the current slide, so the presenter sees what's coming. Only in
+        presentation mode, and skipped on the last slide (the current slide's
+        size is unchanged there, so nothing jumps)."""
+        if not (self._stack_preview and self._has_next()):
+            return
+        _, (px, py, ps) = self._stack_layout(w, h)
+        nxt = self.model.slides[self.current + 1]
+        cr.set_source_rgba(0, 0, 0, 0.28)                 # drop shadow
+        cr.rectangle(px + 3, py + 3, SLIDE_W * ps, SLIDE_H * ps)
+        cr.fill()
+        cr.save()
+        cr.translate(px, py)
+        cr.scale(ps, ps)
+        cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
+        cr.clip()
+        render_slide(cr, nxt, show_placeholders=True)
+        cr.restore()
+        cr.set_source_rgba(0.5, 0.5, 0.55, 0.28)          # dim veil (reads as secondary)
+        cr.rectangle(px, py, SLIDE_W * ps, SLIDE_H * ps)
+        cr.fill()
 
     @staticmethod
     def _handle_points(x, y, w, h):
