@@ -2930,13 +2930,38 @@ def _apply_accents(text):
     return _MD_ACCENT_RE.sub(sub, text)
 
 
+# Inline `code` spans are literal: nothing inside them is re-rendered — no
+# LaTeX symbol substitution, no super/subscripts, no bold/italic — matching how
+# a Markdown viewer treats code. _split_code_spans chops a line into
+# (segment, is_code) runs so the display transforms below skip the code ones.
+_MD_CODE_SPAN_RE = re.compile(r'`[^`\n]+?`')
+
+
+def _split_code_spans(text):
+    """Split text into (segment, is_code) runs, is_code True for `code` spans
+    (backticks included). A line with no code spans yields one (text, False)."""
+    out, i = [], 0
+    for m in _MD_CODE_SPAN_RE.finditer(text):
+        if m.start() > i:
+            out.append((text[i:m.start()], False))
+        out.append((m.group(0), True))
+        i = m.end()
+    if i < len(text) or not out:
+        out.append((text[i:], False))
+    return out
+
+
 def _symbolize(text):
-    """Replace LaTeX-style \\commands with their Unicode symbols (display only)."""
-    text = _MD_SYMBOL_RE.sub(
-        lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), text)
-    # Accents run after symbol substitution so \hat{\alpha} → α̂ (the inner
-    # \alpha is already α by the time the accent is placed on it).
-    return _apply_accents(text)
+    """Replace LaTeX-style \\commands with their Unicode symbols (display only),
+    leaving the contents of `code` spans untouched."""
+    def sub_seg(seg):
+        seg = _MD_SYMBOL_RE.sub(
+            lambda m: _MD_SYMBOLS.get('\\' + m.group(1), m.group(0)), seg)
+        # Accents run after symbol substitution so \hat{\alpha} → α̂ (the inner
+        # \alpha is already α by the time the accent is placed on it).
+        return _apply_accents(seg)
+    return "".join(seg if is_code else sub_seg(seg)
+                   for seg, is_code in _split_code_spans(text))
 
 
 # Shared inline-Markdown / script regexes (used by the notes editor's TextTag
@@ -2950,17 +2975,14 @@ _MD_SCRIPT_RE = re.compile(r'(\^|_)(?:\{([^}]*)\}|(\S+))')
 
 def _notes_to_pango_markup(text):
     """One paragraph of notes source → Pango markup for callout rendering:
-    \\commands become symbols (always), ^x/_x become super/subscripts, and
-    **bold** / *italic* / `code` become the matching tags. Markers themselves
-    are dropped (like the editor hides them off the cursor line)."""
-    s = _symbolize(text)
-    s = GLib.markup_escape_text(s)
-    # scripts first (operate on clean escaped text), then inline can wrap them
+    \\commands become symbols, ^x/_x become super/subscripts, and **bold** /
+    *italic* / `code` become the matching tags. Inside a `code` span nothing
+    else is rendered — the text is shown verbatim. Markers themselves are
+    dropped (like the editor hides them off the cursor line)."""
     def _script(m):
         content = m.group(2) if m.group(2) is not None else m.group(3)
         tag = "sup" if m.group(1) == '^' else "sub"
         return f"<{tag}>{content}</{tag}>"
-    s = _MD_SCRIPT_RE.sub(_script, s)
 
     def _inline(m):
         if m.group(1) is not None:
@@ -2968,7 +2990,18 @@ def _notes_to_pango_markup(text):
         if m.group(2) is not None:
             return f"<i>{m.group(2)}</i>"
         return f"<tt>{m.group(3)}</tt>"
-    return _MD_INLINE_RE.sub(_inline, s)
+
+    parts = []
+    for seg, is_code in _split_code_spans(text):
+        if is_code:                      # `code` → verbatim monospace
+            parts.append(f"<tt>{GLib.markup_escape_text(seg[1:-1])}</tt>")
+            continue
+        # symbols first, then escape, then scripts, then bold/italic. The
+        # segment has no backticks, so _inline only ever sees bold/italic here.
+        s = GLib.markup_escape_text(_symbolize(seg))
+        s = _MD_SCRIPT_RE.sub(_script, s)
+        parts.append(_MD_INLINE_RE.sub(_inline, s))
+    return "".join(parts)
 
 
 # ── share a PDF to a phone over the LAN (#62) ─────────────────────────────────
@@ -4192,6 +4225,14 @@ class MarkdownNotesView(GtkSource.View):
     def _highlight_line(self, buf, ls, ln, text):
         on_cursor = (ln == self._cursor_line)
 
+        # `code` spans render verbatim: bold/italic and super/subscript inside
+        # them are left as literal text (a Markdown viewer treats code the same).
+        code_ranges = [(m.start(), m.end())
+                       for m in _MD_CODE_SPAN_RE.finditer(text)]
+
+        def in_code(a, b):
+            return any(cs <= a and b <= ce for cs, ce in code_ranges)
+
         def at(n):
             it = ls.copy(); it.forward_chars(n); return it
 
@@ -4213,6 +4254,8 @@ class MarkdownNotesView(GtkSource.View):
         # Inline: bold / italic / code (combined regex handles priority)
         for m in self._INLINE.finditer(text):
             a, b = m.start(), m.end()
+            if m.group(3) is None and in_code(a, b):
+                continue                     # bold/italic inside `code` stays literal
             if m.group(1) is not None:       # **bold**
                 apply("bold", a + 2, b - 2)
                 hide(a, a + 2)
@@ -4230,6 +4273,8 @@ class MarkdownNotesView(GtkSource.View):
         if not on_cursor:
             for m in self._SCRIPT_RE.finditer(text):
                 a, b = m.start(), m.end()
+                if in_code(a, b):
+                    continue                 # ^/_ inside `code` stays literal
                 tag_name = "superscript" if m.group(1) == '^' else "subscript"
                 if m.group(2) is not None:   # braced: ^{content}
                     apply("hide", a, a + 2)  # hide ^{ or _{
@@ -9295,18 +9340,54 @@ class PresenterWindow(Adw.Window):
             self._nav(-1)
 
 
+BASE_APP_ID = "de.hspitz.sidemark"
+# Where an installed copy lives (AUR package / install.sh). A copy running from
+# one of these paths keeps the canonical id so it matches the .desktop file for
+# its icon/name and every launch shares one instance (tabs drag between windows).
+_INSTALLED_PATHS = (
+    "/usr/share/sidemark/sidemark.py",
+    os.path.expanduser("~/.local/share/sidemark/sidemark.py"),
+)
+
+
+def _application_id():
+    """The GApplication id, scoped to this *version* of the code so a launch
+    only ever joins another instance running the same copy.
+
+    The installed copy uses the plain id `de.hspitz.sidemark`. Any other copy —
+    a working-tree checkout you launch for a smoke test — gets its own id keyed
+    to its path, so it never forwards into (and vanishes behind) the instance
+    you have installed and are using. Set SIDEMARK_INSTANCE=<name> to force a
+    specific suffix (share on purpose, or isolate a throwaway instance)."""
+    override = os.environ.get("SIDEMARK_INSTANCE")
+    if override is not None:
+        key = re.sub(r'[^A-Za-z0-9]', '', override)
+        return f"{BASE_APP_ID}.i{key}" if key else BASE_APP_ID
+    try:
+        src = os.path.realpath(os.path.abspath(__file__))
+    except NameError:                        # e.g. exec'd without a __file__
+        return BASE_APP_ID
+    if src in {os.path.realpath(p) for p in _INSTALLED_PATHS}:
+        return BASE_APP_ID
+    # id elements can't start with a digit, so prefix the path hash with a letter
+    key = hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
+    return f"{BASE_APP_ID}.v{key}"
+
+
 class PDFEditorApp(Adw.Application):
     def __init__(self):
-        # Single instance: every launch is routed to this one process, so all
-        # windows share it and a tab can be dragged between any of them.
-        # HANDLES_COMMAND_LINE lets the primary instance parse each launch's
-        # arguments (a file, --page) and open them in a fresh window.
+        # Single instance *per version*: every launch of this same copy is
+        # routed to one process, so all its windows share it and a tab can be
+        # dragged between any of them. A different copy (installed vs. a dev
+        # checkout) gets a different id from _application_id(), so smoke-testing
+        # a checkout never forwards into the installed instance. HANDLES_COMMAND_LINE
+        # lets the primary parse each launch's arguments (a file, --page).
         flags = Gio.ApplicationFlags.HANDLES_COMMAND_LINE
         # Ctrl+R reload sets SIDEMARK_STANDALONE so its fresh-code process runs
         # independently instead of forwarding to the (old-code) instance.
         if os.environ.get("SIDEMARK_STANDALONE"):
             flags |= Gio.ApplicationFlags.NON_UNIQUE
-        super().__init__(application_id="de.hspitz.sidemark", flags=flags)
+        super().__init__(application_id=_application_id(), flags=flags)
 
     def do_startup(self):
         Adw.Application.do_startup(self)
