@@ -2958,15 +2958,76 @@ def _split_markup(text):
 def _parse_note_link(inner):
     """A [[target]] body → {'path', 'page', 'label'}. Forms:
     `#page=N` / `#N` (same document), `file.pdf`, `file.pdf#page=N` / `#N`.
-    `path` is None for a same-document link; `page` is 1-based or None."""
+    An optional `|display text` sets the label shown in place of the target
+    (`[[file.pdf#page=3|the proof]]`). `path` is None for a same-document link;
+    `page` is 1-based or None; `label` is the display text (the alias if given,
+    else the target verbatim)."""
     inner = inner.strip()
-    path, frag = (inner.split('#', 1) + [''])[:2] if '#' in inner else (inner, '')
+    # Split on the FIRST '|' only — the target never contains one, so anything
+    # after it is display text (which may itself contain '|').
+    target, alias = (inner.split('|', 1) + [None])[:2]
+    target = target.strip()
+    path, frag = (target.split('#', 1) + [''])[:2] if '#' in target else (target, '')
     page = None
     if frag:
         mm = re.fullmatch(r'(?:page=)?(\d+)', frag.strip())
         if mm:
             page = int(mm.group(1))
-    return {"path": path.strip() or None, "page": page, "label": inner}
+    label = alias.strip() if alias is not None else target
+    return {"path": path.strip() or None, "page": page, "label": label}
+
+
+def _link_query_at_cursor(line_text, cursor_col):
+    """If the cursor sits inside an *open* `[[…` on this line (no closing `]]`
+    yet and not the `![[embed]]` marker), return the text typed between `[[` and
+    the cursor — the autocomplete query. Otherwise None. `cursor_col` is a
+    character offset into `line_text`."""
+    before = line_text[:cursor_col]
+    open_at = before.rfind('[[')
+    if open_at == -1:
+        return None
+    if open_at > 0 and before[open_at - 1] == '!':
+        return None                      # ![[embed]] marker, not a link
+    query = before[open_at + 2:]
+    if ']' in query or '[' in query:     # link already closed, or a fresh [[
+        return None
+    return query
+
+
+def _link_insert_path(target_path, base_dir):
+    """The path to write inside `[[…]]` so a note in `base_dir` links to
+    `target_path`: a relative path when possible (same folder → just the
+    basename, which is the tidiest and most portable), else the raw path."""
+    if not base_dir:
+        return os.path.basename(target_path)
+    try:
+        return os.path.relpath(target_path, base_dir)
+    except ValueError:                   # different drive on Windows, etc.
+        return target_path
+
+
+def _link_candidates(query, files, current_page=None, base_dir=None):
+    """Ordered autocomplete candidates for a `[[` query.
+
+    `files` is an ordered, de-duplicated list of `(path, kind)` (most relevant
+    first — open tabs before recents; kind in {'open','recent'}). A candidate is
+    `{insert, label, detail, kind}` where `insert` is the text to drop between
+    `[[` and `]]`. The query filters files by case-insensitive basename
+    substring; a "this page" entry is offered when it matches too."""
+    q = query.strip().lower()
+    out = []
+    if current_page is not None and q in "this page":
+        out.append({"insert": f"#page={current_page}",
+                    "label": f"This page (p.{current_page})",
+                    "detail": "same document", "kind": "page"})
+    for path, kind in files:
+        base = os.path.basename(path)
+        if q and q not in base.lower():
+            continue
+        out.append({"insert": _link_insert_path(path, base_dir),
+                    "label": base, "detail": os.path.dirname(path) or "",
+                    "kind": kind})
+    return out
 
 
 def _symbolize(text):
@@ -3819,6 +3880,12 @@ class MarkdownNotesView(GtkSource.View):
         self.font_zoom_cb = None
         # set by the window: called with a _parse_note_link() dict to navigate
         self.on_follow_link = None
+        # set by the window: called with the [[query → list of _link_candidates()
+        # dicts to offer in the autocomplete popup (None disables the popup)
+        self.link_candidates_cb = None
+        self._link_popup = None      # lazily-built Gtk.Popover
+        self._link_list = None       # the Gtk.ListBox inside it
+        self._link_rows = []         # candidate dicts currently shown, in order
 
     # ── formatting shortcuts ──────────────────────────────────────────────────
 
@@ -3868,7 +3935,165 @@ class MarkdownNotesView(GtkSource.View):
         self.set_cursor(Gdk.Cursor.new_from_name(
             "pointer" if over else "text", None))
 
+    # ── [[ autocomplete popup ─────────────────────────────────────────────────
+    # Typing `[[` opens a popup of link targets (open tabs / recents / this
+    # page). It is autohide=False so the text view keeps focus — navigation keys
+    # are intercepted in _on_key while it is visible.
+
+    def _cursor_line_and_col(self):
+        buf = self.get_buffer()
+        it = buf.get_iter_at_mark(buf.get_insert())
+        col = it.get_line_offset()
+        ok, ls = buf.get_iter_at_line(it.get_line())
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        return buf.get_text(ls, le, False), col
+
+    def _update_link_popup(self):
+        """Refresh the popup: show it when the cursor sits in an open `[[…` with
+        matching candidates, hide it otherwise."""
+        if not self.link_candidates_cb or getattr(self, "_accepting_link", False):
+            return
+        line, col = self._cursor_line_and_col()
+        query = _link_query_at_cursor(line, col)
+        if query is None:
+            self._hide_link_popup()
+            return
+        cands = self.link_candidates_cb(query) or []
+        if not cands:
+            self._hide_link_popup()
+            return
+        self._link_rows = cands
+        # A Gtk.Popover can only be shown against a realized surface; skip the
+        # widget when the view isn't mapped (notes panel hidden, or in tests).
+        # Acceptance still works off _link_rows above.
+        if not self.get_mapped():
+            return
+        self._populate_link_popup(cands)
+        self._position_link_popup()
+        self._link_popup.set_visible(True)
+
+    def _ensure_link_popup(self):
+        if self._link_popup is not None:
+            return
+        pop = Gtk.Popover()
+        pop.set_parent(self)
+        pop.set_autohide(False)          # keep text-view focus; we drive the keys
+        pop.set_has_arrow(False)
+        pop.set_position(Gtk.PositionType.BOTTOM)
+        sw = Gtk.ScrolledWindow(propagate_natural_height=True,
+                                propagate_natural_width=True)
+        sw.set_max_content_height(220)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._link_list = Gtk.ListBox()
+        self._link_list.add_css_class("link-complete")
+        self._link_list.connect("row-activated", self._on_link_row_activated)
+        sw.set_child(self._link_list)
+        pop.set_child(sw)
+        self._link_popup = pop
+
+    def _populate_link_popup(self, cands):
+        self._ensure_link_popup()
+        lb = self._link_list
+        while (child := lb.get_first_child()) is not None:
+            lb.remove(child)
+        self._link_rows = cands
+        for c in cands:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.set_margin_start(8); box.set_margin_end(8)
+            box.set_margin_top(3); box.set_margin_bottom(3)
+            title = Gtk.Label(label=c["label"], xalign=0)
+            box.append(title)
+            detail = (c.get("detail") or "").strip()
+            if detail:
+                sub = Gtk.Label(label=detail, xalign=0)
+                sub.add_css_class("dim-label"); sub.add_css_class("caption")
+                sub.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                box.append(sub)
+            row = Gtk.ListBoxRow()
+            row.set_child(box)
+            lb.append(row)
+        lb.select_row(lb.get_row_at_index(0))
+
+    def _position_link_popup(self):
+        buf = self.get_buffer()
+        it = buf.get_iter_at_mark(buf.get_insert())
+        rect = self.get_iter_location(it)
+        bx, by = self.buffer_to_window_coords(
+            Gtk.TextWindowType.WIDGET, rect.x, rect.y + rect.height)
+        self._link_popup.set_pointing_to(
+            Gdk.Rectangle(x=bx, y=by, width=1, height=1))
+
+    def _move_link_selection(self, delta):
+        lb = self._link_list
+        n = len(self._link_rows)
+        if lb is None or n == 0:
+            return
+        row = lb.get_selected_row()
+        i = row.get_index() if row is not None else 0
+        lb.select_row(lb.get_row_at_index((i + delta) % n))
+
+    def _on_link_row_activated(self, _lb, row):
+        self._accept_link_index(row.get_index())
+
+    def _accept_link_selection(self):
+        lb = self._link_list
+        row = lb.get_selected_row() if lb is not None else None
+        self._accept_link_index(row.get_index() if row is not None else 0)
+
+    def _accept_link_index(self, idx):
+        if 0 <= idx < len(self._link_rows):
+            self._insert_link_target(self._link_rows[idx]["insert"])
+        self._hide_link_popup()
+
+    def _insert_link_target(self, insert):
+        """Replace the current `[[query` with `[[insert]]`, cursor after `]]`."""
+        buf = self.get_buffer()
+        cur = buf.get_iter_at_mark(buf.get_insert())
+        col = cur.get_line_offset()
+        ok, ls = buf.get_iter_at_line(cur.get_line())
+        le = ls.copy()
+        if not le.ends_line():
+            le.forward_to_line_end()
+        line = buf.get_text(ls, le, False)
+        open_at = line.rfind('[[', 0, col)
+        if open_at == -1:
+            return
+        start = ls.copy(); start.forward_chars(open_at + 2)   # just after [[
+        closer = '' if line[col:col + 2] == ']]' else ']]'    # keep a stray ]]
+        self._accepting_link = True
+        buf.begin_user_action()
+        try:
+            buf.delete(start, cur)
+            buf.insert(buf.get_iter_at_mark(buf.get_insert()), insert + closer)
+        finally:
+            buf.end_user_action()
+            self._accepting_link = False
+        end = buf.get_iter_at_mark(buf.get_insert())
+        if closer == '':
+            end.forward_chars(2)         # step past the pre-existing ]]
+        buf.place_cursor(end)
+
+    def _hide_link_popup(self):
+        if self._link_popup is not None and self._link_popup.get_visible():
+            self._link_popup.set_visible(False)
+        self._link_rows = []
+
     def _on_key(self, ctrl, keyval, keycode, state):
+        # While the [[ autocomplete popup is open it owns the navigation keys
+        # (the text view keeps focus, so this capture-phase handler is where we
+        # intercept them — the popup is autohide=False and never grabs input).
+        if self._link_popup is not None and self._link_popup.get_visible():
+            if keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+                self._move_link_selection(1);  return True
+            if keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+                self._move_link_selection(-1); return True
+            if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_Tab):
+                self._accept_link_selection(); return True
+            if keyval == Gdk.KEY_Escape:
+                self._hide_link_popup();       return True
+
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
         alt_held = bool(state & Gdk.ModifierType.ALT_MASK)
         if ctrl_held and not alt_held:
@@ -4151,6 +4376,7 @@ class MarkdownNotesView(GtkSource.View):
     # ── signal handlers ───────────────────────────────────────────────────────
 
     def _on_cursor_moved(self, buf, _):
+        self._update_link_popup()
         line = buf.get_iter_at_mark(buf.get_insert()).get_line()
         if line != self._cursor_line:
             self._cursor_line = line
@@ -4158,6 +4384,7 @@ class MarkdownNotesView(GtkSource.View):
 
     def _on_changed(self, _buf):
         if not self._in_highlight:
+            self._update_link_popup()
             self._schedule()
 
     def _schedule(self):
@@ -4332,13 +4559,17 @@ class MarkdownNotesView(GtkSource.View):
             hide(0, m.end())
             return
 
-        # [[wiki links]] → styled + clickable; brackets hidden off cursor line
+        # [[wiki links]] → styled + clickable; brackets hidden off cursor line.
+        # The link tag covers the whole inner (so a click anywhere follows it),
+        # but an optional `target|label` alias hides the `target|` prefix too,
+        # leaving only the label visible off the cursor line.
         for m in _MD_LINK_RE.finditer(text):
             a, b = m.start(), m.end()
             if in_code(a, b):
                 continue                     # [[..]] inside `code` is literal
             apply("link", a + 2, b - 2)
-            hide(a, a + 2)                   # [[
+            bar = text.find('|', a + 2, b - 2)
+            hide(a, bar + 1 if bar != -1 else a + 2)   # [[  (and `target|`)
             hide(b - 2, b)                   # ]]
 
         # Inline: bold / italic / code (combined regex handles priority)
@@ -5831,6 +6062,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._panel_notes_view = s._notes_view
         s._notes_view.font_zoom_cb = lambda d: s.win._change_notes_font(d)
         s._notes_view.on_follow_link = lambda link: s.win._follow_note_link(link)
+        s._notes_view.link_candidates_cb = lambda q: s.win._link_completions(q)
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
@@ -5953,6 +6185,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # and margins together), not the persistent notes-font setting
         tp.view.font_zoom_cb = lambda d: tp.zoom_step(d)
         tp.view.on_follow_link = lambda link: s.win._follow_note_link(link)
+        tp.view.link_candidates_cb = lambda q: s.win._link_completions(q)
         tp.view.get_buffer().connect(
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
@@ -6619,6 +6852,40 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         self.open_file_in_tab(full)
         jump(page)
+
+    def _link_notes_base_dir(self):
+        """The folder the active document's [[links]] resolve against — the
+        same base _follow_note_link() uses, so inserted and followed links agree."""
+        return os.path.dirname(
+            self._path or self._active_notes_path or self._notes_path or "")
+
+    def _link_completions(self, query):
+        """Autocomplete candidates for a `[[query` in the notes: the other open
+        tabs (most relevant), then recent files, plus a 'this page' entry. The
+        current document is left out of the file list — 'this page' covers it."""
+        base = self._link_notes_base_dir()
+        current = self._path and os.path.abspath(self._path)
+        files, seen = [], set()
+        for kind, path in self._link_candidate_sources():
+            ap = os.path.abspath(path)
+            if ap in seen or (current and ap == current) or not os.path.isfile(ap):
+                continue
+            seen.add(ap)
+            files.append((path, kind))
+        page = None
+        if not self._text_mode and self.canvas.document:
+            page = self.canvas.current_page_idx + 1   # links are 1-based
+        return _link_candidates(query, files, current_page=page, base_dir=base)
+
+    def _link_candidate_sources(self):
+        """(kind, path) pairs feeding autocomplete: open tabs first (in tab
+        order), then recent files — de-duplicated by the caller."""
+        for s in self._sessions:
+            p = getattr(s, "_path", None)
+            if p and not getattr(s, "_is_untitled", False):
+                yield ("open", p)
+        for it in _load_recent():
+            yield ("recent", it["path"])
 
     def _nav_page(self, delta):
         """Relative page navigation (PageUp/Down, mouse back/forward): zoomed

@@ -2031,6 +2031,17 @@ class TestLatexFormatting(unittest.TestCase):
         it = buf.get_iter_at_line(0)[1]; it.forward_chars(4)          # 'b' after _
         self.assertFalse(it.has_tag(v._t["subscript"]))
 
+    def test_wiki_link_alias_hides_target_shows_label(self):
+        # [[t.pdf|proof]] — off the cursor line, the `t.pdf|` prefix is hidden
+        # and only 'proof' stays visible (still under the clickable link tag)
+        v, buf = self._render_line0('[[t.pdf|proof]]')
+        # chars: [ [ t . p d f | p r o o f ] ]  → 'p' of proof at index 8
+        target = buf.get_iter_at_line(0)[1]; target.forward_chars(4)  # in 't.pdf'
+        self.assertTrue(target.has_tag(v._t["hide"]))
+        label = buf.get_iter_at_line(0)[1]; label.forward_chars(8)    # 'p' of proof
+        self.assertTrue(label.has_tag(v._t["link"]))
+        self.assertFalse(label.has_tag(v._t["hide"]))
+
     def test_embed_marker_is_not_linkified(self):
         v, buf = self._render_line0('![[deck.pdf]]')
         it = buf.get_iter_at_line(0)[1]; it.forward_chars(3)          # inside [[
@@ -2057,6 +2068,143 @@ class TestNoteLinkParse(unittest.TestCase):
 
     def test_bad_fragment_has_no_page(self):
         self.assertIsNone(self._p('a.pdf#nope')["page"])
+
+    def test_alias_sets_label_only(self):
+        # [[target|label]] — the alias becomes the display label; the target
+        # (left of the |) still drives path/page resolution
+        got = self._p('l2.pdf#page=3|the proof')
+        self.assertEqual(
+            (got["path"], got["page"], got["label"]),
+            ("l2.pdf", 3, "the proof"))
+
+    def test_alias_on_same_document_link(self):
+        got = self._p('#page=12|see here')
+        self.assertEqual((got["path"], got["page"], got["label"]),
+                         (None, 12, "see here"))
+
+    def test_only_first_bar_splits_target_from_label(self):
+        # the target never contains a '|', so a second one is part of the label
+        got = self._p('a.pdf|a | b')
+        self.assertEqual((got["path"], got["label"]), ("a.pdf", "a | b"))
+
+    def test_no_alias_label_is_the_target(self):
+        self.assertEqual(self._p('deck.pdf')["label"], "deck.pdf")
+
+
+class TestLinkAutocompleteHelpers(unittest.TestCase):
+    def _q(self, line, col=None):
+        from sidemark import _link_query_at_cursor
+        return _link_query_at_cursor(line, len(line) if col is None else col)
+
+    def test_query_after_open_brackets(self):
+        self.assertEqual(self._q('see [[lec'), 'lec')
+        self.assertEqual(self._q('[['), '')
+
+    def test_no_query_without_open_brackets(self):
+        self.assertIsNone(self._q('plain text'))
+        self.assertIsNone(self._q('a [ b'))
+
+    def test_closed_link_is_not_a_query(self):
+        # cursor sits after a completed [[..]] — nothing to complete
+        self.assertIsNone(self._q('[[a.pdf]] '))
+
+    def test_embed_marker_is_not_a_query(self):
+        self.assertIsNone(self._q('![[deck.pdf'))
+
+    def test_query_uses_cursor_column_not_line_end(self):
+        # cursor in the middle: only text up to the cursor is the query
+        self.assertEqual(self._q('[[lecture]] tail', col=4), 'le')
+
+    def test_insert_path_same_folder_is_basename(self):
+        from sidemark import _link_insert_path
+        self.assertEqual(_link_insert_path('/a/b/lec.pdf', '/a/b'), 'lec.pdf')
+
+    def test_insert_path_other_folder_is_relative(self):
+        from sidemark import _link_insert_path
+        self.assertEqual(_link_insert_path('/a/sub/lec.pdf', '/a/b'),
+                         '../sub/lec.pdf')
+
+    def test_candidates_rank_open_before_recent(self):
+        from sidemark import _link_candidates
+        files = [('/d/open.pdf', 'open'), ('/d/recent.pdf', 'recent')]
+        got = _link_candidates('', files, base_dir='/d')
+        self.assertEqual([c['kind'] for c in got], ['open', 'recent'])
+        self.assertEqual(got[0]['insert'], 'open.pdf')
+
+    def test_candidates_filter_by_basename_substring(self):
+        from sidemark import _link_candidates
+        files = [('/d/algebra.pdf', 'open'), ('/d/calculus.pdf', 'recent')]
+        got = _link_candidates('calc', files, base_dir='/d')
+        self.assertEqual([c['label'] for c in got], ['calculus.pdf'])
+
+    def test_this_page_entry_offered_and_filtered(self):
+        from sidemark import _link_candidates
+        got = _link_candidates('', [], current_page=7)
+        self.assertEqual(got[0]['insert'], '#page=7')
+        # a query that can't be a prefix of "this page" drops the entry
+        self.assertEqual(_link_candidates('xyz', [], current_page=7), [])
+
+
+class TestLinkAutocompletePopup(unittest.TestCase):
+    """The [[ autocomplete popup's buffer behaviour (the popover widget itself
+    is driven by these, but state is asserted deterministically)."""
+
+    def _view(self, cb=None):
+        from sidemark import MarkdownNotesView
+        v = MarkdownNotesView()
+        v.link_candidates_cb = cb
+        return v
+
+    def _cursor_after(self, buf, text, needle):
+        buf.set_text(text)
+        buf.place_cursor(buf.get_iter_at_offset(text.index(needle) + len(needle)))
+
+    def test_insert_completes_the_closing_brackets(self):
+        v = self._view(); buf = v.get_buffer()
+        self._cursor_after(buf, 'see [[le', 'le')
+        v._insert_link_target('lecture.pdf')
+        self.assertEqual(buf.get_text(buf.get_start_iter(),
+                                      buf.get_end_iter(), True),
+                         'see [[lecture.pdf]]')
+        self.assertTrue(buf.get_iter_at_mark(buf.get_insert()).is_end())
+
+    def test_insert_reuses_existing_closing_brackets(self):
+        v = self._view(); buf = v.get_buffer()
+        self._cursor_after(buf, '[[le]]', 'le')     # cursor sits before the ]]
+        v._insert_link_target('lec.pdf')
+        self.assertEqual(buf.get_text(buf.get_start_iter(),
+                                      buf.get_end_iter(), True), '[[lec.pdf]]')
+
+    def test_popup_populates_on_open_query(self):
+        cands = [{"insert": "a.pdf", "label": "a.pdf", "detail": "", "kind": "open"}]
+        v = self._view(cb=lambda q: cands); buf = v.get_buffer()
+        self._cursor_after(buf, '[[a', 'a')
+        v._update_link_popup()
+        self.assertEqual(v._link_rows, cands)
+
+    def test_popup_hidden_when_not_in_a_link(self):
+        v = self._view(cb=lambda q: [{"insert": "x", "label": "x"}])
+        buf = v.get_buffer()
+        self._cursor_after(buf, 'plain text', 'text')
+        v._update_link_popup()
+        self.assertEqual(v._link_rows, [])
+
+    def test_embed_marker_does_not_open_popup(self):
+        v = self._view(cb=lambda q: [{"insert": "x", "label": "x"}])
+        buf = v.get_buffer()
+        self._cursor_after(buf, '![[a', 'a')
+        v._update_link_popup()
+        self.assertEqual(v._link_rows, [])
+
+    def test_accept_inserts_selected_and_hides(self):
+        cands = [{"insert": "a.pdf", "label": "a.pdf", "detail": "", "kind": "open"}]
+        v = self._view(cb=lambda q: cands); buf = v.get_buffer()
+        self._cursor_after(buf, '[[a', 'a')
+        v._update_link_popup()
+        v._accept_link_selection()
+        self.assertEqual(buf.get_text(buf.get_start_iter(),
+                                      buf.get_end_iter(), True), '[[a.pdf]]')
+        self.assertEqual(v._link_rows, [])
 
 
 class TestCalloutMarkup(unittest.TestCase):
@@ -2114,6 +2262,11 @@ class TestCalloutMarkup(unittest.TestCase):
         self.assertEqual(self._markup('[[my_file.pdf]]'),
                          '<u>my_file.pdf</u>')      # the _ is NOT a subscript
         self.assertTrue(self._parses(self._markup(r'[[a\beta.pdf#page=3]]')))
+
+    def test_wiki_link_alias_shows_label_not_target(self):
+        # [[target|label]] renders just the label (underlined), not the target
+        self.assertEqual(self._markup('[[l2.pdf#page=3|the proof]]'),
+                         '<u>the proof</u>')
 
     def test_embed_line_is_not_a_link(self):
         # the ![[name.pdf]] embed marker must not be treated as a wiki link
@@ -7652,6 +7805,54 @@ class TestFollowNoteLink(unittest.TestCase):
                 # no exception, still on the original document
                 self.assertEqual(
                     os.path.basename(win._active_session._path), "a.pdf")
+        self._run_in_window(body)
+
+
+class TestLinkCompletions(unittest.TestCase):
+    """The window gathers [[ autocomplete candidates from the open tabs, recent
+    files and the current page (the pure ranking/filtering is TestLink*)."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.linkcomplete")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_completions_span_open_tabs_and_this_page(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=3)
+                b = os.path.join(d, "b.pdf"); make_pdf(b, n_pages=1)
+                win._do_open_file(a)
+                win.open_file_in_tab(b)          # b is active, a is another tab
+                inserts = [c["insert"] for c in win._link_completions("")]
+                self.assertIn("#page=1", inserts)   # this page (b, page 1)
+                self.assertIn("a.pdf", inserts)     # other open tab, same folder
+                self.assertNotIn("b.pdf", inserts)  # current doc → this-page covers it
+        self._run_in_window(body)
+
+    def test_completions_filter_by_query(self):
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "algebra.pdf"); make_pdf(a, n_pages=1)
+                b = os.path.join(d, "calculus.pdf"); make_pdf(b, n_pages=1)
+                win._do_open_file(a)
+                win.open_file_in_tab(b)
+                labels = [c["label"] for c in win._link_completions("alg")]
+                self.assertEqual(labels, ["algebra.pdf"])
         self._run_in_window(body)
 
 

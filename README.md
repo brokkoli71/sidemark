@@ -216,8 +216,14 @@ Wiki-style `[[…]]` links in the notes jump to another slide — in the same de
 | `[[#page=12]]` or `[[#12]]` | page 12 of the current document |
 | `[[lecture2.pdf]]` | opens `lecture2.pdf` (in a tab) |
 | `[[lecture2.pdf#page=5]]` or `[[lecture2.pdf#5]]` | opens `lecture2.pdf` at page 5 |
+| `[[lecture2.pdf#page=5\|the proof]]` | same, but shows *the proof* in the text |
 
-Paths are relative to the current document. The link target is kept verbatim (never symbol-substituted), and the `.md` keeps the plain `[[…]]` text, so it round-trips through Obsidian (which uses the same wiki-link syntax). The existing `![[name.pdf]]` embed marker is left alone.
+Typing `[[` opens an **autocomplete popup** of link targets — your other open
+tabs, recent files, and a *This page* entry — filtered as you type; **↑/↓** move,
+**Enter/Tab** insert (closing the `]]` for you), **Esc** dismisses. Add
+`|display text` to any target to show a readable label in place of the raw
+target (`[[…#page=5|the proof]]`) — the same alias syntax Obsidian uses. Paths
+are relative to the current document. The link target is kept verbatim (never symbol-substituted), and the `.md` keeps the plain `[[…]]` text, so it round-trips through Obsidian (which uses the same wiki-link syntax). The existing `![[name.pdf]]` embed marker is left alone.
 
 ### Search
 
