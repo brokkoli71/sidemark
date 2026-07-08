@@ -131,11 +131,23 @@ fix (row 101), and **Phase 2 — deck themes**:
   geometry from the master placeholders (EMU→fraction). Imported decks now
   carry a theme so added slides match. This clrMap+scheme+placeholder chain is
   the machinery structured PPTX text import (row 99) will reuse.
+- *Part 3, PPTX background import (row 107):* `_extract_pptx_theme` resolves the
+  page background with real inheritance (slide→layout→master, nested `_bg_spec`)
+  and extracts **picture backgrounds** (`blipFill` → media → PNG via
+  `fitz.Pixmap`) as `design["bg_image"]` (PNG bytes; gradients → first-stop
+  colour). `build_imported_theme` base64s it into the theme; `render_slide`
+  paints it full-bleed (`EXTEND_PAD`) via `deck._theme_bg_surface` (cache under
+  `_bg_surface`, which `to_json` strips — themes are now `_clean`ed on save).
+  NB: import fidelity of **fonts** depends on the source typeface being
+  installed locally (else Pango substitutes); the user's own decks also have no
+  importable background (plain `bg1` master), so this helps other decks, not
+  those — see ideas.csv row 107.
 
 **Next up:** Cairo smart-arts, build-step animations, Claude-generated
 LaTeX/TikZ figures (roadmap in `~/.claude/plans/linked-launching-allen.md`).
 Nearer-term follow-ups: structured PPTX text import (row 99, now unblocked by
-the placeholder machinery) and deck-bar collapse polish (row 100).
+the placeholder machinery), a "missing fonts" heads-up on import, and deck-bar
+collapse polish (row 100).
 
 Open cosmetic polish: ideas.csv row 100 (row 100 follow-up #2's
 present-button half is now fixed; the deck bar still doesn't fold, it

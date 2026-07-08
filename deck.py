@@ -163,16 +163,22 @@ def build_imported_theme(design):
     (given as 0..1 slide fractions) override the content layout's geometry."""
     d = DEFAULT_THEME
     bg = design.get("bg") or d["bg"]
+    # with a picture background the base colour can't drive contrast, so assume
+    # a mid/dark image and keep light text unless the parsed text colour is set
+    img = design.get("bg_image")
     text = _contrast_text(bg, design.get("text") or d["title_color"])
     layouts = copy.deepcopy(_BASE_LAYOUTS)
     _apply_rect(layouts["content"], "title", design.get("title_rect"))
     _apply_rect(layouts["content"], "body", design.get("body_rect"))
-    return {"name": design.get("name") or "Imported",
-            "bg": list(bg), "accent": list(design.get("accent") or d["accent"]),
-            "title_color": list(text), "body_color": list(text),
-            "heading_font": design.get("heading_font") or d["heading_font"],
-            "body_font": design.get("body_font") or d["body_font"],
-            "layouts": layouts}
+    theme = {"name": design.get("name") or "Imported",
+             "bg": list(bg), "accent": list(design.get("accent") or d["accent"]),
+             "title_color": list(text), "body_color": list(text),
+             "heading_font": design.get("heading_font") or d["heading_font"],
+             "body_font": design.get("body_font") or d["body_font"],
+             "layouts": layouts}
+    if img:                          # PNG bytes → base64 payload the theme carries
+        theme["bg_image"] = base64.b64encode(img).decode("ascii")
+    return theme
 
 
 def _normalize_theme(data):
@@ -212,7 +218,7 @@ class DeckModel:
     def to_json(self):
         return {"format": "smdeck", "version": FORMAT_VERSION,
                 "slide_size": [SLIDE_W, SLIDE_H],
-                "theme": self.theme,
+                "theme": _clean(self.theme),   # drop runtime caches (_bg_surface)
                 "slides": [{"layout": s.get("layout", "blank"),
                             "notes": s.get("notes", ""),
                             "ink": s.get("ink", []),
@@ -289,6 +295,27 @@ def deck_from_images(images, theme=None):
 
 # ── rendering (shared by canvas, sidebar thumbnails, presenter and export) ──
 
+def _theme_bg_surface(theme):
+    """Decode (and cache) a theme's optional full-bleed background image (a PNG
+    imported from a .pptx page background). Returns None when the theme has no
+    image background. The cache lives under the `_bg_surface` key, which
+    `_clean` strips before the theme is serialized."""
+    data_b64 = theme.get("bg_image")
+    if not data_b64:
+        return None
+    surf = theme.get("_bg_surface")
+    if surf is None:
+        try:
+            surf = cairo.ImageSurface.create_from_png(
+                io.BytesIO(base64.b64decode(data_b64)))
+        except Exception:
+            logger.warning("deck: could not decode theme background",
+                           exc_info=True)
+            surf = False           # sentinel: a bad payload is not retried
+        theme["_bg_surface"] = surf
+    return surf or None
+
+
 def _image_surface(obj):
     """Decode (and cache) an image object's PNG payload as a cairo surface."""
     surf = obj.get("_surface")
@@ -347,6 +374,18 @@ def render_slide(cr, slide, theme=None, show_placeholders=False, skip=None):
     cr.set_source_rgb(*theme["bg"])
     cr.rectangle(0, 0, SLIDE_W, SLIDE_H)
     cr.fill()
+    # an imported page-background picture is painted full-bleed over the base
+    # colour, behind every object (the solid bg stays as its letterbox/fallback)
+    bgsurf = _theme_bg_surface(theme)
+    if bgsurf is not None:
+        iw = max(bgsurf.get_width(), 1)
+        ih = max(bgsurf.get_height(), 1)
+        cr.save()
+        cr.scale(SLIDE_W / iw, SLIDE_H / ih)
+        cr.set_source_surface(bgsurf, 0, 0)
+        cr.get_source().set_extend(cairo.EXTEND_PAD)   # no transparent edge seam
+        cr.paint()
+        cr.restore()
     for obj in slide["objects"]:
         if obj is skip:
             continue

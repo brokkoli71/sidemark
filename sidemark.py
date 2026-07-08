@@ -2875,8 +2875,10 @@ def _extract_pptx_theme(pptx_path):
     read that first master + theme. Geometry is returned as 0..1 slide fractions
     (EMU / the presentation's <p:sldSz>), so this stays free of deck units — the
     same zip/rels walk as _extract_pptx_notes. Design keys (all optional): name,
-    bg, text, accent (each an (r,g,b) 0..1), heading_font, body_font,
-    title_rect, body_rect (each an (x,y,w,h) fraction)."""
+    bg, text, accent (each an (r,g,b) 0..1), bg_image (PNG bytes of a full-bleed
+    page-background picture, following slide→layout→master inheritance),
+    heading_font, body_font, title_rect, body_rect (each an (x,y,w,h)
+    fraction)."""
     import zipfile
     import posixpath
     from xml.etree import ElementTree as ET
@@ -2944,6 +2946,21 @@ def _extract_pptx_theme(pptx_path):
             theme = (ET.fromstring(z.read(theme_part))
                      if theme_part and theme_part in names else None)
 
+            # the first slide and its layout, so the page background can follow
+            # the real PPTX inheritance (slide → layout → master) — many
+            # templates put the background on the layout, not the master.
+            slide_part = layout_part = None
+            slst = pres.find(f"{P}sldIdLst")
+            sid = slst.find(f"{P}sldId") if slst is not None else None
+            if sid is not None:
+                srid = sid.get(f"{R}id")
+                slide_part = next((t for i, _ty, t in pres_rels if i == srid),
+                                  None)
+                if slide_part and slide_part in names:
+                    layout_part = next(
+                        (t for _i, ty, t in _rels(z, slide_part)
+                         if ty.endswith("/slideLayout")), None)
+
             # scheme colours (dk1, lt1, accent1 …) from the theme part
             scheme = {}
             if theme is not None:
@@ -2968,17 +2985,87 @@ def _extract_pptx_theme(pptx_path):
                     return slot(sc.get("val"))
                 return _color_of(elem)
 
-            # page background: master <p:bg> solid fill or bgRef (else default)
-            bg = None
-            bgel = master.find(f"{P}cSld/{P}bg")
-            if bgel is not None:
+            def _read_part(part):
+                if part and part in names:
+                    try:
+                        return ET.fromstring(z.read(part))
+                    except ET.ParseError:
+                        return None
+                return None
+
+            def _img_to_png(data):
+                """Any raster image bytes → PNG bytes (cairo only reads PNG),
+                via PyMuPDF; None if it isn't a decodable raster."""
+                try:
+                    pix = fitz.Pixmap(data)
+                    if pix.n - pix.alpha >= 4:        # CMYK/other → RGB
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    return pix.tobytes("png")
+                except Exception:
+                    return None
+
+            def _bg_image_png(blip, part):
+                """The PNG bytes for a <a:blip r:embed> background, resolving the
+                relationship to a media part in the same part's .rels."""
+                embed = blip.get(f"{R}embed")
+                if not embed:
+                    return None
+                media = next((t for i, _ty, t in _rels(z, part)
+                              if i == embed), None)
+                if not media or media not in names:
+                    return None
+                try:
+                    return _img_to_png(z.read(media))
+                except KeyError:
+                    return None
+
+            def _bg_spec(root, part):
+                """One part's own <p:bg> as ('image', png) / ('color', rgb) /
+                None — not inherited; the caller walks slide → layout → master.
+                Handles a picture (blipFill), a solid fill, a gradient (kept as
+                its first stop colour) and a theme fill reference (bgRef)."""
+                if root is None:
+                    return None
+                bgel = root.find(f"{P}cSld/{P}bg")
+                if bgel is None:
+                    return None
                 bgpr = bgel.find(f"{P}bgPr")
                 if bgpr is not None:
+                    blip = bgpr.find(f"{A}blipFill/{A}blip")
+                    if blip is not None:
+                        png = _bg_image_png(blip, part)
+                        if png:
+                            return ("image", png)
                     sf = bgpr.find(f"{A}solidFill")
-                    bg = fill_color(sf) if sf is not None else None
+                    if sf is not None:
+                        c = fill_color(sf)
+                        return ("color", c) if c else None
+                    gf = bgpr.find(f"{A}gradFill")
+                    if gf is not None:
+                        gs = gf.find(f"{A}gsLst/{A}gs")
+                        c = fill_color(gs) if gs is not None else None
+                        return ("color", c) if c else None
+                    return None
+                bgref = bgel.find(f"{P}bgRef")
+                if bgref is not None:
+                    c = fill_color(bgref)
+                    return ("color", c) if c else None
+                return None
+
+            # page background, following the PPTX inheritance order slide →
+            # layout → master; the first part that defines a <p:bg> wins.
+            bg = bg_image = None
+            for root, part in ((_read_part(slide_part), slide_part),
+                               (_read_part(layout_part), layout_part),
+                               (master, master_part)):
+                spec = _bg_spec(root, part)
+                if spec is None:
+                    continue
+                if spec[0] == "image":
+                    bg_image = spec[1]
                 else:
-                    bgref = bgel.find(f"{P}bgRef")
-                    bg = fill_color(bgref) if bgref is not None else None
+                    bg = spec[1]
+                break
 
             # fonts: major (headings) / minor (body) Latin typeface
             def font(which):
@@ -3014,7 +3101,8 @@ def _extract_pptx_theme(pptx_path):
                     body_rect = rect_of(sp)
 
             return {"name": theme.get("name") if theme is not None else None,
-                    "bg": bg, "text": slot("tx1"), "accent": slot("accent1"),
+                    "bg": bg, "bg_image": bg_image,
+                    "text": slot("tx1"), "accent": slot("accent1"),
                     "heading_font": font("major"), "body_font": font("minor"),
                     "title_rect": title_rect, "body_rect": body_rect}
     except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError, ValueError):

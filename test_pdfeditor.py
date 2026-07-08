@@ -100,34 +100,56 @@ def make_pptx(path, slide_notes):
 
 def make_themed_pptx(path, name="Test Theme", bg_slot="bg1",
                      dk1="000000", lt1="FFFFFF", accent1="2E75B6",
-                     major="Georgia", minor="Verdana", with_master=True):
+                     major="Georgia", minor="Verdana", with_master=True,
+                     bg_image_png=None, bg_on="master"):
     """A minimal .pptx carrying just enough design (theme + slide master) to
     exercise _extract_pptx_theme without LibreOffice or python-pptx: a colour
     scheme, a font scheme, a clrMap, a solid master background and title/body
     placeholders with EMU geometry. `with_master=False` omits the master (to
-    test the None fallback)."""
+    test the None fallback).
+
+    Pass `bg_image_png` (PNG bytes) to embed a full-bleed picture background at
+    the inheritance level `bg_on` ∈ {"master","layout","slide"} — this also adds
+    a first slide + its layout so the slide→layout→master walk can be tested."""
     import zipfile
     A = "http://schemas.openxmlformats.org/drawingml/2006/main"
     P = "http://schemas.openxmlformats.org/presentationml/2006/main"
     R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    has_slide = bg_image_png is not None and bg_on in ("layout", "slide")
+    blip = '<p:bg><p:bgPr><a:blipFill><a:blip r:embed="rIdBG"/>' \
+           '</a:blipFill></p:bgPr></p:bg>'
+    solid = (f'<p:bg><p:bgPr><a:solidFill><a:schemeClr val="{bg_slot}"/>'
+             f'</a:solidFill></p:bgPr></p:bg>')
+
     with zipfile.ZipFile(path, "w") as z:
         master_id = ('<p:sldMasterIdLst><p:sldMasterId r:id="rIdM"/>'
                      '</p:sldMasterIdLst>') if with_master else ''
+        slide_id = ('<p:sldIdLst><p:sldId id="256" r:id="rIdS1"/></p:sldIdLst>'
+                    if has_slide else '')
         z.writestr("ppt/presentation.xml",
-                   f'<p:presentation xmlns:p="{P}" xmlns:r="{R}">{master_id}'
+                   f'<p:presentation xmlns:p="{P}" xmlns:r="{R}">'
+                   f'{master_id}{slide_id}'
                    f'<p:sldSz cx="12192000" cy="6858000"/></p:presentation>')
+        pres_rels = (f'<Relationship Id="rIdM" Type="{R}/slideMaster" '
+                     f'Target="slideMasters/slideMaster1.xml"/>')
+        if has_slide:
+            pres_rels += (f'<Relationship Id="rIdS1" Type="{R}/slide" '
+                          f'Target="slides/slide1.xml"/>')
         z.writestr("ppt/_rels/presentation.xml.rels",
-                   f'<Relationships xmlns="{REL}"><Relationship Id="rIdM" '
-                   f'Type="{R}/slideMaster" '
-                   f'Target="slideMasters/slideMaster1.xml"/></Relationships>')
+                   f'<Relationships xmlns="{REL}">{pres_rels}</Relationships>')
         if not with_master:
             return
+
+        if bg_image_png is not None:
+            z.writestr("ppt/media/image1.png", bg_image_png)
+
+        master_bg = blip if (bg_image_png and bg_on == "master") else solid
         z.writestr(
             "ppt/slideMasters/slideMaster1.xml",
-            f'<p:sldMaster xmlns:p="{P}" xmlns:a="{A}"><p:cSld>'
-            f'<p:bg><p:bgPr><a:solidFill><a:schemeClr val="{bg_slot}"/>'
-            f'</a:solidFill></p:bgPr></p:bg><p:spTree>'
+            f'<p:sldMaster xmlns:p="{P}" xmlns:a="{A}" xmlns:r="{R}"><p:cSld>'
+            f'{master_bg}<p:spTree>'
             f'<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>'
             f'<p:spPr><a:xfrm><a:off x="838200" y="365760"/>'
             f'<a:ext cx="10515600" cy="1325563"/></a:xfrm></p:spPr></p:sp>'
@@ -137,10 +159,39 @@ def make_themed_pptx(path, name="Test Theme", bg_slot="bg1",
             f'</p:spTree></p:cSld>'
             f'<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" '
             f'accent1="accent1"/></p:sldMaster>')
+        master_rels = (f'<Relationship Id="rIdT" Type="{R}/theme" '
+                       f'Target="../theme/theme1.xml"/>')
+        if bg_image_png and bg_on == "master":
+            master_rels += (f'<Relationship Id="rIdBG" Type="{R}/image" '
+                            f'Target="../media/image1.png"/>')
         z.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels",
-                   f'<Relationships xmlns="{REL}"><Relationship Id="rIdT" '
-                   f'Type="{R}/theme" Target="../theme/theme1.xml"/>'
-                   f'</Relationships>')
+                   f'<Relationships xmlns="{REL}">{master_rels}</Relationships>')
+
+        if has_slide:
+            slide_bg = blip if bg_on == "slide" else ''
+            layout_bg = blip if bg_on == "layout" else ''
+            z.writestr("ppt/slides/slide1.xml",
+                       f'<p:sld xmlns:p="{P}" xmlns:a="{A}" xmlns:r="{R}">'
+                       f'<p:cSld>{slide_bg}<p:spTree/></p:cSld></p:sld>')
+            slide_rels = (f'<Relationship Id="rIdSL" Type="{R}/slideLayout" '
+                          f'Target="../slideLayouts/slideLayout1.xml"/>')
+            if bg_on == "slide":
+                slide_rels += (f'<Relationship Id="rIdBG" Type="{R}/image" '
+                               f'Target="../media/image1.png"/>')
+            z.writestr("ppt/slides/_rels/slide1.xml.rels",
+                       f'<Relationships xmlns="{REL}">{slide_rels}'
+                       f'</Relationships>')
+            z.writestr("ppt/slideLayouts/slideLayout1.xml",
+                       f'<p:sldLayout xmlns:p="{P}" xmlns:a="{A}" xmlns:r="{R}">'
+                       f'<p:cSld>{layout_bg}<p:spTree/></p:cSld></p:sldLayout>')
+            layout_rels = (f'<Relationship Id="rIdLM" Type="{R}/slideMaster" '
+                           f'Target="../slideMasters/slideMaster1.xml"/>')
+            if bg_on == "layout":
+                layout_rels += (f'<Relationship Id="rIdBG" Type="{R}/image" '
+                                f'Target="../media/image1.png"/>')
+            z.writestr("ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+                       f'<Relationships xmlns="{REL}">{layout_rels}'
+                       f'</Relationships>')
         z.writestr(
             "ppt/theme/theme1.xml",
             f'<a:theme xmlns:a="{A}" name="{name}"><a:themeElements>'
@@ -6861,6 +6912,45 @@ class TestPptxNotes(unittest.TestCase):
         self.assertEqual(model.theme["name"], "Corporate")
         self.assertEqual(model.theme["heading_font"], "Georgia")
 
+    def test_extract_bg_image_from_master(self):
+        from sidemark import _extract_pptx_theme
+        img = _png_bytes(8, 8, rgb=(1, 0, 0))
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.pptx")
+            make_themed_pptx(p, bg_image_png=img, bg_on="master")
+            g = _extract_pptx_theme(p)
+        self.assertTrue(g["bg_image"].startswith(b"\x89PNG"))   # a real PNG
+        self.assertIsNone(g["bg"])          # a picture bg leaves no solid colour
+
+    def test_bg_image_inherits_layout_over_master(self):
+        # master has only a solid bg; the picture lives on the slide's layout,
+        # which must win (slide → layout → master inheritance).
+        from sidemark import _extract_pptx_theme
+        img = _png_bytes(8, 8, rgb=(0, 1, 0))
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.pptx")
+            make_themed_pptx(p, bg_image_png=img, bg_on="layout")
+            g = _extract_pptx_theme(p)
+        self.assertTrue(g["bg_image"].startswith(b"\x89PNG"))
+
+    def test_bg_image_on_slide_wins(self):
+        from sidemark import _extract_pptx_theme
+        img = _png_bytes(8, 8, rgb=(0, 0, 1))
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.pptx")
+            make_themed_pptx(p, bg_image_png=img, bg_on="slide")
+            g = _extract_pptx_theme(p)
+        self.assertTrue(g["bg_image"].startswith(b"\x89PNG"))
+
+    def test_no_bg_image_when_solid(self):
+        from sidemark import _extract_pptx_theme
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.pptx")
+            make_themed_pptx(p)                 # plain solid master bg
+            g = _extract_pptx_theme(p)
+        self.assertIsNone(g["bg_image"])
+        self.assertEqual(g["bg"], (1.0, 1.0, 1.0))
+
 
 class TestMultiTab(unittest.TestCase):
     """Opening several PDFs as tabs in one window (idea #51): a DocumentSession
@@ -7852,6 +7942,49 @@ class TestDeckMode(unittest.TestCase):
         dv.model = model
         dv.add_slide("content")
         self.assertEqual(dv.theme_name(), "Brand")
+
+    def test_build_imported_theme_carries_bg_image(self):
+        deck = self._deck()
+        import base64
+        png = self._png_bytes()          # a red PNG
+        t = deck.build_imported_theme({"bg_image": png})
+        self.assertEqual(base64.b64decode(t["bg_image"]), png)
+        # a design without a picture leaves the key off entirely
+        self.assertNotIn("bg_image", deck.build_imported_theme({}))
+
+    def test_theme_bg_image_is_painted(self):
+        deck = self._deck()
+        # a red full-bleed background image must show through on a blank slide
+        # even though the base bg colour is white
+        theme = deck.build_imported_theme({"bg": (1, 1, 1),
+                                           "bg_image": self._png_bytes()})
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 32, 18)
+        cr = cairo.Context(surf)
+        cr.scale(32 / deck.SLIDE_W, 18 / deck.SLIDE_H)
+        deck.render_slide(cr, deck.new_slide("blank"), theme)
+        surf.flush()
+        b, g, r, _a = surf.get_data()[:4]       # BGRA premultiplied
+        self.assertGreater(r, 200)              # red image, not white bg
+        self.assertLess(g, 60)
+        self.assertLess(b, 60)
+
+    def test_theme_bg_image_round_trips_and_strips_cache(self):
+        deck = self._deck()
+        import base64
+        png = self._png_bytes()
+        theme = deck.build_imported_theme({"bg_image": png})
+        m = deck.DeckModel(theme)
+        # render once to populate the runtime surface cache on the theme dict
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 8, 5)
+        deck.render_slide(cairo.Context(surf), m.slides[0], m.theme)
+        self.assertIn("_bg_surface", m.theme)       # cache present in memory
+        data = m.to_json()
+        self.assertNotIn("_bg_surface", data["theme"])   # but not serialized
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.smdeck")
+            m.save(p)
+            m2 = deck.DeckModel.load(p)
+        self.assertEqual(base64.b64decode(m2.theme["bg_image"]), png)
 
     def test_export_pdf(self):
         deck = self._deck()
