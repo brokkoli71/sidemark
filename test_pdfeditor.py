@@ -2021,6 +2021,56 @@ class TestLatexFormatting(unittest.TestCase):
         self.assertFalse(v._line_originals)
         self.assertEqual(v.get_source_text(), 'brand new')
 
+    # ── `code` spans render verbatim (no symbols/scripts/bold inside) ──────────
+    def _render_line0(self, text):
+        """Render `text` as line 0 with the cursor parked on a second line, so
+        line 0 goes through the off-cursor render path. Returns (view, buffer)."""
+        v = self._view()
+        buf = v.get_buffer()
+        buf.set_text(text + '\nother')
+        buf.place_cursor(buf.get_iter_at_line(1)[1])
+        v._rehighlight()
+        return v, buf
+
+    def _line0_text(self, buf):
+        ok, ls = buf.get_iter_at_line(0)
+        le = ls.copy(); le.forward_to_line_end()
+        return buf.get_text(ls, le, False)
+
+    def test_symbolize_skips_code_span(self):
+        from sidemark import _symbolize
+        self.assertEqual(_symbolize(r'`\alpha` and \beta'), '`\\alpha` and β')
+        self.assertEqual(_symbolize(r'`\hat{x}`'), r'`\hat{x}`')
+
+    def test_code_span_command_not_substituted_in_buffer(self):
+        v, buf = self._render_line0(r'`\sum` here')
+        # the \sum inside backticks survives; nothing outside to substitute
+        self.assertIn(r'\sum', self._line0_text(buf))
+        self.assertNotIn('Σ', self._line0_text(buf))
+
+    def test_command_outside_code_still_substituted(self):
+        v, buf = self._render_line0(r'`x` then \sum')
+        self.assertIn('Σ', self._line0_text(buf))
+
+    def test_code_span_suppresses_subscript_tag(self):
+        v, buf = self._render_line0('`x_1`')
+        # `x_1`  → chars: ` x _ 1 ` — the 1 (index 3) must not be subscripted
+        it = buf.get_iter_at_line(0)[1]; it.forward_chars(3)
+        self.assertFalse(it.has_tag(v._t["subscript"]))
+
+    def test_subscript_outside_code_still_tagged(self):
+        # regression guard: the super/subscript mechanism still fires normally
+        v, buf = self._render_line0('x_1')
+        it = buf.get_iter_at_line(0)[1]; it.forward_chars(2)   # the 1
+        self.assertTrue(it.has_tag(v._t["subscript"]))
+
+    def test_code_span_suppresses_bold_tag(self):
+        v, buf = self._render_line0('`a **b** c`')
+        # the ** inside the code span must not turn on the bold tag
+        for off in range(1, 9):
+            it = buf.get_iter_at_line(0)[1]; it.forward_chars(off)
+            self.assertFalse(it.has_tag(v._t["bold"]), off)
+
 
 class TestCalloutMarkup(unittest.TestCase):
     """Callout boxes render LaTeX symbols (always), super/subscripts and inline
@@ -2054,6 +2104,21 @@ class TestCalloutMarkup(unittest.TestCase):
         for s in (r'\alpha x^2 **b** a_{ij}', '`x_1 < 2`', 'plain text',
                   r'i=1^n \to \infty'):
             self.assertTrue(self._parses(self._markup(s)), s)
+
+    def test_code_span_is_verbatim(self):
+        # inside `code` nothing else renders: LaTeX commands, ^/_ scripts and
+        # **bold** stay literal (only the backticks become the <tt> wrapper)
+        self.assertEqual(self._markup(r'`\alpha`'), r'<tt>\alpha</tt>')
+        self.assertEqual(self._markup('`x_1`'), '<tt>x_1</tt>')
+        self.assertEqual(self._markup('`**b**`'), '<tt>**b**</tt>')
+
+    def test_code_span_escapes_but_does_not_render(self):
+        self.assertEqual(self._markup('`a < b`'), '<tt>a &lt; b</tt>')
+
+    def test_rendering_still_applies_outside_code(self):
+        self.assertEqual(
+            self._markup(r'\alpha `x_1` x^2'),
+            'α <tt>x_1</tt> x<sup>2</sup>')
 
 
 # ── export ────────────────────────────────────────────────────────────────────
@@ -8290,6 +8355,120 @@ class TestDeckMode(unittest.TestCase):
                 self.assertEqual(objs[-1]["type"], "image")
 
             self._run_in_window(body)
+
+
+class TestInstanceId(unittest.TestCase):
+    """The GApplication id is scoped per version of the code so a smoke-test
+    launch of a checkout never forwards into the copy the user has installed."""
+
+    def setUp(self):
+        import sidemark
+        self.sm = sidemark
+        self._saved_env = os.environ.get("SIDEMARK_INSTANCE")
+        self._saved_paths = sidemark._INSTALLED_PATHS
+        os.environ.pop("SIDEMARK_INSTANCE", None)
+
+    def tearDown(self):
+        if self._saved_env is None:
+            os.environ.pop("SIDEMARK_INSTANCE", None)
+        else:
+            os.environ["SIDEMARK_INSTANCE"] = self._saved_env
+        self.sm._INSTALLED_PATHS = self._saved_paths
+
+    def test_checkout_gets_own_suffixed_id(self):
+        # running from the test checkout (not an install path) → suffixed id
+        app_id = self.sm._application_id()
+        self.assertTrue(app_id.startswith("de.hspitz.sidemark."), app_id)
+        self.assertNotEqual(app_id, self.sm.BASE_APP_ID)
+        self.assertTrue(Gio.Application.id_is_valid(app_id), app_id)
+
+    def test_id_is_stable_for_same_path(self):
+        self.assertEqual(self.sm._application_id(), self.sm._application_id())
+
+    def test_installed_copy_keeps_base_id(self):
+        # pretend this file is the installed script → canonical id (icon match)
+        self.sm._INSTALLED_PATHS = (os.path.realpath(self.sm.__file__),)
+        self.assertEqual(self.sm._application_id(), self.sm.BASE_APP_ID)
+
+    def test_env_override_forces_suffix(self):
+        os.environ["SIDEMARK_INSTANCE"] = "smoke-test 2"
+        app_id = self.sm._application_id()
+        self.assertEqual(app_id, "de.hspitz.sidemark.ismoketest2")
+        self.assertTrue(Gio.Application.id_is_valid(app_id), app_id)
+
+    def test_empty_env_override_falls_back_to_base(self):
+        os.environ["SIDEMARK_INSTANCE"] = ""
+        self.assertEqual(self.sm._application_id(), self.sm.BASE_APP_ID)
+
+
+class TestOpenTargetReuse(unittest.TestCase):
+    """Feature A: a launched file lands as a tab in the window you were last
+    using instead of spawning a new window, so opening several files doesn't
+    litter the desktop; SIDEMARK_NEW_WINDOW forces the old new-window behavior."""
+
+    def setUp(self):
+        from sidemark import PDFEditorApp
+        self._App = PDFEditorApp
+        self._saved = {k: os.environ.get(k)
+                       for k in ("SIDEMARK_STANDALONE", "SIDEMARK_NEW_WINDOW")}
+        # NON_UNIQUE so the test app is always primary and never forwards to a
+        # real running Sidemark; drop any inherited new-window override.
+        os.environ["SIDEMARK_STANDALONE"] = "1"
+        os.environ.pop("SIDEMARK_NEW_WINDOW", None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _editor_windows(self, app):
+        from sidemark import PDFEditorWindow
+        return [w for w in app.get_windows()
+                if isinstance(w, PDFEditorWindow)]
+
+    def _drive(self, body):
+        errors = []
+        app = self._App()
+
+        def once():
+            try:
+                body(app)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                app.quit()
+            return False
+
+        GLib.idle_add(once)
+        app.run([])            # HANDLES_COMMAND_LINE → one scratchpad window
+        if errors:
+            raise errors[0]
+
+    def test_file_reuses_active_window(self):
+        def body(app):
+            wins = self._editor_windows(app)
+            self.assertEqual(len(wins), 1)      # the launch's scratchpad window
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "a.pdf"); make_pdf(pdf, n_pages=2)
+                reused = app._open_target(pdf, 0)
+                self.assertTrue(reused)
+                self.assertEqual(len(self._editor_windows(app)), 1)   # no new one
+                self.assertEqual(
+                    os.path.basename(wins[0]._active_session._path), "a.pdf")
+        self._drive(body)
+
+    def test_env_forces_new_window(self):
+        def body(app):
+            with tempfile.TemporaryDirectory() as d:
+                pdf = os.path.join(d, "b.pdf"); make_pdf(pdf, n_pages=1)
+                os.environ["SIDEMARK_NEW_WINDOW"] = "1"
+                n = len(self._editor_windows(app))
+                reused = app._open_target(pdf, 0)
+                self.assertFalse(reused)
+                self.assertEqual(len(self._editor_windows(app)), n + 1)
+        self._drive(body)
 
 
 if __name__ == "__main__":

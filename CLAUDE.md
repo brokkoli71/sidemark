@@ -104,7 +104,17 @@ PyMuPDF (`fitz`), cairo, numpy; LibreOffice headless is an *optional* backend
 
 ## Current state (2026-07)
 
-On the `deck` branch. Shipped since v2: PPTX→deck import (image + speaker
+On the `deck` branch, freshly merged with `origin/master` (two features, both
+already correct for decks): (1) *open launched file as a tab in the last-used
+window* (`_open_target`/`open_file_in_tab`) — decks ride along automatically
+because `.smdeck`/`.pptx` route through `open_file`→`_do_open_file`; (2)
+*verbatim `code` spans + per-version instance id* — the code-span change is in
+`_notes_to_pango_markup`/`_split_code_spans`, which is `deck.notes_to_markup`,
+so **slide textboxes now render `code` verbatim too**, no deck code changed.
+When merging master, always audit each feature for deck impact (see memory
+`feedback_merge_check_deck_impact`).
+
+Shipped since v2: PPTX→deck import (image + speaker
 notes, row 98), the deck presenter's next-slide preview + present-button
 fix (row 101), and **Phase 2 — deck themes**:
 - *Part 1, native themes (row 102):* `DeckModel.theme` in the `.smdeck`
