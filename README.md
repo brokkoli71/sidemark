@@ -38,7 +38,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
-- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter and eraser (`Alt+drag` draws without leaving the text tool; ink rides along with the text you anchor it to). The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
+- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — straight-line snap, smoothing, move/resize/duplicate included (`Alt+drag` draws without leaving the text tool; ink rides along with the text you anchor it to). The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
 
 ### Navigation
 

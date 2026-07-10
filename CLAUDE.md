@@ -135,6 +135,8 @@ per closed tab/window (row 102) — the `--fast` test tier (row 103), lasso
 resize handles + Ctrl+D duplicate (row 104), and text-page pinch zoom +
 Shift+click fit (row 105). The deck branch's `doc_mode`/`_MODE_CHROME` mode
 framework is ported to master (row 107) so parity work no longer waits on a
-deck-merge decision. Open follow-ups: the text/PDF tool-parity roadmap
-(row 106 — the gap audit lives there; build items on the mode framework) and
-the text-page items in rows 92–95.
+deck-merge decision, and parity items 1–3 landed on it (row 108): text pages
+now have the lasso (select/move/resize/duplicate/recolour, re-anchoring the
+marks — closes row 95), straight-line snap and stroke smoothing. Open
+follow-ups: parity items 4–7 in row 106 (pan/zoom gestures, temp-highlighter,
+presenter for text pages) and the text-page items in rows 92–94.

@@ -7610,11 +7610,11 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 for w in (win._notes_toggle, win._present_btn, win._toc_btn,
                           win._nav_box, win._pages_box, win._mode_anchor,
-                          win._mode_lasso, win._mode_pan, win._mode_zoom,
+                          win._mode_pan, win._mode_zoom,
                           win._mode_select):
                     self.assertFalse(w.get_visible(), w)
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
-                          win._mode_text):
+                          win._mode_lasso, win._mode_text):   # lasso: #108
                     self.assertTrue(w.get_visible(), w)
                 # the caret tool leads the tool strip
                 self.assertIs(win._tools_box.get_first_child(), win._mode_text)
@@ -7911,6 +7911,270 @@ class TestTextFirstMode(unittest.TestCase):
                 win._tool_style_popup(pop)
                 self.assertTrue(pop.get_visible())
                 pop.popdown()
+
+            self._run_in_window(body)
+
+
+class TestTextPageLasso(unittest.TestCase):
+    """#108 — text/PDF tool parity items 1–3: lasso (select / move / resize /
+    duplicate / recolor, with re-anchoring), straight-line snap, and stroke
+    smoothing on the text-first page."""
+
+    MD = "# Title\n\n" + "\n".join(f"paragraph line {i}" for i in range(30))
+
+    _run_in_window = TestTextFirstMode._run_in_window
+    _settle = staticmethod(TestTextFirstMode._settle)
+
+    def _open_md(self, win, d):
+        md = os.path.join(d, "note.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write(self.MD)
+        win._do_open_file(md)
+        self._settle()
+        return md
+
+    @staticmethod
+    def _gesture(sx=300.0, sy=100.0):
+        return types.SimpleNamespace(
+            get_current_event_state=lambda: Gdk.ModifierType(0),
+            set_state=lambda s: None,
+            get_current_button=lambda: 1,
+            get_start_point=lambda: (True, sx, sy))
+
+    def _draw_stroke(self, win, pts):
+        tp = win._active_session._text_page
+        win._set_tool_mode("pen")
+        tp._commit_stroke(pts)
+        return tp
+
+    def _lasso_around(self, win, tp, bbox, margin=12.0):
+        """Drive the real gesture handlers to loop around the overlay bbox."""
+        win._set_tool_mode("lasso")
+        x0, y0, x1, y1 = (bbox[0] - margin, bbox[1] - margin,
+                          bbox[2] + margin, bbox[3] + margin)
+        g = self._gesture(x0, y0)
+        tp._on_ink_begin(g, x0, y0)
+        for px, py in ((x1, y0), (x1, y1), (x0, y1), (x0, y0)):
+            tp._on_ink_update(g, px - x0, py - y0)
+        tp._on_ink_end(g, 0.0, 0.0)
+
+    @staticmethod
+    def _bbox(pts):
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def test_lasso_selects_enclosed_and_crossing_strokes(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                # a snapped straight line: 2 points, far to the right
+                self._draw_stroke(win, [(500.0, 100.0), (700.0, 100.0)])
+                free, line = tp.strokes
+                self._lasso_around(
+                    win, tp, self._bbox(tp._stroke_overlay_pts(free)))
+                self.assertEqual(tp._selected, [free])
+                # a small loop around the line's MIDDLE contains none of its 2
+                # points — segment-crossing must still catch it
+                self._lasso_around(win, tp, (590.0, 95.0, 610.0, 105.0),
+                                   margin=0.0)
+                self.assertEqual(tp._selected, [line])
+                # empty loop clears the selection
+                self._lasso_around(win, tp, (60.0, 300.0, 80.0, 320.0),
+                                   margin=0.0)
+                self.assertEqual(tp._selected, [])
+
+            self._run_in_window(body)
+
+    def test_lasso_move_reanchors_and_undoes(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                st = tp.strokes[0]
+                before_pts = tp._stroke_overlay_pts(st)
+                before_mark = st["mark"]
+                self._lasso_around(win, tp, self._bbox(before_pts))
+                self.assertEqual(tp._selected, [st])
+                # grab the middle of the selection and drag it down-right
+                bx = self._bbox(before_pts)
+                cx, cy = (bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2
+                g = self._gesture(cx, cy)
+                tp._on_ink_begin(g, cx, cy)
+                self.assertTrue(tp._lasso_moving)
+                tp._on_ink_update(g, 60.0, 90.0)
+                tp._on_ink_end(g, 60.0, 90.0)
+                after_pts = tp._stroke_overlay_pts(st)
+                for (ax, ay), (bx_, by) in zip(after_pts, before_pts):
+                    self.assertAlmostEqual(ax, bx_ + 60.0, delta=2.0)
+                    self.assertAlmostEqual(ay, by + 90.0, delta=2.0)
+                # the move re-anchored: fresh mark, offsets at the current font
+                self.assertIsNot(st["mark"], before_mark)
+                self.assertEqual(st["font_px"], tp.font_px)
+                # one undo restores the old anchor and position
+                tp.undo_ink()
+                undone = tp._stroke_overlay_pts(st)
+                for (ax, ay), (bx_, by) in zip(undone, before_pts):
+                    self.assertAlmostEqual(ax, bx_, delta=2.0)
+                    self.assertAlmostEqual(ay, by, delta=2.0)
+                self.assertIs(st["mark"], before_mark)
+
+            self._run_in_window(body)
+
+    def test_lasso_resize_scales_points_and_width(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0), (340.0, 140.0)])
+                st = tp.strokes[0]
+                drawn_before = st["width"] * tp.font_px / st["font_px"]
+                self._lasso_around(
+                    win, tp, self._bbox(tp._stroke_overlay_pts(st)))
+                bbox = tp._selection_bbox()
+                pad = 5.0
+                # grab the top-left handle; anchor is the bottom-right corner
+                hx, hy = bbox[0] - pad, bbox[1] - pad
+                ax, ay = bbox[2], bbox[3]
+                g = self._gesture(hx, hy)
+                tp._on_ink_begin(g, hx, hy)
+                self.assertTrue(tp._lasso_scaling)
+                # drag the handle to double its distance from the anchor
+                dx, dy = (hx - ax), (hy - ay)
+                tp._on_ink_update(g, dx, dy)
+                self.assertAlmostEqual(tp._lasso_scale_factor, 2.0, delta=0.01)
+                tp._on_ink_end(g, dx, dy)
+                span = tp._stroke_overlay_pts(st)
+                w = abs(span[1][0] - span[0][0])
+                self.assertAlmostEqual(w, 80.0, delta=3.0)   # 40 × 2
+                drawn_after = st["width"] * tp.font_px / st["font_px"]
+                self.assertAlmostEqual(drawn_after, drawn_before * 2,
+                                       delta=0.05)
+                tp.undo_ink()
+                drawn_undone = st["width"] * tp.font_px / st["font_px"]
+                self.assertAlmostEqual(drawn_undone, drawn_before, delta=0.05)
+
+            self._run_in_window(body)
+
+    def test_duplicate_and_delete_selected(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                st = tp.strokes[0]
+                self._lasso_around(
+                    win, tp, self._bbox(tp._stroke_overlay_pts(st)))
+                tp.duplicate_selected()
+                self.assertEqual(len(tp.strokes), 2)
+                clone = tp.strokes[1]
+                self.assertEqual(tp._selected, [clone])   # drag-to-place next
+                op, oc = (tp._stroke_overlay_pts(st)[0],
+                          tp._stroke_overlay_pts(clone)[0])
+                self.assertAlmostEqual(oc[0], op[0] + 14.0, delta=2.0)
+                self.assertAlmostEqual(oc[1], op[1] + 14.0, delta=2.0)
+                # one undo removes the clone
+                tp.undo_ink()
+                self.assertEqual(tp.strokes, [st])
+                # delete the original through the selection
+                self._lasso_around(
+                    win, tp, self._bbox(tp._stroke_overlay_pts(st)))
+                tp.delete_selected_strokes()
+                self.assertEqual(tp.strokes, [])
+                tp.undo_ink()
+                self.assertEqual(tp.strokes, [st])
+
+            self._run_in_window(body)
+
+    def test_recolor_selected_applies_pen_attrs(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                st = tp.strokes[0]
+                self._lasso_around(
+                    win, tp, self._bbox(tp._stroke_overlay_pts(st)))
+                tp.recolor_selected((1.0, 0.0, 0.0), 4.0, 0.8)
+                self.assertEqual(st["color"], (1.0, 0.0, 0.0))
+                self.assertEqual(st["opacity"], 0.8)
+                # the chosen width is the on-screen width at the current font
+                self.assertAlmostEqual(
+                    st["width"] * tp.font_px / max(st["font_px"], 1), 4.0,
+                    delta=0.01)
+                tp.undo_ink()
+                self.assertNotEqual(st["color"], (1.0, 0.0, 0.0))
+
+            self._run_in_window(body)
+
+    def test_switching_tool_clears_selection(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                self._lasso_around(
+                    win, tp, self._bbox(tp._stroke_overlay_pts(tp.strokes[0])))
+                self.assertTrue(tp.has_lasso_selection())
+                self.assertTrue(tp.ink.get_can_target())   # lasso is an ink tool
+                win._set_tool_mode("pen")
+                self.assertFalse(tp.has_lasso_selection())
+
+            self._run_in_window(body)
+
+    def test_straight_line_snap_on_rest(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                g = self._gesture(300.0, 100.0)
+                tp._on_ink_begin(g, 300.0, 100.0)
+                for i in range(1, 6):
+                    tp._on_ink_update(g, i * 10.0, i * 7.0)
+                self.assertIsNotNone(tp._straight_timer)
+                tp._cancel_straight_timer()
+                tp._snap_to_straight()   # the rest timer firing
+                self.assertTrue(tp._straight_mode)
+                self.assertEqual(tp.current_stroke,
+                                 [(300.0, 100.0), (350.0, 135.0)])
+                # locked to a line: only the endpoint follows further motion
+                tp._on_ink_update(g, 80.0, 20.0)
+                self.assertEqual(tp.current_stroke,
+                                 [(300.0, 100.0), (380.0, 120.0)])
+                tp._on_ink_end(g, 80.0, 20.0)
+                # committed exactly as the 2-point line, no smoothing applied
+                self.assertEqual(len(tp.strokes[0]["pts"]), 2)
+
+            self._run_in_window(body)
+
+    def test_freehand_ink_is_smoothed_on_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                # a zigzag: smoothing must pull the interior points inward
+                raw = [(300.0, 100.0), (310.0, 130.0), (320.0, 100.0),
+                       (330.0, 130.0), (340.0, 100.0)]
+                g = self._gesture(*raw[0])
+                tp._on_ink_begin(g, *raw[0])
+                for px, py in raw[1:]:
+                    tp._on_ink_update(g, px - raw[0][0], py - raw[0][1])
+                tp._cancel_straight_timer()   # the cursor never rested
+                tp._on_ink_end(g, 40.0, 0.0)
+                st = tp.strokes[0]
+                expect = PDFCanvas._smooth_points(raw, tp.get_smoothing())
+                got = tp._stroke_overlay_pts(st)
+                self.assertEqual(len(got), len(expect))
+                for (gx, gy), (ex, ey) in zip(got, expect):
+                    self.assertAlmostEqual(gx, ex, delta=2.0)
+                    self.assertAlmostEqual(gy, ey, delta=2.0)
+                # the zigzag's middle spike is measurably flattened
+                self.assertLess(abs(got[1][1] - got[2][1]), 25.0)
 
             self._run_in_window(body)
 

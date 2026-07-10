@@ -4870,6 +4870,29 @@ class TextPageView(Gtk.Overlay):
         # (color, width, opacity) for the given highlighter flag — the window
         # points this at the shared pen settings so both modes feel identical
         self.pen_style = lambda highlighter: ((0.05, 0.05, 0.8), 2.0, 1.0)
+        # smoothing strength / accent colour follow the session's canvas the
+        # same way (parity: both modes obey the one pen-settings popover)
+        self.get_smoothing = lambda: 0.5
+        self.accent = lambda: (0.52, 0.70, 0.30)
+        # GoodNotes-style straight-line snap, same as the PDF canvas: holding
+        # still mid-stroke collapses the in-progress stroke to a line
+        self._straight_mode = False
+        self._straight_timer = None
+        # lasso selection (PDF-canvas parity: select, move, resize, duplicate).
+        # Selected strokes are ordinary strokes; a move/resize RE-ANCHORS them
+        # — fresh GtkTextMark at the new spot, offsets recomputed — so they
+        # keep riding with the paragraph they now sit on.
+        self._selected = []
+        self._lassoing = False
+        self._lasso_path = []          # overlay coords of the loop in progress
+        self._lasso_moving = False
+        self._lasso_moved = False
+        self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
+        self._lasso_scaling = False
+        self._lasso_scale_anchor = (0.0, 0.0)   # overlay-space fixed corner
+        self._lasso_scale_start = (0.0, 0.0)
+        self._lasso_scale_factor = 1.0
+        self._lasso_orig = []          # (stroke, overlay pts) at drag begin
 
         # the sheet always reads like paper: white page, dark text, light scheme
         self.view = MarkdownNotesView("Adwaita")
@@ -4943,6 +4966,16 @@ class TextPageView(Gtk.Overlay):
         pinch.connect("scale-changed", self._on_sheet_pinch_scale)
         self.add_controller(pinch)
 
+        # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
+        # overlay: the sheet's TextView usually keeps focus (the ink
+        # DrawingArea isn't focusable), so these must win before the editor's
+        # own Delete / Ctrl+D line-duplicate — gated on the lasso actually
+        # holding a selection, typing is never affected.
+        key = Gtk.EventControllerKey()
+        key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        key.connect("key-pressed", self._on_lasso_key)
+        self.add_controller(key)
+
         # the ink must repaint whenever the sheet scrolls or reflows under it
         self.scroll.get_vadjustment().connect(
             "value-changed", lambda *_: self.ink.queue_draw())
@@ -4955,11 +4988,15 @@ class TextPageView(Gtk.Overlay):
 
     def set_tool(self, tool):
         """Anything that isn't a drawing tool falls back to text editing."""
-        self.tool = tool if tool in ("pen", "highlighter", "eraser") else "text"
+        self.tool = (tool if tool in ("pen", "highlighter", "eraser", "lasso")
+                     else "text")
         inking = self.tool != "text"
         self.ink.set_can_target(inking)
         self.ink.set_cursor(
-            Gdk.Cursor.new_from_name("crosshair") if inking else None)
+            Gdk.Cursor.new_from_name("crosshair")
+            if inking and self.tool != "lasso" else None)
+        if self.tool != "lasso":
+            self.clear_lasso_selection()
         if not inking and self.current_stroke:
             self.current_stroke = []
             self.ink.queue_draw()
@@ -5117,9 +5154,13 @@ class TextPageView(Gtk.Overlay):
         self._shift_fitting = False
         button = gesture.get_current_button()
         self._erased_now = []
-        if self.tool == "eraser" or button == 3:
+        if self.tool == "lasso" and button != 3:
+            self._lasso_begin(x, y)
+        elif self.tool == "eraser" or button == 3:
             self._erase_at(x, y)
         else:
+            self._cancel_straight_timer()
+            self._straight_mode = False
             self.current_stroke = [(x, y)]
         self.ink.queue_draw()
 
@@ -5130,8 +5171,27 @@ class TextPageView(Gtk.Overlay):
         if not ok:
             return
         x, y = sx + dx, sy + dy
-        if self.current_stroke:
-            self.current_stroke.append((x, y))
+        if self._lassoing:
+            self._lasso_path.append((x, y))
+        elif self._lasso_scaling:
+            ax, ay = self._lasso_scale_anchor
+            d0 = math.hypot(self._lasso_scale_start[0] - ax,
+                            self._lasso_scale_start[1] - ay)
+            if d0 > 1e-6:
+                self._lasso_scale_factor = max(
+                    0.05, min(20.0, math.hypot(x - ax, y - ay) / d0))
+        elif self._lasso_moving:
+            self._lasso_drag = (dx, dy)
+            if abs(dx) + abs(dy) > 1:
+                self._lasso_moved = True
+        elif self.current_stroke:
+            if self._straight_mode:
+                # locked to a line: only the endpoint follows the cursor
+                self.current_stroke = [self.current_stroke[0], (x, y)]
+            else:
+                self.current_stroke.append((x, y))
+                # re-arm on every motion → the snap fires once the cursor rests
+                self._arm_straight_timer()
         else:
             self._erase_at(x, y)
         self.ink.queue_draw()
@@ -5140,8 +5200,37 @@ class TextPageView(Gtk.Overlay):
         if self._shift_fitting:
             self._shift_fitting = False
             return
-        if self.current_stroke:
-            self._commit_stroke(self.current_stroke)
+        self._cancel_straight_timer()
+        was_straight = self._straight_mode
+        self._straight_mode = False
+        if self._lassoing:
+            self._lassoing = False
+            self._finish_lasso()
+        elif self._lasso_scaling:
+            self._lasso_scaling = False
+            self.ink.set_cursor(None)
+            f = self._lasso_scale_factor
+            if abs(f - 1.0) > 1e-3 and self._selected:
+                ax, ay = self._lasso_scale_anchor
+                self._reanchor_selected(
+                    lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f),
+                    width_factor=f)
+            self._lasso_orig = []
+        elif self._lasso_moving:
+            self._lasso_moving = False
+            self.ink.set_cursor(None)
+            mdx, mdy = self._lasso_drag
+            self._lasso_drag = (0.0, 0.0)
+            if self._lasso_moved and self._selected:
+                self._reanchor_selected(lambda p: (p[0] + mdx, p[1] + mdy))
+            self._lasso_orig = []
+        elif self.current_stroke:
+            pts = self.current_stroke
+            # smooth freehand ink on commit (same recipe as the PDF canvas);
+            # a snapped straight line and dots are left exactly as drawn
+            if not was_straight and len(pts) > 2:
+                pts = PDFCanvas._smooth_points(pts, self.get_smoothing())
+            self._commit_stroke(pts)
             self.current_stroke = []
         elif self._erased_now:
             self._undo_ops.append(("erase", self._erased_now))
@@ -5150,6 +5239,31 @@ class TextPageView(Gtk.Overlay):
             if self.on_ink_action:
                 self.on_ink_action()
         self.ink.queue_draw()
+
+    # ── straight-line snap (PDF-canvas parity) ───────────────────────────────
+
+    STRAIGHT_HOLD_MS = PDFCanvas.STRAIGHT_HOLD_MS
+
+    def _arm_straight_timer(self):
+        self._cancel_straight_timer()
+        self._straight_timer = GLib.timeout_add(
+            self.STRAIGHT_HOLD_MS, self._snap_to_straight)
+
+    def _cancel_straight_timer(self):
+        if self._straight_timer is not None:
+            GLib.source_remove(self._straight_timer)
+            self._straight_timer = None
+
+    def _snap_to_straight(self):
+        """Fired when the cursor has rested mid-stroke: collapse the in-progress
+        free stroke into a straight line from its start to the current point."""
+        self._straight_timer = None
+        if len(self.current_stroke) >= 2:
+            self._straight_mode = True
+            self.current_stroke = [self.current_stroke[0],
+                                   self.current_stroke[-1]]
+            self.ink.queue_draw()
+        return False   # one-shot
 
     def _commit_stroke(self, pts_overlay):
         if len(pts_overlay) < 2:
@@ -5191,48 +5305,292 @@ class TextPageView(Gtk.Overlay):
         if self.on_ink_changed:
             self.on_ink_changed()
 
+    # ── lasso (PDF-canvas parity; geometry shared with PDFCanvas) ────────────
+    # Everything is hit-tested in overlay space — a stroke's on-screen points
+    # already follow its mark and font scale, so a selection stays honest even
+    # when text edits move the paragraphs underneath it.
+
+    def _lasso_begin(self, x, y):
+        handle = self._lasso_handle_at(x, y) if self._selected else None
+        if handle is not None:
+            # press on a corner handle scales the selection, anchored at the
+            # opposite corner
+            corners = PDFCanvas._bbox_corners(self._selection_bbox())
+            self._lasso_scaling = True
+            self._lasso_scale_anchor = corners[(handle + 2) % 4]
+            self._lasso_scale_start = (x, y)
+            self._lasso_scale_factor = 1.0
+            self._lasso_orig = [(st, self._stroke_overlay_pts(st))
+                                for st in self._selected]
+            self.ink.set_cursor(Gdk.Cursor.new_from_name(
+                "nwse-resize" if handle in (0, 2) else "nesw-resize"))
+        elif self._selected and self._point_in_selection(x, y):
+            # press inside the current selection grabs it for a move
+            self._lasso_moving = True
+            self._lasso_moved = False
+            self._lasso_drag = (0.0, 0.0)
+            self._lasso_orig = [(st, self._stroke_overlay_pts(st))
+                                for st in self._selected]
+            self.ink.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
+        else:
+            # otherwise start a fresh loop, dropping any prior selection
+            self._lassoing = True
+            self._set_selected([])
+            self._lasso_path = [(x, y)]
+
+    def _finish_lasso(self):
+        """Close the loop and select every stroke that touches it: any point
+        inside (the common freehand case), or — for sparse strokes like
+        snapped straight lines — any segment crossing the boundary."""
+        path, self._lasso_path = self._lasso_path, []
+        if len(path) < 3:
+            self._set_selected([])
+            return
+        sel = []
+        for st in self.strokes:
+            pts = self._stroke_overlay_pts(st)
+            if (any(PDFCanvas._point_in_polygon(px, py, path)
+                    for px, py in pts)
+                    or PDFCanvas._polyline_crosses_polygon(pts, path)):
+                sel.append(st)
+        self._set_selected(sel)
+
+    def _set_selected(self, strokes):
+        self._selected = strokes
+        self.ink.queue_draw()
+
+    def has_lasso_selection(self):
+        return bool(self._selected)
+
+    def clear_lasso_selection(self):
+        if self._selected or self._lasso_path:
+            self._lasso_path = []
+            self._set_selected([])
+
+    def _selection_bbox(self):
+        """Overlay-space (x0, y0, x1, y1) box of the selected strokes, or None."""
+        pts = [p for st in self._selected
+               for p in self._stroke_overlay_pts(st)]
+        if not pts:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _point_in_selection(self, x, y):
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        x0, y0, x1, y1 = bbox
+        pad = 8.0
+        return x0 - pad <= x <= x1 + pad and y0 - pad <= y <= y1 + pad
+
+    def _lasso_handle_at(self, x, y, hit=4.0):
+        """Index (0–3) of the corner resize handle under the overlay point, or
+        None — same pad/hit-box compromise as the PDF canvas (a grab just
+        inside the box still means move, even on tiny selections)."""
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return None
+        pad = 5.0
+        x0, y0, x1, y1 = bbox
+        corners = ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
+                   (x1 + pad, y1 + pad), (x0 - pad, y1 + pad))
+        for i, (hx, hy) in enumerate(corners):
+            if abs(x - hx) <= hit and abs(y - hy) <= hit:
+                return i
+        return None
+
+    def _anchor_stroke_at(self, overlay_pts):
+        """The _commit_stroke anchoring recipe as a helper: mark at the first
+        point, buffer-pixel offsets at the current font. Returns the fields a
+        stroke stores for its geometry."""
+        buf_pts = [self._overlay_to_buffer(px, py) for px, py in overlay_pts]
+        buf = self.view.get_buffer()
+        _over_text, it = self.view.get_iter_at_location(*buf_pts[0])
+        mark = buf.create_mark(None, it, True)
+        r = self.view.get_iter_location(it)
+        return mark, [(bx - r.x, by - r.y) for bx, by in buf_pts]
+
+    def _reanchor_selected(self, transform, width_factor=1.0):
+        """A move/resize landed: transform each selected stroke's drag-begin
+        overlay points and re-anchor it there — new mark, new offsets, current
+        font — so it rides with the paragraph it now sits on. Old marks are
+        kept (not deleted) so undo can restore them; one undo entry covers the
+        whole selection."""
+        entries = []
+        for st, orig in self._lasso_orig:
+            before = (st["mark"], list(st["pts"]), st["font_px"], st["width"])
+            mark, pts = self._anchor_stroke_at([transform(p) for p in orig])
+            # stored width draws as width × (font now / font at store): keep
+            # the on-screen width (× the resize factor) across the re-anchor
+            st["width"] = (st["width"] * self.font_px / max(st["font_px"], 1)
+                           * width_factor)
+            st["mark"], st["pts"], st["font_px"] = mark, pts, self.font_px
+            entries.append((st, before,
+                            (mark, list(pts), st["font_px"], st["width"])))
+        self._undo_ops.append(("anchor", entries))
+        self._redo_ops.clear()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    def duplicate_selected(self, offset=14.0):
+        """Ctrl+D: copy the selected strokes offset a little, anchored where
+        the copies land, and select the copies so drag-to-place is the natural
+        next gesture — one undo entry."""
+        if not self._selected:
+            return
+        clones = []
+        for st in self._selected:
+            pts = [(px + offset, py + offset)
+                   for px, py in self._stroke_overlay_pts(st)]
+            mark, rel = self._anchor_stroke_at(pts)
+            clones.append({
+                "mark": mark,
+                "pts": rel,
+                "color": tuple(st["color"]),
+                "width": st["width"] * self.font_px / max(st["font_px"], 1),
+                "opacity": st["opacity"],
+                "font_px": self.font_px,
+            })
+        self.strokes.extend(clones)
+        self._undo_ops.append(("add", clones))
+        self._redo_ops.clear()
+        self._set_selected(clones)
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    def delete_selected_strokes(self):
+        """Remove the selected strokes (one undo entry, reusing erase ops)."""
+        if not self._selected:
+            return
+        for st in self._selected:
+            if st in self.strokes:
+                self.strokes.remove(st)   # mark kept so undo can restore it
+        self._undo_ops.append(("erase", list(self._selected)))
+        self._redo_ops.clear()
+        self._set_selected([])
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    def recolor_selected(self, color, width, opacity):
+        """Apply the given pen attrs to the selection (one undo entry). The
+        stored width is rescaled so the stroke draws at exactly the chosen
+        width at the current font/zoom."""
+        if not self._selected:
+            return
+        entries = []
+        for st in self._selected:
+            before = (st["color"], st["width"], st["opacity"])
+            st["color"] = tuple(color)
+            st["width"] = width * max(st["font_px"], 1) / self.font_px
+            st["opacity"] = opacity
+            entries.append((st, before,
+                            (st["color"], st["width"], st["opacity"])))
+        self._undo_ops.append(("recolor", entries))
+        self._redo_ops.clear()
+        self.ink.queue_draw()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    def _on_lasso_key(self, _ctrl, keyval, _keycode, state):
+        if self.tool != "lasso" or not self._selected:
+            return False
+        if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
+            self.delete_selected_strokes()
+            return True
+        if keyval == Gdk.KEY_Escape:
+            self.clear_lasso_selection()
+            return True
+        if (keyval in (Gdk.KEY_d, Gdk.KEY_D)
+                and state & Gdk.ModifierType.CONTROL_MASK):
+            self.duplicate_selected()
+            return True
+        return False
+
     # ── ink undo (driven by the window's chronological timeline) ─────────────
+
+    def _apply_ink_op(self, op, undo):
+        """add/erase toggle stroke membership; anchor/recolor swap the stored
+        before/after state on the strokes in place."""
+        kind, payload = op
+        if kind == "add" or kind == "erase":
+            removing = (kind == "add") == undo
+            if removing:
+                for st in payload:
+                    if st in self.strokes:
+                        self.strokes.remove(st)
+            else:
+                self.strokes.extend(payload)
+        elif kind == "anchor":
+            for st, before, after in payload:
+                mark, pts, font_px, width = before if undo else after
+                st["mark"], st["font_px"], st["width"] = mark, font_px, width
+                st["pts"] = list(pts)
+        elif kind == "recolor":
+            for st, before, after in payload:
+                st["color"], st["width"], st["opacity"] = \
+                    before if undo else after
 
     def undo_ink(self):
         if not self._undo_ops:
             return
-        kind, strokes = self._undo_ops.pop()
-        if kind == "add":
-            for st in strokes:
-                if st in self.strokes:
-                    self.strokes.remove(st)
-        else:
-            self.strokes.extend(strokes)
-        self._redo_ops.append((kind, strokes))
-        if self.on_ink_changed:
+        op = self._undo_ops.pop()
+        self._apply_ink_op(op, undo=True)
+        self._redo_ops.append(op)
+        self.clear_lasso_selection()   # like the canvas: don't keep a
+        if self.on_ink_changed:        # selection of strokes undo just changed
             self.on_ink_changed()
         self.ink.queue_draw()
 
     def redo_ink(self):
         if not self._redo_ops:
             return
-        kind, strokes = self._redo_ops.pop()
-        if kind == "add":
-            self.strokes.extend(strokes)
-        else:
-            for st in strokes:
-                if st in self.strokes:
-                    self.strokes.remove(st)
-        self._undo_ops.append((kind, strokes))
+        op = self._redo_ops.pop()
+        self._apply_ink_op(op, undo=False)
+        self._undo_ops.append(op)
+        self.clear_lasso_selection()
         if self.on_ink_changed:
             self.on_ink_changed()
         self.ink.queue_draw()
 
     # ── rendering ────────────────────────────────────────────────────────────
 
+    def _lasso_drag_pts(self):
+        """{id(stroke): transformed overlay pts} for the selection while a
+        move/resize drag is in flight, else empty."""
+        if not self._lasso_orig or not (self._lasso_moving
+                                        or self._lasso_scaling):
+            return {}
+        if self._lasso_moving:
+            mdx, mdy = self._lasso_drag
+            fn = lambda p: (p[0] + mdx, p[1] + mdy)
+        else:
+            f = self._lasso_scale_factor
+            ax, ay = self._lasso_scale_anchor
+            fn = lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f)
+        return {id(st): [fn(p) for p in orig] for st, orig in self._lasso_orig}
+
     def _draw_ink(self, _area, ctx, _w, _h):
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
         ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        drag = self._lasso_drag_pts()
+        wf = self._lasso_scale_factor if self._lasso_scaling else 1.0
         for st in self.strokes:
-            pts = self._stroke_overlay_pts(st)
+            pts = drag.get(id(st)) or self._stroke_overlay_pts(st)
             if len(pts) < 2:
                 continue
             f = self.font_px / max(st["font_px"], 1)
+            if id(st) in drag:
+                f *= wf   # width scales live with the resize drag
             ctx.set_source_rgba(*st["color"], st["opacity"])
             ctx.set_line_width(st["width"] * f)
             ctx.move_to(*pts[0])
@@ -5247,6 +5605,63 @@ class TextPageView(Gtk.Overlay):
             for p in self.current_stroke[1:]:
                 ctx.line_to(*p)
             ctx.stroke()
+        self._draw_lasso(ctx, drag, wf)
+
+    def _draw_lasso(self, ctx, drag, wf):
+        """Selection glow, dashed bounding box with corner handles, and the
+        loop being drawn — same look as the PDF canvas."""
+        ar, ag, ab = self.accent()
+        if self._selected:
+            sel_pts = []
+            for st in self._selected:
+                pts = drag.get(id(st)) or self._stroke_overlay_pts(st)
+                sel_pts.extend(pts)
+                f = self.font_px / max(st["font_px"], 1)
+                if id(st) in drag:
+                    f *= wf
+                # a translucent glow wider than the stroke, so its real
+                # colour still shows through the centre
+                ctx.set_source_rgba(ar, ag, ab, 0.35)
+                ctx.set_line_width(st["width"] * f + 7.0)
+                if len(pts) < 2:
+                    if pts:
+                        ctx.arc(pts[0][0], pts[0][1],
+                                st["width"] * f / 2 + 3.5, 0, 2 * math.pi)
+                        ctx.fill()
+                    continue
+                ctx.move_to(*pts[0])
+                for p in pts[1:]:
+                    ctx.line_to(*p)
+                ctx.stroke()
+            if sel_pts:
+                # dashed bounding box (follows the live drag) + resize handles
+                xs = [p[0] for p in sel_pts]
+                ys = [p[1] for p in sel_pts]
+                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+                pad = 5.0
+                ctx.set_source_rgba(ar, ag, ab, 0.85)
+                ctx.set_line_width(1.0)
+                ctx.set_dash([4.0, 3.0])
+                ctx.rectangle(x0 - pad, y0 - pad,
+                              (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+                ctx.stroke()
+                ctx.set_dash([])
+                for hx, hy in ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
+                               (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)):
+                    ctx.rectangle(hx - 4, hy - 4, 8, 8)
+                    ctx.set_source_rgba(1, 1, 1, 0.95)
+                    ctx.fill_preserve()
+                    ctx.set_source_rgba(ar, ag, ab, 0.9)
+                    ctx.stroke()
+        if self._lassoing and len(self._lasso_path) >= 2:
+            ctx.set_source_rgba(ar, ag, ab, 0.9)
+            ctx.set_line_width(1.5)
+            ctx.set_dash([5.0, 3.0])
+            ctx.move_to(*self._lasso_path[0])
+            for pt in self._lasso_path[1:]:
+                ctx.line_to(*pt)
+            ctx.stroke()
+            ctx.set_dash([])
 
     # ── persistence ──────────────────────────────────────────────────────────
     # Anchors are serialised as (line, char offset, source-line hash). On load
@@ -6471,6 +6886,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.pen_style = lambda hl, s=s: (
             (s.canvas.hl_color, s.canvas.hl_width, s.canvas.hl_opacity) if hl
             else (s.canvas.pen_color, s.canvas.pen_width, 1.0))
+        tp.get_smoothing = lambda s=s: s.canvas.smoothing
+        tp.accent = lambda s=s: s.canvas.zoom_accent
         # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
         # and margins together), not the persistent notes-font setting
         tp.view.font_zoom_cb = lambda d: tp.zoom_step(d)
@@ -8044,7 +8461,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_mode_pen":     ("pdf", "text"),
         "_mode_hl":      ("pdf", "text"),
         "_mode_eraser":  ("pdf", "text"),
-        "_mode_lasso":   ("pdf",),
+        "_mode_lasso":   ("pdf", "text"),
         "_mode_select":  ("pdf",),
         "_mode_pan":     ("pdf",),
         "_mode_zoom":    ("pdf",),
@@ -8148,8 +8565,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 self.canvas.clear_lasso_selection()
             # cursor reflects the active tool (text/grab/crosshair, or default)
             self.canvas.set_cursor(self.canvas._default_cursor())
-            # text-first page: pen/highlighter/eraser ink the sheet, everything
-            # else falls back to the text caret
+            # text-first page: pen/highlighter/eraser/lasso work the sheet's
+            # ink, everything else falls back to the text caret
             if self._text_page is not None:
                 self._text_page.set_tool(mode)
             # on a text page "select" is represented by the caret button
@@ -8679,9 +9096,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _recolor_lasso_if_any(self):
         """When the lasso tool holds a selection, picking a new colour/width in
         the pen popover retints the selected strokes (one undo entry)."""
-        if self.canvas.tool == "lasso" and self.canvas.has_lasso_selection():
-            color, width, opacity = self.canvas._pen_attrs()
+        if self.canvas.tool != "lasso":
+            return
+        color, width, opacity = self.canvas._pen_attrs()
+        if self.canvas.has_lasso_selection():
             self.canvas.recolor_selected(color, width, opacity)
+        if self._text_page is not None and self._text_page.has_lasso_selection():
+            self._text_page.recolor_selected(color, width, opacity)
 
     def _toggle_highlighter(self):
         """Ctrl+H: flip highlighter on/off, falling back to pen."""
@@ -9889,18 +10310,24 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return True
         # lasso selection: Delete removes it, Escape drops it, Ctrl+D duplicates
         # it (only when the notes editor isn't focused, so typing in notes —
-        # including its own Ctrl+D line-duplicate — is never affected)
-        if (self.canvas.has_lasso_selection()
-                and not self._notes_view.has_focus()):
+        # including its own Ctrl+D line-duplicate — is never affected). On a
+        # text page the sheet's own capture-phase controller normally wins
+        # (focus sits inside it); this window-level fallback covers focus
+        # resting elsewhere, e.g. on the header bar.
+        tp = self._text_page if self._text_mode else None
+        surface = (tp if tp is not None and tp.has_lasso_selection()
+                   else self.canvas)
+        if (surface.has_lasso_selection()
+                and (surface is tp or not self._notes_view.has_focus())):
             if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
-                self.canvas.delete_selected_strokes()
+                surface.delete_selected_strokes()
                 return True
             if keyval == Gdk.KEY_Escape:
-                self.canvas.clear_lasso_selection()
+                surface.clear_lasso_selection()
                 return True
             if (keyval in (Gdk.KEY_d, Gdk.KEY_D)
                     and state & Gdk.ModifierType.CONTROL_MASK):
-                self.canvas.duplicate_selected()
+                surface.duplicate_selected()
                 return True
         # PageUp/PageDown and Ctrl+\ are handled in _on_global_key (capture phase)
         # so they work even when the notes editor has focus.
