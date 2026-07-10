@@ -2868,6 +2868,10 @@ class _FakeDrag:
     def __init__(self, sx, sy, button=1, state=None):
         self._sx, self._sy, self._b = sx, sy, button
         self._st = state if state is not None else Gdk.ModifierType(0)
+        self.claimed = None            # last set_state() the handler applied
+
+    def set_state(self, state):
+        self.claimed = state
 
     def get_current_button(self):
         return self._b
@@ -7586,6 +7590,52 @@ class TestTextFirstMode(unittest.TestCase):
                 want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
                 self.assertAlmostEqual(tp.zoom, want, places=6)
                 self.assertEqual(tp.strokes, [])   # nothing was drawn
+
+            self._run_in_window(body)
+
+    def test_ctrl_and_middle_drag_pan_the_sheet(self):
+        """Ctrl+left-drag and middle-drag grab-pan the sheet (PDF-canvas
+        parity, #106 item 4); a plain left-drag is left for the caret/pen."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                # pin a generous scroll range so the assertions don't ride on
+                # the sheet's laid-out height (which varies across the suite)
+                va = tp.scroll.get_vadjustment()
+                ha = tp.scroll.get_hadjustment()
+                for adj in (va, ha):
+                    adj.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+
+                # Ctrl+left-drag pans: content follows the pointer (offset moves
+                # opposite the drag delta), and the gesture claims the sequence
+                va.set_value(200.0)
+                g = _FakeDrag(50, 50, button=1,
+                              state=Gdk.ModifierType.CONTROL_MASK)
+                tp._on_pan_begin(g, 50, 50)
+                self.assertTrue(tp._panning)
+                self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
+                tp._on_pan_update(g, 0, -60)
+                self.assertAlmostEqual(va.get_value(), 260.0, places=3)
+                tp._on_pan_end(g, 0, -60)
+                self.assertFalse(tp._panning)
+
+                # middle-drag pans too (no modifier needed)
+                va.set_value(100.0)
+                ha.set_value(0.0)
+                g2 = _FakeDrag(50, 50, button=2)
+                tp._on_pan_begin(g2, 50, 50)
+                self.assertTrue(tp._panning)
+                tp._on_pan_update(g2, 0, 40)
+                self.assertAlmostEqual(va.get_value(), 60.0, places=3)
+                tp._on_pan_end(g2, 0, 40)
+
+                # a plain left-drag is NOT a pan — the gesture denies itself so
+                # drawing / text selection keep the sequence
+                g3 = _FakeDrag(50, 50, button=1)
+                tp._on_pan_begin(g3, 50, 50)
+                self.assertFalse(tp._panning)
+                self.assertEqual(g3.claimed, Gtk.EventSequenceState.DENIED)
 
             self._run_in_window(body)
 

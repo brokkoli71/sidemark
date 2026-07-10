@@ -137,6 +137,7 @@ Shift+click fit (row 105). The deck branch's `doc_mode`/`_MODE_CHROME` mode
 framework is ported to master (row 107) so parity work no longer waits on a
 deck-merge decision, and parity items 1–3 landed on it (row 108): text pages
 now have the lasso (select/move/resize/duplicate/recolour, re-anchoring the
-marks — closes row 95), straight-line snap and stroke smoothing. Open
-follow-ups: parity items 4–7 in row 106 (pan/zoom gestures, temp-highlighter,
+marks — closes row 95), straight-line snap and stroke smoothing. Text pages
+also got the PDF canvas' Ctrl+drag / middle-drag pan gesture (row 106 item 4).
+Open follow-ups: parity items 5–7 in row 106 (zoom-to-region, temp-highlighter,
 presenter for text pages) and the text-page items in rows 92–94.

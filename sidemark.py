@@ -4966,6 +4966,22 @@ class TextPageView(Gtk.Overlay):
         pinch.connect("scale-changed", self._on_sheet_pinch_scale)
         self.add_controller(pinch)
 
+        # Ctrl+drag or middle-drag grab-pans the sheet (PDF-canvas parity —
+        # #106 item 4). Capture phase on the overlay so it wins over both the
+        # text caret and an active drawing tool; button 0 catches every button
+        # and the begin handler claims only the two pan chords, denying itself
+        # otherwise so ordinary clicks / drawing / text selection are untouched.
+        self._panning = False
+        self._pan_start = (0.0, 0.0)
+        pan = Gtk.GestureDrag()
+        pan.set_button(0)
+        pan.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        pan.connect("drag-begin", self._on_pan_begin)
+        pan.connect("drag-update", self._on_pan_update)
+        pan.connect("drag-end", self._on_pan_end)
+        self.add_controller(pan)
+        self._pan_drag = pan
+
         # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
         # overlay: the sheet's TextView usually keeps focus (the ink
         # DrawingArea isn't focusable), so these must win before the editor's
@@ -5047,6 +5063,43 @@ class TextPageView(Gtk.Overlay):
         ha.set_value(hv)
         va.set_value(vv)
         GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
+
+    # ── grab pan (PDF-canvas parity) ─────────────────────────────────────────
+
+    def _pan_chord(self, gesture):
+        """True when the drag is a pan gesture: middle-drag, or Ctrl+left-drag
+        (the same two chords the PDF canvas pans on)."""
+        state = gesture.get_current_event_state()
+        button = gesture.get_current_button()
+        if button == Gdk.BUTTON_MIDDLE:
+            return True
+        return (button == Gdk.BUTTON_PRIMARY
+                and bool(state & Gdk.ModifierType.CONTROL_MASK))
+
+    def _on_pan_begin(self, gesture, x, y):
+        if not self._pan_chord(gesture):
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._panning = True
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        self._pan_start = (ha.get_value(), va.get_value())
+        self.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
+
+    def _on_pan_update(self, gesture, dx, dy):
+        if not self._panning:
+            return
+        # drag the paper under the cursor: content follows the pointer, so the
+        # scroll offset moves opposite the drag delta
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        ha.set_value(self._pan_start[0] - dx)
+        va.set_value(self._pan_start[1] - dy)
+
+    def _on_pan_end(self, gesture, dx, dy):
+        if not self._panning:
+            return
+        self._panning = False
+        self.set_cursor(None)
 
     def _apply_zoom(self):
         """Width, margins and font all scale by the same factor, so the text
