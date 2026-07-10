@@ -7414,6 +7414,34 @@ class TestOCR(unittest.TestCase):
             self.assertTrue(out["dirty"])
 
 
+class TestDocMode(unittest.TestCase):
+    """#107 — doc_mode replaces the _text_mode boolean (ported from the deck
+    branch's mode framework); _text_mode stays as a compatibility property."""
+
+    def test_defaults_to_pdf(self):
+        s = DocumentSession()
+        self.assertEqual(s.doc_mode, "pdf")
+        self.assertFalse(s._text_mode)
+
+    def test_text_mode_property_round_trips(self):
+        s = DocumentSession()
+        s._text_mode = True
+        self.assertEqual(s.doc_mode, "text")
+        self.assertTrue(s._text_mode)
+        s._text_mode = False
+        self.assertEqual(s.doc_mode, "pdf")
+
+    def test_clearing_text_mode_when_already_pdf_is_noop(self):
+        s = DocumentSession()
+        s._text_mode = False
+        self.assertEqual(s.doc_mode, "pdf")
+
+    def test_mode_chrome_covers_only_known_modes(self):
+        for name, modes in sidemark.PDFEditorWindow._MODE_CHROME.items():
+            self.assertTrue(set(modes) <= {"pdf", "text"},
+                            f"{name} names an unknown mode: {modes}")
+
+
 class TestTextFirstMode(unittest.TestCase):
     """#61 — text-first mode: a bare .md opens as an endless A4-width page
     with no sidebars; ink anchors to the text through GtkTextMarks and lives
@@ -7480,6 +7508,38 @@ class TestTextFirstMode(unittest.TestCase):
                 # the caret tool is preselected; clicks reach the text
                 self.assertTrue(win._mode_text.get_active())
                 self.assertFalse(s._text_page.ink.get_can_target())
+
+            self._run_in_window(body)
+
+    def _assert_chrome_matches(self, win, mode):
+        """Every widget in _MODE_CHROME (and its popover twin) is visible
+        exactly when the table names the active mode."""
+        for name, modes in sidemark.PDFEditorWindow._MODE_CHROME.items():
+            want = mode in modes
+            self.assertEqual(getattr(win, name).get_visible(), want,
+                             f"{name} visibility in {mode} mode")
+            if name.startswith("_mode_"):
+                twin = getattr(win, "_pmode_" + name[len("_mode_"):], None)
+                if twin is not None:
+                    self.assertEqual(twin.get_visible(), want,
+                                     f"popover twin of {name} in {mode} mode")
+
+    def test_header_chrome_follows_mode_table(self):
+        """#107 — header visibility is driven by the _MODE_CHROME table in
+        both directions (enter text mode, back to pdf)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                # present/share are re-gated by the collapse level; pin the
+                # header to full width so the table is the only variable
+                win._apply_collapse_level(0)
+                self.assertEqual(win._active_session.doc_mode, "text")
+                self._assert_chrome_matches(win, "text")
+                win._leave_text_mode()
+                self._settle(100)
+                win._apply_collapse_level(0)
+                self.assertEqual(win._active_session.doc_mode, "pdf")
+                self._assert_chrome_matches(win, "pdf")
 
             self._run_in_window(body)
 

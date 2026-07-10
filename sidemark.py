@@ -5330,7 +5330,25 @@ class DocumentSession:
     """One open document — its canvas, notes editor, sidebar, search bar and all
     the per-document state. The window owns an Adw.TabView of these and proxies
     the active one's attributes onto itself via _session_prop, so multiple PDFs
-    can be open as tabs without rewriting every method to thread a session."""
+    can be open as tabs without rewriting every method to thread a session.
+
+    A session shows one of two document types — the window is one unified UI
+    and `doc_mode` picks which set of tools it wears (see _MODE_CHROME):
+      "pdf"  — the PDF canvas with the notes panel beside it
+      "text" — a text-first page (endless Markdown sheet with ink)
+    `_text_mode` is a compatibility view over doc_mode — the window's many
+    call sites keep reading/writing the boolean unchanged."""
+
+    @property
+    def _text_mode(self):
+        return self.doc_mode == "text"
+
+    @_text_mode.setter
+    def _text_mode(self, on):
+        if on:
+            self.doc_mode = "text"
+        elif self.doc_mode == "text":
+            self.doc_mode = "pdf"
 
     # names proxied onto PDFEditorWindow via _session_prop — keep in sync with
     # the property declarations in the window class body.
@@ -5378,7 +5396,7 @@ class DocumentSession:
         self._has_toc = False
         self._toc_thumbs = False
         self._drop_indicator_row = None
-        self._text_mode = False     # True when the tab shows a text-first page
+        self.doc_mode = "pdf"       # pdf | text (see class docstring)
         self._tab_page = None       # the Adw.TabPage hosting this session
         # widgets are built by the window and assigned through the proxies
         for w in self.WIDGETS:
@@ -6500,25 +6518,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Hide the PDF-only chrome while a text-first page is shown. Pen,
         highlighter and eraser stay; the PDF select tool swaps for the caret
         tool (leftmost, so 'just type' reads as the default)."""
-        text = bool(self._active_session and self._active_session._text_mode)
-        for w in (self._toc_btn, self._nav_box, self._pages_box,
-                  self._mode_lasso, self._mode_select, self._mode_pan,
-                  self._mode_zoom, self._mode_anchor,
-                  self._present_btn, self._share_btn, self._notes_toggle,
-                  self._pmode_lasso, self._pmode_select, self._pmode_pan,
-                  self._pmode_zoom, self._pmode_anchor):
-            w.set_visible(not text)
-        self._mode_text.set_visible(text)
-        self._pmode_text.set_visible(text)
+        mode = (self._active_session.doc_mode if self._active_session
+                else "pdf")
+        for name, modes in self._MODE_CHROME.items():
+            vis = mode in modes
+            getattr(self, name).set_visible(vis)
+            if name.startswith("_mode_"):
+                # each tool button has a twin inside the pen popover (shown
+                # when the bar collapses) — keep it in step
+                twin = getattr(self, "_pmode_" + name[len("_mode_"):], None)
+                if twin is not None:
+                    twin.set_visible(vis)
         # leaving a text page with the caret active: hand it to the PDF select
         # button (same mode underneath, different face)
-        if not text and self._mode_text.get_active():
+        if mode != "text" and self._mode_text.get_active():
             self._set_tool_mode("select")
-        # the ☰ menu drops its PDF-only actions (export, OCR, share, notes file)
-        for item in self._pdf_menu_items:
-            item.set_visible(not text)
-        for item in self._text_menu_items:
-            item.set_visible(text)
+        # the ☰ menu shows only the active mode's actions
+        for m, items in (("pdf", self._pdf_menu_items),
+                         ("text", self._text_menu_items)):
+            for item in items:
+                item.set_visible(mode == m)
         # cluster widths changed: re-measure the collapse levels and force the
         # current level to re-apply (it also gates presenter/share visibility)
         self._collapse_natural = None
@@ -8010,6 +8029,29 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             target = bounds.get_y() + bounds.get_height() / 2 - adj.get_page_size() / 2
             adj.set_value(max(0.0, min(target, adj.get_upper() - adj.get_page_size())))
 
+    # which header chrome each doc mode shows (see DocumentSession.doc_mode).
+    # Tool buttons ("_mode_*") apply to their popover twins ("_pmode_*")
+    # automatically in _update_header_for_mode. When a future mode arrives
+    # (the deck branch adds "deck"), it becomes one more entry per row.
+    _MODE_CHROME = {
+        "_toc_btn":      ("pdf",),
+        "_nav_box":      ("pdf",),
+        "_pages_box":    ("pdf",),
+        "_share_btn":    ("pdf",),
+        "_notes_toggle": ("pdf",),
+        "_present_btn":  ("pdf",),
+        "_mode_text":    ("text",),
+        "_mode_pen":     ("pdf", "text"),
+        "_mode_hl":      ("pdf", "text"),
+        "_mode_eraser":  ("pdf", "text"),
+        "_mode_lasso":   ("pdf",),
+        "_mode_select":  ("pdf",),
+        "_mode_pan":     ("pdf",),
+        "_mode_zoom":    ("pdf",),
+        "_mode_anchor":  ("pdf",),
+        "_pen_btn":      ("pdf", "text"),
+    }
+
     _TOOL_ORDER = {"pen": 0, "highlighter": 1, "eraser": 2, "lasso": 3,
                    "select": 4, "pan": 5, "zoom": 6, "anchor": 7}
 
@@ -8181,12 +8223,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # undo/redo go first (level 2); the rest hold on until it gets tighter
         for b in (self._undo_btn, self._redo_btn, self._undo_sep):
             b.set_visible(level < 2)
-        # presenter/share are PDF-only chrome: a text-first page keeps them
-        # hidden at every collapse level (see _update_header_for_mode)
-        text = bool(self._active_session and self._active_session._text_mode)
+        # presenter/share stay within what the mode allows (the chrome table
+        # in _update_header_for_mode) at every collapse level
+        mode = (self._active_session.doc_mode if self._active_session
+                else "pdf")
         self._search_btn.set_visible(level < 3)
-        for b in (self._present_btn, self._share_btn):
-            b.set_visible(level < 3 and not text)
+        self._present_btn.set_visible(
+            level < 3 and mode in self._MODE_CHROME["_present_btn"])
+        self._share_btn.set_visible(
+            level < 3 and mode in self._MODE_CHROME["_share_btn"])
 
     # widen-to-expand needs this much extra slack over the bare fit, so a level
     # change doesn't flicker on 1px resize jitter at the boundary
