@@ -355,6 +355,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self._lasso_move_start = None
         self._lasso_move_orig = []     # original pts of selected strokes at drag begin
         self._lasso_moved = False
+        self._lasso_scaling = False    # dragging a corner handle resizes the selection
+        self._lasso_scale_anchor = None   # PDF-space fixed point (opposite corner)
+        self._lasso_scale_start = None    # PDF-space grab point at drag begin
+        self._lasso_scale_orig = []       # (stroke, pts, width) snapshots at drag begin
+        self._lasso_scale_factor = 1.0
 
         self._panning = False
         self._pan_start_offset = (0.0, 0.0)
@@ -1428,6 +1433,23 @@ class PDFCanvas(Gtk.DrawingArea):
                 return
             if self.tool == "lasso":
                 px, py = self._screen_to_pdf(start_x, start_y)
+                handle = (self._lasso_handle_at(start_x, start_y)
+                          if self._selected_strokes else None)
+                if handle is not None:
+                    # press on a corner handle scales the selection, anchored
+                    # at the opposite corner
+                    corners = self._bbox_corners(self._selection_bbox())
+                    self._lasso_scaling = True
+                    self._lasso_scale_anchor = corners[(handle + 2) % 4]
+                    self._lasso_scale_start = (px, py)
+                    self._lasso_scale_orig = [
+                        (s, list(s["pts"]), s["width"])
+                        for s in self._selected_strokes]
+                    self._lasso_scale_factor = 1.0
+                    self.set_cursor(Gdk.Cursor.new_from_name(
+                        "nwse-resize" if handle in (0, 2) else "nesw-resize",
+                        None))
+                    return
                 if self._selected_strokes and self._point_in_selection(px, py):
                     # press inside the current selection grabs it for a move
                     self._lasso_moving = True
@@ -1545,6 +1567,22 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._erasing:
             self._erase_at(sx + offset_x, sy + offset_y)
             return
+        if self._lasso_scaling:
+            px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            ax, ay = self._lasso_scale_anchor
+            d0 = math.hypot(self._lasso_scale_start[0] - ax,
+                            self._lasso_scale_start[1] - ay)
+            d1 = math.hypot(px - ax, py - ay)
+            # uniform scale from the anchor; clamped so a stray drag through
+            # the anchor can't invert or vanish the selection
+            f = max(0.05, min(20.0, d1 / d0)) if d0 > 1e-6 else 1.0
+            self._lasso_scale_factor = f
+            for s, opts, ow in self._lasso_scale_orig:
+                s["pts"] = [(ax + (x - ax) * f, ay + (y - ay) * f)
+                            for x, y in opts]
+                s["width"] = ow * f   # keep the drawing's look at any size
+            self.queue_draw()
+            return
         if self._lasso_moving:
             if math.hypot(offset_x, offset_y) >= 3:
                 self._lasso_moved = True
@@ -1657,6 +1695,23 @@ class PDFCanvas(Gtk.DrawingArea):
                     and self._undo_stack[-1][4] == self._erase_group
                     and self.on_user_action):
                 self.on_user_action()
+            return
+        if self._lasso_scaling:
+            self._lasso_scaling = False
+            self.set_cursor(self._default_cursor())
+            f = self._lasso_scale_factor
+            if abs(f - 1.0) > 1e-3 and self._selected_strokes:
+                ax, ay = self._lasso_scale_anchor
+                self._undo_stack.append(("lasso_scale", self.current_page_idx,
+                                         list(self._selected_strokes),
+                                         f, ax, ay))
+                self._redo_stack.clear()
+                if self.on_change:
+                    self.on_change()
+                if self.on_user_action:
+                    self.on_user_action()
+            self._lasso_scale_orig = []
+            self.queue_draw()
             return
         if self._lasso_moving:
             self._lasso_moving = False
@@ -2071,9 +2126,44 @@ class PDFCanvas(Gtk.DrawingArea):
             j = i
         return inside
 
+    @staticmethod
+    def _segments_intersect(a, b, c, d):
+        """Do the closed segments a–b and c–d intersect? Orientation test with
+        the collinear-touch cases handled."""
+        def orient(p, q, r):
+            v = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+            return 0 if v == 0 else (1 if v > 0 else -1)
+
+        def on_seg(p, q, r):
+            return (min(p[0], q[0]) <= r[0] <= max(p[0], q[0])
+                    and min(p[1], q[1]) <= r[1] <= max(p[1], q[1]))
+
+        o1, o2 = orient(a, b, c), orient(a, b, d)
+        o3, o4 = orient(c, d, a), orient(c, d, b)
+        if o1 != o2 and o3 != o4:
+            return True
+        return ((o1 == 0 and on_seg(a, b, c)) or (o2 == 0 and on_seg(a, b, d))
+                or (o3 == 0 and on_seg(c, d, a)) or (o4 == 0 and on_seg(c, d, b)))
+
+    @classmethod
+    def _polyline_crosses_polygon(cls, pts, poly):
+        """Does any segment of the polyline cross an edge of the polygon?
+        Needed for sparse strokes: a snapped straight line is just 2 points, so
+        a loop around its *middle* contains none of its points even though the
+        stroke clearly passes through the lasso."""
+        n = len(poly)
+        for i in range(len(pts) - 1):
+            a, b = pts[i], pts[i + 1]
+            for j in range(n):
+                if cls._segments_intersect(a, b, poly[j], poly[(j + 1) % n]):
+                    return True
+        return False
+
     def _finish_lasso(self):
-        """Close the in-progress loop and select every stroke on the page with at
-        least one point inside it (forgiving 'any point inside' rule)."""
+        """Close the in-progress loop and select every stroke on the page that
+        touches it: any point inside the loop (the common freehand case), or —
+        for sparse strokes like snapped straight lines — any segment crossing
+        the loop's boundary."""
         path = self._lasso_path
         self._lasso_path = []
         if len(path) < 3:
@@ -2081,7 +2171,8 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         poly = [self._screen_to_pdf(x, y) for x, y in path]
         sel = [s for s in self.strokes
-               if any(self._point_in_polygon(px, py, poly) for px, py in s["pts"])]
+               if any(self._point_in_polygon(px, py, poly) for px, py in s["pts"])
+               or self._polyline_crosses_polygon(s["pts"], poly)]
         self._set_selected_strokes(sel)
 
     def _selection_bbox(self):
@@ -2101,6 +2192,57 @@ class PDFCanvas(Gtk.DrawingArea):
         x0, y0, x1, y1 = bbox
         pad = 8.0 / self.scale
         return x0 - pad <= px <= x1 + pad and y0 - pad <= py <= y1 + pad
+
+    # box corners in the order the resize handles are drawn/hit-tested; the
+    # anchor for a scale is the corner opposite the grabbed one ((i+2) % 4)
+    @staticmethod
+    def _bbox_corners(bbox):
+        x0, y0, x1, y1 = bbox
+        return ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+
+    def _lasso_handle_at(self, sx, sy, hit=4.0):
+        """Index (0–3) of the selection's corner resize handle under the given
+        screen point, or None. Corners carry the same 5 px pad the dashed box
+        is drawn with, so the handles sit exactly where they are painted; the
+        hit box matches the drawn 8×8 handle so a grab just inside the box
+        still means move, even on tiny selections."""
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return None
+        pad = 5.0
+        x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
+        x1, y1 = self._pdf_to_screen(bbox[2], bbox[3])
+        corners = ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
+                   (x1 + pad, y1 + pad), (x0 - pad, y1 + pad))
+        for i, (hx, hy) in enumerate(corners):
+            if abs(sx - hx) <= hit and abs(sy - hy) <= hit:
+                return i
+        return None
+
+    def duplicate_selected(self, offset=14.0):
+        """Copy the lasso-selected strokes, offset a little so the copy is
+        visible, and select the copies — one undo entry (the clones share a
+        draw group, like a text highlight)."""
+        if not self._selected_strokes:
+            return
+        d = offset / self.scale
+        self._draw_group += 1
+        clones = []
+        for s in self._selected_strokes:
+            c = {"pts": [(x + d, y + d) for x, y in s["pts"]],
+                 "color": s["color"], "width": s["width"],
+                 "opacity": s.get("opacity", 1.0)}
+            self.strokes.append(c)
+            self._undo_stack.append(
+                ("draw", self.current_page_idx, c, self._draw_group))
+            clones.append(c)
+        self._redo_stack.clear()
+        self._set_selected_strokes(clones)
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        self.queue_draw()
 
     def _set_selected_strokes(self, strokes):
         self._selected_strokes = strokes
@@ -2201,6 +2343,14 @@ class PDFCanvas(Gtk.DrawingArea):
                               (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
                 ctx.stroke()
                 ctx.set_dash([])
+                # corner resize handles (drag one to scale the selection)
+                for hx, hy in ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
+                               (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)):
+                    ctx.rectangle(hx - 4, hy - 4, 8, 8)
+                    ctx.set_source_rgba(1, 1, 1, 0.95)
+                    ctx.fill_preserve()
+                    ctx.set_source_rgba(ar, ag, ab, 0.9)
+                    ctx.stroke()
         # the loop being drawn
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
@@ -2286,6 +2436,12 @@ class PDFCanvas(Gtk.DrawingArea):
             _, _, refs, dx, dy = op
             for s in refs:
                 s["pts"] = [(x - dx, y - dy) for x, y in s["pts"]]
+        elif op[0] == "lasso_scale":
+            _, _, refs, f, ax, ay = op
+            for s in refs:
+                s["pts"] = [(ax + (x - ax) / f, ay + (y - ay) / f)
+                            for x, y in s["pts"]]
+                s["width"] /= f
         elif op[0] == "recolor":
             for s, oc, ow, oo in op[2]:
                 s["color"], s["width"], s["opacity"] = oc, ow, oo
@@ -2320,6 +2476,12 @@ class PDFCanvas(Gtk.DrawingArea):
             _, _, refs, dx, dy = ops[0]
             for s in refs:
                 s["pts"] = [(x + dx, y + dy) for x, y in s["pts"]]
+        elif ops[0][0] == "lasso_scale":
+            _, _, refs, f, ax, ay = ops[0]
+            for s in refs:
+                s["pts"] = [(ax + (x - ax) * f, ay + (y - ay) * f)
+                            for x, y in s["pts"]]
+                s["width"] *= f
         elif ops[0][0] == "recolor":
             _, _, before, nc, nw, no = ops[0]
             for s, _oc, _ow, _oo in before:
@@ -2601,6 +2763,37 @@ def _hex_to_rgb(h):
     return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
 
 
+def _display_provider_while_realized(widget, provider, priority):
+    """Register a display-wide CssProvider only while `widget` is realized.
+
+    Display providers outlive their widgets — adding one per tab or window
+    without ever removing it leaks a provider (plus a dead CSS rule and a style
+    recalc) on every closed tab/window in a long-running single instance.
+    Tying add/remove to realize/unrealize keeps the provider active across tab
+    drags between windows (unrealize → realize on the new toplevel) and drops
+    it for good once the widget is destroyed. Returns the shared state dict
+    ({'added': bool}) so tests can observe the lifecycle."""
+    state = {"added": False}
+
+    def _add(*_a):
+        if not state["added"]:
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider, priority)
+            state["added"] = True
+
+    def _remove(*_a):
+        if state["added"]:
+            Gtk.StyleContext.remove_provider_for_display(
+                Gdk.Display.get_default(), provider)
+            state["added"] = False
+
+    widget.connect("realize", _add)
+    widget.connect("unrealize", _remove)
+    if widget.get_realized():
+        _add()
+    return state
+
+
 def _themed_icon(*candidates):
     """First candidate icon the active theme actually has, else the first.
 
@@ -2671,6 +2864,34 @@ def _find_autosave(path):
         pass
     snap_notes = os.path.join(d, "notes.md")
     return snap_pdf, (snap_notes if os.path.exists(snap_notes) else None), saved_at
+
+
+def _find_text_autosave(path):
+    """Text-page variant of _find_autosave: return (snapshot_md,
+    snapshot_ink_or_None, saved_at) when a recoverable snapshot of a text-first
+    page newer than the .md itself exists, else None. Snapshots are note.md /
+    ink.json (vs. doc.pdf / notes.md for a PDF), so the two kinds can't be
+    mistaken for each other."""
+    d = _autosave_dir_for(path)
+    snap_md = os.path.join(d, "note.md")
+    meta_path = os.path.join(d, "meta.json")
+    if not (os.path.exists(snap_md) and os.path.exists(meta_path)):
+        return None
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if meta.get("path") != os.path.abspath(path):
+        return None   # hash collision or moved file — don't recover blindly
+    saved_at = meta.get("saved_at", 0)
+    try:
+        if os.path.getmtime(path) >= saved_at:
+            return None   # the file was saved/modified after the snapshot
+    except OSError:
+        pass
+    snap_ink = os.path.join(d, "ink.json")
+    return snap_md, (snap_ink if os.path.exists(snap_ink) else None), saved_at
 
 
 def _discard_autosave(path):
@@ -4640,6 +4861,7 @@ class TextPageView(Gtk.Overlay):
         # {"mark", "pts": [(dx, dy), ...], "color", "width", "opacity", "font_px"}
         self.strokes = []
         self.current_stroke = []  # overlay coords while a stroke is in flight
+        self._shift_fitting = False   # a Shift+click is fitting, not drawing
         self._undo_ops = []       # ("add", [stroke, ...]) | ("erase", [stroke, ...])
         self._redo_ops = []
         self._erased_now = []     # strokes removed during the ongoing erase drag
@@ -4665,9 +4887,8 @@ class TextPageView(Gtk.Overlay):
         self._zoom_class = f"text-page-{id(self)}"
         self.view.add_css_class(self._zoom_class)
         self._zoom_css = Gtk.CssProvider()
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), self._zoom_css,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self._zoom_css_state = _display_provider_while_realized(
+            self, self._zoom_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         self.view.set_margin_top(self.PAGE_GAP)
         self.view.set_margin_bottom(self.PAGE_GAP)
         self.view.set_margin_start(self.PAGE_GAP)
@@ -4712,6 +4933,16 @@ class TextPageView(Gtk.Overlay):
         self.add_controller(alt)
         self._alt_drag = alt
 
+        # Two-finger pinch zooms the sheet, mirroring the PDF canvas. Capture
+        # phase on the overlay so the gesture wins over text-view scrolling.
+        self._pinch_base_zoom = 1.0
+        self._pinch_center = (0.0, 0.0)
+        pinch = Gtk.GestureZoom.new()
+        pinch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        pinch.connect("begin", self._on_sheet_pinch_begin)
+        pinch.connect("scale-changed", self._on_sheet_pinch_scale)
+        self.add_controller(pinch)
+
         # the ink must repaint whenever the sheet scrolls or reflows under it
         self.scroll.get_vadjustment().connect(
             "value-changed", lambda *_: self.ink.queue_draw())
@@ -4748,6 +4979,37 @@ class TextPageView(Gtk.Overlay):
             self.set_zoom(1.0)
         else:
             self.set_zoom(self.zoom * (1.1 ** direction))
+
+    def fit_width(self):
+        """Zoom so the paper spans the viewport — Shift+click parity with the
+        PDF canvas' fit-page (available while a drawing tool is active; with
+        the text tool, Shift+click keeps its editing meaning)."""
+        vw = self.scroll.get_width()
+        if vw > 0:
+            self.set_zoom((vw - 2 * self.PAGE_GAP) / self.PAGE_WIDTH)
+
+    def _on_sheet_pinch_begin(self, gesture, _seq):
+        self._pinch_base_zoom = self.zoom
+        ok, cx, cy = gesture.get_bounding_box_center()
+        self._pinch_center = ((cx, cy) if ok else
+                              (self.get_width() / 2, self.get_height() / 2))
+
+    def _on_sheet_pinch_scale(self, _gesture, scale):
+        old = self.zoom
+        self.set_zoom(self._pinch_base_zoom * scale)
+        if self.zoom == old:
+            return
+        # keep the point under the gesture centre fixed: the sheet scales
+        # linearly with the zoom (same wrap), so scroll offsets scale too.
+        # The relayout is asynchronous, so re-apply once it has landed.
+        f = self.zoom / old
+        cx, cy = self._pinch_center
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        hv = (ha.get_value() + cx) * f - cx
+        vv = (va.get_value() + cy) * f - cy
+        ha.set_value(hv)
+        va.set_value(vv)
+        GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
 
     def _apply_zoom(self):
         """Width, margins and font all scale by the same factor, so the text
@@ -4845,6 +5107,14 @@ class TextPageView(Gtk.Overlay):
         self._alt_saved_tool = None
 
     def _on_ink_begin(self, gesture, x, y):
+        state = gesture.get_current_event_state()
+        if state & Gdk.ModifierType.SHIFT_MASK:
+            # Shift+click fits the paper to the window (PDF-canvas parity);
+            # the flag makes the rest of the drag a no-op
+            self._shift_fitting = True
+            self.fit_width()
+            return
+        self._shift_fitting = False
         button = gesture.get_current_button()
         self._erased_now = []
         if self.tool == "eraser" or button == 3:
@@ -4854,6 +5124,8 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_update(self, gesture, dx, dy):
+        if self._shift_fitting:
+            return
         ok, sx, sy = gesture.get_start_point()
         if not ok:
             return
@@ -4865,6 +5137,9 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_end(self, gesture, dx, dy):
+        if self._shift_fitting:
+            self._shift_fitting = False
+            return
         if self.current_stroke:
             self._commit_stroke(self.current_stroke)
             self.current_stroke = []
@@ -5246,10 +5521,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                    + "; }"
         provider = Gtk.CssProvider()
         provider.load_from_data(css.encode())
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
+        _display_provider_while_realized(
+            self, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         # Notes-panel font size lives in its own provider so Ctrl+± / Ctrl+scroll
         # can rescale it at runtime (handy for reading presenter notes). Added
@@ -5260,10 +5533,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 int(_load_settings().get("notes_font_px", self._NOTES_FONT_DEFAULT))),
         )
         self._notes_font_provider = Gtk.CssProvider()
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), self._notes_font_provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-        )
+        _display_provider_while_realized(
+            self, self._notes_font_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
         self._apply_notes_font()
 
         # ── header bar ────────────────────────────────────────────────────────
@@ -6524,6 +6796,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             elif r == "discard":
                 if s._path:
                     _discard_autosave(s._path)
+                elif s._text_mode and s._notes_path:
+                    _discard_autosave(s._notes_path)
                 self._remember_closed(s)
                 tab_view.close_page_finish(page, True)
             else:
@@ -6682,13 +6956,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     # ── autosave ──────────────────────────────────────────────────────────────
 
     def _autosave_tick(self):
-        # snapshot every dirty tab, not just the active one
+        # snapshot every dirty tab, not just the active one. Text-first pages
+        # have no _path (the .md IS the document) — they snapshot via their
+        # _notes_path; an untitled page has no path to key a snapshot by yet,
+        # so it stays uncovered until the first save-as names it.
         for s in self._sessions:
-            if s._dirty and s._path:
-                try:
+            if not s._dirty:
+                continue
+            try:
+                if s._path:
                     self._write_autosave_for(s)
-                except Exception:
-                    logger.error("autosave failed:\n" + traceback.format_exc())
+                elif s._text_mode and s._notes_path:
+                    self._write_text_autosave_for(s)
+            except Exception:
+                logger.error("autosave failed:\n" + traceback.format_exc())
         return True   # keep the timer running
 
     def _write_autosave(self):
@@ -6706,6 +6987,81 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             json.dump(meta, f)
         os.replace(tmp, os.path.join(d, "meta.json"))
         logger.info(f"autosave: snapshot written for {s._path}")
+
+    def _write_text_autosave_for(self, s):
+        """Snapshot a text-first page — the .md text (committed from the live
+        buffer) plus its ink — keyed by the .md path, mirroring
+        _write_autosave_for. The original file is never touched."""
+        d = _autosave_dir_for(s._notes_path)
+        os.makedirs(d, exist_ok=True)
+        self._commit_note_for(s)
+        tmp = os.path.join(d, "note.md.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(s.notes_model.get(0))
+        os.replace(tmp, os.path.join(d, "note.md"))
+        if s._text_page is not None:
+            tmp = os.path.join(d, "ink.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(s._text_page.ink_to_json(), f)
+            os.replace(tmp, os.path.join(d, "ink.json"))
+        meta = {"path": os.path.abspath(s._notes_path), "saved_at": time.time()}
+        tmp = os.path.join(d, "meta.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp, os.path.join(d, "meta.json"))
+        logger.info(f"autosave: text snapshot written for {s._notes_path}")
+
+    def _maybe_offer_text_recovery(self, path):
+        """Text-page counterpart of _maybe_offer_recovery: offer to restore an
+        autosaved .md text (and ink sidecar) over what was just loaded."""
+        found = _find_text_autosave(path)
+        if not found:
+            return
+        snap_md, snap_ink, saved_at = found
+        when = time.strftime("%H:%M on %Y-%m-%d", time.localtime(saved_at))
+        dlg = Adw.AlertDialog.new(
+            "Recover unsaved changes?",
+            f"Sidemark closed with unsaved changes for this note "
+            f"(autosaved at {when}).",
+        )
+        dlg.add_response("later",   "Not now")
+        dlg.add_response("discard", "Discard them")
+        dlg.add_response("recover", "Recover")
+        dlg.set_response_appearance("recover", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("recover")
+        dlg.set_close_response("later")
+
+        def on_response(d, r):
+            if r == "recover":
+                try:
+                    with open(snap_md, encoding="utf-8", errors="replace") as f:
+                        raw = f.read()
+                except OSError:
+                    return
+                self.notes_model.set(0, raw)
+                buf = self._notes_view.get_buffer()
+                buf.begin_irreversible_action()
+                buf.set_text(raw)
+                buf.end_irreversible_action()
+                self._notes_view.reset_render_state()
+                self._notes_burst_open = False
+                self._burst_base = raw
+                tp = self._active_session._text_page
+                if snap_ink and tp is not None:
+                    try:
+                        with open(snap_ink, encoding="utf-8") as f:
+                            tp.load_ink(json.load(f))
+                    except (OSError, ValueError) as e:
+                        logger.warning("Could not load ink snapshot %s: %s",
+                                       snap_ink, e)
+                self._mark_dirty()   # recovered state isn't on disk until saved
+            elif r == "discard":
+                _discard_autosave(path)
+            # "later": keep the snapshot for the next open
+
+        dlg.connect("response", on_response)
+        dlg.present(self)
 
     def _maybe_offer_recovery(self, path):
         found = _find_autosave(path)
@@ -6775,6 +7131,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             elif r == "discard":
                 if s._path:
                     _discard_autosave(s._path)
+                elif s._text_mode and s._notes_path:
+                    _discard_autosave(s._notes_path)
                 self._clear_dirty()
                 self._prompt_close_next_dirty()
             # cancel: stop closing, leave the window open
@@ -6847,7 +7205,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not os.path.isfile(full):
             self._toast(f"Link target not found: {path}")
             return
-        if self._path and os.path.samefile(full, self._path):
+        try:
+            same = self._path and os.path.samefile(full, self._path)
+        except OSError:
+            # our own file was deleted/renamed on disk while open — the target
+            # exists (checked above), so treat it as a different document
+            same = False
+        if same:
             jump(page)          # link into the document we're already showing
             return
         self.open_file_in_tab(full)
@@ -7929,9 +8293,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._present_bar = bar
         self._present_overlay.add_overlay(bar)
         self._present_css = Gtk.CssProvider()
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), self._present_css,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        _display_provider_while_realized(
+            self, self._present_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self._present_bar_scale = 0.0
         self._scale_present_bar(1280, 800)
 
@@ -8569,6 +8932,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._burst_base = self.notes_model.get(0)
         self._clear_dirty()
         self._remember_recent(md_path)
+        self._maybe_offer_text_recovery(md_path)
 
     def _on_new_pdf(self, _btn):
         # New, like Open, originates from within the window: a fresh tab rather
@@ -9404,6 +9768,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         if self._path:
             _discard_autosave(self._path)   # changes are on disk now
+        elif self._text_mode and notes_file:
+            _discard_autosave(notes_file)   # ditto for a text-first page
         if after:
             after()
 
@@ -9476,8 +9842,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if keyval == Gdk.KEY_F5:
             self._present_btn.set_active(not self._present_btn.get_active())
             return True
-        # lasso selection: Delete removes it, Escape drops it (only when the notes
-        # editor isn't focused, so typing in notes is never affected)
+        # lasso selection: Delete removes it, Escape drops it, Ctrl+D duplicates
+        # it (only when the notes editor isn't focused, so typing in notes —
+        # including its own Ctrl+D line-duplicate — is never affected)
         if (self.canvas.has_lasso_selection()
                 and not self._notes_view.has_focus()):
             if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
@@ -9485,6 +9852,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 return True
             if keyval == Gdk.KEY_Escape:
                 self.canvas.clear_lasso_selection()
+                return True
+            if (keyval in (Gdk.KEY_d, Gdk.KEY_D)
+                    and state & Gdk.ModifierType.CONTROL_MASK):
+                self.canvas.duplicate_selected()
                 return True
         # PageUp/PageDown and Ctrl+\ are handled in _on_global_key (capture phase)
         # so they work even when the notes editor has focus.

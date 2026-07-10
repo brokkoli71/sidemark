@@ -63,6 +63,10 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   `GDK_BACKEND=offscreen`; needs `weston` installed). Pytest args pass through
   (`./run_tests.sh -x -q test_pdfeditor.py::SomeTest`); `./run_tests.sh --stop`
   tears the compositor down.
+- **Iterate with `./run_tests.sh --fast`** (~3 s): it skips the `window`-marked
+  tier (classes that build real windows; auto-marked by `conftest.py` from the
+  class source — a misclassified test still *passes*, it just lands in the
+  wrong speed tier). Run the full suite once before committing.
 - Tests set `SIDEMARK_TEST=1` and use the system `/usr/bin/python3` (not venv
   shims). Window tests build a real `PDFEditorWindow` inside a throwaway
   `Adw.Application` and pump the main loop (`_settle()` pattern — copy it).
@@ -76,7 +80,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 1. Tests in `test_pdfeditor.py`.
 2. A row in `ideas.csv` (the project's decision log — write detailed Notes,
    they are the long-term memory of *why*; see rows 96–99 for the style).
-3. README section/bullet.
+3. README, **only if a user must know about it** — and then at most 1–3 lines
+   at the altitude of "what it does for you", folded into an *existing* bullet
+   or table row where one fits. The README is the sales pitch and quick
+   reference for humans, not the feature log: sub-behaviors, edge cases,
+   internal names, and anything a user would discover on their own belong in
+   the `ideas.csv` Notes (and code comments), not here. Bug fixes, refactors,
+   and dev-workflow changes get **no README text at all**. When in doubt, ask:
+   would a new user's decision or daily use change without this sentence? If
+   not, leave the README alone.
 4. Packaging if files/deps changed: `install.sh`, `PKGBUILD`, and
    `aur/sidemark/PKGBUILD`; bash completion in `extras/sidemark.bash`;
    `.desktop` keywords.
@@ -109,7 +121,11 @@ impact when it next merges master.
 
 The `[[wiki links]]` linking workflow shipped (row 99) along with verbatim
 `code` spans (row 96), a per-version single-instance id (row 97), and
-opening launched files as a tab in the last-used window (row 98). Open
-follow-ups are text-page focused (ideas.csv rows 92–95): text-snapping
-highlighter, pagination/print view, margin inks, and lasso re-anchoring for
-text-page ink.
+opening launched files as a tab in the last-used window (row 98). A July
+review pass added autosave/crash recovery for text-first pages (row 101), a
+bug-fix batch — lasso now catches snapped straight lines, link-follow
+survives a deleted current file, display-wide CSS providers no longer leak
+per closed tab/window (row 102) — the `--fast` test tier (row 103), lasso
+resize handles + Ctrl+D duplicate (row 104), and text-page pinch zoom +
+Shift+click fit (row 105). Open follow-ups: the text/PDF tool-parity roadmap
+(row 106 — the gap audit lives there) and the text-page items in rows 92–95.

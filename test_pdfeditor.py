@@ -2931,6 +2931,25 @@ class TestLassoSelect(unittest.TestCase):
         canvas._finish_lasso()
         self.assertEqual(canvas._selected_strokes, [])
 
+    def test_lasso_catches_straight_stroke_through_its_middle(self):
+        """A snapped straight line is only 2 points; a loop around its middle
+        contains neither, but the stroke passes through it and must be caught
+        (the README promises 'any stroke touching the loop')."""
+        canvas = self._canvas()
+        line = self._stroke([(0, 50), (400, 50)])   # both endpoints far outside
+        canvas.all_strokes[0] = [line]
+        canvas._lasso_path = [(150, 20), (250, 20), (250, 80), (150, 80)]
+        canvas._finish_lasso()
+        self.assertEqual(canvas._selected_strokes, [line])
+
+    def test_segments_intersect(self):
+        X = PDFCanvas._segments_intersect
+        self.assertTrue(X((0, 0), (10, 10), (0, 10), (10, 0)))     # crossing
+        self.assertFalse(X((0, 0), (10, 0), (0, 5), (10, 5)))      # parallel
+        self.assertTrue(X((0, 0), (10, 0), (5, 0), (15, 0)))       # collinear overlap
+        self.assertTrue(X((0, 0), (10, 0), (10, 0), (10, 10)))     # touch at endpoint
+        self.assertFalse(X((0, 0), (10, 0), (11, 1), (20, 5)))     # disjoint
+
     def test_delete_selected_and_undo_restores(self):
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
@@ -2973,6 +2992,62 @@ class TestLassoSelect(unittest.TestCase):
         self.assertEqual(a["pts"], orig)
         canvas.redo_last()
         self.assertEqual(a["pts"], [(x + 30, y + 40) for x, y in orig])
+
+    def test_resize_scales_points_and_width_with_undo_redo(self):
+        """Dragging a corner handle scales the selection uniformly around the
+        opposite corner — stroke width included, so the drawing keeps its
+        look at any size."""
+        canvas = self._canvas()
+        a = self._stroke([(100, 100), (200, 200)], width=4.0)
+        canvas.all_strokes[0] = [a]
+        canvas._set_selected_strokes([a])
+        # bbox (100,100)-(200,200); handle 2 = bottom-right at (205,205)
+        # (5 px pad), anchor = top-left corner (100,100)
+        self.assertEqual(canvas._lasso_handle_at(205, 205), 2)
+        canvas._on_drag_begin(_FakeDrag(205, 205), 205, 205)
+        self.assertTrue(canvas._lasso_scaling)
+        self.assertEqual(canvas._lasso_scale_anchor, (100, 100))
+        # drag the handle to double the diagonal distance from the anchor
+        canvas._on_drag_update(_FakeDrag(205, 205), 105, 105)
+        canvas._on_drag_end(_FakeDrag(205, 205), 105, 105)
+        f = canvas._undo_stack[-1][3]
+        self.assertAlmostEqual(a["pts"][1][0], 100 + 100 * f, places=6)
+        self.assertAlmostEqual(a["width"], 4.0 * f, places=6)
+        self.assertGreater(f, 1.5)   # clearly grew
+        canvas.undo_last()
+        self.assertAlmostEqual(a["pts"][1][0], 200, places=6)
+        self.assertAlmostEqual(a["width"], 4.0, places=6)
+        canvas.redo_last()
+        self.assertAlmostEqual(a["width"], 4.0 * f, places=6)
+
+    def test_resize_handle_beats_move_grab(self):
+        """A press on the corner handle scales even though the point is also
+        inside the padded move-grab bbox."""
+        canvas = self._canvas()
+        a, _ = self._two_strokes(canvas)
+        canvas._set_selected_strokes([a])
+        canvas._on_drag_begin(_FakeDrag(65, 65), 65, 65)   # bbox corner + pad
+        self.assertTrue(canvas._lasso_scaling)
+        self.assertFalse(canvas._lasso_moving)
+        canvas._on_drag_end(_FakeDrag(65, 65), 0, 0)       # no move → no undo op
+        self.assertFalse(any(op[0] == "lasso_scale" for op in canvas._undo_stack))
+
+    def test_duplicate_selected_clones_offset_and_single_undo(self):
+        canvas = self._canvas()
+        a, b = self._two_strokes(canvas)
+        canvas._set_selected_strokes([a, b])
+        canvas.duplicate_selected(offset=10.0)
+        self.assertEqual(len(canvas.all_strokes[0]), 4)
+        clones = canvas._selected_strokes           # the copies are selected
+        self.assertEqual(len(clones), 2)
+        self.assertNotIn(a, clones)
+        self.assertEqual(clones[0]["pts"][0],
+                         (a["pts"][0][0] + 10, a["pts"][0][1] + 10))
+        self.assertEqual(clones[0]["color"], a["color"])
+        canvas.undo_last()                           # one undo removes both
+        self.assertEqual(canvas.all_strokes[0], [a, b])
+        canvas.redo_last()
+        self.assertEqual(len(canvas.all_strokes[0]), 4)
 
     def test_new_loop_clears_prior_selection(self):
         canvas = self._canvas()
@@ -5952,6 +6027,43 @@ class TestAutosave(unittest.TestCase):
         self.assertFalse(os.path.exists(old_dir))
         self.assertTrue(os.path.exists(new_dir))
 
+    def _write_text_snapshot(self, path, saved_at=None):
+        d = self.sm._autosave_dir_for(path)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "note.md"), "w", encoding="utf-8") as f:
+            f.write("recovered text\n")
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            import json
+            json.dump({"path": os.path.abspath(path),
+                       "saved_at": saved_at or (os.path.getmtime(path) + 100)}, f)
+        return d
+
+    def test_find_text_autosave_returns_newer_snapshot(self):
+        md = os.path.join(self._dir, "note.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write("original\n")
+        self._write_text_snapshot(md)
+        found = self.sm._find_text_autosave(md)
+        self.assertIsNotNone(found)
+        self.assertTrue(found[0].endswith("note.md"))
+        self.assertIsNone(found[1])   # no ink snapshot written
+
+    def test_find_text_autosave_ignores_stale_snapshot(self):
+        md = os.path.join(self._dir, "note.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write("original\n")
+        self._write_text_snapshot(md, saved_at=os.path.getmtime(md) - 100)
+        self.assertIsNone(self.sm._find_text_autosave(md))
+
+    def test_find_text_autosave_ignores_pdf_snapshot(self):
+        """A PDF snapshot (doc.pdf/notes.md) for the same path must not be
+        mistaken for a text-page snapshot."""
+        md = os.path.join(self._dir, "note.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write("original\n")
+        self._write_snapshot(md)   # writes doc.pdf + meta.json, no note.md
+        self.assertIsNone(self.sm._find_text_autosave(md))
+
     def test_window_autosave_tick_and_cleanup_on_save(self):
         """Dirty window → tick writes a snapshot; explicit save removes it.
         The recovery dialog construction must not raise either."""
@@ -5975,6 +6087,51 @@ class TestAutosave(unittest.TestCase):
                     if not os.path.exists(os.path.join(snap_dir, fn)):
                         raise AssertionError(f"snapshot missing {fn}")
                 win._maybe_offer_recovery(pdf)   # dialog construction must not raise
+                win._on_save()
+                if os.path.exists(snap_dir):
+                    raise AssertionError("snapshot not cleaned up after save")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_text_page_autosave_tick_and_cleanup_on_save(self):
+        """A dirty text-first page (no _path — the .md IS the document) must
+        snapshot on the tick and clean up on save; text pages used to be
+        skipped by the tick entirely, so a crash lost the whole lecture."""
+        errors = []
+        sm = self.sm
+        md = os.path.join(self._dir, "lecture.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write("# Lecture\n")
+        app = Adw.Application(application_id="test.sidemark.textautosave")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._do_open_file(md)
+                if not win._text_mode:
+                    raise AssertionError("md did not open as a text page")
+                buf = win._notes_view.get_buffer()
+                buf.insert(buf.get_end_iter(), "new insight\n")
+                if not win._dirty:
+                    raise AssertionError("typing did not mark the page dirty")
+                win._autosave_tick()
+                snap_dir = sm._autosave_dir_for(md)
+                for fn in ("note.md", "meta.json"):
+                    if not os.path.exists(os.path.join(snap_dir, fn)):
+                        raise AssertionError(f"snapshot missing {fn}")
+                with open(os.path.join(snap_dir, "note.md"),
+                          encoding="utf-8") as f:
+                    if "new insight" not in f.read():
+                        raise AssertionError("snapshot missing the live edit")
+                win._maybe_offer_text_recovery(md)  # dialog must not raise
                 win._on_save()
                 if os.path.exists(snap_dir):
                     raise AssertionError("snapshot not cleaned up after save")
@@ -7326,6 +7483,67 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_pinch_zoom_scales_sheet(self):
+        """Two-finger pinch zooms the sheet like on the PDF canvas."""
+        class _FakePinch:
+            def get_bounding_box_center(self):
+                return True, 300.0, 200.0
+
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp._on_sheet_pinch_begin(_FakePinch(), None)
+                tp._on_sheet_pinch_scale(_FakePinch(), 1.5)
+                self.assertAlmostEqual(tp.zoom, 1.5, places=6)
+                # a second pinch starts from the new zoom
+                tp._on_sheet_pinch_begin(_FakePinch(), None)
+                tp._on_sheet_pinch_scale(_FakePinch(), 0.5)
+                self.assertAlmostEqual(tp.zoom, 0.75, places=6)
+                # clamped to the sheet's zoom limits
+                tp._on_sheet_pinch_begin(_FakePinch(), None)
+                tp._on_sheet_pinch_scale(_FakePinch(), 100.0)
+                self.assertAlmostEqual(tp.zoom, tp.ZOOM_MAX, places=6)
+
+            self._run_in_window(body)
+
+    def test_shift_click_fits_paper_to_window(self):
+        """Shift+click with a drawing tool fits the sheet to the viewport
+        width (PDF-canvas parity) instead of drawing a dot."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                tp.set_zoom(2.0)
+                gesture = _FakeDrag(100, 100,
+                                    state=Gdk.ModifierType.SHIFT_MASK)
+                tp._on_ink_begin(gesture, 100, 100)
+                tp._on_ink_update(gesture, 3, 3)
+                tp._on_ink_end(gesture, 3, 3)
+                vw = tp.scroll.get_width()
+                want = (vw - 2 * tp.PAGE_GAP) / tp.PAGE_WIDTH
+                want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
+                self.assertAlmostEqual(tp.zoom, want, places=6)
+                self.assertEqual(tp.strokes, [])   # nothing was drawn
+
+            self._run_in_window(body)
+
+    def test_zoom_css_provider_released_on_tab_close(self):
+        """The sheet-zoom CssProvider is display-wide; it must be dropped when
+        the text page's tab closes, or every closed tab leaks a provider in
+        the long-running single instance."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                self.assertTrue(tp._zoom_css_state["added"])   # realized → active
+                win._tab_view.close_page(win._active_session._tab_page)
+                self._settle()
+                self.assertFalse(tp._zoom_css_state["added"])  # closed → removed
+
+            self._run_in_window(body)
+
     def test_pdf_only_chrome_is_hidden(self):
         with tempfile.TemporaryDirectory() as d:
             def body(win):
@@ -7441,7 +7659,9 @@ class TestTextFirstMode(unittest.TestCase):
                 tp = self._draw_stroke(win)
                 win._set_tool_mode("eraser")
                 px, py = tp._stroke_overlay_pts(tp.strokes[0])[0]
-                fake = types.SimpleNamespace(get_current_button=lambda: 1)
+                fake = types.SimpleNamespace(
+                    get_current_button=lambda: 1,
+                    get_current_event_state=lambda: Gdk.ModifierType(0))
                 tp._on_ink_begin(fake, px, py)
                 tp._on_ink_end(fake, 0, 0)
                 self.assertEqual(len(tp.strokes), 0)
@@ -7805,6 +8025,22 @@ class TestFollowNoteLink(unittest.TestCase):
                 # no exception, still on the original document
                 self.assertEqual(
                     os.path.basename(win._active_session._path), "a.pdf")
+        self._run_in_window(body)
+
+    def test_follow_survives_current_file_deleted(self):
+        """os.path.samefile against a _path that vanished from disk must not
+        traceback — the link opens as a different document instead."""
+        def body(win):
+            with tempfile.TemporaryDirectory() as d:
+                a = os.path.join(d, "a.pdf"); make_pdf(a, n_pages=1)
+                b = os.path.join(d, "b.pdf"); make_pdf(b, n_pages=2)
+                win._do_open_file(a)
+                os.unlink(a)   # our own file disappears while open
+                win._follow_note_link(
+                    {"path": "b.pdf", "page": 2, "label": "b.pdf#page=2"})
+                self.assertEqual(
+                    os.path.basename(win._active_session._path), "b.pdf")
+                self.assertEqual(win.canvas.current_page_idx, 1)
         self._run_in_window(body)
 
 
