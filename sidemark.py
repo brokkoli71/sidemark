@@ -4866,7 +4866,9 @@ class TextPageView(Gtk.Overlay):
     re-matched by line hash, so external edits to the .md don't strand the
     drawings."""
 
-    PAGE_WIDTH = 794          # ≈ A4 width at 96 dpi
+    PAGE_WIDTH = 794          # ≈ A4 width at 96 dpi (default sheet width)
+    PAGE_WIDTH_MIN, PAGE_WIDTH_MAX = 360, 1400   # drag-to-resize clamp
+    EDGE_GRAB = 7             # px either side of the paper edge that resizes it
     PAGE_GAP = 30             # surround gap around the sheet
     ERASE_RADIUS = 9          # px hit distance for the eraser
     MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 56, 48, 96   # inner paper margins
@@ -4876,6 +4878,9 @@ class TextPageView(Gtk.Overlay):
         super().__init__()
         self.tool = "text"        # text | pen | highlighter | eraser
         self.zoom = 1.0           # sheet zoom: paper, text and ink together
+        # per-document sheet width (the wrap column), persisted in the ink
+        # sidecar; distinct from zoom, which scales everything together
+        self.page_width = self.PAGE_WIDTH
         self._base_font_px = font_px
         self.font_px = font_px    # effective (base × zoom); strokes scale with it
         # {"mark", "pts": [(dx, dy), ...], "color", "width", "opacity", "font_px"}
@@ -4922,7 +4927,7 @@ class TextPageView(Gtk.Overlay):
         # the sheet always reads like paper: white page, dark text, light scheme
         self.view = MarkdownNotesView("Adwaita")
         self.view.add_css_class("text-page")
-        self.view.set_size_request(self.PAGE_WIDTH, -1)
+        self.view.set_size_request(self.page_width, -1)
         self.view.set_hexpand(False)
         self.view.set_vexpand(True)
         self.view.set_halign(Gtk.Align.CENTER)
@@ -5037,6 +5042,20 @@ class TextPageView(Gtk.Overlay):
         rclick.connect("pressed", self._on_secondary_pressed)
         self.ink.add_controller(rclick)
 
+        # drag the paper's side edge to set the per-document width (the wrap
+        # column). Capture phase on the overlay, claims only an unmodified
+        # left-drag that STARTS on an edge while the caret tool is active — so
+        # typing, drawing, pan (Ctrl) and zoom (Shift) keep every other drag.
+        self._resizing_width = False
+        self._resize_center_x = 0.0
+        wresize = Gtk.GestureDrag()
+        wresize.set_button(Gdk.BUTTON_PRIMARY)
+        wresize.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        wresize.connect("drag-begin", self._on_width_begin)
+        wresize.connect("drag-update", self._on_width_update)
+        wresize.connect("drag-end", self._on_width_end)
+        self.add_controller(wresize)
+
         # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
         # overlay: the sheet's TextView usually keeps focus (the ink
         # DrawingArea isn't focusable), so these must win before the editor's
@@ -5102,7 +5121,67 @@ class TextPageView(Gtk.Overlay):
         the text tool, Shift+click keeps its editing meaning)."""
         vw = self.scroll.get_width()
         if vw > 0:
-            self.set_zoom((vw - 2 * self.PAGE_GAP) / self.PAGE_WIDTH)
+            self.set_zoom((vw - 2 * self.PAGE_GAP) / self.page_width)
+
+    def set_page_width(self, px):
+        """Set the per-document sheet width (the wrap column), clamped. Marks
+        the document dirty so the new width persists to the ink sidecar."""
+        px = int(max(self.PAGE_WIDTH_MIN, min(self.PAGE_WIDTH_MAX, px)))
+        if px == self.page_width:
+            return
+        self.page_width = px
+        self._apply_zoom()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
+    # ── drag the paper edge to set the width ─────────────────────────────────
+
+    def _paper_bounds(self):
+        """The sheet's rectangle in overlay coords, or None before layout."""
+        ok, r = self.view.compute_bounds(self)
+        return (r.get_x(), r.get_y(), r.get_width(), r.get_height()) if ok else None
+
+    def _on_paper_edge(self, x, y):
+        """True when (x, y) is within EDGE_GRAB of the paper's left or right
+        side (and within its vertical extent) — the resize hot-zone."""
+        b = self._paper_bounds()
+        if b is None:
+            return False
+        px, py, pw, ph = b
+        if not (py <= y <= py + ph):
+            return False
+        return (abs(x - px) <= self.EDGE_GRAB
+                or abs(x - (px + pw)) <= self.EDGE_GRAB)
+
+    def _on_width_begin(self, gesture, x, y):
+        state = gesture.get_current_event_state()
+        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+                | Gdk.ModifierType.ALT_MASK)
+        if self.tool != "text" or state & mods or not self._on_paper_edge(x, y):
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._resizing_width = True
+        px, _py, pw, _ph = self._paper_bounds()
+        self._resize_center_x = px + pw / 2
+        self.set_cursor(Gdk.Cursor.new_from_name("ew-resize"))
+
+    def _on_width_update(self, gesture, dx, dy):
+        if not self._resizing_width:
+            return
+        ok, sx, sy = gesture.get_start_point()
+        if not ok:
+            return
+        # the grabbed edge follows the cursor; the sheet stays centred, so its
+        # width is twice the cursor's distance from centre (back out the zoom)
+        half = abs((sx + dx) - self._resize_center_x)
+        self.set_page_width(round(2 * half / self.zoom))
+
+    def _on_width_end(self, gesture, dx, dy):
+        if not self._resizing_width:
+            return
+        self._resizing_width = False
+        self.set_cursor(None)
 
     def _on_secondary_pressed(self, gesture, n_press, x, y):
         if self._zoom_selecting:
@@ -5218,6 +5297,12 @@ class TextPageView(Gtk.Overlay):
             ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
             ha.set_value(self._thumb_start[0] - (x - self._thumb_origin[0]))
             va.set_value(self._thumb_start[1] - (y - self._thumb_origin[1]))
+            return
+        # hint that the paper edge is draggable (caret tool only, matching where
+        # _on_width_begin claims); leave other tools' cursors alone
+        if not self._resizing_width and self.tool == "text":
+            self.set_cursor(Gdk.Cursor.new_from_name("ew-resize")
+                            if self._on_paper_edge(x, y) else None)
 
     def _on_thumb_event(self, ctrl, event):
         if event is None:   # PyGObject sometimes fails to marshal the arg
@@ -5242,7 +5327,7 @@ class TextPageView(Gtk.Overlay):
         wraps at the same words and the mark-anchored ink stays glued."""
         z = self.zoom
         self.font_px = self._base_font_px * z
-        self.view.set_size_request(round(self.PAGE_WIDTH * z), -1)
+        self.view.set_size_request(round(self.page_width * z), -1)
         self.view.set_left_margin(round(self.MARGIN_X * z))
         self.view.set_right_margin(round(self.MARGIN_X * z))
         self.view.set_top_margin(round(self.MARGIN_TOP * z))
@@ -5913,7 +5998,7 @@ class TextPageView(Gtk.Overlay):
                 "opacity": st["opacity"],
                 "font_px": st["font_px"],
             })
-        return {"version": 1, "strokes": out}
+        return {"version": 1, "page_width": self.page_width, "strokes": out}
 
     def load_ink(self, data):
         buf = self.view.get_buffer()
@@ -5922,6 +6007,11 @@ class TextPageView(Gtk.Overlay):
         self.strokes = []
         self._undo_ops.clear()
         self._redo_ops.clear()
+        # restore the saved sheet width (set directly, not via set_page_width,
+        # so loading doesn't mark the fresh document dirty)
+        self.page_width = int(max(self.PAGE_WIDTH_MIN, min(
+            self.PAGE_WIDTH_MAX, data.get("page_width", self.PAGE_WIDTH))))
+        self._apply_zoom()
         src_lines = self.view.get_source_text().split("\n")
         hashes = [self._line_hash(t) for t in src_lines]
         for rec in data.get("strokes", []):

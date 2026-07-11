@@ -7833,6 +7833,69 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_page_width_setter_clamps_and_persists(self):
+        """Per-document sheet width: setter clamps + marks dirty, and it
+        round-trips through the ink sidecar (#112)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp.set_zoom(1.0)
+                changed = []
+                tp.on_ink_changed = lambda: changed.append(True)
+                tp.set_page_width(500)
+                self.assertEqual(tp.page_width, 500)
+                self.assertEqual(tp.view.get_size_request()[0], 500)
+                self.assertTrue(changed)                      # dirty → persists
+                tp.set_page_width(99999)
+                self.assertEqual(tp.page_width, tp.PAGE_WIDTH_MAX)
+                tp.set_page_width(1)
+                self.assertEqual(tp.page_width, tp.PAGE_WIDTH_MIN)
+                # sidecar round-trip
+                data = tp.ink_to_json()
+                self.assertEqual(data["page_width"], tp.PAGE_WIDTH_MIN)
+                tp2 = sidemark.TextPageView()
+                tp2.load_ink(data)
+                self.assertEqual(tp2.page_width, tp.PAGE_WIDTH_MIN)
+                # a sidecar without the key falls back to the default
+                tp2.load_ink({"strokes": []})
+                self.assertEqual(tp2.page_width, tp2.PAGE_WIDTH)
+
+            self._run_in_window(body)
+
+    def test_drag_paper_edge_resizes_width(self):
+        """Dragging the paper's side edge changes the width; the middle of the
+        sheet and non-caret tools do not (they keep their own drags)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp.set_zoom(1.0)
+                self._settle()
+                b = tp._paper_bounds()
+                self.assertIsNotNone(b)
+                px, py, pw, ph = b
+                right, midy = px + pw, py + ph / 2
+                self.assertTrue(tp._on_paper_edge(right, midy))
+                self.assertFalse(tp._on_paper_edge(px + pw / 2, midy))  # middle
+                w0 = tp.page_width
+                g = _FakeDrag(right, midy)          # plain primary, no modifiers
+                tp._on_width_begin(g, right, midy)
+                self.assertTrue(tp._resizing_width)
+                self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
+                tp._on_width_update(g, 40, 0)       # pull the edge out 40px
+                self.assertAlmostEqual(tp.page_width, w0 + 80, delta=3)
+                tp._on_width_end(g, 40, 0)
+                self.assertFalse(tp._resizing_width)
+                # a drawing tool keeps its drag (edge resize denies itself)
+                win._set_tool_mode("pen")
+                g2 = _FakeDrag(right, midy)
+                tp._on_width_begin(g2, right, midy)
+                self.assertFalse(tp._resizing_width)
+                self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
+
+            self._run_in_window(body)
+
     def test_zoom_css_provider_released_on_tab_close(self):
         """The sheet-zoom CssProvider is display-wide; it must be dropped when
         the text page's tab closes, or every closed tab leaks a provider in
