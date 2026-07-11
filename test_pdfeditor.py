@@ -7936,13 +7936,13 @@ class TestTextFirstMode(unittest.TestCase):
             self._run_in_window(body)
 
     @staticmethod
-    def _fake_drag(alt=True):
+    def _fake_drag(alt=True, button=1, start=(300.0, 100.0)):
         state = Gdk.ModifierType.ALT_MASK if alt else Gdk.ModifierType(0)
         return types.SimpleNamespace(
             get_current_event_state=lambda: state,
             set_state=lambda s: None,
-            get_current_button=lambda: 1,
-            get_start_point=lambda: (True, 300.0, 100.0))
+            get_current_button=lambda: button,
+            get_start_point=lambda: (True, start[0], start[1]))
 
     def test_alt_drag_draws_with_pen_in_text_tool(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7964,6 +7964,38 @@ class TestTextFirstMode(unittest.TestCase):
                 tp._on_alt_update(g, 0.0, 3.0)
                 tp._on_alt_end(g, 0.0, 6.0)
                 self.assertEqual(len(tp.strokes), 1)
+
+            self._run_in_window(body)
+
+    def test_alt_right_drag_erases_in_text_tool(self):
+        """Alt+right is the quick-eraser twin of Alt+left's quick-pen: while the
+        caret tool is active, holding Alt and dragging the right button erases
+        ink (and restores the caret on release)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                self._settle()
+                tp = win._active_session._text_page
+                # draw a stroke with the Alt+left quick-pen
+                g = self._fake_drag(alt=True, button=1)
+                tp._on_alt_begin(g, 300.0, 100.0)
+                for i in range(1, 5):
+                    tp._on_alt_update(g, 0.0, i * 3.0)
+                tp._on_alt_end(g, 0.0, 12.0)
+                self.assertEqual(len(tp.strokes), 1)
+                # Alt+right over its first point erases it
+                sx, sy = tp._stroke_overlay_pts(tp.strokes[0])[0]
+                e = self._fake_drag(alt=True, button=3, start=(sx, sy))
+                tp._on_alt_begin(e, sx, sy)
+                self.assertEqual(tp.tool, "eraser")   # switched mid-gesture
+                tp._on_alt_update(e, 0.0, 2.0)
+                tp._on_alt_end(e, 0.0, 2.0)
+                self.assertEqual(len(tp.strokes), 0)  # erased
+                self.assertEqual(tp.tool, "text")     # caret restored
+                # Alt+MIDDLE is left for panning — the quick-ink gesture denies
+                m = self._fake_drag(alt=True, button=2)
+                tp._on_alt_begin(m, 300.0, 100.0)
+                self.assertIsNone(tp._alt_saved_tool)  # not claimed as ink
 
             self._run_in_window(body)
 

@@ -4946,13 +4946,15 @@ class TextPageView(Gtk.Overlay):
         self.ink.add_controller(drag)
         self._drag = drag
 
-        # Alt+drag draws with the pen even while the text tool is active — a
-        # quick annotation without switching tools. Capture phase on the
-        # overlay sees the press before the TextView; without Alt the gesture
-        # denies itself so clicking and selecting text work untouched.
+        # Alt+drag is the "quick ink" escape while the text caret is active —
+        # a fast annotation without switching tools: Alt+left draws with the
+        # pen, Alt+right erases (mirroring the ink tools' left-draw/right-erase
+        # pairing). Capture phase on the overlay sees the press before the
+        # TextView; without Alt (or on the middle button) the gesture denies
+        # itself so clicking, selecting text and the right-click menu stay put.
         self._alt_saved_tool = None
         alt = Gtk.GestureDrag()
-        alt.set_button(Gdk.BUTTON_PRIMARY)
+        alt.set_button(0)
         alt.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         alt.connect("drag-begin", self._on_alt_begin)
         alt.connect("drag-update", self._on_alt_update)
@@ -5210,12 +5212,17 @@ class TextPageView(Gtk.Overlay):
 
     def _on_alt_begin(self, gesture, x, y):
         state = gesture.get_current_event_state()
-        if self.tool != "text" or not state & Gdk.ModifierType.ALT_MASK:
+        button = gesture.get_current_button()
+        if (self.tool != "text" or not state & Gdk.ModifierType.ALT_MASK
+                or button not in (Gdk.BUTTON_PRIMARY, Gdk.BUTTON_SECONDARY)):
+            # only Alt+left / Alt+right escape to ink; middle (pan) and the
+            # unmodified caret keep their meaning
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
         self._alt_saved_tool = self.tool
-        self.tool = "pen"           # style + erase checks read self.tool
+        # Alt+left = pen, Alt+right = eraser (style + erase checks read self.tool)
+        self.tool = ("eraser" if button == Gdk.BUTTON_SECONDARY else "pen")
         self._on_ink_begin(gesture, x, y)
 
     def _on_alt_update(self, gesture, dx, dy):
