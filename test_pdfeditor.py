@@ -7671,6 +7671,13 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 tp = win._active_session._text_page
                 win._set_tool_mode("zoom")
+                # the cancel controller must live on the ink overlay (the widget
+                # that owns the zoom drag), else the right press never fires
+                # while the left-drag holds the pointer grab
+                secondary = [c for c in tp.ink.observe_controllers()
+                             if isinstance(c, Gtk.GestureClick)
+                             and c.get_button() == Gdk.BUTTON_SECONDARY]
+                self.assertTrue(secondary, "right-click cancel not wired to ink")
                 z0 = tp.zoom
                 g = _FakeDrag(100, 100)
                 tp._on_ink_begin(g, 100, 100)

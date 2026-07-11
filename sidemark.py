@@ -5026,13 +5026,16 @@ class TextPageView(Gtk.Overlay):
         self.add_controller(thumb)
 
         # right-click aborts an in-progress zoom-region drag (same escape hatch
-        # as the PDF canvas). Own secondary-button controller so it fires even
-        # while the left-drag holds the sequence; guarded on _zoom_selecting so
-        # a normal right-click (context menu / erase) is untouched.
+        # as the PDF canvas). Must live on the SAME widget that owns the zoom
+        # drag — the ink overlay — so it is in the pointer-grab chain and sees
+        # the right press while the left-drag holds the sequence (on the parent
+        # Overlay it never fired, making cancel PDF-only in practice). Guarded on
+        # _zoom_selecting so a normal right-click (context menu / erase) is left
+        # alone; the ink overlay is targetable whenever a zoom rect can exist.
         rclick = Gtk.GestureClick.new()
         rclick.set_button(Gdk.BUTTON_SECONDARY)
         rclick.connect("pressed", self._on_secondary_pressed)
-        self.add_controller(rclick)
+        self.ink.add_controller(rclick)
 
         # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
         # overlay: the sheet's TextView usually keeps focus (the ink
