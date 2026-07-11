@@ -5007,17 +5007,20 @@ class TextPageView(Gtk.Overlay):
     # ── tool routing ─────────────────────────────────────────────────────────
 
     def set_tool(self, tool):
-        """Anything that isn't a drawing tool falls back to text editing."""
-        self.tool = (tool if tool in ("pen", "highlighter", "eraser", "lasso")
+        """Anything that isn't a drawing / zoom tool falls back to text editing.
+        The zoom tool is the modifier-free twin of the Shift+drag zoom-to-region
+        gesture (PDF-canvas parity), so it must claim the overlay like the pens."""
+        self.tool = (tool
+                     if tool in ("pen", "highlighter", "eraser", "lasso", "zoom")
                      else "text")
-        inking = self.tool != "text"
-        self.ink.set_can_target(inking)
+        targeting = self.tool != "text"
+        self.ink.set_can_target(targeting)
         self.ink.set_cursor(
             Gdk.Cursor.new_from_name("crosshair")
-            if inking and self.tool != "lasso" else None)
+            if targeting and self.tool != "lasso" else None)
         if self.tool != "lasso":
             self.clear_lasso_selection()
-        if not inking and self.current_stroke:
+        if self.tool not in ("pen", "highlighter") and self.current_stroke:
             self.current_stroke = []
             self.ink.queue_draw()
 
@@ -5228,9 +5231,10 @@ class TextPageView(Gtk.Overlay):
 
     def _on_ink_begin(self, gesture, x, y):
         state = gesture.get_current_event_state()
-        if state & Gdk.ModifierType.SHIFT_MASK:
-            # Shift starts a zoom-to-region rubber-band (PDF-canvas parity); a
-            # click that never grows into a rect falls back to fit-width on end
+        if state & Gdk.ModifierType.SHIFT_MASK or self.tool == "zoom":
+            # Shift (or the modifier-free zoom tool) starts a zoom-to-region
+            # rubber-band (PDF-canvas parity); a click that never grows into a
+            # rect falls back to fit-width on end
             self._zoom_selecting = True
             self._zoom_start = (x, y)
             self._zoom_end = (x, y)
@@ -8573,7 +8577,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_mode_lasso":   ("pdf", "text"),
         "_mode_select":  ("pdf",),
         "_mode_pan":     ("pdf",),
-        "_mode_zoom":    ("pdf",),
+        # zoom-to-region has a toolbar tool in both modes (its Shift+drag
+        # gesture's modifier-free twin) — parity with the PDF bar. Pan stays
+        # PDF-only on purpose: the text sheet already scrolls (wheel/touchpad/
+        # Ctrl-drag), so a dedicated pan tool would be redundant there.
+        "_mode_zoom":    ("pdf", "text"),
         "_mode_anchor":  ("pdf",),
         "_pen_btn":      ("pdf", "text"),
     }

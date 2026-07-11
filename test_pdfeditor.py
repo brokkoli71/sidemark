@@ -7621,6 +7621,31 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_zoom_tool_drags_a_region_without_shift(self):
+        """The zoom tool is the modifier-free twin of Shift+drag (PDF-canvas
+        parity): selecting it and dragging zooms to the region, no Shift held.
+        The tool button shows in the text toolbar and claims the ink overlay."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("zoom")
+                self.assertEqual(tp.tool, "zoom")
+                self.assertTrue(tp.ink.get_can_target())   # grabs the drag
+                self.assertTrue(win._mode_zoom.get_visible())
+                g = _FakeDrag(100, 100)                    # NO Shift modifier
+                tp._on_ink_begin(g, 100, 100)
+                self.assertTrue(tp._zoom_selecting)
+                tp._on_ink_update(g, 200, 150)
+                tp._on_ink_end(g, 200, 150)
+                vw, vh = tp.scroll.get_width(), tp.scroll.get_height()
+                want = min(vw / 200.0, vh / 150.0) * 0.97
+                want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
+                self.assertAlmostEqual(tp.zoom, want, places=6)
+                self.assertEqual(tp.strokes, [])           # no ink drawn
+
+            self._run_in_window(body)
+
     def test_ctrl_and_middle_drag_pan_the_sheet(self):
         """Ctrl+left-drag and middle-drag grab-pan the sheet (PDF-canvas
         parity, #106 item 4); a plain left-drag is left for the caret/pen."""
@@ -7688,11 +7713,11 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 for w in (win._notes_toggle, win._present_btn, win._toc_btn,
                           win._nav_box, win._pages_box, win._mode_anchor,
-                          win._mode_pan, win._mode_zoom,
-                          win._mode_select):
+                          win._mode_pan, win._mode_select):
                     self.assertFalse(w.get_visible(), w)
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
-                          win._mode_lasso, win._mode_text):   # lasso: #108
+                          win._mode_lasso, win._mode_zoom,   # zoom tool: #106.5
+                          win._mode_text):                   # lasso: #108
                     self.assertTrue(w.get_visible(), w)
                 # the caret tool leads the tool strip
                 self.assertIs(win._tools_box.get_first_child(), win._mode_text)
