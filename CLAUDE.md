@@ -138,7 +138,18 @@ framework is ported to master (row 107) so parity work no longer waits on a
 deck-merge decision, and parity items 1–3 landed on it (row 108): text pages
 now have the lasso (select/move/resize/duplicate/recolour, re-anchoring the
 marks — closes row 95), straight-line snap and stroke smoothing. Text pages
-also got the PDF canvas' Ctrl+drag / middle-drag pan gesture (row 106 item 4)
-and Shift+drag zoom-to-region (item 5; Shift+click still fits width).
-Open follow-ups: parity items 6–7 in row 106 (temp-highlighter,
-presenter for text pages) and the text-page items in rows 92–94.
+also reached tool/gesture parity with the PDF canvas (row 106 items 4–5 + a
+workflow pass, row 113): pan and zoom-to-region are now both toolbar tools
+*and* gestures (Ctrl/middle-drag + plain-drag-with-tool pan, thumb-button pan,
+two-finger drag pans as well as zooms; Shift+drag / zoom-tool zoom-to-region,
+Shift+click fits width), and Alt is the caret's ink escape (Alt+left pen,
+Alt+right eraser). Tool tooltips carry the Alt-hold hint per mode.
+
+**Next up (user-prioritised backlog, do before the remaining parity items):**
+1. **row 110** — window-reuse bug (launched files should open as tabs in the
+   last window, not new windows; the feature exists but misbehaves — needs a
+   repro then fix). 2. **row 109** — finer Ctrl+Z granularity in the
+   notes/text editor. 3. **row 112** — per-document width for text sheets.
+   Then row 106 items 6–7 (temp-highlighter, presenter for text pages) and the
+   text-page items in rows 92–94. Backlog: **row 111** (duplicate-download
+   dialog).
