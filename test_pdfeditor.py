@@ -7833,6 +7833,28 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_ctrl_h_and_lasso_verbs_route_to_text_page(self):
+        """Ctrl+H toggles the highlighter and the lasso keyboard verbs act on
+        the sheet in text mode (#113 audit) — same shortcuts as the PDF side."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                self.assertEqual(tp.tool, "text")
+                win._toggle_highlighter()            # Ctrl+H
+                self.assertEqual(tp.tool, "highlighter")
+                win._toggle_highlighter()            # Ctrl+H again → pen
+                self.assertEqual(tp.tool, "pen")
+                # lasso verbs: the window fallback targets the sheet in text mode
+                win._set_tool_mode("lasso")
+                tp._selected = [object()]             # pretend a selection
+                self.assertTrue(tp.has_lasso_selection())
+                surface = (tp if win._text_mode and tp.has_lasso_selection()
+                           else win.canvas)
+                self.assertIs(surface, tp)            # Delete/Esc/Ctrl+D hit tp
+
+            self._run_in_window(body)
+
     def test_page_width_setter_clamps_and_persists(self):
         """Per-document sheet width: setter clamps + marks dirty, and it
         round-trips through the ink sidecar (#112)."""

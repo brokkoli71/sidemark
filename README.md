@@ -238,7 +238,7 @@ plain `[[…]]` text, so links round-trip through Obsidian.
 | `Ctrl+O` | Open file (in a new tab) |
 | `Ctrl+N` | New blank PDF (in a new tab) |
 | `Ctrl+Alt+N` | New text page — endless Markdown paper you can draw on |
-| `Alt+Drag` | On a text page: draw with the pen while the text tool is active |
+| `Alt+Drag` / `Alt+Right-drag` | On a text page: draw / erase without leaving the text tool. The pen, highlighter, eraser, lasso, pan and zoom tools — and their `Ctrl`/middle-drag (pan), `Shift+drag` (zoom to region) and `Ctrl+H` (highlighter) gestures — all match the PDF canvas, so switching modes needs no relearning |
 | `Ctrl+Scroll` / pinch | On a text page: zoom the sheet — paper, text and ink together (`Ctrl+0` resets; `Shift+click` with a drawing tool fits the width) |
 | `Ctrl+S` | Save (prompts for name if untitled) |
 | `Ctrl+W` | Close the current tab (prompts to save unsaved changes; closes the window with the last tab) |
