@@ -7607,18 +7607,33 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._presenter is not None:
             self._presenter.refresh()
 
-    def _on_notes_changed(self, _buf):
+    def _on_notes_changed(self, buf):
         # A real user edit (not a page restore, not the symbol-substitution
-        # machinery) opens a typing burst: one timeline entry that covers all
-        # typing until the next canvas action or page switch.
-        if (not self._suppress_dirty and not self._notes_view._in_highlight
-                and not self._notes_burst_open):
-            self._undo_timeline.append(
-                ("notes", self.canvas.current_page_idx, self._burst_base))
-            self._notes_burst_open = True
-            self._redo_timeline.clear()   # typing is a new action
+        # machinery) opens a typing burst — one entry in the #29 unified
+        # canvas+notes timeline. The burst ENDS at a word / line boundary so
+        # Ctrl+Z peels typing back a word at a time instead of wiping the whole
+        # session; the chronological interleaving with canvas strokes is
+        # unchanged (there are just more, smaller notes entries between them).
+        if not self._suppress_dirty and not self._notes_view._in_highlight:
+            if not self._notes_burst_open:
+                self._undo_timeline.append(
+                    ("notes", self.canvas.current_page_idx, self._burst_base))
+                self._notes_burst_open = True
+                self._redo_timeline.clear()   # typing is a new action
+            if self._at_word_boundary(buf):
+                # the word (with its trailing space/newline) is one undo step;
+                # the next character opens a fresh burst from here
+                self._notes_burst_open = False
+                self._burst_base = self._notes_view.get_source_text()
         self._mark_dirty()
         self._update_canvas_anchors()
+
+    @staticmethod
+    def _at_word_boundary(buf):
+        """True when the character just typed was whitespace — a natural
+        undo boundary so each word/line becomes its own timeline entry."""
+        prev = buf.get_iter_at_mark(buf.get_insert())
+        return prev.backward_char() and prev.get_char() in " \t\n"
 
     def _clear_dirty(self):
         self._dirty = False

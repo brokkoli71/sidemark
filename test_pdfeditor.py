@@ -6329,17 +6329,33 @@ class TestGlobalUndo(unittest.TestCase):
             win._global_undo()   # empty timeline must be a no-op
         self._run_in_window(1, body)
 
-    def test_typing_burst_undone_as_one(self):
+    def test_typing_undoes_word_by_word(self):
+        """A word (with its trailing space) is one undo step, so Ctrl+Z peels
+        typing back a word at a time instead of wiping the whole session —
+        while still one unified timeline with the canvas (#29)."""
         def body(win):
             buf = win._notes_view.get_buffer()
-            buf.insert(buf.get_end_iter(), "first ")
-            buf.insert(buf.get_end_iter(), "second")
-            if len(win._undo_timeline) != 1:
-                raise AssertionError(f"expected one burst entry, got "
+            # char-by-char, like real typing, so the word-boundary logic runs
+            for ch in "first second":
+                buf.insert(buf.get_end_iter(), ch)
+            # two words → two notes entries
+            notes_entries = [op for op in win._undo_timeline if op[0] == "notes"]
+            if len(notes_entries) != 2:
+                raise AssertionError(f"expected two word entries, got "
                                      f"{win._undo_timeline!r}")
             win._global_undo()
+            if self._buf_text(win) != "first ":
+                raise AssertionError(f"first undo should leave 'first ', got "
+                                     f"{self._buf_text(win)!r}")
+            win._global_undo()
             if self._buf_text(win) != "":
-                raise AssertionError("burst undo did not clear all typing")
+                raise AssertionError(f"second undo should clear it, got "
+                                     f"{self._buf_text(win)!r}")
+            # and redo re-applies word by word
+            win._global_redo()
+            if self._buf_text(win) != "first ":
+                raise AssertionError(f"redo should restore 'first ', got "
+                                     f"{self._buf_text(win)!r}")
         self._run_in_window(1, body)
 
     def test_canvas_action_splits_bursts(self):
