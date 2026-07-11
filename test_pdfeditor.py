@@ -7593,6 +7593,34 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_shift_drag_zooms_to_region(self):
+        """Shift+DRAG rubber-bands a region and zooms so it fills the viewport
+        (PDF-canvas parity, #106 item 5); no ink is drawn."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("pen")
+                g = _FakeDrag(100, 100, state=Gdk.ModifierType.SHIFT_MASK)
+                tp._on_ink_begin(g, 100, 100)
+                self.assertTrue(tp._zoom_selecting)
+                # drag out a 200×150 rectangle
+                tp._on_ink_update(g, 200, 150)
+                self.assertEqual(tp._zoom_end, (300, 250))
+                tp._on_ink_end(g, 200, 150)
+                vw, vh = tp.scroll.get_width(), tp.scroll.get_height()
+                want = min(vw / 200.0, vh / 150.0) * 0.97
+                want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
+                self.assertAlmostEqual(tp.zoom, want, places=6)
+                self.assertGreater(tp.zoom, 1.0)   # a region smaller than the
+                #                                     viewport zooms IN
+                self.assertEqual(tp.strokes, [])   # nothing was drawn
+                # marquee state is cleared for the next gesture
+                self.assertFalse(tp._zoom_selecting)
+                self.assertIsNone(tp._zoom_start)
+
+            self._run_in_window(body)
+
     def test_ctrl_and_middle_drag_pan_the_sheet(self):
         """Ctrl+left-drag and middle-drag grab-pan the sheet (PDF-canvas
         parity, #106 item 4); a plain left-drag is left for the caret/pen."""

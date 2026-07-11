@@ -4861,7 +4861,11 @@ class TextPageView(Gtk.Overlay):
         # {"mark", "pts": [(dx, dy), ...], "color", "width", "opacity", "font_px"}
         self.strokes = []
         self.current_stroke = []  # overlay coords while a stroke is in flight
-        self._shift_fitting = False   # a Shift+click is fitting, not drawing
+        # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
+        # fits the paper to the window — both PDF-canvas parity (#106 item 5).
+        self._zoom_selecting = False
+        self._zoom_start = None       # overlay coords of the drag origin
+        self._zoom_end = None         # overlay coords of the current corner
         self._undo_ops = []       # ("add", [stroke, ...]) | ("erase", [stroke, ...])
         self._redo_ops = []
         self._erased_now = []     # strokes removed during the ongoing erase drag
@@ -5041,6 +5045,32 @@ class TextPageView(Gtk.Overlay):
         if vw > 0:
             self.set_zoom((vw - 2 * self.PAGE_GAP) / self.PAGE_WIDTH)
 
+    def _zoom_to_region(self, start, end):
+        """Zoom so the dragged overlay rectangle fills the viewport, then
+        scroll it into view centred — the text-sheet twin of the PDF canvas'
+        _execute_zoom_to_rect. The sheet scales linearly (identical wrap), so
+        the region keeps its shape; only the zoom scalar and scroll move."""
+        x1, y1 = min(start[0], end[0]), min(start[1], end[1])
+        rw, rh = abs(end[0] - start[0]), abs(end[1] - start[1])
+        vw, vh = self.scroll.get_width(), self.scroll.get_height()
+        if rw < 8 or rh < 8 or vw <= 0 or vh <= 0:
+            return
+        old = self.zoom
+        # fit both axes (like the PDF canvas), leaving a hair of margin
+        self.set_zoom(old * min(vw / rw, vh / rh) * 0.97)
+        f = self.zoom / old
+        # place the region's top-left so the scaled rect sits centred: the
+        # content point under overlay (x1, y1) must land at (mx, my)
+        mx = max(0.0, (vw - rw * f) / 2)
+        my = max(0.0, (vh - rh * f) / 2)
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        hv = (ha.get_value() + x1) * f - mx
+        vv = (va.get_value() + y1) * f - my
+        ha.set_value(hv)
+        va.set_value(vv)
+        # the relayout to the new width is async — re-apply once it lands
+        GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
+
     def _on_sheet_pinch_begin(self, gesture, _seq):
         self._pinch_base_zoom = self.zoom
         ok, cx, cy = gesture.get_bounding_box_center()
@@ -5199,12 +5229,14 @@ class TextPageView(Gtk.Overlay):
     def _on_ink_begin(self, gesture, x, y):
         state = gesture.get_current_event_state()
         if state & Gdk.ModifierType.SHIFT_MASK:
-            # Shift+click fits the paper to the window (PDF-canvas parity);
-            # the flag makes the rest of the drag a no-op
-            self._shift_fitting = True
-            self.fit_width()
+            # Shift starts a zoom-to-region rubber-band (PDF-canvas parity); a
+            # click that never grows into a rect falls back to fit-width on end
+            self._zoom_selecting = True
+            self._zoom_start = (x, y)
+            self._zoom_end = (x, y)
+            self.ink.queue_draw()
             return
-        self._shift_fitting = False
+        self._zoom_selecting = False
         button = gesture.get_current_button()
         self._erased_now = []
         if self.tool == "lasso" and button != 3:
@@ -5218,12 +5250,14 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_update(self, gesture, dx, dy):
-        if self._shift_fitting:
-            return
         ok, sx, sy = gesture.get_start_point()
         if not ok:
             return
         x, y = sx + dx, sy + dy
+        if self._zoom_selecting:
+            self._zoom_end = (x, y)
+            self.ink.queue_draw()
+            return
         if self._lassoing:
             self._lasso_path.append((x, y))
         elif self._lasso_scaling:
@@ -5250,8 +5284,18 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_end(self, gesture, dx, dy):
-        if self._shift_fitting:
-            self._shift_fitting = False
+        if self._zoom_selecting:
+            self._zoom_selecting = False
+            start, end = self._zoom_start, self._zoom_end
+            self._zoom_start = self._zoom_end = None
+            if start and end:
+                rw = abs(end[0] - start[0])
+                rh = abs(end[1] - start[1])
+                if rw >= 8 and rh >= 8:
+                    self._zoom_to_region(start, end)
+                else:
+                    self.fit_width()   # Shift+click with no rect → fit page
+            self.ink.queue_draw()
             return
         self._cancel_straight_timer()
         was_straight = self._straight_mode
@@ -5713,6 +5757,18 @@ class TextPageView(Gtk.Overlay):
             ctx.move_to(*self._lasso_path[0])
             for pt in self._lasso_path[1:]:
                 ctx.line_to(*pt)
+            ctx.stroke()
+            ctx.set_dash([])
+        if self._zoom_selecting and self._zoom_start and self._zoom_end:
+            # dashed zoom-to-region marquee (PDF-canvas parity)
+            x0 = min(self._zoom_start[0], self._zoom_end[0])
+            y0 = min(self._zoom_start[1], self._zoom_end[1])
+            zw = abs(self._zoom_end[0] - self._zoom_start[0])
+            zh = abs(self._zoom_end[1] - self._zoom_start[1])
+            ctx.set_source_rgba(ar, ag, ab, 0.9)
+            ctx.set_line_width(1.5)
+            ctx.set_dash([5.0, 3.0])
+            ctx.rectangle(x0, y0, zw, zh)
             ctx.stroke()
             ctx.set_dash([])
 
