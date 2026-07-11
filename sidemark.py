@@ -4988,6 +4988,19 @@ class TextPageView(Gtk.Overlay):
         self.add_controller(alt)
         self._alt_drag = alt
 
+        # Ctrl+Shift+drag lays down a one-off HIGHLIGHTER stroke regardless of
+        # the active tool (PDF-canvas parity, #106 item 6 — the gesture twin of
+        # the Ctrl+H toggle). Same capture-phase escape pattern as Alt+drag.
+        self._temp_hl_saved_tool = None
+        thl = Gtk.GestureDrag()
+        thl.set_button(Gdk.BUTTON_PRIMARY)
+        thl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        thl.connect("drag-begin", self._on_temp_hl_begin)
+        thl.connect("drag-update", self._on_temp_hl_update)
+        thl.connect("drag-end", self._on_temp_hl_end)
+        self.add_controller(thl)
+        self._temp_hl_drag = thl
+
         # Two-finger pinch zooms the sheet, mirroring the PDF canvas. Capture
         # phase on the overlay so the gesture wins over text-view scrolling.
         self._pinch_base_zoom = 1.0
@@ -5255,14 +5268,19 @@ class TextPageView(Gtk.Overlay):
     def _pan_chord(self, gesture):
         """True when the drag should pan: middle-drag, Ctrl+left-drag (the two
         chords the PDF canvas pans on), or a plain left-drag while the pan tool
-        is active (its modifier-free twin)."""
+        is active (its modifier-free twin). Ctrl+SHIFT is reserved for the
+        temp-highlighter, so it never pans."""
         state = gesture.get_current_event_state()
         button = gesture.get_current_button()
         if button == Gdk.BUTTON_MIDDLE:
             return True
-        return (button == Gdk.BUTTON_PRIMARY
-                and (self.tool == "pan"
-                     or bool(state & Gdk.ModifierType.CONTROL_MASK)))
+        if button != Gdk.BUTTON_PRIMARY:
+            return False
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if ctrl and shift:
+            return False                     # Ctrl+Shift+drag → temp-highlighter
+        return self.tool == "pan" or ctrl
 
     def _on_pan_begin(self, gesture, x, y):
         if not self._pan_chord(gesture):
@@ -5422,10 +5440,41 @@ class TextPageView(Gtk.Overlay):
         self.tool = self._alt_saved_tool
         self._alt_saved_tool = None
 
+    # ── temp-highlighter (Ctrl+Shift+drag, PDF-canvas parity) ────────────────
+
+    def _on_temp_hl_begin(self, gesture, x, y):
+        state = gesture.get_current_event_state()
+        need = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+        if (state & need) != need:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        # borrow the highlighter for this one stroke (pen_style + _commit_stroke
+        # read self.tool); restored on release
+        self._temp_hl_saved_tool = self.tool
+        self.tool = "highlighter"
+        self._on_ink_begin(gesture, x, y)
+
+    def _on_temp_hl_update(self, gesture, dx, dy):
+        if self._temp_hl_saved_tool is not None:
+            self._on_ink_update(gesture, dx, dy)
+
+    def _on_temp_hl_end(self, gesture, dx, dy):
+        if self._temp_hl_saved_tool is None:
+            return
+        self._on_ink_end(gesture, dx, dy)
+        self.tool = self._temp_hl_saved_tool
+        self._temp_hl_saved_tool = None
+
     def _on_ink_begin(self, gesture, x, y):
         state = gesture.get_current_event_state()
         self._zoom_cancelled = False
-        if state & Gdk.ModifierType.SHIFT_MASK or self.tool == "zoom":
+        # Shift alone (or the zoom tool) zooms to a region; Ctrl+Shift is the
+        # temp-highlighter (handled by its own capture gesture) so it is NOT a
+        # zoom here.
+        shift_only = (state & Gdk.ModifierType.SHIFT_MASK
+                      and not state & Gdk.ModifierType.CONTROL_MASK)
+        if shift_only or self.tool == "zoom":
             # Shift (or the modifier-free zoom tool) starts a zoom-to-region
             # rubber-band (PDF-canvas parity); a click that never grows into a
             # rect falls back to fit-width on end

@@ -145,11 +145,14 @@ two-finger drag pans as well as zooms; Shift+drag / zoom-tool zoom-to-region,
 Shift+click fits width), and Alt is the caret's ink escape (Alt+left pen,
 Alt+right eraser). Tool tooltips carry the Alt-hold hint per mode.
 
-**Next up (user-prioritised backlog, do before the remaining parity items):**
-1. **row 110** — window-reuse bug (launched files should open as tabs in the
-   last window, not new windows; the feature exists but misbehaves — needs a
-   repro then fix). 2. **row 109** — finer Ctrl+Z granularity in the
-   notes/text editor. 3. **row 112** — per-document width for text sheets.
-   Then row 106 items 6–7 (temp-highlighter, presenter for text pages) and the
-   text-page items in rows 92–94. Backlog: **row 111** (duplicate-download
-   dialog).
+Text/PDF tool parity (row 106) is now **complete**: pan + zoom tools/gestures,
+thumb-button and two-finger pan, Alt-left/right ink escape, Ctrl+H + lasso
+verbs, and the Ctrl+Shift+drag temp-highlighter all work on text pages (item 7,
+presenter/share for text mode, is **won't-do** per the user). The ranked
+backlog (rows 110 window-reuse [not-a-bug], 109 word-level Ctrl+Z, 112 per-doc
+width) and the workflow model (row 113) are done.
+
+**Open follow-ups:** text-page items in rows 92–94 (text-snapping highlighter,
+pagination/print view, margin inks that don't reflow) and row 100's link
+authoring (link-to-here + backlinks). Backlog: **row 111** (duplicate-download
+dialog), plus older rows 26/27/64.

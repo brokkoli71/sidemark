@@ -7833,6 +7833,35 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_ctrl_shift_drag_temp_highlighter(self):
+        """Ctrl+Shift+drag lays down a one-off highlighter stroke regardless of
+        the active tool, then restores it (PDF-canvas parity, #106 item 6)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                self._settle()
+                tp = win._active_session._text_page
+                self.assertEqual(tp.tool, "text")          # caret is the default
+                hl_opacity = tp.pen_style(True)[2]
+                self.assertLess(hl_opacity, 1.0)           # highlighter is translucent
+                g = _FakeDrag(120, 120, state=(Gdk.ModifierType.CONTROL_MASK
+                                               | Gdk.ModifierType.SHIFT_MASK))
+                tp._on_temp_hl_begin(g, 120, 120)
+                self.assertEqual(tp.tool, "highlighter")   # borrowed mid-gesture
+                for i in range(1, 5):
+                    tp._on_temp_hl_update(g, 0, i * 3)
+                tp._on_temp_hl_end(g, 0, 12)
+                self.assertEqual(tp.tool, "text")          # restored after release
+                self.assertEqual(len(tp.strokes), 1)
+                self.assertAlmostEqual(tp.strokes[0]["opacity"], hl_opacity, places=5)
+                # without Ctrl+Shift the gesture denies itself (no stroke)
+                g2 = _FakeDrag(120, 120)
+                tp._on_temp_hl_begin(g2, 120, 120)
+                self.assertIsNone(tp._temp_hl_saved_tool)
+                self.assertEqual(g2.claimed, Gtk.EventSequenceState.DENIED)
+
+            self._run_in_window(body)
+
     def test_ctrl_h_and_lasso_verbs_route_to_text_page(self):
         """Ctrl+H toggles the highlighter and the lasso keyboard verbs act on
         the sheet in text mode (#113 audit) — same shortcuts as the PDF side."""
