@@ -7690,6 +7690,80 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertFalse(tp._panning)
                 self.assertEqual(g3.claimed, Gtk.EventSequenceState.DENIED)
 
+                # …but with the PAN TOOL active, a plain left-drag DOES pan
+                win._set_tool_mode("pan")
+                self.assertEqual(tp.tool, "pan")
+                self.assertFalse(tp.ink.get_can_target())   # pan rides capture
+                va.set_value(300.0)
+                g4 = _FakeDrag(50, 50, button=1)            # no modifier
+                tp._on_pan_begin(g4, 50, 50)
+                self.assertTrue(tp._panning)
+                self.assertEqual(g4.claimed, Gtk.EventSequenceState.CLAIMED)
+                tp._on_pan_update(g4, 0, -40)
+                self.assertAlmostEqual(va.get_value(), 340.0, places=3)
+                tp._on_pan_end(g4, 0, -40)
+
+            self._run_in_window(body)
+
+    def test_thumb_button_pans_the_sheet(self):
+        """The MX Master thumb button (btn 10) grab-pans the sheet while held,
+        mirroring the PDF canvas (#106 — text mode had no thumb-pan)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                ha = tp.scroll.get_hadjustment()
+                for adj in (va, ha):
+                    adj.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(200.0)
+
+                press = types.SimpleNamespace(
+                    get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
+                    get_button=lambda: 10)
+                release = types.SimpleNamespace(
+                    get_event_type=lambda: Gdk.EventType.BUTTON_RELEASE,
+                    get_button=lambda: 10)
+                tp._on_sheet_motion(None, 100.0, 100.0)   # pointer at origin
+                tp._on_thumb_event(None, press)
+                self.assertTrue(tp._thumb_panning)
+                tp._on_sheet_motion(None, 100.0, 60.0)    # move up 40px
+                self.assertAlmostEqual(va.get_value(), 240.0, places=3)
+                tp._on_thumb_event(None, release)
+                self.assertFalse(tp._thumb_panning)
+                # a later move no longer pans
+                tp._on_sheet_motion(None, 100.0, 0.0)
+                self.assertAlmostEqual(va.get_value(), 240.0, places=3)
+
+            self._run_in_window(body)
+
+    def test_two_finger_drag_pans_and_zooms(self):
+        """A pinch that MOVES its centroid pans the sheet (touchscreen parity),
+        not only scales — the point under the fingers stays put."""
+        class _Pinch:
+            def __init__(self, center):
+                self._c = center
+            def get_bounding_box_center(self):
+                return True, self._c[0], self._c[1]
+
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                ha = tp.scroll.get_hadjustment()
+                for adj in (va, ha):
+                    adj.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(100.0)
+
+                # two fingers move down 50px at constant distance (scale 1.0):
+                # pure pan, no zoom → scroll follows the centroid (100 → 50)
+                tp._on_sheet_pinch_begin(_Pinch((300.0, 200.0)), None)
+                tp._on_sheet_pinch_scale(_Pinch((300.0, 250.0)), 1.0)
+                self.assertAlmostEqual(tp.zoom, 1.0, places=6)
+                self.assertAlmostEqual(va.get_value(), 50.0, places=3)
+                self.assertAlmostEqual(ha.get_value(), 0.0, places=3)
+
             self._run_in_window(body)
 
     def test_zoom_css_provider_released_on_tab_close(self):
@@ -7713,10 +7787,11 @@ class TestTextFirstMode(unittest.TestCase):
                 self._open_md(win, d)
                 for w in (win._notes_toggle, win._present_btn, win._toc_btn,
                           win._nav_box, win._pages_box, win._mode_anchor,
-                          win._mode_pan, win._mode_select):
+                          win._mode_select):
                     self.assertFalse(w.get_visible(), w)
                 for w in (win._mode_pen, win._mode_hl, win._mode_eraser,
                           win._mode_lasso, win._mode_zoom,   # zoom tool: #106.5
+                          win._mode_pan,                     # pan tool: #106.4
                           win._mode_text):                   # lasso: #108
                     self.assertTrue(w.get_visible(), w)
                 # the caret tool leads the tool strip

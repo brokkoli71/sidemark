@@ -4965,6 +4965,7 @@ class TextPageView(Gtk.Overlay):
         # Two-finger pinch zooms the sheet, mirroring the PDF canvas. Capture
         # phase on the overlay so the gesture wins over text-view scrolling.
         self._pinch_base_zoom = 1.0
+        self._pinch_base_scroll = (0.0, 0.0)
         self._pinch_center = (0.0, 0.0)
         pinch = Gtk.GestureZoom.new()
         pinch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -4988,6 +4989,21 @@ class TextPageView(Gtk.Overlay):
         self.add_controller(pan)
         self._pan_drag = pan
 
+        # MX Master thumb button (btn 10): hold to grab-pan the sheet, same as
+        # the PDF canvas. A motion controller tracks the pointer; a legacy
+        # controller catches the thumb button press/release (GestureClick's high
+        # buttons are unreliable — the PDF canvas uses the same legacy route).
+        self._thumb_panning = False
+        self._thumb_origin = (0.0, 0.0)
+        self._thumb_start = (0.0, 0.0)
+        self._mouse_xy = (0.0, 0.0)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_sheet_motion)
+        self.add_controller(motion)
+        thumb = Gtk.EventControllerLegacy()
+        thumb.connect("event", self._on_thumb_event)
+        self.add_controller(thumb)
+
         # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
         # overlay: the sheet's TextView usually keeps focus (the ink
         # DrawingArea isn't focusable), so these must win before the editor's
@@ -5009,17 +5025,22 @@ class TextPageView(Gtk.Overlay):
     # ── tool routing ─────────────────────────────────────────────────────────
 
     def set_tool(self, tool):
-        """Anything that isn't a drawing / zoom tool falls back to text editing.
-        The zoom tool is the modifier-free twin of the Shift+drag zoom-to-region
-        gesture (PDF-canvas parity), so it must claim the overlay like the pens."""
+        """Anything that isn't a drawing / zoom / pan tool falls back to text
+        editing. zoom and pan are the modifier-free twins of the Shift+drag and
+        Ctrl/middle-drag gestures (PDF-canvas parity). The ink-drawing tools and
+        zoom claim the overlay; pan rides its capture-phase gesture (see
+        _pan_chord) so it needs no overlay target — just a grab cursor."""
         self.tool = (tool
-                     if tool in ("pen", "highlighter", "eraser", "lasso", "zoom")
+                     if tool in ("pen", "highlighter", "eraser", "lasso",
+                                 "zoom", "pan")
                      else "text")
-        targeting = self.tool != "text"
+        targeting = self.tool in ("pen", "highlighter", "eraser", "lasso", "zoom")
         self.ink.set_can_target(targeting)
         self.ink.set_cursor(
             Gdk.Cursor.new_from_name("crosshair")
             if targeting and self.tool != "lasso" else None)
+        self.set_cursor(Gdk.Cursor.new_from_name("grab")
+                        if self.tool == "pan" else None)
         if self.tool != "lasso":
             self.clear_lasso_selection()
         if self.tool not in ("pen", "highlighter") and self.current_stroke:
@@ -5076,40 +5097,50 @@ class TextPageView(Gtk.Overlay):
         # the relayout to the new width is async — re-apply once it lands
         GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
 
+    def _sheet_center(self):
+        return (self.get_width() / 2, self.get_height() / 2)
+
     def _on_sheet_pinch_begin(self, gesture, _seq):
         self._pinch_base_zoom = self.zoom
-        ok, cx, cy = gesture.get_bounding_box_center()
-        self._pinch_center = ((cx, cy) if ok else
-                              (self.get_width() / 2, self.get_height() / 2))
-
-    def _on_sheet_pinch_scale(self, _gesture, scale):
-        old = self.zoom
-        self.set_zoom(self._pinch_base_zoom * scale)
-        if self.zoom == old:
-            return
-        # keep the point under the gesture centre fixed: the sheet scales
-        # linearly with the zoom (same wrap), so scroll offsets scale too.
-        # The relayout is asynchronous, so re-apply once it has landed.
-        f = self.zoom / old
-        cx, cy = self._pinch_center
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-        hv = (ha.get_value() + cx) * f - cx
-        vv = (va.get_value() + cy) * f - cy
+        self._pinch_base_scroll = (ha.get_value(), va.get_value())
+        ok, cx, cy = gesture.get_bounding_box_center()
+        self._pinch_center = (cx, cy) if ok else self._sheet_center()
+
+    def _on_sheet_pinch_scale(self, gesture, scale):
+        self.set_zoom(self._pinch_base_zoom * scale)
+        # Zoom AND pan together (touchscreen parity, #106): the content point
+        # under the fingers' start centroid stays under their CURRENT centroid,
+        # so a two-finger drag pans even when the pinch scale barely changes.
+        # The sheet scales linearly with the zoom (same wrap), so base scroll +
+        # base centroid scale by f; subtracting the live centroid adds the pan.
+        f = self.zoom / self._pinch_base_zoom
+        ok, cx, cy = gesture.get_bounding_box_center()
+        if not ok:
+            cx, cy = self._pinch_center
+        c0x, c0y = self._pinch_center
+        s0h, s0v = self._pinch_base_scroll
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        hv = (s0h + c0x) * f - cx
+        vv = (s0v + c0y) * f - cy
         ha.set_value(hv)
         va.set_value(vv)
+        # the relayout to the new width is async — re-apply once it lands
         GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
 
     # ── grab pan (PDF-canvas parity) ─────────────────────────────────────────
 
     def _pan_chord(self, gesture):
-        """True when the drag is a pan gesture: middle-drag, or Ctrl+left-drag
-        (the same two chords the PDF canvas pans on)."""
+        """True when the drag should pan: middle-drag, Ctrl+left-drag (the two
+        chords the PDF canvas pans on), or a plain left-drag while the pan tool
+        is active (its modifier-free twin)."""
         state = gesture.get_current_event_state()
         button = gesture.get_current_button()
         if button == Gdk.BUTTON_MIDDLE:
             return True
         return (button == Gdk.BUTTON_PRIMARY
-                and bool(state & Gdk.ModifierType.CONTROL_MASK))
+                and (self.tool == "pan"
+                     or bool(state & Gdk.ModifierType.CONTROL_MASK)))
 
     def _on_pan_begin(self, gesture, x, y):
         if not self._pan_chord(gesture):
@@ -5134,7 +5165,34 @@ class TextPageView(Gtk.Overlay):
         if not self._panning:
             return
         self._panning = False
-        self.set_cursor(None)
+        # the pan tool keeps its open-hand cursor between drags
+        self.set_cursor(Gdk.Cursor.new_from_name("grab")
+                        if self.tool == "pan" else None)
+
+    def _on_sheet_motion(self, _ctrl, x, y):
+        self._mouse_xy = (x, y)
+        if self._thumb_panning:
+            ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+            ha.set_value(self._thumb_start[0] - (x - self._thumb_origin[0]))
+            va.set_value(self._thumb_start[1] - (y - self._thumb_origin[1]))
+
+    def _on_thumb_event(self, ctrl, event):
+        if event is None:   # PyGObject sometimes fails to marshal the arg
+            event = ctrl.get_current_event()
+        if event is None:
+            return False
+        t = event.get_event_type()
+        if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
+            self._thumb_panning = True
+            self._thumb_origin = self._mouse_xy
+            ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+            self._thumb_start = (ha.get_value(), va.get_value())
+            self.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
+        elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
+            self._thumb_panning = False
+            self.set_cursor(Gdk.Cursor.new_from_name("grab")
+                            if self.tool == "pan" else None)
+        return False
 
     def _apply_zoom(self):
         """Width, margins and font all scale by the same factor, so the text
@@ -6449,9 +6507,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # "select" mode underneath, but visually an I-beam (the page is text)
         self._mode_text = Gtk.ToggleButton()
         self._mode_text.set_child(_glyph(_draw_mode_text))
+        # the Alt-hold ink hint lives on the pen / eraser tooltips (the tools it
+        # actually refers to), set per-mode in _update_header_for_mode
         self._mode_text.set_tooltip_text(
-            "Text cursor — click to place the caret and type "
-            "(Alt+drag draws with the pen)")
+            "Text cursor — click to place the caret and type")
         self._mode_text.set_group(self._mode_pen)
         self._mode_text.set_visible(False)
         self._mode_pan = Gtk.ToggleButton()
@@ -7066,6 +7125,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 twin = getattr(self, "_pmode_" + name[len("_mode_"):], None)
                 if twin is not None:
                     twin.set_visible(vis)
+        # The pen / eraser tooltips carry the text-mode Alt-hold ink hint on the
+        # tool itself (not on the caret), and drop it in PDF mode where Alt+drag
+        # means text-select instead. Same pen either way — no "quick pen".
+        if mode == "text":
+            self._mode_pen.set_tooltip_text(
+                "Pen — or hold Alt while typing to draw")
+            self._mode_eraser.set_tooltip_text(
+                "Eraser (right-drag · Alt+right while typing)")
+        else:
+            self._mode_pen.set_tooltip_text("Pen")
+            self._mode_eraser.set_tooltip_text("Eraser (right-drag)")
         # leaving a text page with the caret active: hand it to the PDF select
         # button (same mode underneath, different face)
         if mode != "text" and self._mode_text.get_active():
@@ -8583,11 +8653,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         "_mode_eraser":  ("pdf", "text"),
         "_mode_lasso":   ("pdf", "text"),
         "_mode_select":  ("pdf",),
-        "_mode_pan":     ("pdf",),
-        # zoom-to-region has a toolbar tool in both modes (its Shift+drag
-        # gesture's modifier-free twin) — parity with the PDF bar. Pan stays
-        # PDF-only on purpose: the text sheet already scrolls (wheel/touchpad/
-        # Ctrl-drag), so a dedicated pan tool would be redundant there.
+        # pan and zoom-to-region both get a toolbar tool in BOTH modes — the
+        # modifier-free twins of their Ctrl/middle-drag and Shift+drag gestures,
+        # so the text bar reads the same as the PDF bar.
+        "_mode_pan":     ("pdf", "text"),
         "_mode_zoom":    ("pdf", "text"),
         "_mode_anchor":  ("pdf",),
         "_pen_btn":      ("pdf", "text"),
