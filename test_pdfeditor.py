@@ -288,13 +288,29 @@ class TestZoomToRegion(unittest.TestCase):
         self.assertEqual(len(c._zoom_stack), 0)
         self.assertAlmostEqual(c.scale, 1.0)
 
-    def test_constrain_zoom_end_aspect_ratio(self):
+    def test_zoom_rect_is_free_proportioned(self):
+        """The zoom rectangle follows the pointer exactly (no forced canvas
+        aspect ratio) — matching the text sheet, one unified feel."""
         c = self._canvas()
-        # Canvas 800×600 → aspect 4/3
-        # Drag 120px horizontally → expect 90px vertically (120 * 600/800)
-        ex, ey = c._constrain_zoom_end(0, 0, 120, 999)
-        self.assertAlmostEqual(ex, 120)
-        self.assertAlmostEqual(ey, 90.0, places=5)
+        c._zoom_selecting = True
+        c._zoom_start = (0, 0)
+        c._on_drag_update(_FakeDrag(0, 0), 120, 999)
+        # end tracks the raw cursor, not a constrained corner
+        self.assertEqual(c._zoom_end, (120, 999))
+
+    def test_right_click_cancels_zoom_rect(self):
+        """Right-click while dragging a zoom rectangle aborts it: nothing zooms
+        and the leftover left-drag is ignored."""
+        c = self._canvas()
+        before = (c.scale, c.offset_x, c.offset_y)
+        c._zoom_selecting = True
+        c._zoom_start, c._zoom_end = (0, 0), (300, 250)
+        c._on_secondary_pressed(types.SimpleNamespace(set_state=lambda *_: None),
+                                1, 10, 10)
+        self.assertFalse(c._zoom_selecting)
+        self.assertTrue(c._ignoring)          # rest of the drag is a no-op
+        c._on_drag_end(_FakeDrag(0, 0), 300, 250)
+        self.assertEqual((c.scale, c.offset_x, c.offset_y), before)  # no zoom
 
     def test_zoom_stack_is_lifo(self):
         c = self._canvas()
@@ -7643,6 +7659,34 @@ class TestTextFirstMode(unittest.TestCase):
                 want = max(tp.ZOOM_MIN, min(tp.ZOOM_MAX, want))
                 self.assertAlmostEqual(tp.zoom, want, places=6)
                 self.assertEqual(tp.strokes, [])           # no ink drawn
+
+            self._run_in_window(body)
+
+    def test_right_click_cancels_zoom_rect(self):
+        """Right-click while dragging the zoom rectangle aborts it: the sheet
+        keeps its zoom and the rest of the drag draws nothing (parity with the
+        PDF canvas' right-click cancel)."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                win._set_tool_mode("zoom")
+                z0 = tp.zoom
+                g = _FakeDrag(100, 100)
+                tp._on_ink_begin(g, 100, 100)
+                tp._on_ink_update(g, 200, 150)
+                self.assertTrue(tp._zoom_selecting)
+                # right-click cancels
+                tp._on_secondary_pressed(
+                    types.SimpleNamespace(set_state=lambda *_: None), 1, 5, 5)
+                self.assertFalse(tp._zoom_selecting)
+                self.assertTrue(tp._zoom_cancelled)
+                # leftover drag motion + release do nothing
+                tp._on_ink_update(g, 260, 200)
+                tp._on_ink_end(g, 260, 200)
+                self.assertAlmostEqual(tp.zoom, z0, places=6)   # unchanged
+                self.assertEqual(tp.strokes, [])                # nothing drawn
+                self.assertFalse(tp._zoom_cancelled)            # reset for next
 
             self._run_in_window(body)
 

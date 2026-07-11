@@ -194,6 +194,23 @@ import fitz          # PyMuPDF
 import numpy as np
 
 
+def _draw_zoom_marquee(ctx, x, y, w, h, rgb):
+    """The zoom-to-region rubber-band — one look shared by both the PDF canvas
+    and the text sheet (a translucent accent fill plus a dashed accent border),
+    so switching modes feels the same. Coords are in the caller's on-screen /
+    overlay space; line width is fixed screen pixels."""
+    r, g, b = rgb
+    ctx.set_source_rgba(r, g, b, 0.15)
+    ctx.rectangle(x, y, w, h)
+    ctx.fill()
+    ctx.set_source_rgba(r, g, b, 0.85)
+    ctx.set_line_width(1.5)
+    ctx.set_dash([5.0, 3.0])
+    ctx.rectangle(x, y, w, h)
+    ctx.stroke()
+    ctx.set_dash([])
+
+
 class PDFCanvas(Gtk.DrawingArea):
     SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
     TOUCHPAD_FLIP_THRESHOLD = 180.0   # px of touchpad scroll past the edge before flipping
@@ -325,7 +342,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
         self._zoom_selecting = False
         self._zoom_start = None        # screen (x, y)
-        self._zoom_end = None          # screen (x, y), constrained
+        self._zoom_end = None          # screen (x, y), free-proportioned
 
         # scroll-past-boundary page flip: signed accumulator of scroll notches
         # while the page edge is already visible; flips after the threshold
@@ -471,6 +488,14 @@ class PDFCanvas(Gtk.DrawingArea):
         click.set_button(1)
         click.connect("pressed", self._on_click_pressed)
         self.add_controller(click)
+
+        # right-click while dragging a zoom rectangle cancels it (a way out once
+        # you've started the drag). Own secondary-button click controller so it
+        # sees the press even while the left-button drag holds the sequence.
+        rclick = Gtk.GestureClick.new()
+        rclick.set_button(Gdk.BUTTON_SECONDARY)
+        rclick.connect("pressed", self._on_secondary_pressed)
+        self.add_controller(rclick)
 
 
 
@@ -894,22 +919,13 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
             ctx.restore()
 
-        # zoom-selection rubber-band
+        # zoom-selection rubber-band (shared look with the text sheet)
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
             x1 = min(self._zoom_start[0], self._zoom_end[0])
             y1 = min(self._zoom_start[1], self._zoom_end[1])
             rw = abs(self._zoom_end[0] - self._zoom_start[0])
             rh = abs(self._zoom_end[1] - self._zoom_start[1])
-            ar, ag, ab = self.zoom_accent
-            ctx.set_source_rgba(ar, ag, ab, 0.15)
-            ctx.rectangle(x1, y1, rw, rh)
-            ctx.fill()
-            ctx.set_source_rgba(ar, ag, ab, 0.85)
-            ctx.set_line_width(1.5)
-            ctx.set_dash([5.0, 3.0])
-            ctx.rectangle(x1, y1, rw, rh)
-            ctx.stroke()
-            ctx.set_dash([])
+            _draw_zoom_marquee(ctx, x1, y1, rw, rh, self.zoom_accent)
 
     def _note_box_layout(self, ctx, text):
         """A Pango layout for a callout / text box, rendering symbols + markup."""
@@ -1612,7 +1628,9 @@ class PDFCanvas(Gtk.DrawingArea):
             self.queue_draw()
             return
         if self._zoom_selecting:
-            self._zoom_end = self._constrain_zoom_end(sx, sy, sx + offset_x, sy + offset_y)
+            # free-proportioned rectangle (matches the text sheet) — the zoom
+            # fits whatever region you draw, no forced canvas aspect ratio
+            self._zoom_end = (sx + offset_x, sy + offset_y)
         else:
             pt = self._screen_to_pdf(sx + offset_x, sy + offset_y)
             if self._straight_mode:
@@ -2362,13 +2380,15 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
             ctx.set_dash([])
 
-    def _constrain_zoom_end(self, sx, sy, ex, ey):
-        """Constrain (ex, ey) so the rect has the same aspect ratio as the canvas."""
-        cw = self.get_width() or 800
-        ch = self.get_height() or 600
-        dx = ex - sx
-        dy_constrained = abs(dx) * ch / cw
-        return sx + dx, sy + (dy_constrained if ey >= sy else -dy_constrained)
+    def _on_secondary_pressed(self, gesture, n_press, x, y):
+        if self._zoom_selecting:
+            # abort the zoom rectangle; _ignoring makes the rest of the still-
+            # held left drag (update + end) a no-op so nothing is drawn/zoomed
+            self._zoom_selecting = False
+            self._zoom_start = self._zoom_end = None
+            self._ignoring = True
+            self.queue_draw()
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _execute_zoom_to_rect(self, start, end):
         x1, y1 = min(start[0], end[0]), min(start[1], end[1])
@@ -4866,6 +4886,7 @@ class TextPageView(Gtk.Overlay):
         self._zoom_selecting = False
         self._zoom_start = None       # overlay coords of the drag origin
         self._zoom_end = None         # overlay coords of the current corner
+        self._zoom_cancelled = False  # right-click aborted the rect mid-drag
         self._undo_ops = []       # ("add", [stroke, ...]) | ("erase", [stroke, ...])
         self._redo_ops = []
         self._erased_now = []     # strokes removed during the ongoing erase drag
@@ -5004,6 +5025,15 @@ class TextPageView(Gtk.Overlay):
         thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
 
+        # right-click aborts an in-progress zoom-region drag (same escape hatch
+        # as the PDF canvas). Own secondary-button controller so it fires even
+        # while the left-drag holds the sequence; guarded on _zoom_selecting so
+        # a normal right-click (context menu / erase) is untouched.
+        rclick = Gtk.GestureClick.new()
+        rclick.set_button(Gdk.BUTTON_SECONDARY)
+        rclick.connect("pressed", self._on_secondary_pressed)
+        self.add_controller(rclick)
+
         # lasso keyboard verbs (Delete / Escape / Ctrl+D). Capture phase on the
         # overlay: the sheet's TextView usually keeps focus (the ink
         # DrawingArea isn't focusable), so these must win before the editor's
@@ -5070,6 +5100,16 @@ class TextPageView(Gtk.Overlay):
         vw = self.scroll.get_width()
         if vw > 0:
             self.set_zoom((vw - 2 * self.PAGE_GAP) / self.PAGE_WIDTH)
+
+    def _on_secondary_pressed(self, gesture, n_press, x, y):
+        if self._zoom_selecting:
+            # abort the zoom rectangle; _zoom_cancelled makes the rest of the
+            # still-held left drag (update + end) a no-op so nothing zooms
+            self._zoom_selecting = False
+            self._zoom_start = self._zoom_end = None
+            self._zoom_cancelled = True
+            self.ink.queue_draw()
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     def _zoom_to_region(self, start, end):
         """Zoom so the dragged overlay rectangle fills the viewport, then
@@ -5296,6 +5336,7 @@ class TextPageView(Gtk.Overlay):
 
     def _on_ink_begin(self, gesture, x, y):
         state = gesture.get_current_event_state()
+        self._zoom_cancelled = False
         if state & Gdk.ModifierType.SHIFT_MASK or self.tool == "zoom":
             # Shift (or the modifier-free zoom tool) starts a zoom-to-region
             # rubber-band (PDF-canvas parity); a click that never grows into a
@@ -5319,6 +5360,8 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_update(self, gesture, dx, dy):
+        if self._zoom_cancelled:   # right-click aborted this drag
+            return
         ok, sx, sy = gesture.get_start_point()
         if not ok:
             return
@@ -5353,6 +5396,9 @@ class TextPageView(Gtk.Overlay):
         self.ink.queue_draw()
 
     def _on_ink_end(self, gesture, dx, dy):
+        if self._zoom_cancelled:   # right-click aborted this drag — do nothing
+            self._zoom_cancelled = False
+            return
         if self._zoom_selecting:
             self._zoom_selecting = False
             start, end = self._zoom_start, self._zoom_end
@@ -5829,17 +5875,12 @@ class TextPageView(Gtk.Overlay):
             ctx.stroke()
             ctx.set_dash([])
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
-            # dashed zoom-to-region marquee (PDF-canvas parity)
+            # zoom-to-region marquee — same fill+dash look as the PDF canvas
             x0 = min(self._zoom_start[0], self._zoom_end[0])
             y0 = min(self._zoom_start[1], self._zoom_end[1])
             zw = abs(self._zoom_end[0] - self._zoom_start[0])
             zh = abs(self._zoom_end[1] - self._zoom_start[1])
-            ctx.set_source_rgba(ar, ag, ab, 0.9)
-            ctx.set_line_width(1.5)
-            ctx.set_dash([5.0, 3.0])
-            ctx.rectangle(x0, y0, zw, zh)
-            ctx.stroke()
-            ctx.set_dash([])
+            _draw_zoom_marquee(ctx, x0, y0, zw, zh, self.accent())
 
     # ── persistence ──────────────────────────────────────────────────────────
     # Anchors are serialised as (line, char offset, source-line hash). On load
