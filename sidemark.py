@@ -422,6 +422,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._post_pinch_base = (0.0, 0.0)
 
         self._thumb_panning = False
+        self._thumb_zooming = False    # Shift+thumb: zoom-to-region in flight
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start_offset = (0.0, 0.0)
 
@@ -1050,6 +1051,19 @@ class PDFCanvas(Gtk.DrawingArea):
             return False
         t = event.get_event_type()
         if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
+            # the thumb button mirrors the middle (navigation) button, as the
+            # more ergonomic reach: hold to pan, Shift+hold to zoom-to-region
+            # (scroll-while-held zooms — see _on_scroll)
+            if (self._shift_held
+                    or event.get_modifier_state() & Gdk.ModifierType.SHIFT_MASK):
+                logger.debug("thumb zoom-region start")
+                self._thumb_zooming = True
+                self._zoom_selecting = True
+                self._zoom_start = (self._mouse_x, self._mouse_y)
+                self._zoom_end = (self._mouse_x, self._mouse_y)
+                self._fire_gesture_tool("zoom")
+                self.queue_draw()
+                return False
             logger.debug(f"thumb pan start ({self._mouse_x:.0f},{self._mouse_y:.0f})")
             self._thumb_panning = True
             self._is_fitted = False
@@ -1057,6 +1071,12 @@ class PDFCanvas(Gtk.DrawingArea):
             self._thumb_start_offset = (self.offset_x, self.offset_y)
             self._fire_gesture_tool("pan")
         elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
+            if self._thumb_zooming:
+                logger.debug("thumb zoom-region end")
+                self._thumb_zooming = False
+                self._finish_zoom_region()
+                self._fire_gesture_tool(None)
+                return False
             logger.debug("thumb pan end")
             self._thumb_panning = False
             self._fire_gesture_tool(None)
@@ -1066,6 +1086,9 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._thumb_panning:
             self.offset_x = self._thumb_start_offset[0] + (x - self._thumb_origin[0])
             self.offset_y = self._thumb_start_offset[1] + (y - self._thumb_origin[1])
+            self.queue_draw()
+        elif self._thumb_zooming:
+            self._zoom_end = (x, y)
             self.queue_draw()
         self._mouse_x = x
         self._mouse_y = y
@@ -1143,6 +1166,21 @@ class PDFCanvas(Gtk.DrawingArea):
             self.offset_y = min(self.offset_y, hi)
         if self.current_page_idx >= self.n_pages - 1:
             self.offset_y = max(self.offset_y, lo)
+
+    def _finish_zoom_region(self):
+        """Commit a finished zoom-to-region rubber-band — shared by the drag
+        gesture (Shift/zoom-tool/Shift+middle) and the Shift+thumb hold. A
+        selection that never grew into a rect falls back to fit-page."""
+        if self._zoom_start and self._zoom_end:
+            dx = abs(self._zoom_end[0] - self._zoom_start[0])
+            dy = abs(self._zoom_end[1] - self._zoom_start[1])
+            if dx >= 8 and dy >= 8:
+                self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
+            else:
+                self.zoom_to_fit()   # Shift+click with no rect → fit page
+        self._zoom_selecting = False
+        self._zoom_start = None
+        self._zoom_end = None
 
     def _zoom_at(self, factor, cx, cy):
         """Multiply the zoom by ``factor`` keeping the document point under
@@ -1298,12 +1336,6 @@ class PDFCanvas(Gtk.DrawingArea):
             # for whichever document mode the active tab is in
             self.on_modifier_tool(self._ctrl_held, self._shift_held,
                                   self._alt_held)
-
-    def _modifier_tool(self):
-        """Which tool the held modifiers stand in for, mirroring the gesture
-        routing in _on_drag_begin — or None when nothing relevant is held."""
-        return chord_tool(self._ctrl_held, self._shift_held, self._alt_held,
-                          "pdf")
 
     def _fire_gesture_tool(self, tool):
         if self.on_gesture_tool:
@@ -1853,16 +1885,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._finish_text_selection()
             return
         if self._zoom_selecting:
-            if self._zoom_start and self._zoom_end:
-                dx = abs(self._zoom_end[0] - self._zoom_start[0])
-                dy = abs(self._zoom_end[1] - self._zoom_start[1])
-                if dx >= 8 and dy >= 8:
-                    self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
-                else:
-                    self.zoom_to_fit()   # Shift+click with no rect → fit page
-            self._zoom_selecting = False
-            self._zoom_start = None
-            self._zoom_end = None
+            self._finish_zoom_region()
         else:
             if self.current_stroke:
                 pts = self.current_stroke
@@ -5157,6 +5180,7 @@ class TextPageView(Gtk.Overlay):
         # controller catches the thumb button press/release (GestureClick's high
         # buttons are unreliable — the PDF canvas uses the same legacy route).
         self._thumb_panning = False
+        self._thumb_zooming = False    # Shift+thumb: zoom-to-region in flight
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start = (0.0, 0.0)
         self._mouse_xy = (0.0, 0.0)
@@ -5166,6 +5190,13 @@ class TextPageView(Gtk.Overlay):
         thumb = Gtk.EventControllerLegacy()
         thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
+        # scroll-while-thumb-held zooms the sheet (capture phase, so it wins
+        # over the ScrolledWindow's own scrolling only while the pan is live)
+        tscroll = Gtk.EventControllerScroll(
+            flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        tscroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        tscroll.connect("scroll", self._on_thumb_scroll)
+        self.add_controller(tscroll)
 
         # right-click aborts an in-progress zoom-region drag (same escape hatch
         # as the PDF canvas). Must live on the SAME widget that owns the zoom
@@ -5491,6 +5522,10 @@ class TextPageView(Gtk.Overlay):
             ha.set_value(self._thumb_start[0] - (x - self._thumb_origin[0]))
             va.set_value(self._thumb_start[1] - (y - self._thumb_origin[1]))
             return
+        if self._thumb_zooming:
+            self._zoom_end = (x, y)
+            self.ink.queue_draw()
+            return
         # hint that the paper edge is draggable (caret tool only, matching where
         # _on_width_begin claims); leave other tools' cursors alone
         if not self._resizing_width and self.tool == "text":
@@ -5504,6 +5539,21 @@ class TextPageView(Gtk.Overlay):
             return False
         t = event.get_event_type()
         if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
+            # thumb mirrors the middle (navigation) button, as the more
+            # ergonomic reach: hold to pan, Shift+hold to zoom-to-region,
+            # scroll-while-held to zoom (see _on_thumb_scroll)
+            shift = bool(event.get_modifier_state()
+                         & Gdk.ModifierType.SHIFT_MASK)
+            if not shift and self.get_held_mods is not None:
+                shift = self.get_held_mods()[1]
+            if shift:
+                self._thumb_zooming = True
+                self._zoom_selecting = True
+                self._zoom_start = self._mouse_xy
+                self._zoom_end = self._mouse_xy
+                self._fire_gesture_tool("zoom")
+                self.ink.queue_draw()
+                return False
             self._thumb_panning = True
             self._thumb_origin = self._mouse_xy
             ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
@@ -5511,11 +5561,28 @@ class TextPageView(Gtk.Overlay):
             self._fire_gesture_tool("pan")
             self.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
         elif t == Gdk.EventType.BUTTON_RELEASE and event.get_button() == 10:
+            if self._thumb_zooming:
+                self._thumb_zooming = False
+                self._fire_gesture_tool(None)
+                self._finish_zoom_region()
+                return False
             self._thumb_panning = False
             self._fire_gesture_tool(None)
             self.set_cursor(Gdk.Cursor.new_from_name("grab")
                             if self.tool == "pan" else None)
         return False
+
+    def _on_thumb_scroll(self, ctrl, _dx, dy):
+        """Scroll while the thumb button pans zooms the sheet (PDF-canvas
+        parity: the thumb hold latches a pan+zoom navigation mode). Rebase the
+        pan origin afterwards so the next motion event doesn't jump."""
+        if not self._thumb_panning or not dy:
+            return False
+        self.zoom_step(-1 if dy > 0 else 1)
+        self._thumb_origin = self._mouse_xy
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        self._thumb_start = (ha.get_value(), va.get_value())
+        return True
 
     def _apply_zoom(self):
         """Width, margins and font all scale by the same factor, so the text
@@ -6968,12 +7035,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_pan = Gtk.ToggleButton()
         self._mode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._mode_pan.set_tooltip_text(
-            "Pan (Ctrl+drag · middle-drag · thumb gesture button)")
+            "Pan (Ctrl+drag · middle-drag · hold thumb button, scroll to zoom)")
         self._mode_pan.set_group(self._mode_pen)
         self._mode_zoom = Gtk.ToggleButton()
         self._mode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._mode_zoom.set_tooltip_text(
-            "Zoom to region (Shift+drag · Shift+middle-drag)")
+            "Zoom to region (Shift+drag · Shift+middle/thumb-drag)")
         self._mode_zoom.set_group(self._mode_pen)
         self._mode_anchor = Gtk.ToggleButton()
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
@@ -7044,12 +7111,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_pan = Gtk.ToggleButton()
         self._pmode_pan.set_child(_glyph(_draw_mode_pan, 20))
         self._pmode_pan.set_tooltip_text(
-            "Pan (Ctrl+drag · middle-drag · thumb gesture button)")
+            "Pan (Ctrl+drag · middle-drag · hold thumb button, scroll to zoom)")
         self._pmode_pan.set_group(self._pmode_pen)
         self._pmode_zoom = Gtk.ToggleButton()
         self._pmode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._pmode_zoom.set_tooltip_text(
-            "Zoom to region (Shift+drag · Shift+middle-drag)")
+            "Zoom to region (Shift+drag · Shift+middle/thumb-drag)")
         self._pmode_zoom.set_group(self._pmode_pen)
         self._pmode_anchor = Gtk.ToggleButton()
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
@@ -7603,13 +7670,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if mode == "text":
             pen_tip = "Pen — or hold Alt while typing to draw"
             eraser_tip = "Eraser (right-drag, even while typing · Alt+right)"
+            # no plain Shift+drag here: under the caret Shift is text selection
+            zoom_tip = "Zoom to region (Shift+middle/thumb-drag)"
         else:
             pen_tip = "Pen"
             eraser_tip = "Eraser (right-drag)"
+            zoom_tip = "Zoom to region (Shift+drag · Shift+middle/thumb-drag)"
         for b in (self._mode_pen, self._pmode_pen):
             b.set_tooltip_text(pen_tip)
         for b in (self._mode_eraser, self._pmode_eraser):
             b.set_tooltip_text(eraser_tip)
+        for b in (self._mode_zoom, self._pmode_zoom):
+            b.set_tooltip_text(zoom_tip)
         # leaving a text page with the caret active: hand it to the PDF select
         # button (same mode underneath, different face)
         if mode != "text" and self._mode_text.get_active():
@@ -7664,8 +7736,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+Scroll",   "Zoom in / out"),
             ("Scroll",        "Pan"),
             ("Ctrl+Drag",     "Pan (also middle-drag · thumb button holds)"),
+            ("Thumb+Scroll",  "Zoom in / out while the thumb button pans"),
             ("Shift+Drag",    "Zoom to region"),
-            ("Shift+Middle-drag", "Zoom to region (works on text pages too)"),
+            ("Shift+Middle/Thumb-drag", "Zoom to region (works on text pages too)"),
             ("Shift+Click",   "Fit page"),
             ("File",          None),
             ("Ctrl+O",        "Open file…"),
@@ -8092,9 +8165,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             except Exception:
                 logger.error("autosave failed:\n" + traceback.format_exc())
         return True   # keep the timer running
-
-    def _write_autosave(self):
-        self._write_autosave_for(self._active_session)
 
     def _write_autosave_for(self, s):
         d = _autosave_dir_for(s._path)

@@ -332,6 +332,37 @@ class TestZoomToRegion(unittest.TestCase):
         self.assertTrue(c._panning)
         self.assertFalse(c._zoom_selecting)
 
+    @staticmethod
+    def _thumb_event(etype, mods=Gdk.ModifierType(0)):
+        return types.SimpleNamespace(get_event_type=lambda: etype,
+                                     get_button=lambda: 10,
+                                     get_modifier_state=lambda: mods)
+
+    def test_shift_thumb_zooms_to_region(self):
+        # the thumb button mirrors the middle button: Shift+hold rubber-bands
+        # a zoom region instead of panning
+        c = self._canvas()
+        c._shift_held = True
+        c._mouse_x, c._mouse_y = 100, 100
+        c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_PRESS))
+        self.assertTrue(c._thumb_zooming)
+        self.assertTrue(c._zoom_selecting)
+        self.assertFalse(c._thumb_panning)
+        c._on_motion(None, 300, 250)
+        self.assertEqual(c._zoom_end, (300, 250))
+        c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_RELEASE))
+        self.assertFalse(c._thumb_zooming)
+        self.assertEqual(len(c._zoom_stack), 1)
+        self.assertGreater(c.scale, 1.0)
+
+    def test_plain_thumb_still_pans(self):
+        c = self._canvas()
+        c._mouse_x, c._mouse_y = 100, 100
+        c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_PRESS))
+        self.assertTrue(c._thumb_panning)
+        self.assertFalse(c._thumb_zooming)
+        c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_RELEASE))
+
     def test_zoom_stack_is_lifo(self):
         c = self._canvas()
         c._execute_zoom_to_rect((50, 50), (200, 200))
@@ -3126,12 +3157,11 @@ class TestLassoSelect(unittest.TestCase):
         canvas._on_drag_end(_FakeDrag(30, 30, state=mods), 60, 60)
         self.assertEqual(canvas._selected_strokes, [a])
 
-    def test_modifier_tool_maps_lasso_before_anchor(self):
-        canvas = self._canvas()
-        canvas._ctrl_held = canvas._shift_held = canvas._alt_held = True
-        self.assertEqual(canvas._modifier_tool(), "lasso")
-        canvas._shift_held = False          # Ctrl+Alt is still anchor
-        self.assertEqual(canvas._modifier_tool(), "anchor")
+    def test_chord_maps_lasso_before_anchor(self):
+        # chord precedence: the full triple is the lasso, dropping Shift
+        # falls back to the anchor chord
+        self.assertEqual(sidemark.chord_tool(True, True, True, "pdf"), "lasso")
+        self.assertEqual(sidemark.chord_tool(True, False, True, "pdf"), "anchor")
 
 
 class TestThumbSelectionClearing(unittest.TestCase):
@@ -5319,22 +5349,15 @@ class TestToolModes(unittest.TestCase):
         self.assertFalse(self.canvas._temp_highlighter)
         self.assertEqual(self.canvas.tool, "pen")
 
-    def test_modifier_tool_mapping(self):
-        c = self.canvas
-        c._ctrl_held = c._alt_held = c._shift_held = False
-        self.assertIsNone(c._modifier_tool())
-        c._ctrl_held = True
-        self.assertEqual(c._modifier_tool(), "pan")
-        c._alt_held = True
-        self.assertEqual(c._modifier_tool(), "anchor")   # ctrl+alt
-        c._alt_held = False
-        c._shift_held = True
-        self.assertEqual(c._modifier_tool(), "highlighter")  # ctrl+shift
-        c._ctrl_held = False
-        self.assertEqual(c._modifier_tool(), "zoom")     # shift only
-        c._shift_held = False
-        c._alt_held = True
-        self.assertEqual(c._modifier_tool(), "select")   # alt only
+    def test_chord_tool_pdf_mapping(self):
+        ct = sidemark.chord_tool
+        self.assertIsNone(ct(False, False, False, "pdf"))
+        self.assertEqual(ct(True, False, False, "pdf"), "pan")
+        self.assertEqual(ct(True, False, True, "pdf"), "anchor")
+        self.assertEqual(ct(True, True, False, "pdf"), "highlighter")
+        self.assertEqual(ct(False, True, False, "pdf"), "zoom")
+        self.assertEqual(ct(False, False, True, "pdf"), "select")
+        self.assertIsNone(ct(False, True, True, "pdf"))   # Shift+Alt unassigned
 
     def test_modifier_key_fires_callback(self):
         # the callback now carries the raw modifier set; the window maps it
@@ -5931,6 +5954,7 @@ class TestThumbHoldPan(unittest.TestCase):
         e = mock.Mock()
         e.get_event_type.return_value = kind
         e.get_button.return_value = button
+        e.get_modifier_state.return_value = Gdk.ModifierType(0)
         return e
 
     def test_press_starts_pan_release_ends_it(self):
@@ -7877,10 +7901,12 @@ class TestTextFirstMode(unittest.TestCase):
 
                 press = types.SimpleNamespace(
                     get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
-                    get_button=lambda: 10)
+                    get_button=lambda: 10,
+                    get_modifier_state=lambda: Gdk.ModifierType(0))
                 release = types.SimpleNamespace(
                     get_event_type=lambda: Gdk.EventType.BUTTON_RELEASE,
-                    get_button=lambda: 10)
+                    get_button=lambda: 10,
+                    get_modifier_state=lambda: Gdk.ModifierType(0))
                 tp._on_sheet_motion(None, 100.0, 100.0)   # pointer at origin
                 tp._on_thumb_event(None, press)
                 self.assertTrue(tp._thumb_panning)
@@ -8735,6 +8761,55 @@ class TestTextPageLasso(unittest.TestCase):
                 tp._on_pan_update(g, 150.0, 120.0)
                 tp._on_pan_end(g, 150.0, 120.0)
                 self.assertGreater(tp.zoom, z0)
+
+            self._run_in_window(body)
+
+    @staticmethod
+    def _thumb_event(etype, mods=Gdk.ModifierType(0)):
+        return types.SimpleNamespace(get_event_type=lambda: etype,
+                                     get_button=lambda: 10,
+                                     get_modifier_state=lambda: mods)
+
+    def test_shift_thumb_zooms_text_page(self):
+        # Shift+thumb-hold rubber-bands a zoom region under the caret,
+        # mirroring Shift+middle (thumb = the ergonomic wheel-button stand-in)
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                z0 = tp.zoom
+                tp._mouse_xy = (100.0, 100.0)
+                tp._on_thumb_event(None, self._thumb_event(
+                    Gdk.EventType.BUTTON_PRESS, Gdk.ModifierType.SHIFT_MASK))
+                self.assertTrue(tp._thumb_zooming)
+                self.assertFalse(tp._thumb_panning)
+                tp._on_sheet_motion(None, 260.0, 220.0)
+                self.assertEqual(tp._zoom_end, (260.0, 220.0))
+                tp._on_thumb_event(None, self._thumb_event(
+                    Gdk.EventType.BUTTON_RELEASE))
+                self.assertFalse(tp._thumb_zooming)
+                self.assertGreater(tp.zoom, z0)
+
+            self._run_in_window(body)
+
+    def test_thumb_scroll_zooms_text_page(self):
+        # scroll while the thumb button pans zooms the sheet (PDF parity)
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp._mouse_xy = (100.0, 100.0)
+                tp._on_thumb_event(None, self._thumb_event(
+                    Gdk.EventType.BUTTON_PRESS))
+                self.assertTrue(tp._thumb_panning)
+                z0 = tp.zoom
+                self.assertTrue(tp._on_thumb_scroll(None, 0.0, -1.0))
+                self.assertGreater(tp.zoom, z0)      # scroll up → zoom in
+                self.assertTrue(tp._on_thumb_scroll(None, 0.0, 1.0))
+                tp._on_thumb_event(None, self._thumb_event(
+                    Gdk.EventType.BUTTON_RELEASE))
+                # without the thumb held, the controller stays out of the way
+                self.assertFalse(tp._on_thumb_scroll(None, 0.0, 1.0))
 
             self._run_in_window(body)
 

@@ -36,7 +36,9 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   (Ctrl=pan, Alt=ink↔text flip, Ctrl+Shift=highlighter, Ctrl+Shift+Alt=lasso,
   Ctrl+Alt=anchor pdf-only, Shift=zoom pdf/ink-only; Shift+Alt unassigned).
   Buttons: left=tool, right=eraser, middle=navigation (Shift+middle=zoom
-  region — the portable zoom chord), thumb=pan. Gesture routing, the
+  region — the portable zoom chord), thumb=middle's ergonomic stand-in
+  (hold=pan, Shift+hold=zoom region, scroll-while-held=zoom). Gesture
+  routing, the
   transient tool-button highlight and tooltips must all derive from it —
   never grow a second mapping. Chord routing merges window-tracked held
   modifiers (`_chord_state`) so keyboard+touch works; see ideas.csv row 115.
