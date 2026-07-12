@@ -312,6 +312,26 @@ class TestZoomToRegion(unittest.TestCase):
         c._on_drag_end(_FakeDrag(0, 0), 300, 250)
         self.assertEqual((c.scale, c.offset_x, c.offset_y), before)  # no zoom
 
+    def test_shift_middle_drag_zooms_to_region(self):
+        """Shift+middle-drag is the portable zoom chord (the middle button is
+        the navigation button): it rubber-bands a zoom region, not a pan."""
+        c = self._canvas()
+        g = _FakeDrag(100, 100, button=2, state=Gdk.ModifierType.SHIFT_MASK)
+        c._on_drag_begin(g, 100, 100)
+        self.assertTrue(c._zoom_selecting)
+        self.assertFalse(c._panning)
+        c._on_drag_update(g, 200, 150)
+        c._on_drag_end(g, 200, 150)
+        self.assertEqual(len(c._zoom_stack), 1)
+        self.assertGreater(c.scale, 1.0)
+
+    def test_plain_middle_drag_still_pans(self):
+        c = self._canvas()
+        g = _FakeDrag(100, 100, button=2)
+        c._on_drag_begin(g, 100, 100)
+        self.assertTrue(c._panning)
+        self.assertFalse(c._zoom_selecting)
+
     def test_zoom_stack_is_lifo(self):
         c = self._canvas()
         c._execute_zoom_to_rect((50, 50), (200, 200))
@@ -4647,15 +4667,35 @@ class TestResponsiveHeader(unittest.TestCase):
         def body(win):
             win._mode_pen.set_active(True)
             # holding Ctrl lights the pan button transiently, no tool change
-            win._highlight_transient_tool("pan")
+            win._highlight_transient_tool(True, False, False)
             if not win._mode_pan.has_css_class("tool-transient"):
                 raise AssertionError("pan button not highlighted while Ctrl held")
             if win.canvas.tool != "pen":
                 raise AssertionError("transient highlight must not change the tool")
             # releasing clears it
-            win._highlight_transient_tool(None)
+            win._highlight_transient_tool(False, False, False)
             if win._mode_pan.has_css_class("tool-transient"):
                 raise AssertionError("highlight not cleared on release")
+        self._run_in_window(body)
+
+    def test_button_gesture_highlights_tool_button(self):
+        # button gestures (right-drag erase, middle-drag pan) light the
+        # matching button too — same .tool-transient path as the chords
+        def body(win):
+            win._mode_pen.set_active(True)
+            win._highlight_gesture_tool("eraser")
+            if not win._mode_eraser.has_css_class("tool-transient"):
+                raise AssertionError("eraser not highlighted during right-drag")
+            if win.canvas.tool != "pen":
+                raise AssertionError("gesture highlight must not change the tool")
+            # release falls back to the still-held chord (Ctrl → pan)
+            win._highlight_transient_tool(True, False, False)
+            win._highlight_gesture_tool(None)
+            if win._mode_eraser.has_css_class("tool-transient"):
+                raise AssertionError("gesture highlight not cleared on release")
+            if not win._mode_pan.has_css_class("tool-transient"):
+                raise AssertionError("release did not fall back to held chord")
+            win._highlight_transient_tool(False, False, False)
         self._run_in_window(body)
 
     def test_select_style_menu_switches_canvas_style(self):
@@ -5124,6 +5164,7 @@ class TestMiddleMousePan(unittest.TestCase):
     def test_middle_drag_pans_like_ctrl_drag(self):
         g = mock.Mock()
         g.get_current_button.return_value = 2
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
         self.canvas._on_drag_begin(g, 100, 100)
         self.assertTrue(self.canvas._panning)
         self.assertFalse(self.canvas._is_fitted)
@@ -5296,12 +5337,61 @@ class TestToolModes(unittest.TestCase):
         self.assertEqual(c._modifier_tool(), "select")   # alt only
 
     def test_modifier_key_fires_callback(self):
+        # the callback now carries the raw modifier set; the window maps it
+        # through the shared chord_tool grammar per document mode
         seen = []
-        self.canvas.on_modifier_tool = lambda t: seen.append(t)
+        self.canvas.on_modifier_tool = (
+            lambda c, s, a: seen.append(sidemark.chord_tool(c, s, a, "pdf")))
         # press Ctrl → pan; release → None
         self.canvas._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, True)
         self.canvas._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, False)
         self.assertEqual(seen, ["pan", None])
+
+    def test_touch_drag_uses_tracked_modifiers(self):
+        # a touch sequence's event state has no keyboard modifiers on
+        # Wayland; the tracked held keys must be merged in so keyboard+touch
+        # chords route the same as mouse chords
+        c = self.canvas
+        c._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, True)
+        g = _FakeDrag(100, 100, state=Gdk.ModifierType(0))  # bare touch state
+        c._on_drag_begin(g, 100, 100)
+        self.assertTrue(c._panning)          # Ctrl (held) + drag → pan
+        c._on_drag_end(g, 10, 10)
+        c._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, False)
+
+    def test_focus_loss_resets_tracked_modifiers(self):
+        # a modifier released while unfocused never sends key-release; the
+        # reset keeps a later plain drag from misrouting
+        c = self.canvas
+        seen = []
+        c.on_modifier_tool = lambda *m: seen.append(m)
+        c._on_modifier_key(None, Gdk.KEY_Control_L, 0, 0, True)
+        c.reset_modifiers()
+        self.assertFalse(c._ctrl_held or c._shift_held or c._alt_held)
+        self.assertEqual(seen[-1], (False, False, False))
+        g = _FakeDrag(100, 100, state=Gdk.ModifierType(0))
+        c._on_drag_begin(g, 100, 100)
+        self.assertFalse(c._panning)         # back to the plain tool
+
+    def test_chord_grammar_is_shared_across_modes(self):
+        ct = sidemark.chord_tool
+        # a chord never means two different things in the two modes — it is
+        # either the same tool or absent
+        for mods in [(c, s, a) for c in (0, 1) for s in (0, 1) for a in (0, 1)]:
+            pdf = ct(*mods, "pdf")
+            txt = ct(*mods, "text")
+            if pdf is not None and txt is not None:
+                # Alt is the ink<->text flip: the one deliberate asymmetry
+                if mods == (0, 0, 1):
+                    self.assertEqual((pdf, txt), ("select", "pen"))
+                else:
+                    self.assertEqual(pdf, txt, f"chord {mods} diverges")
+        # text mode: no anchors, and Shift-alone belongs to text selection
+        # unless an ink tool owns the sheet
+        self.assertIsNone(ct(True, False, True, "text"))
+        self.assertIsNone(ct(False, True, False, "text", ink_active=False))
+        self.assertEqual(ct(False, True, False, "text", ink_active=True), "zoom")
+        self.assertEqual(ct(True, True, True, "text"), "lasso")
 
 
 class TestReadingOrderSelection(unittest.TestCase):
@@ -8566,6 +8656,107 @@ class TestTextPageLasso(unittest.TestCase):
                     self.assertAlmostEqual(gy, ey, delta=2.0)
                 # the zigzag's middle spike is measurably flattened
                 self.assertLess(abs(got[1][1] - got[2][1]), 25.0)
+
+            self._run_in_window(body)
+
+    # ── chord grammar on the text page ───────────────────────────────────────
+
+    @staticmethod
+    def _chord_gesture(mods, button=1, sx=300.0, sy=100.0):
+        return types.SimpleNamespace(
+            get_current_event_state=lambda: mods,
+            set_state=lambda s: None,
+            get_current_button=lambda: button,
+            get_start_point=lambda: (True, sx, sy))
+
+    def test_chord_lasso_selects_with_caret_active(self):
+        # Ctrl+Shift+Alt+drag lassoes marks while the CARET is the tool, and
+        # the selection survives the chord's tool restore
+        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+                | Gdk.ModifierType.ALT_MASK)
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                win._set_tool_mode("select")     # back to the caret
+                self.assertEqual(tp.tool, "text")
+                x0, y0, x1, y1 = self._bbox(
+                    tp._stroke_overlay_pts(tp.strokes[0]))
+                x0 -= 12; y0 -= 12; x1 += 12; y1 += 12
+                g = self._chord_gesture(mods, sx=x0, sy=y0)
+                tp._on_chord_lasso_begin(g, x0, y0)
+                for px, py in ((x1, y0), (x1, y1), (x0, y1), (x0, y0)):
+                    tp._on_chord_lasso_update(g, px - x0, py - y0)
+                tp._on_chord_lasso_end(g, 0.0, 0.0)
+                self.assertEqual(tp._selected, tp.strokes)
+                self.assertEqual(tp.tool, "text")   # tool restored, not reset
+
+            self._run_in_window(body)
+
+    def test_chord_gesture_guards_are_mutually_exclusive(self):
+        # Ctrl+Shift+Alt must be claimed by the lasso chord ONLY: the
+        # temp-highlighter (Ctrl+Shift) and Alt-ink gestures both stand down
+        mods = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+                | Gdk.ModifierType.ALT_MASK)
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                denied = []
+                g = types.SimpleNamespace(
+                    get_current_event_state=lambda: mods,
+                    set_state=lambda s: denied.append(s),
+                    get_current_button=lambda: 1,
+                    get_start_point=lambda: (True, 300.0, 100.0))
+                tp._on_temp_hl_begin(g, 300.0, 100.0)
+                tp._on_alt_begin(g, 300.0, 100.0)
+                self.assertEqual(denied,
+                                 [Gtk.EventSequenceState.DENIED] * 2)
+                self.assertIsNone(tp._temp_hl_saved_tool)
+                self.assertIsNone(tp._alt_saved_tool)
+
+            self._run_in_window(body)
+
+    def test_shift_middle_drag_zooms_text_page(self):
+        # Shift+middle is the portable zoom chord: it works with the CARET
+        # active, where plain Shift+drag belongs to text selection
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                self.assertEqual(tp.tool, "text")
+                z0 = tp.zoom
+                g = self._chord_gesture(Gdk.ModifierType.SHIFT_MASK, button=2,
+                                        sx=100.0, sy=100.0)
+                tp._on_pan_begin(g, 100.0, 100.0)
+                self.assertTrue(tp._mzoom)
+                self.assertFalse(tp._panning)
+                tp._on_pan_update(g, 150.0, 120.0)
+                tp._on_pan_end(g, 150.0, 120.0)
+                self.assertGreater(tp.zoom, z0)
+
+            self._run_in_window(body)
+
+    def test_right_drag_erases_with_caret_active(self):
+        # plain right-DRAG erases even while the caret owns the sheet
+        # (chord grammar: the right button is the eraser everywhere)
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = self._draw_stroke(
+                    win, [(300.0, 100.0 + i * 3) for i in range(5)])
+                win._set_tool_mode("select")
+                self.assertEqual(tp.tool, "text")
+                x, y = tp._stroke_overlay_pts(tp.strokes[0])[0]
+                g = self._chord_gesture(Gdk.ModifierType(0), button=3,
+                                        sx=x, sy=y)
+                tp._on_rerase_begin(g, x, y)
+                tp._on_rerase_update(g, 8.0, 0.0)   # past the click threshold
+                tp._on_rerase_end(g, 8.0, 0.0)
+                self.assertEqual(tp.strokes, [])
+                # and the erase is one undoable op
+                self.assertEqual(tp._undo_ops[-1][0], "erase")
 
             self._run_in_window(body)
 

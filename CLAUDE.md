@@ -32,6 +32,14 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   reads `self.canvas`, `self._notes_view` etc. and transparently follows the
   active tab. When adding per-document state, add it to `DocumentSession.STATE`
   / `WIDGETS` (kept in sync with the `_session_prop` proxy list).
+- **Input chords**: module-level `chord_tool()` is THE modifier-chord grammar
+  (Ctrl=pan, Alt=ink↔text flip, Ctrl+Shift=highlighter, Ctrl+Shift+Alt=lasso,
+  Ctrl+Alt=anchor pdf-only, Shift=zoom pdf/ink-only; Shift+Alt unassigned).
+  Buttons: left=tool, right=eraser, middle=navigation (Shift+middle=zoom
+  region — the portable zoom chord), thumb=pan. Gesture routing, the
+  transient tool-button highlight and tooltips must all derive from it —
+  never grow a second mapping. Chord routing merges window-tracked held
+  modifiers (`_chord_state`) so keyboard+touch works; see ideas.csv row 115.
 - **Modes**: a tab is either a PDF or a text-first page, tracked by
   `doc_mode` (`"pdf"` | `"text"`) on the session
   (`_enter_text_mode`/`_leave_text_mode`; `_text_mode` survives as a
@@ -152,7 +160,15 @@ presenter/share for text mode, is **won't-do** per the user). The ranked
 backlog (rows 110 window-reuse [not-a-bug], 109 word-level Ctrl+Z, 112 per-doc
 width) and the workflow model (row 113) are done.
 
+A July pass unified the input model into one chord grammar (row 115, see
+"Input chords" above): text pages gained the lasso chord and right-drag erase
+under the caret (a clean right-click re-pops the TextView menu itself — it
+must claim at press), Shift+middle-drag zooms to a region in both modes, the
+transient tool-button highlight now works fully in text mode and also lights
+during button gestures, and chord routing merges tracked modifiers for touch.
+
 **Open follow-ups:** text-page items in rows 92–94 (text-snapping highlighter,
 pagination/print view, margin inks that don't reflow) and row 100's link
 authoring (link-to-here + backlinks). Backlog: **row 111** (duplicate-download
-dialog), plus older rows 26/27/64.
+dialog), plus older rows 26/27/64. Row 115 still owes manual checks on real
+hardware: right-click menu re-pop feel, Shift+middle mouse, keyboard+touch.
