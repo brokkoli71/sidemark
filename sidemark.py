@@ -4214,11 +4214,8 @@ class MarkdownNotesView(GtkSource.View):
         key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         self.add_controller(key)
 
-        # Ctrl+scroll rescales the notes font (mirrors the canvas zoom gesture)
-        scroll = Gtk.EventControllerScroll(
-            flags=Gtk.EventControllerScrollFlags.VERTICAL)
-        scroll.connect("scroll", self._on_scroll)
-        self.add_controller(scroll)
+        # Ctrl+scroll rescales the notes font — but the controller canNOT live
+        # on the view itself, so the owner installs it: see attach_zoom_scroll().
 
         # Ctrl+click follows a [[wiki link]]; hover over one shows a hand cursor
         click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
@@ -4240,6 +4237,29 @@ class MarkdownNotesView(GtkSource.View):
         self._link_rows = []         # candidate dicts currently shown, in order
 
     # ── formatting shortcuts ──────────────────────────────────────────────────
+
+    def attach_zoom_scroll(self, ancestor):
+        """Install the Ctrl+scroll font-zoom controller on `ancestor`, in the
+        CAPTURE phase. The owner must call this, because the controller cannot
+        live on the view itself:
+
+        GtkScrolledWindow installs its OWN capture-phase scroll controller
+        (BOTH_AXES|KINETIC) in its init and returns STOP whenever it can
+        scroll. Capture runs top-down and a view inside a ScrolledWindow is
+        below it, so a handler on the view only ever fires while the content
+        is too short to scroll — it silently dies once the notes grow. The
+        ScrolledWindow itself is no good either: controllers on the same
+        widget in the same phase run in add order, and GTK's is added first.
+        So `ancestor` MUST be a widget above the ScrolledWindow.
+
+        TextPageView does the same job for the sheet in _on_sheet_scroll (it
+        also folds in thumb-scroll), which is why the text page does not call
+        this."""
+        ctrl = Gtk.EventControllerScroll(
+            flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        ctrl.connect("scroll", self._on_scroll)
+        ancestor.add_controller(ctrl)
 
     def _on_scroll(self, ctrl, _dx, dy):
         ev = ctrl.get_current_event()
@@ -6015,11 +6035,24 @@ class TextPageView(Gtk.Overlay):
         if self.on_ink_changed:
             self.on_ink_changed()
 
+    def _erase_radius(self, st):
+        """Overlay-space hit radius for `st`: its on-screen half-width plus a
+        little slack — the PDF canvas' model, so thick ink is as easy to hit
+        as it looks — with ERASE_RADIUS as a floor to keep thin ink forgiving.
+        The sheet draws a stroke at width*f (see _draw_ink), so the radius has
+        to carry the same font scale."""
+        f = self.font_px / max(st["font_px"], 1)
+        return max(self.ERASE_RADIUS, st["width"] * f / 2 + 3.0)
+
     def _erase_at(self, x, y):
-        rad2 = self.ERASE_RADIUS ** 2
+        # Hit-test every SEGMENT, not just the stored vertices, reusing the PDF
+        # canvas' geometry so the two erasers cannot drift apart. Vertices alone
+        # are not enough: _snap_to_straight collapses a stroke to its two
+        # endpoints, so a straight line has nothing to hit in the middle and was
+        # erasable only near its ends — the same trap the lasso hit in row 102.
         hit = [st for st in self.strokes
-               if any((px - x) ** 2 + (py - y) ** 2 <= rad2
-                      for px, py in self._stroke_overlay_pts(st))]
+               if PDFCanvas._stroke_hits(self._stroke_overlay_pts(st), x, y,
+                                         self._erase_radius(st))]
         if not hit:
             return
         for st in hit:
@@ -7524,6 +7557,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
         s._notes_box.append(notes_scroll)
+        # must be attached ABOVE notes_scroll, or the ScrolledWindow swallows
+        # Ctrl+scroll as soon as the notes are long enough to scroll
+        s._notes_view.attach_zoom_scroll(s._notes_box)
 
         # ── search bar ────────────────────────────────────────────────────────
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)

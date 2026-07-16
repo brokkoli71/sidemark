@@ -4916,6 +4916,49 @@ class TestNotesFontZoom(unittest.TestCase):
                 raise AssertionError("notes view callback did not resize the font")
         self._run_in_window(body)
 
+    def test_notes_ctrl_scroll_controller_sits_above_the_scrolledwindow(self):
+        """The Ctrl+scroll font zoom must be captured ABOVE the panel's
+        ScrolledWindow. GTK's own capture-phase controller on the
+        ScrolledWindow stops scroll whenever it can scroll, so a handler on
+        the view only fires while the notes are too short to scroll — the
+        bug that made this silently die on a full page of notes."""
+        def body(win):
+            s = win._active_session
+            view = s._panel_notes_view
+
+            # no scroll controller may be left on the view: it is unreachable
+            leftover = [c for c in view.observe_controllers()
+                        if isinstance(c, Gtk.EventControllerScroll)]
+            if leftover:
+                raise AssertionError(
+                    "notes view has its own scroll controller; the "
+                    "ScrolledWindow will swallow Ctrl+scroll before it fires")
+
+            # ...and one must exist in the capture phase on an ancestor of the
+            # ScrolledWindow that holds the view
+            sw = view.get_parent()
+            if not isinstance(sw, Gtk.ScrolledWindow):
+                raise AssertionError(f"expected a ScrolledWindow, got {sw}")
+            anc = sw.get_parent()
+            caps = [c for c in anc.observe_controllers()
+                    if isinstance(c, Gtk.EventControllerScroll)
+                    and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE]
+            if not caps:
+                raise AssertionError(
+                    "no capture-phase scroll controller above the ScrolledWindow")
+
+            # and it actually zooms: Ctrl+scroll up → bigger notes font
+            base = win._notes_font_px
+            handled = view._on_scroll(_scroll_ctrl(True), 0, -1)
+            if not handled:
+                raise AssertionError("Ctrl+scroll not claimed")
+            if win._notes_font_px != base + win._NOTES_FONT_STEP:
+                raise AssertionError("Ctrl+scroll did not resize the notes font")
+            # a plain scroll is left alone so the panel scrolls normally
+            if view._on_scroll(_scroll_ctrl(False), 0, -1):
+                raise AssertionError("plain scroll must not be claimed")
+        self._run_in_window(body)
+
 
 class TestThumbnailSidebar(unittest.TestCase):
     def _run_in_window(self, body):
@@ -8244,6 +8287,65 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertEqual(len(tp.strokes), 0)
                 win._global_undo()
                 self.assertEqual(len(tp.strokes), 1)
+
+            self._run_in_window(body)
+
+    def test_eraser_catches_the_middle_of_a_straight_line(self):
+        """_snap_to_straight stores a line as just its two endpoints, so a
+        vertex-only hit test could never erase its middle — you had to hit
+        within a few px of an end. The PDF canvas always handled this
+        (TestEraser.test_erase_removes_hit_stroke erases a 2-point line at
+        its midpoint), so the sheet must too."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp.tool = "pen"
+                tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
+                self.assertEqual(len(tp.strokes), 1)
+                self.assertEqual(len(tp.strokes[0]["pts"]), 2)   # a straight line
+                pts = tp._stroke_overlay_pts(tp.strokes[0])
+                mid = ((pts[0][0] + pts[1][0]) / 2.0,
+                       (pts[0][1] + pts[1][1]) / 2.0)
+                tp._erase_at(*mid)
+                self.assertEqual(len(tp.strokes), 0)
+
+            self._run_in_window(body)
+
+    def test_eraser_leaves_a_stroke_it_misses(self):
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp.tool = "pen"
+                tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
+                pts = tp._stroke_overlay_pts(tp.strokes[0])
+                # far off the line — outside every segment's hit radius
+                tp._erase_at(pts[0][0] + 150.0, pts[0][1] + 140.0)
+                self.assertEqual(len(tp.strokes), 1)
+
+            self._run_in_window(body)
+
+    def test_eraser_radius_follows_stroke_width_and_zoom(self):
+        """Thick ink is as easy to hit as it looks (the PDF canvas' model),
+        and the radius carries the same font scale the sheet draws it at."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp.tool = "pen"
+                tp._commit_stroke([(120.0, 120.0), (420.0, 120.0)])
+                st = tp.strokes[0]
+                st["font_px"] = tp.font_px          # drawn 1:1
+
+                st["width"] = 2                     # thin ink keeps the floor
+                self.assertEqual(tp._erase_radius(st), tp.ERASE_RADIUS)
+
+                st["width"] = 30                    # fat ink: visible edge + slack
+                self.assertAlmostEqual(tp._erase_radius(st), 30 / 2 + 3.0)
+
+                st["font_px"] = tp.font_px / 2      # sheet zoomed → drawn 2x
+                self.assertAlmostEqual(tp._erase_radius(st), 30 * 2 / 2 + 3.0)
 
             self._run_in_window(body)
 
