@@ -8391,6 +8391,41 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_pen_width_is_a_document_width_not_a_screen_width(self):
+        """A stroke must come out the same size whatever zoom it was drawn at
+        (PDF-canvas parity — there the width is in PDF units). The sheet used
+        to store the raw pen width, so ink drawn zoomed-in was thinner in the
+        document and went hairline when you zoomed back out."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp.tool = "pen"
+                pen_w = tp.pen_style(False)[1]
+
+                tp.set_zoom(1.0)
+                tp._commit_stroke([(120.0, 120.0), (300.0, 120.0)])
+                at_1x = tp.strokes[0]
+
+                tp.set_zoom(3.0)
+                tp._commit_stroke([(120.0, 160.0), (300.0, 160.0)])
+                at_3x = tp.strokes[1]
+
+                # on-screen width == what _draw_ink renders: width * f
+                def screen_w(st):
+                    return st["width"] * (tp.font_px / max(st["font_px"], 1))
+
+                # viewed at the SAME zoom, both strokes are the same thickness
+                for z in (1.0, 2.0, 3.0):
+                    tp.set_zoom(z)
+                    self.assertAlmostEqual(screen_w(at_1x), screen_w(at_3x),
+                                           places=4,
+                                           msg=f"ink mismatch at zoom {z}")
+                    # ...and that thickness tracks the zoom, like the paper
+                    self.assertAlmostEqual(screen_w(at_1x), pen_w * z, places=4)
+
+            self._run_in_window(body)
+
     def test_plain_scroll_pans_the_sheet_with_every_tool(self):
         """A drawing tool makes the ink overlay the event target, which cuts
         the ScrolledWindow out of the propagation path — GTK's own scrolling

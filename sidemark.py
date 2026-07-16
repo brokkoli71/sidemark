@@ -5037,7 +5037,11 @@ class TextPageView(Gtk.Overlay):
     EDGE_GRAB = 7             # px either side of the paper edge that resizes it
     PAGE_GAP = 30             # surround gap around the sheet
     MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 56, 48, 96   # inner paper margins
-    ZOOM_MIN, ZOOM_MAX = 0.5, 3.0
+    # Zoom range of the sheet. Wider than it looks like it needs to be: zooming
+    # in close is how you write a small detail by hand, and 3x was not enough
+    # room to do that. The sheet zooms by scaling the font (and the paper with
+    # it), so the ceiling is really just how big a Pango layout stays pleasant.
+    ZOOM_MIN, ZOOM_MAX = 0.25, 8.0
 
     def __init__(self, font_px=13):
         super().__init__()
@@ -6090,7 +6094,14 @@ class TextPageView(Gtk.Overlay):
             "mark": mark,
             "pts": [(bx - r.x, by - r.y) for bx, by in buf_pts],
             "color": tuple(color),
-            "width": width,
+            # The pen setting is a DOCUMENT width (PDF-canvas parity): a stroke
+            # must come out the same size whatever zoom it was drawn at, and
+            # must match the ink already around it. Strokes render at
+            # width * font_px/st["font_px"], so bake the draw-time zoom in here
+            # and that renders as pen_width * zoom at every later zoom.
+            # (Ink drawn at 1.0 stores exactly the pen width, so existing
+            # sidecars — drawn before the sheet could zoom — are unaffected.)
+            "width": width * self.zoom,
             "opacity": opacity,
             "font_px": self.font_px,
         }
@@ -6422,7 +6433,10 @@ class TextPageView(Gtk.Overlay):
         if len(self.current_stroke) >= 2:
             color, width, opacity = self.pen_style(self.tool == "highlighter")
             ctx.set_source_rgba(*color, opacity)
-            ctx.set_line_width(width)
+            # * zoom: the pen is a DOCUMENT width (PDF-canvas parity), so it
+            # draws thicker as you zoom in — and the live stroke matches what
+            # _commit_stroke will store, so nothing jumps on release
+            ctx.set_line_width(width * self.zoom)
             ctx.move_to(*self.current_stroke[0])
             for p in self.current_stroke[1:]:
                 ctx.line_to(*p)
