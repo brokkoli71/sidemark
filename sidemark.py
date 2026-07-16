@@ -258,8 +258,8 @@ def chord_tool(ctrl, shift, alt, mode, ink_active=True):
     mode: "pdf" | "text". ink_active (text mode only): with the caret, plain
     Shift belongs to text selection, so Shift-alone is only zoom-to-region
     while an ink tool owns the sheet. Shift-alone must never be load-bearing
-    in the cross-mode grammar for that reason — the portable zoom chord is
-    Shift+middle-drag."""
+    in the cross-mode grammar for that reason — the portable zoom chords are
+    Alt+Shift+drag (keyboard) and Shift+middle-drag (mouse)."""
     if ctrl and shift and alt:
         return "lasso"
     if ctrl and alt:
@@ -268,14 +268,20 @@ def chord_tool(ctrl, shift, alt, mode, ink_active=True):
         return "highlighter"
     if ctrl:
         return "pan"
-    if alt and not shift:
+    if alt and shift:
+        # Reads compositionally out of the two keys: Alt flips to ink, and
+        # Shift over ink means zoom — so Alt+Shift is "zoom", in BOTH modes.
+        # This is THE portable keyboard zoom chord: it is the only one that
+        # works under the caret, where Shift alone belongs to text selection.
+        return "zoom"
+    if alt:
         # Alt flips ink<->text: it escapes to the OTHER mode's home tool
         # (PDF's home tool is the pen, so Alt selects text; a text page's
         # home tool is the caret, so Alt draws — Alt+right erases in both).
         return "select" if mode == "pdf" else "pen"
-    if shift and not alt:
+    if shift:
         return "zoom" if (mode == "pdf" or ink_active) else None
-    return None   # Shift+Alt is deliberately unassigned, in both modes
+    return None
 
 
 class PDFCanvas(Gtk.DrawingArea):
@@ -1552,18 +1558,16 @@ class PDFCanvas(Gtk.DrawingArea):
             self._panning = False
             self._zoom_selecting = False
             self.grab_focus()
-        elif (state & Gdk.ModifierType.SHIFT_MASK
-                and not state & Gdk.ModifierType.ALT_MASK):
+        elif state & Gdk.ModifierType.SHIFT_MASK:
+            # Shift, or Alt+Shift — the portable keyboard zoom chord, which
+            # means zoom in BOTH modes (chord_tool), so it does the same here
+            # as it does under the text caret
             self._zoom_selecting = True
             self._zoom_start = (start_x, start_y)
             self._zoom_end = (start_x, start_y)
             self._text_selecting = False
             self._panning = False
             self._selected_words = []
-        elif state & Gdk.ModifierType.ALT_MASK:
-            # Shift+Alt is deliberately unassigned in the chord grammar
-            # (chord_tool) — swallow it rather than fall through to the tool
-            self._ignoring = True
         else:
             self._zoom_selecting = False
             self._text_selecting = False
@@ -5041,7 +5045,7 @@ class TextPageView(Gtk.Overlay):
     # in close is how you write a small detail by hand, and 3x was not enough
     # room to do that. The sheet zooms by scaling the font (and the paper with
     # it), so the ceiling is really just how big a Pango layout stays pleasant.
-    ZOOM_MIN, ZOOM_MAX = 0.25, 8.0
+    ZOOM_MIN, ZOOM_MAX = 0.25, 16.0
 
     def __init__(self, font_px=13):
         super().__init__()
@@ -5790,21 +5794,29 @@ class TextPageView(Gtk.Overlay):
     # ── drawing gestures ─────────────────────────────────────────────────────
 
     def _on_alt_begin(self, gesture, x, y):
+        """The caret's escape into the ink chords. The ink overlay is not
+        targetable while the caret owns the sheet, so _on_ink_begin can never
+        see these drags — this capture gesture is the only route to them.
+        Alt+left = pen, Alt+right = eraser, Alt+Shift+left = zoom-to-region
+        (chord_tool: Alt flips to ink, Shift over ink zooms — and it is the
+        only zoom chord available here, since Shift alone is text selection)."""
         state = self._chord_state(gesture)
         button = gesture.get_current_button()
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         if (self.tool != "text" or not state & Gdk.ModifierType.ALT_MASK
-                or state & (Gdk.ModifierType.CONTROL_MASK
-                            | Gdk.ModifierType.SHIFT_MASK)
-                or button not in (Gdk.BUTTON_PRIMARY, Gdk.BUTTON_SECONDARY)):
-            # only Alt+left / Alt+right (Alt ALONE — Ctrl/Shift combos belong
-            # to other chords, see chord_tool) escape to ink; middle (pan)
-            # and the unmodified caret keep their meaning
+                or state & Gdk.ModifierType.CONTROL_MASK
+                or button not in (Gdk.BUTTON_PRIMARY, Gdk.BUTTON_SECONDARY)
+                or (shift and button != Gdk.BUTTON_PRIMARY)):
+            # Ctrl combos belong to other chords; middle (pan) and the
+            # unmodified caret keep their meaning
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
         self._alt_saved_tool = self.tool
-        # Alt+left = pen, Alt+right = eraser (style + erase checks read self.tool)
-        self.tool = ("eraser" if button == Gdk.BUTTON_SECONDARY else "pen")
+        # borrow the tool the chord names; _on_ink_begin does the rest, and
+        # reads self.tool for the zoom branch as well as the ink ones
+        self.tool = ("zoom" if shift else
+                     "eraser" if button == Gdk.BUTTON_SECONDARY else "pen")
         self._on_ink_begin(gesture, x, y)
 
     def _on_alt_update(self, gesture, dx, dy):
@@ -7193,7 +7205,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_zoom = Gtk.ToggleButton()
         self._mode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._mode_zoom.set_tooltip_text(
-            "Zoom to region (Shift+drag · Shift+middle/thumb-drag)")
+            "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
         self._mode_zoom.set_group(self._mode_pen)
         self._mode_anchor = Gtk.ToggleButton()
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
@@ -7269,7 +7281,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_zoom = Gtk.ToggleButton()
         self._pmode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._pmode_zoom.set_tooltip_text(
-            "Zoom to region (Shift+drag · Shift+middle/thumb-drag)")
+            "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
         self._pmode_zoom.set_group(self._pmode_pen)
         self._pmode_anchor = Gtk.ToggleButton()
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
@@ -7829,11 +7841,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             pen_tip = "Pen — or hold Alt while typing to draw"
             eraser_tip = "Eraser (right-drag, even while typing · Alt+right)"
             # no plain Shift+drag here: under the caret Shift is text selection
-            zoom_tip = "Zoom to region (Shift+middle/thumb-drag)"
+            # Shift alone is text selection here — Alt+Shift is the chord
+            # that reaches zoom under the caret (chord_tool)
+            zoom_tip = ("Zoom to region (Alt+Shift+drag · "
+                        "Shift+middle/thumb-drag)")
         else:
             pen_tip = "Pen"
             eraser_tip = "Eraser (right-drag)"
-            zoom_tip = "Zoom to region (Shift+drag · Shift+middle/thumb-drag)"
+            zoom_tip = ("Zoom to region (Shift+drag · Alt+Shift+drag · "
+                        "Shift+middle/thumb-drag)")
         for b in (self._mode_pen, self._pmode_pen):
             b.set_tooltip_text(pen_tip)
         for b in (self._mode_eraser, self._pmode_eraser):
@@ -7895,7 +7911,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Scroll",        "Pan"),
             ("Ctrl+Drag",     "Pan (also middle-drag · thumb button holds)"),
             ("Thumb+Scroll",  "Zoom in / out while the thumb button pans"),
-            ("Shift+Drag",    "Zoom to region"),
+            ("Shift+Drag",    "Zoom to region (PDF; on a text page Shift is text selection)"),
+            ("Alt+Shift+Drag", "Zoom to region (works under the text caret too)"),
             ("Shift+Middle/Thumb-drag", "Zoom to region (works on text pages too)"),
             ("Shift+Click",   "Fit page"),
             ("File",          None),

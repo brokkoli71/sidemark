@@ -5411,7 +5411,9 @@ class TestToolModes(unittest.TestCase):
         self.assertEqual(ct(True, True, False, "pdf"), "highlighter")
         self.assertEqual(ct(False, True, False, "pdf"), "zoom")
         self.assertEqual(ct(False, False, True, "pdf"), "select")
-        self.assertIsNone(ct(False, True, True, "pdf"))   # Shift+Alt unassigned
+        # Shift+Alt is the portable keyboard zoom chord — the same in both
+        # modes, because it is the only one that reaches zoom under the caret
+        self.assertEqual(ct(False, True, True, "pdf"), "zoom")
 
     def test_modifier_key_fires_callback(self):
         # the callback now carries the raw modifier set; the window maps it
@@ -8388,6 +8390,60 @@ class TestTextFirstMode(unittest.TestCase):
                 self.assertIn(md, spawned[0])         # reopens THIS document
                 # a text page has no page number to return to
                 self.assertNotIn("--page", spawned[0])
+
+            self._run_in_window(body)
+
+    def test_alt_shift_drag_zooms_to_region_under_the_caret(self):
+        """Alt+Shift is THE portable keyboard zoom chord: under the caret,
+        Shift alone is text selection, so it was impossible to reach
+        zoom-to-region from the keyboard at all. It reads compositionally —
+        Alt flips to ink, Shift over ink zooms."""
+        # the grammar says so, in BOTH modes, caret or not
+        self.assertEqual(
+            sidemark.chord_tool(False, True, True, "text", ink_active=False),
+            "zoom")
+        self.assertEqual(sidemark.chord_tool(False, True, True, "pdf"), "zoom")
+
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                self.assertEqual(tp.tool, "text")        # caret owns the sheet
+                g = _FakeDrag(60, 60, state=(Gdk.ModifierType.ALT_MASK
+                                             | Gdk.ModifierType.SHIFT_MASK))
+                tp._on_alt_begin(g, 60.0, 60.0)
+                self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
+                self.assertTrue(tp._zoom_selecting)      # rubber-band, not ink
+                self.assertEqual(tp.strokes, [])         # and it did NOT draw
+                tp._on_alt_update(g, 120.0, 90.0)
+                z0 = tp.zoom
+                tp._on_alt_end(g, 120.0, 90.0)
+                self.assertFalse(tp._zoom_selecting)
+                self.assertNotAlmostEqual(tp.zoom, z0)   # zoomed to the region
+                self.assertEqual(tp.tool, "text")        # caret restored
+                self.assertEqual(tp.strokes, [])
+
+                # plain Alt still draws — the escape it always was
+                g2 = _FakeDrag(60, 60, state=Gdk.ModifierType.ALT_MASK)
+                tp._on_alt_begin(g2, 60.0, 60.0)
+                self.assertFalse(tp._zoom_selecting)
+                self.assertEqual(tp.tool, "pen")
+                tp._on_alt_end(g2, 10.0, 10.0)
+                self.assertEqual(tp.tool, "text")
+
+            self._run_in_window(body)
+
+    def test_zoom_tooltip_names_the_chord_that_works_in_this_mode(self):
+        """The tooltip must not advertise plain Shift+drag on a text page —
+        there Shift belongs to text selection."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tip = win._mode_zoom.get_tooltip_text()
+                self.assertIn("Alt+Shift+drag", tip)
+                self.assertNotIn("(Shift+drag", tip)   # PDF-only, not here
+                for b in (win._mode_zoom, win._pmode_zoom):
+                    self.assertEqual(b.get_tooltip_text(), tip)
 
             self._run_in_window(body)
 
