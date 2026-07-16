@@ -357,6 +357,24 @@ def paste_objects(clipboard, on_objects, on_texture):
         clipboard.read_texture_async(None, got_texture)
 
 
+def pasted_extent(objects):
+    """(w, h) of a copied selection — its coords are rebased on its own
+    top-left by copy_selection, so this is what a paste centres on.
+
+    Part of the clipboard layer, not of either mode: the wire format is one
+    decision, so both sides read it the same way."""
+    xs, ys = [0.0], [0.0]
+    for obj in objects:
+        if obj.get("type") == "stroke":
+            for px, py in obj.get("pts", []):
+                xs.append(px)
+                ys.append(py)
+        else:
+            xs.append(obj.get("dx", 0.0) + obj.get("w", 0.0))
+            ys.append(obj.get("dy", 0.0) + obj.get("h", 0.0))
+    return max(xs), max(ys)
+
+
 _CLIP_MAX_BYTES = 256 * 1024 * 1024   # a paste this big is a bug, not a note
 
 
@@ -423,6 +441,16 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # {page_idx: [{"pts": [...], "color": (r,g,b,a), "width": float}]}
         self.all_strokes = {}
+        # Pasted images, per page — an OBJECT like ink, never a flattened
+        # stamp (row 118): PNG bytes + a rect in PDF units + a free rotation,
+        # editable forever. The `-ink.json` sidecar beside the PDF is the
+        # SOURCE OF TRUTH; the optional-content layer written into the PDF on
+        # save is a regenerated render target, because insert_image cannot
+        # crop and only rotates in 90° steps.
+        # {page_idx: [{"data": png bytes, "texture": Gdk.Texture,
+        #              "rect": (x, y, w, h) PDF units, "rotate": degrees}]}
+        self.all_images = {}
+        self._selected_images = []
         self.current_stroke = []
         # GoodNotes-style straight-line snap: holding still mid-stroke collapses
         # the in-progress stroke to a line from its start to the cursor
@@ -558,13 +586,21 @@ class PDFCanvas(Gtk.DrawingArea):
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
         self._lasso_move_start = None
-        self._lasso_move_orig = []     # original pts of selected strokes at drag begin
         self._lasso_moved = False
         self._lasso_scaling = False    # dragging a corner handle resizes the selection
         self._lasso_scale_anchor = None   # PDF-space fixed point (opposite corner)
         self._lasso_scale_start = None    # PDF-space grab point at drag begin
         self._lasso_scale_orig = []       # (stroke, pts, width) snapshots at drag begin
+        self._lasso_image_orig = []       # (image, rect) snapshots at drag begin
         self._lasso_scale_factor = 1.0
+        # rotation: a knob on a stalk above the selection box. The angle is
+        # live while the knob is dragged and only lands on the objects at
+        # drag end — an image stores it as a field applied at render, so
+        # repeat rotations never degrade the picture (row 118).
+        self._lasso_rotating = False
+        self._lasso_rotate_deg = 0.0      # live angle while the knob is dragged
+        self._lasso_rotate_from = 0.0     # pointer angle where the drag started
+        self._lasso_rotate_centre = (0.0, 0.0)   # pivot of the rotation drag
 
         self._panning = False
         self._pan_start_offset = (0.0, 0.0)
@@ -622,6 +658,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._hover_x = 0.0
         self._hover_y = 0.0
         self._hovered_link_rect = None
+        # is the pointer over the canvas? — paste_point() lands a paste under
+        # the mouse when it is, so the answer must be tracked, not guessed
+        self._pointer_in = False
 
 
         self.set_draw_func(self._draw)
@@ -705,6 +744,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self.n_pages = len(self.document)
         self.current_stroke = []
         self.all_strokes = {}
+        self.all_images = {}
+        self._selected_images = []
         self._undo_stack = []
         self._redo_stack = []
         self._erase_group = 0
@@ -770,6 +811,10 @@ class PDFCanvas(Gtk.DrawingArea):
     @property
     def strokes(self):
         return self.all_strokes.setdefault(self.current_page_idx, [])
+
+    @property
+    def images(self):
+        return self.all_images.setdefault(self.current_page_idx, [])
 
     def _pen_attrs(self):
         """(color, width, opacity) of the active drawing tool. ``_temp_highlighter``
@@ -982,6 +1027,11 @@ class PDFCanvas(Gtk.DrawingArea):
         ctx.paint()
         ctx.restore()
 
+        # Pasted images sit between the page and the ink: ink draws ON TOP of
+        # images, the same contract the sheet keeps (row 118) — you annotate a
+        # figure, you don't paste over your annotations.
+        self._draw_images(ctx)
+
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
         ctx.set_line_join(cairo.LINE_JOIN_ROUND)
 
@@ -1120,6 +1170,339 @@ class PDFCanvas(Gtk.DrawingArea):
             rh = abs(self._zoom_end[1] - self._zoom_start[1])
             _draw_zoom_marquee(ctx, x1, y1, rw, rh, self.zoom_accent)
 
+    # ── pasted images ────────────────────────────────────────────────────────
+    #
+    # An image is an object, like ink: bytes + rect + rotation, stored in PDF
+    # units so it never bakes in the zoom you pasted at (row 116's pen-width
+    # lesson) and editable forever. The UX is the CONTRACT the sheet defined in
+    # row 118 — this side matches it, it does not re-decide it.
+
+    def _image_draw_rotate(self, im):
+        """The angle to paint `im` at: its own, plus the live rotation drag if
+        it is in one. A tilt is an ANGLE applied at render, never baked into
+        the pixels, so repeat rotations never degrade the picture."""
+        extra = (self._lasso_rotate_deg
+                 if self._lasso_rotating and im in self._selected_images
+                 else 0.0)
+        return im.get("rotate", 0.0) + extra
+
+    def _image_screen_rect(self, im):
+        """`im`'s box in screen coords — for hit-testing against the pointer."""
+        x, y, w, h = im["rect"]
+        sx, sy = self._pdf_to_screen(x, y)
+        return sx, sy, w * self.scale, h * self.scale
+
+    def _draw_images(self, ctx):
+        """Paint this page's images (under the ink), with a glow on the
+        selected ones so they read as picked up."""
+        images = self.images
+        if not images:
+            return
+        ar, ag, ab = self.zoom_accent
+        ctx.save()
+        ctx.translate(self.offset_x, self.offset_y)
+        ctx.scale(self.scale, self.scale)
+        for im in images:
+            x, y, w, h = im["rect"]
+            if w <= 0 or h <= 0:
+                continue
+            rotate = self._image_draw_rotate(im)
+            if im in self._selected_images:
+                pad = 3.0 / self.scale
+                ctx.save()
+                if rotate:
+                    ctx.translate(x + w / 2, y + h / 2)
+                    ctx.rotate(math.radians(rotate))
+                    ctx.translate(-(x + w / 2), -(y + h / 2))
+                ctx.set_source_rgba(ar, ag, ab, 0.55)
+                ctx.rectangle(x - pad, y - pad, w + 2 * pad, h + 2 * pad)
+                ctx.fill()
+                ctx.restore()
+            draw_image(ctx, im["texture"], x, y, w, h, rotate=rotate)
+        ctx.restore()
+
+    def paste_point(self):
+        """Where a paste lands, in SCREEN coords: under the pointer when it is
+        over the canvas, else the middle of what you can see.
+
+        Deliberately not any text caret — pasting must work with any tool, and
+        the mouse is where you are looking (the sheet's rule, row 118)."""
+        if self._pointer_in:
+            return self._mouse_x, self._mouse_y
+        return self.get_width() / 2.0, self.get_height() / 2.0
+
+    def _paste_rect(self, iw, ih, at=None):
+        """The PDF-unit rect a `iw`×`ih` px image pastes into, centred on `at`
+        (screen coords; defaults to paste_point()).
+
+        Size follows the ZOOM: capped at the image's own pixels on screen
+        (stored size = native / scale), so pasting a screenshot while zoomed
+        into a figure gives a small figure, not a wall — and never bigger than
+        the page. The aspect never changes."""
+        f = min(1.0 / max(self.scale, 0.01),
+                self.page_width / max(iw, 1),
+                self.page_height / max(ih, 1))
+        w, h = iw * f, ih * f
+        cx, cy = self._screen_to_pdf(*(at or self.paste_point()))
+        return (cx - w / 2.0, cy - h / 2.0, w, h)
+
+    def add_image(self, data, at=None):
+        """Paste an image onto the current page, centred on `at` (screen
+        coords). `data` is PNG bytes — the sidecar's storage form, so what we
+        hold in memory is exactly what round-trips."""
+        texture = _texture_from_png(data)
+        if texture is None or self.page is None:
+            return None
+        im = {
+            "data": data,
+            "texture": texture,
+            "rect": self._paste_rect(texture.get_width(),
+                                     texture.get_height(), at),
+            "rotate": 0.0,
+        }
+        self._add_images([im])
+        return im
+
+    def _add_images(self, images):
+        """Put `images` on the current page as ONE undo entry, and select them
+        — a paste you can immediately move is the point of the lasso."""
+        if not images:
+            return
+        page = self.current_page_idx
+        self.all_images.setdefault(page, []).extend(images)
+        self._undo_stack.append(("add_images", page, list(images)))
+        self._redo_stack.clear()
+        self._set_selected(self._selected_strokes, list(images))
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        self.queue_draw()
+
+    def images_to_json(self):
+        """The image sidecar's contents: every page's images, in PDF units.
+
+        This file — not the layer we render into the PDF on save — is the
+        SOURCE OF TRUTH (row 118). The PDF can only place an image upright-ish
+        (insert_image rotates in 90° steps and cannot crop), so anything the
+        format cannot express would be lost the moment you reopened."""
+        pages = {}
+        for idx, images in sorted(self.all_images.items()):
+            if not images:
+                continue
+            pages[str(idx)] = [{
+                "rect": [round(v, 2) for v in im["rect"]],
+                "rotate": im.get("rotate", 0.0),
+                # base64 so the sidecar stays one plain JSON file next to the
+                # PDF, rather than a scatter of loose image files to keep in
+                # sync with it (the sheet's sidecar does the same)
+                "png": base64.b64encode(im["data"]).decode("ascii"),
+            } for im in images]
+        return {"version": 1, "images": pages}
+
+    def load_images(self, data):
+        """Restore the image sidecar written by images_to_json()."""
+        self.all_images = {}
+        self._selected_images = []
+        for key, records in (data.get("images") or {}).items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            images = []
+            for rec in records:
+                try:
+                    png = base64.b64decode(rec.get("png", ""))
+                except (ValueError, TypeError):
+                    continue
+                texture = _texture_from_png(png)
+                if texture is None:
+                    continue   # unreadable bytes: skip the image, keep the doc
+                rect = rec.get("rect") or [0, 0, texture.get_width(),
+                                           texture.get_height()]
+                images.append({
+                    "data": png,
+                    "texture": texture,
+                    "rect": tuple(float(v) for v in rect[:4]),
+                    "rotate": float(rec.get("rotate", 0.0)),
+                })
+            if images:
+                self.all_images[idx] = images
+        self.queue_draw()
+
+    # ── the clipboard (the sheet's contract, on the PDF's substrate) ─────────
+
+    def copy_selection(self):
+        """Ctrl+C on a lasso selection: publish the real objects AND a picture.
+
+        Pasted back into Sidemark the ink is still ink and the image is still
+        an image (the private mime); dropped into any other app it is a PNG.
+        Coordinates go out rebased on the selection's top-left, in PDF units,
+        so a paste lands centred on the paste point rather than back where it
+        was copied from."""
+        if not self.has_lasso_selection():
+            return
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return
+        x0, y0, _x1, _y1 = bbox
+        objects = []
+        for s in self._selected_strokes:
+            objects.append({
+                "type": "stroke",
+                "pts": [[round(x - x0, 2), round(y - y0, 2)] for x, y in s["pts"]],
+                "color": list(s["color"]),
+                "width": s["width"],
+                "opacity": s.get("opacity", 1.0),
+            })
+        for im in self._selected_images:
+            x, y, w, h = im["rect"]
+            objects.append({
+                "type": "image",
+                "dx": round(x - x0, 2), "dy": round(y - y0, 2),
+                "w": round(w, 2), "h": round(h, 2),
+                "rotate": im.get("rotate", 0.0),
+                "png": base64.b64encode(im["data"]).decode("ascii"),
+            })
+        texture = self._render_selection(bbox)
+        if texture is None:
+            # not fatal — Sidemark's own paste still works off the objects —
+            # but every OTHER app pastes nothing, so say so out loud
+            logger.warning("copy: could not render the selection to a picture; "
+                           "other apps will see no image")
+        Gdk.Display.get_default().get_clipboard().set_content(
+            clipboard_content_for(objects, texture))
+        logger.info(f"copy: {len(objects)} object(s) "
+                    f"({len(self._selected_strokes)} ink, "
+                    f"{len(self._selected_images)} image) to the clipboard, "
+                    f"picture={texture is not None}")
+
+    COPY_RENDER_SCALE = 3.0   # supersample the picture other apps get
+
+    def _render_selection(self, bbox):
+        """A Gdk.Texture of the selection — what OTHER apps get from a copy.
+
+        Rendered at COPY_RENDER_SCALE× the selection's PDF size: ink is vectors
+        and an image keeps its own bytes, so rendering bigger costs only a
+        little memory and is the only way the paste looks crisp at a useful
+        size. The page itself is NOT drawn — you copied your marks, not the
+        document under them."""
+        x0, y0, x1, y1 = bbox
+        pad = 4
+        s = self.COPY_RENDER_SCALE
+        w = int(((x1 - x0) + 2 * pad) * s)
+        h = int(((y1 - y0) + 2 * pad) * s)
+        if w < 1 or h < 1:
+            return None
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        ctx = cairo.Context(surf)
+        ctx.scale(s, s)
+        ctx.translate(-x0 + pad, -y0 + pad)
+        for im in self._selected_images:
+            draw_image(ctx, im["texture"], *im["rect"],
+                       rotate=im.get("rotate", 0.0))
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        for st in self._selected_strokes:
+            pts = st["pts"]
+            if len(pts) < 2:
+                continue
+            ctx.set_source_rgba(*st["color"], st.get("opacity", 1.0))
+            ctx.set_line_width(st["width"])
+            ctx.move_to(*pts[0])
+            for p in pts[1:]:
+                ctx.line_to(*p)
+            ctx.stroke()
+        surf.flush()
+        buf = io.BytesIO()
+        surf.write_to_png(buf)
+        return _texture_from_png(buf.getvalue())
+
+    def wants_paste(self):
+        """Should Ctrl+V drop something onto the page?
+
+        Decided from the clipboard's ADVERTISED formats, which are readable
+        synchronously — the payload is not, and a key handler must answer now.
+        There is no caret on a PDF page, so unlike the sheet there is nothing
+        to yield to here: the window declines the key on our behalf when the
+        notes editor has focus."""
+        if self.page is None:
+            return False
+        formats = Gdk.Display.get_default().get_clipboard().get_formats()
+        if formats.contain_mime_type(SIDEMARK_MIME):
+            return True
+        return (formats.contain_gtype(Gdk.Texture)
+                or any(formats.contain_mime_type(m) for m in
+                       ("image/png", "image/jpeg", "image/webp",
+                        "image/tiff", "image/bmp", "image/gif")))
+
+    def paste_clipboard_objects(self):
+        """Paste Sidemark objects (ink stays ink, images stay images) or a
+        picture from any other app, at the paste point."""
+        paste_objects(self.get_clipboard(),
+                      self._add_pasted_objects,
+                      lambda tex: self.add_image(_png_from_texture(tex)))
+
+    def _add_pasted_objects(self, objects):
+        """Rebuild copied strokes/images at the paste point, keeping every
+        property — this is what makes an in-app copy lossless rather than a
+        snapshot. The copy stored everything relative to its own top-left, so
+        the whole thing lands CENTRED on the paste point, like a plain image
+        paste does."""
+        if self.page is None:
+            return
+        ew, eh = pasted_extent(objects)
+        cx, cy = self._screen_to_pdf(*self.paste_point())
+        ox, oy = cx - ew / 2.0, cy - eh / 2.0
+        strokes, images = [], []
+        for obj in objects:
+            if obj.get("type") == "image":
+                try:
+                    png = base64.b64decode(obj.get("png", ""))
+                except (ValueError, TypeError):
+                    continue
+                texture = _texture_from_png(png)
+                if texture is None:
+                    continue
+                images.append({
+                    "data": png, "texture": texture,
+                    "rect": (float(obj.get("dx", 0.0)) + ox,
+                             float(obj.get("dy", 0.0)) + oy,
+                             float(obj.get("w", texture.get_width())),
+                             float(obj.get("h", texture.get_height()))),
+                    "rotate": float(obj.get("rotate", 0.0)),
+                })
+            elif obj.get("type") == "stroke":
+                pts = [(p[0] + ox, p[1] + oy) for p in obj.get("pts", [])]
+                if not pts:
+                    continue
+                strokes.append({
+                    "pts": pts,
+                    "color": tuple(obj.get("color", (0.05, 0.05, 0.8)))[:3],
+                    "width": float(obj.get("width", 2.0)),
+                    "opacity": float(obj.get("opacity", 1.0)),
+                })
+        if not strokes and not images:
+            return
+        page = self.current_page_idx
+        # one undo entry for the paste, however mixed it was: the strokes and
+        # the images share a draw group
+        self._draw_group += 1
+        for s in strokes:
+            self.strokes.append(s)
+            self._undo_stack.append(("draw", page, s, self._draw_group))
+        if images:
+            self.all_images.setdefault(page, []).extend(images)
+            self._undo_stack.append(("add_images", page, images,
+                                     self._draw_group))
+        self._redo_stack.clear()
+        self._set_selected(strokes, images)
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        self.queue_draw()
+
     def _note_box_layout(self, ctx, text):
         """A Pango layout for a callout / text box, rendering symbols + markup."""
         layout = PangoCairo.create_layout(ctx)
@@ -1249,6 +1632,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self.queue_draw()
         self._mouse_x = x
         self._mouse_y = y
+        self._pointer_in = True
         self._hover_x, self._hover_y = x, y
         self._update_link_hover()
         self._update_anchor_hover(x, y)
@@ -1471,6 +1855,7 @@ class PDFCanvas(Gtk.DrawingArea):
         return None
 
     def _on_motion_leave(self, _ctrl):
+        self._pointer_in = False
         if self._hovered_link_rect is not None:
             self._hovered_link_rect = None
             self.set_cursor(None)
@@ -1767,8 +2152,23 @@ class PDFCanvas(Gtk.DrawingArea):
         chord so both behave identically: a press on a corner handle scales
         the selection, inside it moves, elsewhere starts a fresh loop."""
         px, py = self._screen_to_pdf(start_x, start_y)
+        # NB: every gate here asks has_lasso_selection(), never
+        # self._selected_strokes — that list is STROKES, and reading it as
+        # "the selection" is what made an images-only selection unpickable on
+        # the sheet (row 118).
+        if (self.has_lasso_selection()
+                and self._lasso_rotate_handle_at(start_x, start_y)):
+            # the knob above the box spins the whole selection about its centre
+            cx, cy = self._selection_centre()
+            self._lasso_rotating = True
+            self._lasso_rotate_deg = 0.0
+            self._lasso_rotate_from = math.degrees(math.atan2(py - cy, px - cx))
+            self._lasso_rotate_centre = (cx, cy)
+            self._snapshot_selection()
+            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
+            return
         handle = (self._lasso_handle_at(start_x, start_y)
-                  if self._selected_strokes else None)
+                  if self.has_lasso_selection() else None)
         if handle is not None:
             # press on a corner handle scales the selection, anchored
             # at the opposite corner
@@ -1776,27 +2176,46 @@ class PDFCanvas(Gtk.DrawingArea):
             self._lasso_scaling = True
             self._lasso_scale_anchor = corners[(handle + 2) % 4]
             self._lasso_scale_start = (px, py)
-            self._lasso_scale_orig = [
-                (s, list(s["pts"]), s["width"])
-                for s in self._selected_strokes]
+            self._snapshot_selection()
             self._lasso_scale_factor = 1.0
             self.set_cursor(Gdk.Cursor.new_from_name(
                 "nwse-resize" if handle in (0, 2) else "nesw-resize",
                 None))
             return
-        if self._selected_strokes and self._point_in_selection(px, py):
+        if self.has_lasso_selection() and self._point_in_selection(px, py):
             # press inside the current selection grabs it for a move
             self._lasso_moving = True
             self._lasso_move_start = (start_x, start_y)
-            self._lasso_move_orig = [list(s["pts"])
-                                    for s in self._selected_strokes]
+            self._snapshot_selection()
             self._lasso_moved = False
             self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
         else:
             # otherwise start a fresh loop, dropping any prior selection
             self._lassoing = True
-            self._set_selected_strokes([])
+            self._set_selected([], [])
             self._lasso_path = [(start_x, start_y)]
+
+    def _end_lasso_edit(self):
+        """The tail every committed lasso edit shares: the redo branch dies and
+        the document is dirty, one timeline entry for the gesture."""
+        self._redo_stack.clear()
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+
+    def _clear_drag_snapshots(self):
+        self._lasso_scale_orig = []
+        self._lasso_image_orig = []
+
+    def _snapshot_selection(self):
+        """Freeze the selection's geometry at drag begin — ONE snapshot pair
+        for move, resize and rotate alike, so strokes and images can never
+        drift apart mid-drag."""
+        self._lasso_scale_orig = [(s, list(s["pts"]), s["width"])
+                                  for s in self._selected_strokes]
+        self._lasso_image_orig = [(im, tuple(im["rect"]))
+                                  for im in self._selected_images]
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
         if self._post_pinch:
@@ -1867,14 +2286,45 @@ class PDFCanvas(Gtk.DrawingArea):
                 s["pts"] = [(ax + (x - ax) * f, ay + (y - ay) * f)
                             for x, y in opts]
                 s["width"] = ow * f   # keep the drawing's look at any size
+            for im, (x, y, w, h) in self._lasso_image_orig:
+                im["rect"] = (ax + (x - ax) * f, ay + (y - ay) * f, w * f, h * f)
+            self.queue_draw()
+            return
+        if self._lasso_rotating:
+            px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
+            cx, cy = self._lasso_rotate_centre
+            now = math.degrees(math.atan2(py - cy, px - cx))
+            deg = now - self._lasso_rotate_from
+            if self._shift_held:
+                deg = round(deg / self.ROTATE_SNAP_DEG) * self.ROTATE_SNAP_DEG
+            self._lasso_rotate_deg = deg
+            rad = math.radians(deg)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+            def spin(x, y):
+                dx, dy = x - cx, y - cy
+                return (cx + dx * cos_a - dy * sin_a,
+                        cy + dx * sin_a + dy * cos_a)
+
+            for s, opts, _ow in self._lasso_scale_orig:
+                s["pts"] = [spin(x, y) for x, y in opts]
+            # An image's rect stays axis-aligned — its tilt lives in the
+            # "rotate" field, applied at render (_image_draw_rotate) — so a
+            # spin moves its CENTRE around the pivot and leaves w/h alone.
+            # Mapping two opposite corners would skew the box instead.
+            for im, (x, y, w, h) in self._lasso_image_orig:
+                ncx, ncy = spin(x + w / 2.0, y + h / 2.0)
+                im["rect"] = (ncx - w / 2.0, ncy - h / 2.0, w, h)
             self.queue_draw()
             return
         if self._lasso_moving:
             if math.hypot(offset_x, offset_y) >= 3:
                 self._lasso_moved = True
             dx, dy = offset_x / self.scale, offset_y / self.scale
-            for s, orig in zip(self._selected_strokes, self._lasso_move_orig):
+            for s, orig, _ow in self._lasso_scale_orig:
                 s["pts"] = [(x + dx, y + dy) for x, y in orig]
+            for im, (x, y, w, h) in self._lasso_image_orig:
+                im["rect"] = (x + dx, y + dy, w, h)
             self.queue_draw()
             return
         if self._lassoing:
@@ -1991,31 +2441,45 @@ class PDFCanvas(Gtk.DrawingArea):
             self._lasso_scaling = False
             self.set_cursor(self._default_cursor())
             f = self._lasso_scale_factor
-            if abs(f - 1.0) > 1e-3 and self._selected_strokes:
+            if abs(f - 1.0) > 1e-3 and self.has_lasso_selection():
                 ax, ay = self._lasso_scale_anchor
                 self._undo_stack.append(("lasso_scale", self.current_page_idx,
                                          list(self._selected_strokes),
+                                         list(self._selected_images),
                                          f, ax, ay))
-                self._redo_stack.clear()
-                if self.on_change:
-                    self.on_change()
-                if self.on_user_action:
-                    self.on_user_action()
-            self._lasso_scale_orig = []
+                self._end_lasso_edit()
+            self._clear_drag_snapshots()
+            self.queue_draw()
+            return
+        if self._lasso_rotating:
+            self._lasso_rotating = False
+            self.set_cursor(self._default_cursor())
+            deg = self._lasso_rotate_deg
+            self._lasso_rotate_deg = 0.0
+            if abs(deg) > 1e-3 and self.has_lasso_selection():
+                # the strokes already carry the spin (their points moved); an
+                # image lands it in its own field, never in its pixels
+                for im in self._selected_images:
+                    im["rotate"] = im.get("rotate", 0.0) + deg
+                cx, cy = self._lasso_rotate_centre
+                self._undo_stack.append(("lasso_rotate", self.current_page_idx,
+                                         list(self._selected_strokes),
+                                         list(self._selected_images),
+                                         deg, cx, cy))
+                self._end_lasso_edit()
+            self._clear_drag_snapshots()
             self.queue_draw()
             return
         if self._lasso_moving:
             self._lasso_moving = False
             self.set_cursor(self._default_cursor())
-            if self._lasso_moved and self._selected_strokes:
+            if self._lasso_moved and self.has_lasso_selection():
                 dx, dy = offset_x / self.scale, offset_y / self.scale
                 self._undo_stack.append(("lasso_move", self.current_page_idx,
-                                         list(self._selected_strokes), dx, dy))
-                self._redo_stack.clear()
-                if self.on_change:
-                    self.on_change()
-                if self.on_user_action:
-                    self.on_user_action()
+                                         list(self._selected_strokes),
+                                         list(self._selected_images), dx, dy))
+                self._end_lasso_edit()
+            self._clear_drag_snapshots()
             self.queue_draw()
             return
         if self._lassoing:
@@ -2194,7 +2658,7 @@ class PDFCanvas(Gtk.DrawingArea):
     def _finish_text_selection(self):
         self.queue_draw()   # highlight stays; copy on Ctrl+C
 
-    def copy_selection(self):
+    def copy_text_selection(self):
         text = self._words_to_text(self._selected_words)
         self._selected_words = []
         self.queue_draw()
@@ -2442,29 +2906,52 @@ class PDFCanvas(Gtk.DrawingArea):
         return False
 
     def _finish_lasso(self):
-        """Close the in-progress loop and select every stroke on the page that
-        touches it: any point inside the loop (the common freehand case), or —
-        for sparse strokes like snapped straight lines — any segment crossing
-        the loop's boundary."""
+        """Close the in-progress loop and select every stroke and image on the
+        page that touches it: any point inside the loop (the common freehand
+        case), or — for sparse strokes like snapped straight lines — any
+        segment crossing the loop's boundary. An image is caught by its box,
+        so a loop that grazes a photo picks it up like a stroke."""
         path = self._lasso_path
         self._lasso_path = []
         if len(path) < 3:
-            self._set_selected_strokes([])
+            self._set_selected([], [])
             return
         poly = [self._screen_to_pdf(x, y) for x, y in path]
         sel = [s for s in self.strokes
                if any(self._point_in_polygon(px, py, poly) for px, py in s["pts"])
                or self._polyline_crosses_polygon(s["pts"], poly)]
-        self._set_selected_strokes(sel)
+        images = []
+        for im in self.images:
+            x, y, w, h = im["rect"]
+            box = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+            if (any(self._point_in_polygon(cx, cy, poly) for cx, cy in box)
+                    or any(self._point_in_polygon(px, py, box) for px, py in poly)
+                    or self._polyline_crosses_polygon(box + box[:1], poly)):
+                images.append(im)
+        self._set_selected(sel, images)
 
     def _selection_bbox(self):
-        """PDF-space (x0, y0, x1, y1) bounding box of the selected strokes, or None."""
+        """PDF-space (x0, y0, x1, y1) bounding box of the selection, or None.
+
+        Covers strokes AND images: ONE box, used by the dashed frame and by
+        every hit-test, or the two drift apart (row 118 — gating on strokes
+        alone is what made an images-only selection unpickable)."""
         pts = [p for s in self._selected_strokes for p in s["pts"]]
+        for im in self._selected_images:
+            x, y, w, h = im["rect"]
+            pts.extend(((x, y), (x + w, y + h)))
         if not pts:
             return None
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         return (min(xs), min(ys), max(xs), max(ys))
+
+    def _selection_centre(self):
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return None
+        x0, y0, x1, y1 = bbox
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 
     def _point_in_selection(self, px, py):
         """Is the PDF point inside the selection's (padded) bounding box?"""
@@ -2501,11 +2988,25 @@ class PDFCanvas(Gtk.DrawingArea):
                 return i
         return None
 
+    ROTATE_HANDLE_GAP = 18.0   # px from the box's top edge up to the knob
+    ROTATE_SNAP_DEG = 15.0     # Shift snaps to this, like the straight-line snap
+
+    def _lasso_rotate_handle_at(self, sx, sy, hit=8.0):
+        """Is the screen point on the rotate knob above the selection?"""
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
+        x1, _y1 = self._pdf_to_screen(bbox[2], bbox[3])
+        hx = (x0 + x1) / 2.0
+        hy = y0 - 5.0 - self.ROTATE_HANDLE_GAP
+        return math.hypot(sx - hx, sy - hy) <= hit
+
     def duplicate_selected(self, offset=14.0):
-        """Copy the lasso-selected strokes, offset a little so the copy is
-        visible, and select the copies — one undo entry (the clones share a
-        draw group, like a text highlight)."""
-        if not self._selected_strokes:
+        """Copy the lasso-selected strokes and images, offset a little so the
+        copy is visible, and select the copies — one undo entry (the clones
+        share a draw group, like a text highlight)."""
+        if not self.has_lasso_selection():
             return
         d = offset / self.scale
         self._draw_group += 1
@@ -2518,31 +3019,45 @@ class PDFCanvas(Gtk.DrawingArea):
             self._undo_stack.append(
                 ("draw", self.current_page_idx, c, self._draw_group))
             clones.append(c)
+        img_clones = []
+        for im in self._selected_images:
+            x, y, w, h = im["rect"]
+            img_clones.append({"data": im["data"], "texture": im["texture"],
+                               "rect": (x + d, y + d, w, h),
+                               "rotate": im.get("rotate", 0.0)})
+        if img_clones:
+            # same draw group as the strokes above: a duplicate is ONE gesture
+            # and undoes as one, however mixed the selection was
+            self.images.extend(img_clones)
+            self._undo_stack.append(("add_images", self.current_page_idx,
+                                     img_clones, self._draw_group))
         self._redo_stack.clear()
-        self._set_selected_strokes(clones)
+        self._set_selected(clones, img_clones)
         if self.on_change:
             self.on_change()
         if self.on_user_action:
             self.on_user_action()
         self.queue_draw()
 
-    def _set_selected_strokes(self, strokes):
+    def _set_selected(self, strokes, images=()):
         self._selected_strokes = strokes
+        self._selected_images = list(images)
         if self.on_lasso_selection:
-            self.on_lasso_selection(bool(strokes))
+            self.on_lasso_selection(bool(strokes or images))
 
     def has_lasso_selection(self):
-        return bool(self._selected_strokes)
+        return bool(self._selected_strokes or self._selected_images)
 
     def clear_lasso_selection(self):
-        if self._selected_strokes or self._lasso_path:
+        if self.has_lasso_selection() or self._lasso_path:
             self._lasso_path = []
-            self._set_selected_strokes([])
+            self._set_selected([], [])
             self.queue_draw()
 
     def delete_selected_strokes(self):
-        """Remove the lasso-selected strokes (one undo entry, reusing erase ops)."""
-        if not self._selected_strokes:
+        """Remove the lasso-selected strokes AND images (one undo entry, reusing
+        the erase ops — the whole gesture shares one erase group)."""
+        if not self.has_lasso_selection():
             return
         page = self.current_page_idx
         sel = set(id(s) for s in self._selected_strokes)
@@ -2557,8 +3072,21 @@ class PDFCanvas(Gtk.DrawingArea):
                 kept.append(s)
         if removed:
             self.all_strokes[page] = kept
+        sel_img = set(id(im) for im in self._selected_images)
+        kept_img = []
+        removed_img = 0
+        for i, im in enumerate(self.images):
+            if id(im) in sel_img:
+                self._undo_stack.append(("erase_images", page, i - removed_img,
+                                         im, self._erase_group))
+                removed_img += 1
+            else:
+                kept_img.append(im)
+        if removed_img:
+            self.all_images[page] = kept_img
+        if removed or removed_img:
             self._redo_stack.clear()
-            self._set_selected_strokes([])
+            self._set_selected([], [])
             if self.on_change:
                 self.on_change()
             if self.on_user_action:
@@ -2566,7 +3094,10 @@ class PDFCanvas(Gtk.DrawingArea):
             self.queue_draw()
 
     def recolor_selected(self, color, width, opacity):
-        """Apply the given pen attrs to the selected strokes (one undo entry)."""
+        """Apply the given pen attrs to the selected strokes (one undo entry).
+
+        Images are skipped on purpose — there is no pen colour on a
+        photograph (row 118)."""
         if not self._selected_strokes:
             return
         before = [(s, s["color"], s["width"], s.get("opacity", 1.0))
@@ -2588,8 +3119,11 @@ class PDFCanvas(Gtk.DrawingArea):
         """Overlay for the lasso tool: highlight selected strokes, the live loop
         being drawn, and a bounding box around the current selection."""
         ar, ag, ab = self.zoom_accent
-        # retint selected strokes so they read as picked up
-        if self._selected_strokes:
+        # retint selected strokes so they read as picked up (a selected image
+        # gets its glow in _draw_images, under the ink where it lives). NB the
+        # frame below is gated on the SELECTION, not on strokes: an
+        # images-only selection must still get its box and handles.
+        if self.has_lasso_selection():
             ctx.save()
             ctx.translate(self.offset_x, self.offset_y)
             ctx.scale(self.scale, self.scale)
@@ -2633,6 +3167,19 @@ class PDFCanvas(Gtk.DrawingArea):
                     ctx.fill_preserve()
                     ctx.set_source_rgba(ar, ag, ab, 0.9)
                     ctx.stroke()
+                # rotate handle: a knob on a stalk above the box (the usual
+                # place, and the same knob the sheet grew in row 118)
+                hx, hy = (x0 + x1) / 2.0, y0 - pad - self.ROTATE_HANDLE_GAP
+                ctx.set_source_rgba(ar, ag, ab, 0.85)
+                ctx.set_line_width(1.0)
+                ctx.move_to(hx, y0 - pad)
+                ctx.line_to(hx, hy)
+                ctx.stroke()
+                ctx.arc(hx, hy, 5, 0, 2 * math.pi)
+                ctx.set_source_rgba(1, 1, 1, 0.95)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(ar, ag, ab, 0.9)
+                ctx.stroke()
         # the loop being drawn
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
@@ -2701,6 +3248,59 @@ class PDFCanvas(Gtk.DrawingArea):
                 del strokes[i]
                 return
 
+    def _undo_add_op(self, page, op):
+        """Take back one "draw"/"add_images" op (used by undo, and by redo in
+        reverse) — the two kinds are one gesture whenever they share a group."""
+        if op[0] == "draw":
+            self._remove_stroke(self.all_strokes.setdefault(page, []), op[2])
+        else:
+            images = self.all_images.setdefault(page, [])
+            for im in op[2]:
+                for i, cur in enumerate(images):
+                    if cur is im:
+                        del images[i]
+                        break
+
+    def _redo_add_op(self, page, op):
+        if op[0] == "draw":
+            self.all_strokes.setdefault(page, []).append(op[2])
+        else:
+            self.all_images.setdefault(page, []).extend(op[2])
+
+    def _undo_erase_op(self, page, op):
+        """Put back what one "erase"/"erase_images" op removed, at its index."""
+        target = (self.all_images.setdefault(page, [])
+                  if op[0] == "erase_images"
+                  else self.all_strokes.setdefault(page, []))
+        target.insert(min(op[2], len(target)), op[3])
+
+    def _redo_erase_op(self, page, op):
+        target = (self.all_images.setdefault(page, [])
+                  if op[0] == "erase_images"
+                  else self.all_strokes.setdefault(page, []))
+        for i, cur in enumerate(target):
+            if cur is op[3]:
+                del target[i]
+                break
+
+    def _apply_rotate_op(self, op, sign):
+        """Spin a "lasso_rotate" op's objects by ±its angle about its pivot."""
+        _, _, refs, imgs, deg, cx, cy = op
+        rad = math.radians(deg * sign)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+        def spin(x, y):
+            dx, dy = x - cx, y - cy
+            return (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+
+        for s in refs:
+            s["pts"] = [spin(x, y) for x, y in s["pts"]]
+        for im in imgs:
+            x, y, w, h = im["rect"]
+            ncx, ncy = spin(x + w / 2.0, y + h / 2.0)
+            im["rect"] = (ncx - w / 2.0, ncy - h / 2.0, w, h)
+            im["rotate"] = im.get("rotate", 0.0) + deg * sign
+
     def undo_last(self):
         """Undo the last draw or erase operation (an erase drag counts as one)."""
         if not self._undo_stack:
@@ -2709,39 +3309,53 @@ class PDFCanvas(Gtk.DrawingArea):
         popped = [op]
         page = op[1]
         strokes = self.all_strokes.setdefault(page, [])
-        if op[0] == "draw":
-            self._remove_stroke(strokes, op[2])
-            # a text-highlight is many per-line strokes sharing a draw group;
-            # collapse them into one undo, like an erase gesture
+        if op[0] in ("draw", "add_images"):
+            self._undo_add_op(page, op)
+            # a text-highlight is many per-line strokes sharing a draw group,
+            # and a duplicate of a mixed selection is strokes AND images
+            # sharing one; collapse them into a single undo, like an erase
+            # gesture
             if len(op) > 3:
                 group = op[3]
-                while (self._undo_stack and self._undo_stack[-1][0] == "draw"
+                while (self._undo_stack
+                       and self._undo_stack[-1][0] in ("draw", "add_images")
+                       and self._undo_stack[-1][1] == page
                        and len(self._undo_stack[-1]) > 3
                        and self._undo_stack[-1][3] == group):
                     op = self._undo_stack.pop()
                     popped.append(op)
-                    self._remove_stroke(strokes, op[2])
+                    self._undo_add_op(page, op)
         elif op[0] == "lasso_move":
-            _, _, refs, dx, dy = op
+            _, _, refs, imgs, dx, dy = op
             for s in refs:
                 s["pts"] = [(x - dx, y - dy) for x, y in s["pts"]]
+            for im in imgs:
+                x, y, w, h = im["rect"]
+                im["rect"] = (x - dx, y - dy, w, h)
         elif op[0] == "lasso_scale":
-            _, _, refs, f, ax, ay = op
+            _, _, refs, imgs, f, ax, ay = op
             for s in refs:
                 s["pts"] = [(ax + (x - ax) / f, ay + (y - ay) / f)
                             for x, y in s["pts"]]
                 s["width"] /= f
+            for im in imgs:
+                x, y, w, h = im["rect"]
+                im["rect"] = (ax + (x - ax) / f, ay + (y - ay) / f, w / f, h / f)
+        elif op[0] == "lasso_rotate":
+            self._apply_rotate_op(op, -1)
         elif op[0] == "recolor":
             for s, oc, ow, oo in op[2]:
                 s["color"], s["width"], s["opacity"] = oc, ow, oo
         else:
-            strokes.insert(min(op[2], len(strokes)), op[3])
+            self._undo_erase_op(page, op)
             group = op[4]
-            while (self._undo_stack and self._undo_stack[-1][0] == "erase"
+            while (self._undo_stack
+                   and self._undo_stack[-1][0] in ("erase", "erase_images")
+                   and self._undo_stack[-1][1] == page
                    and self._undo_stack[-1][4] == group):
                 op = self._undo_stack.pop()
                 popped.append(op)
-                strokes.insert(min(op[2], len(strokes)), op[3])
+                self._undo_erase_op(page, op)
         self.clear_lasso_selection()
         self._redo_stack.append(popped)
         if page != self.current_page_idx:
@@ -2756,21 +3370,28 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         ops = self._redo_stack.pop()
         page = ops[0][1]
-        strokes = self.all_strokes.setdefault(page, [])
-        if ops[0][0] == "draw":
+        if ops[0][0] in ("draw", "add_images"):
             # re-add in chronological order (reverse of the pop order)
             for op in reversed(ops):
-                strokes.append(op[2])
+                self._redo_add_op(page, op)
         elif ops[0][0] == "lasso_move":
-            _, _, refs, dx, dy = ops[0]
+            _, _, refs, imgs, dx, dy = ops[0]
             for s in refs:
                 s["pts"] = [(x + dx, y + dy) for x, y in s["pts"]]
+            for im in imgs:
+                x, y, w, h = im["rect"]
+                im["rect"] = (x + dx, y + dy, w, h)
         elif ops[0][0] == "lasso_scale":
-            _, _, refs, f, ax, ay = ops[0]
+            _, _, refs, imgs, f, ax, ay = ops[0]
             for s in refs:
                 s["pts"] = [(ax + (x - ax) * f, ay + (y - ay) * f)
                             for x, y in s["pts"]]
                 s["width"] *= f
+            for im in imgs:
+                x, y, w, h = im["rect"]
+                im["rect"] = (ax + (x - ax) * f, ay + (y - ay) * f, w * f, h * f)
+        elif ops[0][0] == "lasso_rotate":
+            self._apply_rotate_op(ops[0], 1)
         elif ops[0][0] == "recolor":
             _, _, before, nc, nw, no = ops[0]
             for s, _oc, _ow, _oo in before:
@@ -2778,10 +3399,7 @@ class PDFCanvas(Gtk.DrawingArea):
         else:
             # re-remove in the gesture's chronological order (reverse of pop order)
             for op in reversed(ops):
-                for i, s in enumerate(strokes):
-                    if s is op[3]:
-                        del strokes[i]
-                        break
+                self._redo_erase_op(page, op)
         self.clear_lasso_selection()
         self._undo_stack.extend(reversed(ops))
         if page != self.current_page_idx:
@@ -6984,21 +7602,6 @@ class TextPageView(Gtk.Overlay):
 
         paste_objects(self.get_clipboard(), add_objects, add_texture)
 
-    @staticmethod
-    def _pasted_extent(objects):
-        """(w, h) of a copied selection — its coords are rebased on its own
-        top-left by copy_selection, so this is what we centre on the paste."""
-        xs, ys = [0.0], [0.0]
-        for obj in objects:
-            if obj.get("type") == "stroke":
-                for px, py in obj.get("pts", []):
-                    xs.append(px)
-                    ys.append(py)
-            else:
-                xs.append(obj.get("dx", 0.0) + obj.get("w", 0.0))
-                ys.append(obj.get("dy", 0.0) + obj.get("h", 0.0))
-        return max(xs), max(ys)
-
     def _add_pasted_objects(self, objects):
         """Rebuild copied strokes/images at the paste point, keeping every
         property (this is what makes an in-app copy lossless, not a snapshot).
@@ -7010,7 +7613,7 @@ class TextPageView(Gtk.Overlay):
         bx, by = self._overlay_to_buffer(*self.paste_point())
         _over, it = self.view.get_iter_at_location(int(bx), int(by))
         r = self.view.get_iter_location(it)
-        ew, eh = self._pasted_extent(objects)
+        ew, eh = pasted_extent(objects)
         # offset from the anchor's own position to where the copy's origin goes
         ox, oy = (bx - r.x) - ew / 2.0, (by - r.y) - eh / 2.0
         strokes, images = [], []
@@ -9537,23 +10140,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # window closes once its last tab is gone.
             self._close_active_tab()
             return True
-        # Copy/paste on a text page. These live HERE, at the window's capture
-        # controller, and not on the sheet: the sheet's own controllers only
-        # see a key when focus is somewhere inside the sheet, so picking a tool
-        # from the toolbar (which focuses the BUTTON) silently killed Ctrl+C and
-        # Ctrl+V. Window capture fires no matter what has focus — the rule in
-        # CLAUDE.md. Each handler still declines the key unless it really wants
-        # it, so typing, and the editor's own copy/paste, are untouched.
-        if ctrl_held and keyval in (Gdk.KEY_c, Gdk.KEY_C) and self._text_mode:
-            tp = self._active_session._text_page
-            if tp is not None and tp.has_lasso_selection():
-                tp.copy_selection()
-                return True
-        if ctrl_held and keyval in (Gdk.KEY_v, Gdk.KEY_V) and self._text_mode:
-            tp = self._active_session._text_page
-            if tp is not None and tp.wants_paste():
-                tp.paste_clipboard_objects()
-                return True
+        # Copy/paste of ink and images, in EITHER mode. These live HERE, at the
+        # window's capture controller, and not on the surface: a surface's own
+        # controllers only see a key when focus is somewhere inside it, so
+        # picking a tool from the toolbar (which focuses the BUTTON) silently
+        # killed Ctrl+C and Ctrl+V. Window capture fires no matter what has
+        # focus — the rule in CLAUDE.md. Each surface still declines the key
+        # unless it really wants it, so typing, and the editors' own
+        # copy/paste, are untouched.
+        surface = self._paste_surface()
+        if (ctrl_held and keyval in (Gdk.KEY_c, Gdk.KEY_C)
+                and surface is not None and surface.has_lasso_selection()):
+            surface.copy_selection()
+            return True
+        if (ctrl_held and keyval in (Gdk.KEY_v, Gdk.KEY_V)
+                and surface is not None and surface.wants_paste()):
+            surface.paste_clipboard_objects()
+            return True
         if ctrl_held and keyval == Gdk.KEY_backslash:
             if not self._text_mode:   # a text page has no notes panel to toggle
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
@@ -9607,6 +10210,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.notes_model.set(page, text)
         self._mark_dirty()
         self._update_canvas_anchors()
+
+    def _paste_surface(self):
+        """The surface Ctrl+C / Ctrl+V talk to in the active tab, or None.
+
+        In text mode that is the sheet; on a PDF it is the canvas — but only
+        while the notes editor doesn't have focus, because there Ctrl+V means
+        "type this into my notes" and the editor's own handler must have it.
+        (The sheet makes the same call itself, per-tool, inside wants_paste:
+        it owns a caret, the PDF canvas does not.)"""
+        if self._text_mode:
+            return self._active_session._text_page
+        if self._notes_view.has_focus():
+            return None
+        return self.canvas
 
     def _global_undo(self):
         """Undo the most recent user action — a stroke, an erase gesture, or a
@@ -11158,6 +11775,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self.notes_model.load(self._active_notes_path)
         self._hide_search()
         self.canvas.load(path)  # fires on_page_changed → _restore_note for page 0
+        self._load_pdf_images(path)
         self._populate_toc()
         self._clear_dirty()
         self._undo_timeline.clear()
@@ -11274,6 +11892,36 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._do_open_file(path)
         self._set_file_title("Scratchpad", path)
         self._clear_dirty()
+
+    def _load_pdf_images(self, pdf_path):
+        """Read the PDF's pasted images back from its sidecar.
+
+        The sidecar is the truth; the layer inside the PDF is only what other
+        viewers see (row 118). Reading the PDF's own image layer back instead
+        would lose every rotation and crop, which the PDF format cannot
+        express."""
+        ink_file = _ink_path_for(pdf_path)
+        if not os.path.exists(ink_file):
+            return
+        try:
+            with open(ink_file, encoding="utf-8") as f:
+                self.canvas.load_images(json.load(f))
+        except (OSError, ValueError) as e:
+            # a broken sidecar must not stop you opening the document
+            logger.warning(f"images: cannot read {ink_file}: {e}")
+
+    def _save_pdf_images(self):
+        """Write the PDF's image sidecar. Lazy like the notes file: only once
+        there is something to keep (or a sidecar already exists, so deleting
+        the last image still persists)."""
+        if self._text_mode or not self._path:
+            return
+        ink_file = _ink_path_for(self._path)
+        if any(self.canvas.all_images.values()) or os.path.exists(ink_file):
+            tmp_file = ink_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(self.canvas.images_to_json(), f)
+            os.replace(tmp_file, ink_file)
 
     def _save_text_ink(self):
         """Write the text-first page's ink sidecar next to its .md. Lazy like
@@ -12043,6 +12691,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                  or os.path.exists(notes_file)):
                 self.notes_model.save(notes_file)
             self._save_text_ink()
+            self._save_pdf_images()
             self._clear_dirty()
             toast = Adw.Toast.new("Saved")
             toast.set_timeout(2)
@@ -12109,8 +12758,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     self._on_new_pdf(None)
                 return True
             if keyval == Gdk.KEY_c:
+                # a WORD selection copies as text; a lasso selection wins Ctrl+C
+                # ahead of this, in the window's capture handler above
                 if self.canvas._selected_words and not self._notes_view.has_focus():
-                    self.canvas.copy_selection()
+                    self.canvas.copy_text_selection()
                     return True
             if keyval == Gdk.KEY_z:
                 self._global_undo()

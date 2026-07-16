@@ -6,6 +6,7 @@ Run with:  /usr/bin/python3 test_pdfeditor.py
 import os
 import sys
 import math
+import base64
 import json
 import tempfile
 import time
@@ -3036,7 +3037,7 @@ class TestLassoSelect(unittest.TestCase):
     def test_delete_selected_and_undo_restores(self):
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         canvas.delete_selected_strokes()
         self.assertEqual(canvas.all_strokes[0], [b])
         self.assertFalse(canvas.has_lasso_selection())
@@ -3047,7 +3048,7 @@ class TestLassoSelect(unittest.TestCase):
     def test_recolor_selected_and_undo_redo(self):
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         canvas.recolor_selected((1.0, 0.0, 0.0), 5.0, 0.5)
         self.assertEqual(a["color"], (1.0, 0.0, 0.0))
         self.assertEqual(a["width"], 5.0)
@@ -3064,7 +3065,7 @@ class TestLassoSelect(unittest.TestCase):
         canvas = self._canvas()
         a, _ = self._two_strokes(canvas)
         orig = list(a["pts"])
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         # grab inside A's bbox, drag by (30, 40)
         canvas._on_drag_begin(_FakeDrag(50, 50), 50, 50)
         self.assertTrue(canvas._lasso_moving)
@@ -3083,7 +3084,7 @@ class TestLassoSelect(unittest.TestCase):
         canvas = self._canvas()
         a = self._stroke([(100, 100), (200, 200)], width=4.0)
         canvas.all_strokes[0] = [a]
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         # bbox (100,100)-(200,200); handle 2 = bottom-right at (205,205)
         # (5 px pad), anchor = top-left corner (100,100)
         self.assertEqual(canvas._lasso_handle_at(205, 205), 2)
@@ -3093,7 +3094,7 @@ class TestLassoSelect(unittest.TestCase):
         # drag the handle to double the diagonal distance from the anchor
         canvas._on_drag_update(_FakeDrag(205, 205), 105, 105)
         canvas._on_drag_end(_FakeDrag(205, 205), 105, 105)
-        f = canvas._undo_stack[-1][3]
+        f = canvas._undo_stack[-1][4]   # ("lasso_scale", page, strokes, images, f, …)
         self.assertAlmostEqual(a["pts"][1][0], 100 + 100 * f, places=6)
         self.assertAlmostEqual(a["width"], 4.0 * f, places=6)
         self.assertGreater(f, 1.5)   # clearly grew
@@ -3108,7 +3109,7 @@ class TestLassoSelect(unittest.TestCase):
         inside the padded move-grab bbox."""
         canvas = self._canvas()
         a, _ = self._two_strokes(canvas)
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         canvas._on_drag_begin(_FakeDrag(65, 65), 65, 65)   # bbox corner + pad
         self.assertTrue(canvas._lasso_scaling)
         self.assertFalse(canvas._lasso_moving)
@@ -3118,7 +3119,7 @@ class TestLassoSelect(unittest.TestCase):
     def test_duplicate_selected_clones_offset_and_single_undo(self):
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
-        canvas._set_selected_strokes([a, b])
+        canvas._set_selected([a, b])
         canvas.duplicate_selected(offset=10.0)
         self.assertEqual(len(canvas.all_strokes[0]), 4)
         clones = canvas._selected_strokes           # the copies are selected
@@ -3135,7 +3136,7 @@ class TestLassoSelect(unittest.TestCase):
     def test_new_loop_clears_prior_selection(self):
         canvas = self._canvas()
         a, b = self._two_strokes(canvas)
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         # press outside the selection starts a fresh loop, dropping the old one
         canvas._on_drag_begin(_FakeDrag(200, 200), 200, 200)
         self.assertTrue(canvas._lassoing)
@@ -3144,7 +3145,7 @@ class TestLassoSelect(unittest.TestCase):
     def test_page_change_clears_selection(self):
         canvas = self._canvas(n_pages=2)
         a, _ = self._two_strokes(canvas)
-        canvas._set_selected_strokes([a])
+        canvas._set_selected([a])
         canvas.go_to_page(1)
         self.assertFalse(canvas.has_lasso_selection())
 
@@ -3153,8 +3154,8 @@ class TestLassoSelect(unittest.TestCase):
         a, _ = self._two_strokes(canvas)
         seen = []
         canvas.on_lasso_selection = seen.append
-        canvas._set_selected_strokes([a])
-        canvas._set_selected_strokes([])
+        canvas._set_selected([a])
+        canvas._set_selected([])
         self.assertEqual(seen, [True, False])
 
     def test_ctrl_shift_alt_drag_lassos_regardless_of_tool(self):
@@ -4684,7 +4685,7 @@ class TestResponsiveHeader(unittest.TestCase):
             win._mode_lasso.set_active(True)
             win.canvas.all_strokes[0] = [
                 {"pts": [(50, 50)], "color": (0, 0, 0), "width": 2.0, "opacity": 1.0}]
-            win.canvas._set_selected_strokes(win.canvas.all_strokes[0])
+            win.canvas._set_selected(win.canvas.all_strokes[0])
             win._mode_pen.set_active(True)   # switching tool drops the selection
             if win.canvas.has_lasso_selection():
                 raise AssertionError("selection survived a tool switch")
@@ -4697,7 +4698,7 @@ class TestResponsiveHeader(unittest.TestCase):
             s = {"pts": [(50, 50), (60, 60)], "color": (0.0, 0.0, 0.0),
                  "width": 2.0, "opacity": 1.0}
             win.canvas.all_strokes[0] = [s]
-            win.canvas._set_selected_strokes([s])
+            win.canvas._set_selected([s])
             win.canvas.pen_color = (1.0, 0.0, 0.0)
             win._recolor_lasso_if_any()
             if s["color"] != (1.0, 0.0, 0.0):
@@ -9624,6 +9625,406 @@ class TestTextPageImages(unittest.TestCase):
 
 
 # ── the shared clipboard layer (ink + images, both modes) ─────────────────────
+
+class TestPDFImages(unittest.TestCase):
+    """Row 118's PDF half: a pasted image on a PDF page is an object like ink —
+    pasted at the pointer, sized by the zoom, lasso-editable, round-tripped
+    through the sidecar. The UX is the CONTRACT the sheet set; these tests are
+    written against it, not against this implementation."""
+
+    def _png(self, w=60, h=40):
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(1, 1, w - 1, h - 1), fill=(0, 0, 1))
+        return page.get_pixmap().tobytes("png")
+
+    def _canvas(self, n_pages=2):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            path = f.name
+        make_pdf(path, n_pages=n_pages)
+        canvas.load(path)
+        self._tmp = path
+        canvas.tool = "lasso"
+        canvas.scale = 1.0
+        canvas.offset_x = canvas.offset_y = 0.0
+        return canvas
+
+    def tearDown(self):
+        if hasattr(self, "_tmp") and os.path.exists(self._tmp):
+            os.unlink(self._tmp)
+
+    def _image(self, canvas, at=(100, 100), w=60, h=40):
+        return canvas.add_image(self._png(w, h), at=at)
+
+    def test_paste_lands_centred_on_the_paste_point(self):
+        canvas = self._canvas()
+        im = self._image(canvas, at=(200, 150))
+        x, y, w, h = im["rect"]
+        self.assertAlmostEqual(x + w / 2, 200, places=6)
+        self.assertAlmostEqual(y + h / 2, 150, places=6)
+
+    def test_paste_point_is_the_mouse_over_the_canvas_else_the_centre(self):
+        """Pasting must work with any tool — with the pen in hand there is no
+        caret, and the mouse is where you are looking."""
+        canvas = self._canvas()
+        canvas._pointer_in = True
+        canvas._mouse_x, canvas._mouse_y = 123.0, 45.0
+        self.assertEqual(canvas.paste_point(), (123.0, 45.0))
+        canvas._pointer_in = False
+        self.assertEqual(canvas.paste_point(),
+                         (canvas.get_width() / 2.0, canvas.get_height() / 2.0))
+
+    def test_paste_size_follows_the_zoom_and_is_a_document_size(self):
+        """Stored size = native pixels / zoom, so an image is capped at its own
+        pixels ON SCREEN: pasting a screenshot while zoomed into a figure gives
+        a small figure, not a wall. The stored number is a document unit."""
+        canvas = self._canvas()
+        canvas.scale = 4.0
+        im = self._image(canvas, w=200, h=100)
+        self.assertAlmostEqual(im["rect"][2], 200 / 4.0, places=6)
+        self.assertAlmostEqual(im["rect"][3], 100 / 4.0, places=6)
+
+    def test_a_huge_paste_is_never_wider_than_the_page(self):
+        canvas = self._canvas()
+        im = self._image(canvas, w=4000, h=2000)
+        _x, _y, w, h = im["rect"]
+        self.assertLessEqual(w, canvas.page_width + 0.01)
+        self.assertLessEqual(h, canvas.page_height + 0.01)
+        self.assertAlmostEqual(w / h, 2.0, places=2)      # aspect kept
+
+    def test_sidecar_round_trip_keeps_bytes_rect_and_rotation(self):
+        canvas = self._canvas()
+        png = self._png()
+        im = canvas.add_image(png, at=(100, 100))
+        im["rotate"] = 15.0
+        canvas.go_to_page(1)
+        canvas.add_image(png, at=(50, 50))
+        data = canvas.images_to_json()
+
+        other = self._canvas()
+        other.load_images(data)
+        self.assertEqual(len(other.all_images[0]), 1)
+        self.assertEqual(len(other.all_images[1]), 1)
+        got = other.all_images[0][0]
+        self.assertEqual(got["data"], png)               # bytes survive
+        self.assertEqual(got["rotate"], 15.0)
+        self.assertIsNotNone(got["texture"])
+        for a, b in zip(got["rect"], im["rect"]):
+            self.assertAlmostEqual(a, b, places=2)
+
+    def test_a_broken_sidecar_record_is_skipped_not_fatal(self):
+        canvas = self._canvas()
+        canvas.load_images({"images": {"0": [{"png": "not base64 at all!!"},
+                                             {"png": base64.b64encode(
+                                                 self._png()).decode()}]}})
+        self.assertEqual(len(canvas.all_images.get(0, [])), 1)
+
+    # ── the lasso ────────────────────────────────────────────────────────────
+
+    def _select_around(self, canvas, im):
+        """Lasso a loop around the image's box and return the selection."""
+        x, y, w, h = im["rect"]
+        canvas._lasso_path = [(x - 5, y - 5), (x + w + 5, y - 5),
+                              (x + w + 5, y + h + 5), (x - 5, y + h + 5)]
+        canvas._finish_lasso()
+
+    def test_lasso_picks_up_an_image(self):
+        canvas = self._canvas()
+        im = self._image(canvas)
+        self._select_around(canvas, im)
+        self.assertEqual(canvas._selected_images, [im])
+        self.assertTrue(canvas.has_lasso_selection())
+
+    def test_lasso_bbox_and_grab_cover_an_images_only_selection(self):
+        """Gating on _selected_strokes (which is empty here) is what made a
+        lone photo unpickable, unmovable and undeletable on the sheet."""
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100))
+        self._select_around(canvas, im)
+        x, y, w, h = im["rect"]
+        self.assertEqual(canvas._selection_bbox(), (x, y, x + w, y + h))
+        self.assertTrue(canvas._point_in_selection(x + w / 2, y + h / 2))
+        # a press inside it grabs it for a move, not a fresh loop
+        canvas._lasso_press(x + w / 2, y + h / 2)
+        self.assertTrue(canvas._lasso_moving)
+        self.assertFalse(canvas._lassoing)
+
+    def test_move_an_image_with_undo_and_redo(self):
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100))
+        self._select_around(canvas, im)
+        x0, y0, w, h = im["rect"]
+        canvas._on_drag_begin(_FakeDrag(x0 + 5, y0 + 5), x0 + 5, y0 + 5)
+        canvas._on_drag_update(_FakeDrag(x0 + 5, y0 + 5), 30, 20)
+        canvas._on_drag_end(_FakeDrag(x0 + 5, y0 + 5), 30, 20)
+        self.assertAlmostEqual(im["rect"][0], x0 + 30, places=6)
+        self.assertAlmostEqual(im["rect"][1], y0 + 20, places=6)
+        canvas.undo_last()
+        self.assertAlmostEqual(im["rect"][0], x0, places=6)
+        canvas.redo_last()
+        self.assertAlmostEqual(im["rect"][0], x0 + 30, places=6)
+        self.assertEqual(im["rect"][2:], (w, h))    # a move never resizes
+
+    def test_resize_an_image_from_a_corner_handle_with_undo(self):
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100), w=100, h=100)
+        self._select_around(canvas, im)
+        x0, y0, x1, y1 = canvas._selection_bbox()
+        # grab the bottom-right handle (5 px pad outside the box)
+        canvas._on_drag_begin(_FakeDrag(x1 + 5, y1 + 5), x1 + 5, y1 + 5)
+        self.assertTrue(canvas._lasso_scaling)
+        canvas._on_drag_update(_FakeDrag(x1 + 5, y1 + 5), 50, 50)
+        canvas._on_drag_end(_FakeDrag(x1 + 5, y1 + 5), 50, 50)
+        f = canvas._lasso_scale_factor
+        self.assertGreater(f, 1.2)
+        self.assertAlmostEqual(im["rect"][2], 100 * f, places=6)
+        canvas.undo_last()
+        self.assertAlmostEqual(im["rect"][2], 100, places=6)
+        canvas.redo_last()
+        self.assertAlmostEqual(im["rect"][2], 100 * f, places=6)
+
+    def test_rotation_is_an_angle_not_baked_pixels(self):
+        """A tilt is stored and applied at render, so repeat rotations never
+        degrade the picture — and the box stays axis-aligned, its centre
+        riding round the pivot."""
+        canvas = self._canvas()
+        im = self._image(canvas, at=(200, 200), w=80, h=40)
+        png_before = im["data"]
+        self._select_around(canvas, im)
+        bx0, by0, bx1, by1 = canvas._selection_bbox()
+        knob = ((bx0 + bx1) / 2.0, by0 - 5.0 - canvas.ROTATE_HANDLE_GAP)
+        self.assertTrue(canvas._lasso_rotate_handle_at(*knob))
+        canvas._on_drag_begin(_FakeDrag(*knob), *knob)
+        self.assertTrue(canvas._lasso_rotating)
+        # drag the knob a quarter turn round the centre, to the box's right
+        cx, cy = canvas._selection_centre()
+        target = (cx + 60, cy)
+        canvas._on_drag_update(_FakeDrag(*knob),
+                               target[0] - knob[0], target[1] - knob[1])
+        canvas._on_drag_end(_FakeDrag(*knob),
+                            target[0] - knob[0], target[1] - knob[1])
+        self.assertAlmostEqual(im["rotate"], 90.0, places=4)
+        self.assertEqual(im["data"], png_before)      # pixels untouched
+        self.assertAlmostEqual(im["rect"][2], 80, places=6)   # box unskewed
+        self.assertAlmostEqual(im["rect"][3], 40, places=6)
+        canvas.undo_last()
+        self.assertAlmostEqual(im["rotate"], 0.0, places=4)
+        canvas.redo_last()
+        self.assertAlmostEqual(im["rotate"], 90.0, places=4)
+
+    def test_delete_and_duplicate_an_image(self):
+        canvas = self._canvas()
+        im = self._image(canvas)
+        self._select_around(canvas, im)
+        canvas.duplicate_selected(offset=10.0)
+        self.assertEqual(len(canvas.images), 2)
+        clone = canvas._selected_images[0]
+        self.assertIsNot(clone, im)
+        self.assertEqual(clone["data"], im["data"])
+        canvas.undo_last()                       # one entry for the duplicate
+        self.assertEqual(len(canvas.images), 1)
+
+        self._select_around(canvas, im)
+        canvas.delete_selected_strokes()         # lasso + Del removes images
+        self.assertEqual(canvas.images, [])
+        canvas.undo_last()
+        self.assertEqual(len(canvas.images), 1)
+
+    def test_a_mixed_gesture_is_one_undo_entry(self):
+        """Duplicating ink and a photo together undoes as ONE step, not two."""
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100))
+        stroke = {"pts": [(100, 100), (140, 130)], "color": (0, 0, 1),
+                  "width": 2.0, "opacity": 1.0}
+        canvas.all_strokes[0] = [stroke]
+        canvas._set_selected([stroke], [im])
+        canvas.duplicate_selected(offset=10.0)
+        self.assertEqual((len(canvas.images), len(canvas.strokes)), (2, 2))
+        canvas.undo_last()
+        self.assertEqual((len(canvas.images), len(canvas.strokes)), (1, 1))
+        canvas.redo_last()
+        self.assertEqual((len(canvas.images), len(canvas.strokes)), (2, 2))
+
+    def test_mixed_delete_is_one_undo_entry(self):
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100))
+        stroke = {"pts": [(100, 100), (140, 130)], "color": (0, 0, 1),
+                  "width": 2.0, "opacity": 1.0}
+        canvas.all_strokes[0] = [stroke]
+        canvas._set_selected([stroke], [im])
+        canvas.delete_selected_strokes()
+        self.assertEqual((canvas.images, canvas.strokes), ([], []))
+        canvas.undo_last()
+        self.assertEqual((len(canvas.images), len(canvas.strokes)), (1, 1))
+
+    def test_the_eraser_ignores_images(self):
+        """Ink erases under the eraser; a photo does not — lasso + Del is how
+        you remove one (row 118)."""
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100))
+        canvas.all_strokes[0] = [{"pts": [(100, 100)], "color": (0, 0, 1),
+                                  "width": 2.0, "opacity": 1.0}]
+        canvas._erase_at(100, 100)
+        self.assertEqual(canvas.strokes, [])
+        self.assertEqual(canvas.images, [im])
+
+    def test_recolor_skips_images(self):
+        canvas = self._canvas()
+        im = self._image(canvas)
+        self._select_around(canvas, im)
+        canvas.recolor_selected((1, 0, 0), 5.0, 1.0)   # must not explode
+        self.assertNotIn("color", im)
+
+    # ── the clipboard ────────────────────────────────────────────────────────
+
+    def test_copy_publishes_objects_and_paste_rebuilds_them(self):
+        """In-app copy/paste is lossless: ink comes back as editable INK and an
+        image as an image, rebased onto the paste point."""
+        canvas = self._canvas()
+        im = self._image(canvas, at=(100, 100), w=60, h=40)
+        stroke = {"pts": [(100, 100), (150, 120)], "color": (0.1, 0.2, 0.9),
+                  "width": 3.0, "opacity": 0.5}
+        canvas.all_strokes[0] = [stroke]
+        canvas._set_selected([stroke], [im])
+        canvas.copy_selection()
+
+        canvas._pointer_in = True
+        canvas._mouse_x, canvas._mouse_y = 300.0, 300.0
+        got = {}
+        sidemark.paste_objects(canvas.get_clipboard(),
+                               lambda o: got.setdefault("objects", o),
+                               lambda t: got.setdefault("texture", t))
+        loop = GLib.MainLoop()
+        GLib.timeout_add(10, lambda: loop.quit() if got else True)
+        GLib.timeout_add_seconds(5, loop.quit)
+        loop.run()
+        self.assertIn("objects", got)
+        canvas._add_pasted_objects(got["objects"])
+
+        self.assertEqual(len(canvas.images), 2)
+        self.assertEqual(len(canvas.strokes), 2)
+        pasted_img = canvas.images[-1]
+        pasted_stroke = canvas.strokes[-1]
+        self.assertEqual(pasted_img["data"], im["data"])     # bytes, not pixels
+        self.assertEqual(pasted_stroke["color"], (0.1, 0.2, 0.9))
+        self.assertAlmostEqual(pasted_stroke["width"], 3.0, places=6)
+        self.assertAlmostEqual(pasted_stroke["opacity"], 0.5, places=6)
+        # the copy is centred on the paste point, keeping its internal layout
+        xs = [p[0] for p in pasted_stroke["pts"]] + [pasted_img["rect"][0],
+                                                     pasted_img["rect"][0]
+                                                     + pasted_img["rect"][2]]
+        ys = [p[1] for p in pasted_stroke["pts"]] + [pasted_img["rect"][1],
+                                                     pasted_img["rect"][1]
+                                                     + pasted_img["rect"][3]]
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2, 300.0, places=4)
+        self.assertAlmostEqual((min(ys) + max(ys)) / 2, 300.0, places=4)
+
+    def test_copy_offers_a_picture_to_other_apps(self):
+        canvas = self._canvas()
+        self._select_around(canvas, self._image(canvas))
+        canvas.copy_selection()
+        wire = (canvas.get_clipboard().get_formats()
+                .union_serialize_mime_types())
+        self.assertTrue(wire.contain_mime_type("image/png"),
+                        "other apps would see no image")
+
+    def test_paste_of_a_lone_image_selects_it(self):
+        canvas = self._canvas()
+        im = self._image(canvas)
+        self.assertEqual(canvas._selected_images, [im])
+
+
+class TestPDFImageSidecarInWindow(unittest.TestCase):
+    """The window-level round trip. The canvas-level test above passes even
+    when the window's save gate drops the file — that is exactly how the text
+    side lost image-only pages (row 118), so drive the window's own methods."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.pdfimages")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                body(win)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    def _png(self, w=40, h=30):
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(1, 1, w - 1, h - 1), fill=(1, 0, 0))
+        return page.get_pixmap().tobytes("png")
+
+    def test_save_and_reopen_keeps_a_pasted_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf, n_pages=2)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win.canvas.go_to_page(1)     # not page 0: the page must survive
+                png = self._png()
+                im = win.canvas.add_image(png, at=(120, 90))
+                im["rotate"] = 30.0
+                rect = im["rect"]
+                win._save_pdf_images()
+                ink = sidemark._ink_path_for(pdf)
+                self.assertTrue(os.path.exists(ink),
+                                "a PDF with a pasted image wrote no sidecar")
+
+                # reopening reads the sidecar, not the PDF's own image layer —
+                # the layer cannot carry a free rotation
+                win.canvas.all_images = {}
+                win._load_pdf_images(pdf)
+                back = win.canvas.all_images[1][0]
+                self.assertEqual(back["data"], png)
+                self.assertEqual(back["rotate"], 30.0)
+                self.assertEqual(len(win.canvas.all_images.get(0, [])), 0)
+                for a, b in zip(back["rect"], rect):
+                    self.assertAlmostEqual(a, b, places=2)
+
+            self._run_in_window(body)
+
+    def test_a_pdf_without_images_writes_no_sidecar(self):
+        """Lazy like the notes file: saving a plain PDF must not litter the
+        directory with an empty sidecar."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._do_open_file(pdf)
+                win._save_pdf_images()
+                self.assertFalse(os.path.exists(sidemark._ink_path_for(pdf)))
+
+            self._run_in_window(body)
+
+    def test_paste_surface_yields_to_the_notes_editor(self):
+        """Ctrl+V in the notes panel types into the notes; on the page it
+        pastes onto the page. One gate, asked per keystroke."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+
+            def body(win):
+                win._do_open_file(pdf)
+                self.assertIs(win._paste_surface(), win.canvas)
+                with mock.patch.object(type(win._notes_view), "has_focus",
+                                       lambda _s: True):
+                    self.assertIsNone(win._paste_surface())
+
+            self._run_in_window(body)
+
 
 class TestClipboardLayer(unittest.TestCase):
     """Copy must carry our objects AND a picture in one entry: Sidemark pastes
