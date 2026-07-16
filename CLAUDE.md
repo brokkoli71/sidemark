@@ -9,7 +9,7 @@
 
 ## What this is
 
-Sidemark is a **single-file GTK4/libadwaita Python app** (`sidemark.py`, ~9.6k
+Sidemark is a **single-file GTK4/libadwaita Python app** (`sidemark.py`, ~12.6k
 lines): a PDF annotator with a live Markdown notes panel, built for lecture
 notes and presenting. One window, two document modes (PDF + text — see below).
 There is no other source module on this branch. Dependencies:
@@ -50,6 +50,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   tool buttons drive their `_pmode_*` popover twins automatically) — when
   mode behavior changes, extend the table instead of adding per-mode `if`s.
   The table takes further modes without reshaping (row 107).
+- **Pasted images** — an image is an OBJECT, modelled and behaving like ink:
+  bytes + rect + `rotate` (+ a crop rect one day, row 119), anchored the same
+  way its surface anchors ink, editable forever, never a flattened stamp. The
+  clipboard is one shared layer (`SIDEMARK_MIME`, `clipboard_content_for`,
+  `paste_objects`). Text pages ship (row 118); the PDF side does not exist yet
+  — **read "Image UX is one contract" below before building it.**
 - **`[[wiki links]]` (the linking workflow)** — this is the feature the project
   was designed around and it has shipped (ideas.csv row 99). In notes,
   `[[target]]` is a clickable link (Ctrl+click follows, hover shows a hand).
@@ -129,18 +135,73 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     controllers (`_on_global_key`, `_on_undo_key`, the sheet's own). `_on_key`
     is **bubble** and loses to whatever has focus — put a new app-level
     shortcut in capture unless the editor should win (Ctrl+C, Delete, arrows).
+  - **Capture on a CHILD only fires while focus is inside that child.**
+    Ctrl+C/Ctrl+V on `TextPageView` looked right and died the moment you
+    picked a tool from the toolbar — that focuses the *button*, so the sheet
+    was off the key path. Clues: a sibling shortcut in the SAME handler still
+    worked (Ctrl+D), i.e. the handler was fine, focus was not. App-level keys
+    belong on the WINDOW's capture controller, which fires whatever has focus;
+    let it ask the surface (`wants_paste()`, `has_lasso_selection()`) instead
+    of the surface owning the key.
 - **A text page has no `_path`.** A `.md` opened without a PDF lives in
   `_notes_path`; `_path` is the PDF. Code reading `_path` alone silently
   no-ops in text mode (this is what broke Ctrl+R) — use
   `self._path or self._notes_path`. If a feature really is PDF-only, say so
   loudly (`_on_export`, `_ocr_current`) rather than returning in silence.
 - **One table, not two**: `chord_tool` (chords), `zoom_factor_for_scroll`
-  (scroll→zoom rate), `erase_radius` (what counts as touching ink) are shared
-  by both canvases on purpose. Duplicating a *decision* is how the PDF and
-  text sides drift; duplicating *mechanics* is fine — they have genuinely
-  different substrates (a scale-transform canvas vs a reflowing ScrolledWindow).
+  (scroll→zoom rate), `erase_radius` (what counts as touching ink),
+  `clipboard_content_for`/`paste_objects` (the clipboard), `draw_image` (how a
+  pasted image looks) are shared by both canvases on purpose. Duplicating a
+  *decision* is how the PDF and text sides drift; duplicating *mechanics* is
+  fine — they have genuinely different substrates (a scale-transform canvas vs
+  a reflowing ScrolledWindow).
+- **Geometry you STORE must not go through the int-truncating coord helpers.**
+  `window_to_buffer_coords`/`buffer_to_window_coords` only take ints, so a
+  per-point conversion rounds every point on the way in *and* out. Invisible
+  for a move (all points shift alike); it made a *rotated* stroke go lumpy, and
+  compounded on every re-anchor. `TextPageView._overlay_to_buffer_f` /
+  `_buffer_to_overlay` take the origin once and add the float delta — use them
+  anywhere the result is persisted. Plain `_overlay_to_buffer` (int) is for
+  hit-testing only. Symptom to recognise: shapes degrade a little per edit.
 - The codebase favors long, explanatory comments about *why* (and records
   hard-won platform quirks inline) — match that style.
+- **Image UX is one contract, not two implementations.** Text pages define it
+  (row 118); the PDF side must MATCH, not re-decide. Reuse the shared pieces
+  (`clipboard_content_for` / `paste_objects` / `SIDEMARK_MIME`, `draw_image`,
+  `_texture_from_png` / `_png_from_texture`) and copy the *decisions* below.
+  The row 116 audit's lesson applies exactly: every behavior that reused a
+  shared helper held parity; the one place that reimplemented (the eraser) was
+  the one with a live bug. If PDF genuinely cannot do one of these, say so
+  loudly in `ideas.csv` — do not let it drift silently.
+  - **Ctrl+V pastes at the POINTER** when it is over the surface, else the
+    centre of the view — never at the caret. Pasting must work with any tool;
+    with a pen or lasso in hand there is no useful caret (`paste_point()`).
+  - **Paste size follows the ZOOM**: capped at the image's own pixels on
+    screen (stored size = native / zoom) and never wider than the page. A
+    plain fit-to-page pastes a screenshot as a wall when you are zoomed in.
+  - **Sizes are DOCUMENT units** — store at the base scale, never the zoom you
+    happened to paste at (the pen-width lesson, row 116).
+  - **Ink draws ON TOP of images; text is not covered by them.** On a text page
+    that means images live on the view's `BELOW_TEXT` layer, not the ink
+    overlay. Get this wrong and it also breaks the PDF export, which
+    rasterises the view (one cause, two symptoms).
+  - **Ctrl+C on a lasso selection wins over text copy** (text selection keeps
+    it otherwise) and publishes BOTH: our objects (private mime) and a
+    `COPY_RENDER_SCALE`× supersampled PNG. In-app paste is lossless — ink
+    comes back as editable INK, an image as an image — every other app gets a
+    picture. This is a hard user requirement, not a nicety.
+  - **Lasso verbs**: select / move / resize / rotate / `Ctrl+D` duplicate /
+    `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
+    `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
+    is never baked into the pixels, so repeat rotations never degrade.
+  - **One undo entry per gesture**, even when it moved ink and images together
+    (the `("group", [ops])` op).
+  - **The eraser ignores images** (lasso + `Del` removes them); **recolour
+    skips images** — there is no pen colour on a photograph.
+  - Gate on `has_lasso_selection()`, never on `self._selected` — that list is
+    STROKES, and reading it as "the selection" is what made an images-only
+    selection unpickable, unmovable and undeletable. Same for `_selection_bbox()`:
+    one box, used by the frame AND the hit-tests, or they drift apart.
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,
   auto-deleted on clean exit, kept on errors.
 
@@ -209,8 +270,33 @@ the portable keyboard zoom chord (the only one reaching zoom under the caret),
 and Escape stepping back out of a zoom-to-region (both surfaces keep a zoom
 stack).
 
-**Next up: row 118** — paste images from the clipboard, in both modes. The
-parked `deck` branch has a reference implementation worth reading first.
+**Row 118 (pasted images) is HALF done — text pages ship, PDF pages do not.**
+A text page can paste (Ctrl+V, any tool, at the pointer), and lasso-select /
+move / resize / rotate / duplicate / delete / copy images; they sit under the
+text, ride their paragraph on a `GtkTextMark`, round-trip through the
+`-ink.json` sidecar as base64, and reach the PDF export. Ctrl+C publishes the
+real objects plus a supersampled PNG, so an in-app paste is lossless and other
+apps get a picture. Along the way it fixed a latent bug in ALL ink editing: the
+coord helpers truncated stored geometry to whole pixels (see the gotcha above).
+
+**Next up: the PDF half of row 118.** Read that row FIRST — it carries the
+validated design and the measurements, and its traps all silently corrupt
+documents. In short: the sidecar is the source of truth and the PDF optional
+content group (OCG) layer is a **regenerated render target**. Three
+ingredients, each proven necessary by experiment: `/OC` for per-image
+ownership (the only marker that survives a round-trip — it is what tells our
+images from the document's own); a unique PNG `tEXt` chunk before insert, or
+PyMuPDF DEDUPLICATES byte-identical images onto one xref and ownership dies on
+the first reopen (real workflow: copy a figure out of the PDF, paste it back);
+and strip-and-regenerate over `page.clean_contents()`, never `delete_image()`,
+which only blanks the xref and LEAKS a ghost placement per save. Re-place
+unchanged images with `insert_image(xref=...)` (no re-encode; ~0.45 s/save at
+100 heavy images). Do NOT trust `get_image_info(xrefs=True)` or
+`get_image_rects()` — they resolve placements by visual match and lie about
+xrefs; the content stream + Resources dict are ground truth. **And match the
+UX contract above** — the PDF side re-deciding any of it is the failure mode
+this whole feature is shaped to avoid. Row **119** (crop) is deliberately
+deferred and should land once, for both modes.
 
 **Open follow-ups:** text-page items in rows 92–94 (text-snapping highlighter,
 pagination/print view, margin inks that don't reflow) and row 100's link

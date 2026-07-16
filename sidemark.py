@@ -16,6 +16,9 @@ import json
 import shutil
 import time
 import datetime
+import base64
+import struct
+import zlib
 
 RECENT_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -282,6 +285,117 @@ def chord_tool(ctrl, shift, alt, mode, ink_active=True):
     if shift:
         return "zoom" if (mode == "pdf" or ink_active) else None
     return None
+
+
+# ── the clipboard (ONE layer for both modes, ink and images alike) ──────────
+#
+# Copy publishes the SAME selection twice, in one clipboard entry:
+#
+#   * SIDEMARK_MIME — our own objects verbatim (strokes keep their points,
+#     colour and width; images keep their bytes, crop and rotation). This is
+#     what a Sidemark->Sidemark paste reads, so copying ink gives back editable
+#     INK, not a picture of it, and a pasted image stays an image object.
+#   * image/png (& friends) — a flat picture, for every other application.
+#
+# The consumer picks: paste_objects() asks for our mime FIRST and only falls
+# back to a texture, so fidelity is automatic and there is no "paste as…" mode
+# to choose. Both modes share this because it is a DECISION, not mechanics.
+
+SIDEMARK_MIME = "application/x-sidemark-objects+json"
+
+
+def clipboard_content_for(objects, texture):
+    """A clipboard entry carrying `objects` (our JSON) AND `texture` (a picture).
+
+    GOTCHA — the reason this is a function and not two inline lines: passing the
+    texture straight to Gdk.ContentProvider.new_for_value() boxes it as its
+    CONCRETE class (GdkMemoryTexture), which has no registered serializers, so
+    the clipboard silently advertises NOTHING to other apps. It still works
+    perfectly inside Sidemark (GTK short-circuits to the in-process value), so
+    both headless tests and clicking around pass while pasting into GIMP is
+    broken. Boxing the BASE type is what registers image/png & co.
+    """
+    providers = [Gdk.ContentProvider.new_for_bytes(
+        SIDEMARK_MIME, GLib.Bytes.new(json.dumps(objects).encode("utf-8")))]
+    if texture is not None:
+        value = GObject.Value(Gdk.Texture, texture)   # NOT the concrete class
+        providers.append(Gdk.ContentProvider.new_for_value(value))
+    return Gdk.ContentProvider.new_union(providers)
+
+
+def paste_objects(clipboard, on_objects, on_texture):
+    """Read a paste: our own objects if this came from Sidemark, else a picture.
+
+    Calls exactly one of on_objects(list) / on_texture(Gdk.Texture); neither if
+    the clipboard holds nothing we can use."""
+    def got_texture(clip, res):
+        try:
+            texture = clip.read_texture_finish(res)
+        except GLib.Error:
+            return
+        if texture is not None:
+            on_texture(texture)
+
+    def got_objects(clip, res):
+        try:
+            stream, _mime = clip.read_finish(res)
+            raw = stream.read_bytes(_CLIP_MAX_BYTES, None).get_data()
+            objects = json.loads(raw.decode("utf-8"))
+        except (GLib.Error, ValueError, UnicodeDecodeError):
+            # not ours (or malformed) — fall back to whatever picture is there
+            clipboard.read_texture_async(None, got_texture)
+            return
+        if isinstance(objects, list) and objects:
+            on_objects(objects)
+        else:
+            clipboard.read_texture_async(None, got_texture)
+
+    if clipboard.get_formats().contain_mime_type(SIDEMARK_MIME):
+        clipboard.read_async([SIDEMARK_MIME], GLib.PRIORITY_DEFAULT, None,
+                             got_objects)
+    else:
+        clipboard.read_texture_async(None, got_texture)
+
+
+_CLIP_MAX_BYTES = 256 * 1024 * 1024   # a paste this big is a bug, not a note
+
+
+def _texture_from_png(data):
+    """Gdk.Texture from PNG bytes, or None if they aren't a decodable image."""
+    try:
+        return Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+    except GLib.Error as e:
+        logger.warning(f"image: cannot decode {len(data)} byte(s): {e}")
+        return None
+
+
+def _png_from_texture(texture):
+    """PNG bytes for a texture — the storage form for both modes' sidecars."""
+    return bytes(texture.save_to_png_bytes().get_data())
+
+
+def draw_image(ctx, texture, x, y, w, h, rotate=0.0):
+    """Paint `texture` into the (x, y, w, h) box, rotated about its centre.
+
+    Shared by the sheet and the PDF canvas: how a pasted image LOOKS is one
+    decision, even though the two store it differently (row 118)."""
+    if w <= 0 or h <= 0:
+        return
+    ctx.save()
+    if rotate:
+        ctx.translate(x + w / 2.0, y + h / 2.0)
+        ctx.rotate(math.radians(rotate))
+        ctx.translate(-w / 2.0, -h / 2.0)
+    else:
+        ctx.translate(x, y)
+    ctx.rectangle(0, 0, w, h)
+    ctx.clip()
+    snap = Gtk.Snapshot()
+    texture.snapshot(snap, w, h)
+    node = snap.to_node()
+    if node is not None:
+        node.draw(ctx)
+    ctx.restore()
 
 
 class PDFCanvas(Gtk.DrawingArea):
@@ -4189,6 +4303,14 @@ class MarkdownNotesView(GtkSource.View):
     Cursor line: raw markdown visible for editing.
     """
 
+    def do_snapshot_layer(self, layer, snapshot):
+        """GTK's hook for painting beneath/above the text. BELOW_TEXT renders
+        after the widget background but before the glyphs, in BUFFER
+        coordinates — which is exactly what a pasted image wants: it scrolls
+        and reflows with the buffer, and text drawn over it stays legible."""
+        if layer == Gtk.TextViewLayer.BELOW_TEXT and self.on_snapshot_below:
+            self.on_snapshot_below(snapshot)
+
     # Inline-Markdown / script regexes (module-level; shared with callout markup)
     _INLINE = _MD_INLINE_RE
     _SCRIPT_RE = _MD_SCRIPT_RE
@@ -4200,6 +4322,11 @@ class MarkdownNotesView(GtkSource.View):
     def __init__(self, scheme_id="Adwaita"):
         buf = GtkSource.Buffer()
         super().__init__(buffer=buf)
+        # Painted UNDER the text, in buffer coordinates (see do_snapshot_layer).
+        # The text page hangs its pasted images here so writing over a picture
+        # keeps the words readable — and so the PDF export, which rasterises
+        # this very widget, picks the images up for free.
+        self.on_snapshot_below = None
         self.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.set_left_margin(10)
         self.set_right_margin(10)
@@ -5063,6 +5190,15 @@ class TextPageView(Gtk.Overlay):
         self.font_px = font_px    # effective (base × zoom); strokes scale with it
         # {"mark", "pts": [(dx, dy), ...], "color", "width", "opacity", "font_px"}
         self.strokes = []
+        # Pasted images. Anchored exactly like a stroke — a GtkTextMark plus an
+        # offset in buffer px — so an image rides its paragraph when text above
+        # it is edited, instead of floating at a dead absolute spot. The .md
+        # stays pure Markdown; images round-trip through the -ink.json sidecar
+        # beside the strokes (the user's call: images behave like drawings, not
+        # like a ![](path) embed).
+        # {"mark", "dx", "dy", "w", "h", "font_px", "data": png bytes,
+        #  "texture", "rotate"}
+        self.images = []
         self.current_stroke = []  # overlay coords while a stroke is in flight
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
         # fits the paper to the window — both PDF-canvas parity (#106 item 5).
@@ -5095,6 +5231,12 @@ class TextPageView(Gtk.Overlay):
         # — fresh GtkTextMark at the new spot, offsets recomputed — so they
         # keep riding with the paragraph they now sit on.
         self._selected = []
+        # Selected images ride alongside the strokes rather than inside
+        # self._selected: they are a different shape (a rect + texture, not
+        # points + colour), and every verb below either treats them the same
+        # (move/resize/delete/duplicate/copy) or deliberately skips them
+        # (recolour — there is no pen colour on a photograph).
+        self._selected_images = []
         self._lassoing = False
         self._zoom_stack = []          # [(zoom, scroll_h, scroll_v), ...] for Escape
         self._lasso_path = []          # overlay coords of the loop in progress
@@ -5105,11 +5247,17 @@ class TextPageView(Gtk.Overlay):
         self._lasso_scale_anchor = (0.0, 0.0)   # overlay-space fixed corner
         self._lasso_scale_start = (0.0, 0.0)
         self._lasso_scale_factor = 1.0
+        self._lasso_rotating = False
+        self._lasso_rotate_deg = 0.0   # live angle while the knob is dragged
+        self._lasso_rotate_from = 0.0  # pointer angle where the drag started
+        self._lasso_rotate_centre = (0.0, 0.0)   # pivot of the rotation drag
         self._lasso_orig = []          # (stroke, overlay pts) at drag begin
+        self._lasso_img_orig = []      # (image, overlay rect) at drag begin
 
         # the sheet always reads like paper: white page, dark text, light scheme
         self.view = MarkdownNotesView("Adwaita")
         self.view.add_css_class("text-page")
+        self.view.on_snapshot_below = self._snapshot_images   # images under text
         self.view.set_size_request(self.page_width, -1)
         self.view.set_hexpand(False)
         self.view.set_vexpand(True)
@@ -5252,8 +5400,11 @@ class TextPageView(Gtk.Overlay):
         self._thumb_origin = (0.0, 0.0)
         self._thumb_start = (0.0, 0.0)
         self._mouse_xy = (0.0, 0.0)
+        self._pointer_in = False   # is the pointer over the sheet? (paste target)
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_sheet_motion)
+        motion.connect("enter", self._on_sheet_enter)
+        motion.connect("leave", self._on_sheet_leave)
         self.add_controller(motion)
         thumb = Gtk.EventControllerLegacy()
         thumb.connect("event", self._on_thumb_event)
@@ -5308,6 +5459,12 @@ class TextPageView(Gtk.Overlay):
         key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         key.connect("key-pressed", self._on_lasso_key)
         self.add_controller(key)
+
+        # NB: Ctrl+V and Ctrl+C are NOT handled here. They live on the WINDOW's
+        # capture controller (_on_global_key), because a controller on the
+        # sheet only ever sees a key while focus is inside the sheet — and
+        # picking a tool from the toolbar puts focus on the button. The sheet
+        # exposes wants_paste()/copy_selection() for the window to call.
 
         # the ink must repaint whenever the sheet scrolls or reflows under it
         self.scroll.get_vadjustment().connect(
@@ -5652,8 +5809,16 @@ class TextPageView(Gtk.Overlay):
         self.set_cursor(Gdk.Cursor.new_from_name("grab")
                         if self.tool == "pan" else None)
 
+    def _on_sheet_enter(self, _ctrl, x, y):
+        self._pointer_in = True
+        self._mouse_xy = (x, y)
+
+    def _on_sheet_leave(self, _ctrl):
+        self._pointer_in = False
+
     def _on_sheet_motion(self, _ctrl, x, y):
         self._mouse_xy = (x, y)
+        self._pointer_in = True
         if self._thumb_panning:
             ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
             ha.set_value(self._thumb_start[0] - (x - self._thumb_origin[0]))
@@ -5770,16 +5935,40 @@ class TextPageView(Gtk.Overlay):
     # are stored in buffer space relative to their anchor mark.
 
     def _overlay_to_buffer(self, x, y):
+        """Overlay → buffer coords, rounded to whole pixels. Fine for
+        hit-testing; use _overlay_to_buffer_f to STORE geometry."""
+        bx, by = self._overlay_to_buffer_f(x, y)
+        return int(bx), int(by)
+
+    def _overlay_to_buffer_f(self, x, y):
+        """Overlay → buffer coords WITHOUT losing the fraction.
+
+        window_to_buffer_coords only takes ints, so calling it per point
+        truncates each one to a whole pixel independently. That is invisible
+        for a move (every point shifts alike) but wrecks a ROTATION: each
+        point lands on a different fraction and truncates its own way, so the
+        stroke comes back lumpy — and it compounds on every re-anchor. The
+        conversion is a pure translation (the scroll offset), so take the
+        origin once and add the float delta ourselves."""
         res = self.ink.translate_coordinates(self.view, x, y)
         vx, vy = res if res else (x, y)
-        return self.view.window_to_buffer_coords(
-            Gtk.TextWindowType.WIDGET, int(vx), int(vy))
+        ox, oy = self.view.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, 0, 0)
+        return ox + vx, oy + vy
 
     def _buffer_to_overlay(self, bx, by):
-        vx, vy = self.view.buffer_to_window_coords(
-            Gtk.TextWindowType.WIDGET, int(bx), int(by))
-        res = self.view.translate_coordinates(self.ink, vx, vy)
-        return res if res else (vx, vy)
+        """Buffer → overlay coords, keeping the fraction.
+
+        Same trap as _overlay_to_buffer_f in reverse: buffer_to_window_coords
+        only takes ints, so converting per point rounds every point on the way
+        OUT. Since _stroke_overlay_pts reads through here and _reanchor_selected
+        writes back what it reads, a rotation used to lose a fraction of a pixel
+        per point on EVERY drag — the stroke slowly went lumpy. Take the origin
+        once, add the float delta."""
+        ox, oy = self.view.buffer_to_window_coords(
+            Gtk.TextWindowType.WIDGET, 0, 0)
+        res = self.view.translate_coordinates(self.ink, ox + bx, oy + by)
+        return res if res else (ox + bx, oy + by)
 
     def _stroke_overlay_pts(self, st):
         """Current on-screen positions of a stroke, following its mark and
@@ -5790,6 +5979,127 @@ class TextPageView(Gtk.Overlay):
         f = self.font_px / max(st["font_px"], 1)
         return [self._buffer_to_overlay(r.x + dx * f, r.y + dy * f)
                 for dx, dy in st["pts"]]
+
+    def _image_buffer_rect(self, im):
+        """Where an image sits in BUFFER coordinates: follows its mark and
+        scales with the notes font exactly like a stroke, so ink and images
+        stay glued to the same paragraph."""
+        buf = self.view.get_buffer()
+        it = buf.get_iter_at_mark(im["mark"])
+        r = self.view.get_iter_location(it)
+        f = self.font_px / max(im["font_px"], 1)
+        return (r.x + im["dx"] * f, r.y + im["dy"] * f,
+                im["w"] * f, im["h"] * f)
+
+    def _image_overlay_rect(self, im):
+        """Same box, in the ink overlay's space — for hit-testing against
+        pointer positions (the lasso and paste-at-mouse work in overlay
+        coords)."""
+        bx, by, w, h = self._image_buffer_rect(im)
+        x, y = self._buffer_to_overlay(bx, by)
+        return x, y, w, h
+
+    def _snapshot_images(self, snapshot):
+        """Paint the images under the text (the view's BELOW_TEXT layer), plus
+        a glow on the selected ones."""
+        drag = self._lasso_drag_rects()
+        for im in self.images:
+            if id(im) in drag:
+                # mid-drag the live rect is in OVERLAY space; this layer paints
+                # in buffer space, so convert back
+                ox, oy, w, h = drag[id(im)]
+                x, y = self._overlay_to_buffer(ox, oy)
+            else:
+                x, y, w, h = self._image_buffer_rect(im)
+            if w <= 0 or h <= 0:
+                continue
+            if im in self._selected_images:
+                ar, ag, ab = self.accent()
+                pad = 3.0
+                snapshot.append_color(
+                    Gdk.RGBA(red=ar, green=ag, blue=ab, alpha=0.55),
+                    Graphene.Rect().init(x - pad, y - pad,
+                                         w + 2 * pad, h + 2 * pad))
+            snapshot.save()
+            rotate = self._image_draw_rotate(im)
+            if rotate:
+                snapshot.translate(Graphene.Point().init(x + w / 2, y + h / 2))
+                snapshot.rotate(rotate)
+                snapshot.translate(Graphene.Point().init(-w / 2, -h / 2))
+            else:
+                snapshot.translate(Graphene.Point().init(x, y))
+            snapshot.append_texture(im["texture"],
+                                    Graphene.Rect().init(0, 0, w, h))
+            snapshot.restore()
+
+    def paste_point(self):
+        """Where a paste lands, in OVERLAY coords: under the pointer when it is
+        over the sheet, else the middle of what you can see.
+
+        Deliberately not the caret. Pasting must work with any tool — with the
+        pen or the lasso in hand there IS no useful caret, and the mouse is
+        where you are looking."""
+        if self._pointer_in:
+            return self._mouse_xy
+        return (self.get_width() / 2.0, self.get_height() / 2.0)
+
+    def add_image(self, data, width=None, height=None, at=None):
+        """Paste an image onto the sheet, centred on `at` (overlay coords;
+        defaults to paste_point()) and anchored to the paragraph there.
+
+        `data` is PNG bytes — the sidecar's storage form, so what we hold in
+        memory is what round-trips. Oversized pastes (a screenshot is usually
+        wider than the paper) are fitted to the sheet, keeping the aspect."""
+        texture = _texture_from_png(data)
+        if texture is None:
+            return None
+        iw = width or texture.get_width()
+        ih = height or texture.get_height()
+        # Size it against the ZOOM you are working at, not just the paper.
+        # Stored sizes are document units (displayed = w × zoom, like the pen
+        # width), so a plain fit-to-paper pasted a screenshot at full column
+        # width no matter how far in you were — enormous. Dividing by the zoom
+        # caps it at its OWN pixels on screen: paste while zoomed in and you get
+        # a small figure in the document, not a wall. Still never wider than the
+        # paper, and the aspect never changes.
+        avail = max(self.page_width - 2 * self.MARGIN_X, 40)
+        scale = min(1.0 / max(self.zoom, 0.01), avail / max(iw, 1))
+        w, h = iw * scale, ih * scale
+        buf = self.view.get_buffer()
+        bx, by = self._overlay_to_buffer(*(at or self.paste_point()))
+        _over, it = self.view.get_iter_at_location(int(bx), int(by))
+        r = self.view.get_iter_location(it)
+        f = self.font_px / max(self._base_font_px, 1)
+        im = {
+            "mark": buf.create_mark(None, it, True),
+            # centre the picture on the paste point, expressed as an offset
+            # from its anchor so it rides the paragraph like ink does
+            "dx": (bx - r.x) / f - w / 2.0,
+            "dy": (by - r.y) / f - h / 2.0,
+            "w": w, "h": h,
+            "font_px": self._base_font_px,   # a DOCUMENT size, like pen width:
+            # store at the base font so the image does not bake in the zoom you
+            # happened to paste at (row 116's pen-width lesson)
+            "data": data,
+            "texture": texture,
+            "rotate": 0.0,
+        }
+        self.images.append(im)
+        self._undo_ops.append(("add_images", [im]))
+        self._redo_ops.clear()
+        self._images_changed()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+        return im
+
+    def _images_changed(self):
+        """Images are painted by the VIEW (under the text), not by the ink
+        overlay — so a change has to repaint the view; queue_draw on the ink
+        alone silently leaves the picture stale."""
+        self.view.queue_draw()
+        self.ink.queue_draw()
 
     def stroke_view_pts(self, st):
         """Stroke points in sheet-widget coordinates — scroll-independent, the
@@ -6026,6 +6336,16 @@ class TextPageView(Gtk.Overlay):
             return
         if self._lassoing:
             self._lasso_path.append((x, y))
+        elif self._lasso_rotating:
+            cx, cy = self._lasso_rotate_centre
+            now = math.degrees(math.atan2(y - cy, x - cx))
+            deg = now - self._lasso_rotate_from
+            # Shift snaps to neat angles (the straight-line snap's spirit).
+            # _chord_state, not the raw event state, so a stylus/finger drag
+            # sees a Shift held on the keyboard too.
+            if self._chord_state(gesture) & Gdk.ModifierType.SHIFT_MASK:
+                deg = round(deg / self.ROTATE_SNAP_DEG) * self.ROTATE_SNAP_DEG
+            self._lasso_rotate_deg = deg
         elif self._lasso_scaling:
             ax, ay = self._lasso_scale_anchor
             d0 = math.hypot(self._lasso_scale_start[0] - ax,
@@ -6047,7 +6367,11 @@ class TextPageView(Gtk.Overlay):
                 self._arm_straight_timer()
         else:
             self._erase_at(x, y)
-        self.ink.queue_draw()
+        if self._selected_images and (self._lasso_moving or self._lasso_scaling
+                                      or self._lasso_rotating):
+            self._images_changed()   # images are painted by the VIEW
+        else:
+            self.ink.queue_draw()
 
     def _on_ink_end(self, gesture, dx, dy):
         if self._zoom_cancelled:   # right-click aborted this drag — do nothing
@@ -6062,24 +6386,42 @@ class TextPageView(Gtk.Overlay):
         if self._lassoing:
             self._lassoing = False
             self._finish_lasso()
+        elif self._lasso_rotating:
+            self._lasso_rotating = False
+            self.ink.set_cursor(None)
+            deg = self._lasso_rotate_deg
+            self._lasso_rotate_deg = 0.0
+            if abs(deg) > 1e-3 and self.has_lasso_selection():
+                cx, cy = self._lasso_rotate_centre
+                rad = math.radians(deg)
+                cos_a, sin_a = math.cos(rad), math.sin(rad)
+                def spin(p):
+                    dx, dy = p[0] - cx, p[1] - cy
+                    return (cx + dx * cos_a - dy * sin_a,
+                            cy + dx * sin_a + dy * cos_a)
+                self._reanchor_selected(spin, rotate_deg=deg)
+            self._lasso_orig = []
+            self._lasso_img_orig = []
         elif self._lasso_scaling:
             self._lasso_scaling = False
             self.ink.set_cursor(None)
             f = self._lasso_scale_factor
-            if abs(f - 1.0) > 1e-3 and self._selected:
+            if abs(f - 1.0) > 1e-3 and self.has_lasso_selection():
                 ax, ay = self._lasso_scale_anchor
                 self._reanchor_selected(
                     lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f),
                     width_factor=f)
             self._lasso_orig = []
+            self._lasso_img_orig = []
         elif self._lasso_moving:
             self._lasso_moving = False
             self.ink.set_cursor(None)
             mdx, mdy = self._lasso_drag
             self._lasso_drag = (0.0, 0.0)
-            if self._lasso_moved and self._selected:
+            if self._lasso_moved and self.has_lasso_selection():
                 self._reanchor_selected(lambda p: (p[0] + mdx, p[1] + mdy))
             self._lasso_orig = []
+            self._lasso_img_orig = []
         elif self.current_stroke:
             pts = self.current_stroke
             # smooth freehand ink on commit (same recipe as the PDF canvas);
@@ -6186,7 +6528,25 @@ class TextPageView(Gtk.Overlay):
     # when text edits move the paragraphs underneath it.
 
     def _lasso_begin(self, x, y):
-        handle = self._lasso_handle_at(x, y) if self._selected else None
+        # NB: gate on has_lasso_selection(), NOT self._selected — an
+        # images-only selection has no strokes, and gating on strokes made a
+        # lone photo impossible to grab or resize (it started a new loop
+        # instead).
+        if self.has_lasso_selection() and self._lasso_rotate_handle_at(x, y):
+            # the knob above the box spins the whole selection about its centre
+            cx, cy = self._selection_centre()
+            self._lasso_rotating = True
+            self._lasso_rotate_deg = 0.0
+            self._lasso_rotate_from = math.degrees(math.atan2(y - cy, x - cx))
+            self._lasso_orig = [(st, self._stroke_overlay_pts(st))
+                                for st in self._selected]
+            self._lasso_img_orig = [(im, self._image_overlay_rect(im))
+                                    for im in self._selected_images]
+            self._lasso_rotate_centre = (cx, cy)
+            self.ink.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
+            return
+        handle = (self._lasso_handle_at(x, y)
+                  if self.has_lasso_selection() else None)
         if handle is not None:
             # press on a corner handle scales the selection, anchored at the
             # opposite corner
@@ -6197,15 +6557,19 @@ class TextPageView(Gtk.Overlay):
             self._lasso_scale_factor = 1.0
             self._lasso_orig = [(st, self._stroke_overlay_pts(st))
                                 for st in self._selected]
+            self._lasso_img_orig = [(im, self._image_overlay_rect(im))
+                                    for im in self._selected_images]
             self.ink.set_cursor(Gdk.Cursor.new_from_name(
                 "nwse-resize" if handle in (0, 2) else "nesw-resize"))
-        elif self._selected and self._point_in_selection(x, y):
+        elif self.has_lasso_selection() and self._point_in_selection(x, y):
             # press inside the current selection grabs it for a move
             self._lasso_moving = True
             self._lasso_moved = False
             self._lasso_drag = (0.0, 0.0)
             self._lasso_orig = [(st, self._stroke_overlay_pts(st))
                                 for st in self._selected]
+            self._lasso_img_orig = [(im, self._image_overlay_rect(im))
+                                    for im in self._selected_images]
             self.ink.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
         else:
             # otherwise start a fresh loop, dropping any prior selection
@@ -6228,24 +6592,46 @@ class TextPageView(Gtk.Overlay):
                     for px, py in pts)
                     or PDFCanvas._polyline_crosses_polygon(pts, path)):
                 sel.append(st)
-        self._set_selected(sel)
+        # an image is caught the same way, treated as its four corners plus the
+        # outline between them — so a loop drawn INSIDE a big photo catches it
+        # too (its corners are outside the loop, but its edges cross it)
+        images = []
+        for im in self.images:
+            x, y, w, h = self._image_overlay_rect(im)
+            corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+            if (any(PDFCanvas._point_in_polygon(px, py, path)
+                    for px, py in corners)
+                    or PDFCanvas._polyline_crosses_polygon(
+                        corners + [corners[0]], path)
+                    or PDFCanvas._point_in_polygon(path[0][0], path[0][1],
+                                                   corners)):
+                images.append(im)
+        self._set_selected(sel, images)
 
-    def _set_selected(self, strokes):
+    def _set_selected(self, strokes, images=None):
         self._selected = strokes
-        self.ink.queue_draw()
+        self._selected_images = list(images or [])
+        self._images_changed()   # the glow is drawn with the image, under text
 
     def has_lasso_selection(self):
-        return bool(self._selected)
+        return bool(self._selected or self._selected_images)
 
     def clear_lasso_selection(self):
-        if self._selected or self._lasso_path:
+        if self._selected or self._selected_images or self._lasso_path:
             self._lasso_path = []
             self._set_selected([])
 
     def _selection_bbox(self):
-        """Overlay-space (x0, y0, x1, y1) box of the selected strokes, or None."""
+        """Overlay-space (x0, y0, x1, y1) box of the selection, or None.
+
+        Covers strokes AND images, so the dashed box and its resize handles
+        wrap whatever is actually selected."""
         pts = [p for st in self._selected
                for p in self._stroke_overlay_pts(st)]
+        rects = self._lasso_drag_rects()
+        for im in self._selected_images:
+            x, y, w, h = rects.get(id(im)) or self._image_overlay_rect(im)
+            pts.extend(((x, y), (x + w, y + h)))
         if not pts:
             return None
         xs = [p[0] for p in pts]
@@ -6259,6 +6645,26 @@ class TextPageView(Gtk.Overlay):
         x0, y0, x1, y1 = bbox
         pad = 8.0
         return x0 - pad <= x <= x1 + pad and y0 - pad <= y <= y1 + pad
+
+    ROTATE_HANDLE_GAP = 18.0   # px from the box's top edge up to the knob
+    ROTATE_SNAP_DEG = 15.0     # Shift snaps to this, like the straight-line snap
+
+    def _selection_centre(self):
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return None
+        x0, y0, x1, y1 = bbox
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+    def _lasso_rotate_handle_at(self, x, y, hit=8.0):
+        """Is the overlay point on the rotate knob above the selection?"""
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return False
+        x0, y0, x1, _y1 = bbox
+        hx = (x0 + x1) / 2.0
+        hy = y0 - 5.0 - self.ROTATE_HANDLE_GAP
+        return math.hypot(x - hx, y - hy) <= hit
 
     def _lasso_handle_at(self, x, y, hit=4.0):
         """Index (0–3) of the corner resize handle under the overlay point, or
@@ -6280,14 +6686,30 @@ class TextPageView(Gtk.Overlay):
         """The _commit_stroke anchoring recipe as a helper: mark at the first
         point, buffer-pixel offsets at the current font. Returns the fields a
         stroke stores for its geometry."""
-        buf_pts = [self._overlay_to_buffer(px, py) for px, py in overlay_pts]
+        # float precision: these offsets are STORED, and truncating each point
+        # to a whole pixel is what made a rotated stroke go lumpy
+        buf_pts = [self._overlay_to_buffer_f(px, py) for px, py in overlay_pts]
         buf = self.view.get_buffer()
-        _over_text, it = self.view.get_iter_at_location(*buf_pts[0])
+        _over_text, it = self.view.get_iter_at_location(int(buf_pts[0][0]),
+                                                        int(buf_pts[0][1]))
         mark = buf.create_mark(None, it, True)
         r = self.view.get_iter_location(it)
         return mark, [(bx - r.x, by - r.y) for bx, by in buf_pts]
 
-    def _reanchor_selected(self, transform, width_factor=1.0):
+    def _anchor_point_at(self, ox, oy):
+        """_anchor_stroke_at for a single point: the mark for the paragraph
+        under the overlay point, and the point's buffer-pixel offset from it.
+
+        The caller stores font_px = self.font_px alongside, so these offsets
+        are already in the units _image_buffer_rect will read back."""
+        bx, by = self._overlay_to_buffer_f(ox, oy)   # stored: keep the fraction
+        buf = self.view.get_buffer()
+        _over, it = self.view.get_iter_at_location(int(bx), int(by))
+        mark = buf.create_mark(None, it, True)
+        r = self.view.get_iter_location(it)
+        return mark, (bx - r.x, by - r.y)
+
+    def _reanchor_selected(self, transform, width_factor=1.0, rotate_deg=0.0):
         """A move/resize landed: transform each selected stroke's drag-begin
         overlay points and re-anchor it there — new mark, new offsets, current
         font — so it rides with the paragraph it now sits on. Old marks are
@@ -6304,7 +6726,37 @@ class TextPageView(Gtk.Overlay):
             st["mark"], st["pts"], st["font_px"] = mark, pts, self.font_px
             entries.append((st, before,
                             (mark, list(pts), st["font_px"], st["width"])))
-        self._undo_ops.append(("anchor", entries))
+        img_entries = []
+        for im, orig in self._lasso_img_orig:
+            x, y, w, h = orig
+            before = (im["mark"], im["dx"], im["dy"], im["w"], im["h"],
+                      im["font_px"], im.get("rotate", 0.0))
+            if rotate_deg:
+                # a tilt is stored as the image's own angle, not baked into its
+                # box: the rect stays axis-aligned and the CENTRE swings round
+                # the selection, so repeated rotations never degrade it
+                ncx, ncy = transform((x + w / 2.0, y + h / 2.0))
+                nx, ny = ncx - w / 2.0, ncy - h / 2.0
+                im["rotate"] = im.get("rotate", 0.0) + rotate_deg
+            else:
+                nx, ny = transform((x, y))
+                fx, fy = transform((x + w, y + h))
+                # store at the CURRENT font, like a stroke: the on-screen size
+                # the user just dragged out must survive the re-anchor
+                im["w"], im["h"] = (fx - nx), (fy - ny)
+            mark, (dx, dy) = self._anchor_point_at(nx, ny)
+            im["mark"], im["dx"], im["dy"] = mark, dx, dy
+            im["font_px"] = self.font_px
+            img_entries.append((im, before,
+                                (mark, im["dx"], im["dy"], im["w"], im["h"],
+                                 im["font_px"], im.get("rotate", 0.0))))
+        # ONE undo entry for the whole drag, whatever it grabbed — a move that
+        # took ink and a photo together must come back in one Ctrl+Z
+        if img_entries:
+            self._undo_ops.append(("group", [("anchor", entries),
+                                             ("anchor_images", img_entries)]))
+        else:
+            self._undo_ops.append(("anchor", entries))
         self._redo_ops.clear()
         if self.on_ink_action:
             self.on_ink_action()
@@ -6312,10 +6764,10 @@ class TextPageView(Gtk.Overlay):
             self.on_ink_changed()
 
     def duplicate_selected(self, offset=14.0):
-        """Ctrl+D: copy the selected strokes offset a little, anchored where
-        the copies land, and select the copies so drag-to-place is the natural
-        next gesture — one undo entry."""
-        if not self._selected:
+        """Ctrl+D: copy the selection (ink and images) offset a little,
+        anchored where the copies land, and select the copies so drag-to-place
+        is the natural next gesture — one undo entry."""
+        if not (self._selected or self._selected_images):
             return
         clones = []
         for st in self._selected:
@@ -6330,23 +6782,51 @@ class TextPageView(Gtk.Overlay):
                 "opacity": st["opacity"],
                 "font_px": self.font_px,
             })
+        img_clones = []
+        for im in self._selected_images:
+            x, y, w, h = self._image_overlay_rect(im)
+            mark, (dx, dy) = self._anchor_point_at(x + offset, y + offset)
+            img_clones.append({
+                "mark": mark, "dx": dx, "dy": dy,
+                "w": w, "h": h, "font_px": self.font_px,
+                "rotate": im.get("rotate", 0.0),
+                # the copy shares the ORIGINAL bytes: duplicating a photo must
+                # not re-encode it (and the texture is immutable, so sharing is
+                # safe — a crop replaces the bytes rather than mutating them)
+                "data": im["data"], "texture": im["texture"],
+            })
         self.strokes.extend(clones)
-        self._undo_ops.append(("add", clones))
+        self.images.extend(img_clones)
+        ops = []
+        if clones:
+            ops.append(("add", clones))
+        if img_clones:
+            ops.append(("add_images", img_clones))
+        self._undo_ops.append(ops[0] if len(ops) == 1 else ("group", ops))
         self._redo_ops.clear()
-        self._set_selected(clones)
+        self._set_selected(clones, img_clones)
         if self.on_ink_action:
             self.on_ink_action()
         if self.on_ink_changed:
             self.on_ink_changed()
 
     def delete_selected_strokes(self):
-        """Remove the selected strokes (one undo entry, reusing erase ops)."""
-        if not self._selected:
+        """Remove the selection — ink and images alike (one undo entry,
+        reusing erase ops)."""
+        if not (self._selected or self._selected_images):
             return
         for st in self._selected:
             if st in self.strokes:
                 self.strokes.remove(st)   # mark kept so undo can restore it
-        self._undo_ops.append(("erase", list(self._selected)))
+        for im in self._selected_images:
+            if im in self.images:
+                self.images.remove(im)
+        ops = []
+        if self._selected:
+            ops.append(("erase", list(self._selected)))
+        if self._selected_images:
+            ops.append(("erase_images", list(self._selected_images)))
+        self._undo_ops.append(ops[0] if len(ops) == 1 else ("group", ops))
         self._redo_ops.clear()
         self._set_selected([])
         if self.on_ink_action:
@@ -6376,8 +6856,213 @@ class TextPageView(Gtk.Overlay):
         if self.on_ink_changed:
             self.on_ink_changed()
 
+    def copy_selection(self):
+        """Ctrl+C on a lasso selection: publish the real objects AND a picture.
+
+        Pasted back into Sidemark the ink is still ink and the image is still
+        an image (the private mime); dropped into any other app it is a PNG."""
+        if not self.has_lasso_selection():
+            return
+        bbox = self._selection_bbox()
+        if bbox is None:
+            return
+        x0, y0, _x1, _y1 = bbox
+        objects = []
+        for st in self._selected:
+            # rebased on the selection's top-left so a paste lands centred on
+            # the paste point rather than back at the original coordinates
+            pts = [(px - x0, py - y0) for px, py in self._stroke_overlay_pts(st)]
+            objects.append({
+                "type": "stroke",
+                "pts": [[round(px, 2), round(py, 2)] for px, py in pts],
+                "color": list(st["color"]),
+                "width": st["width"] * self.font_px / max(st["font_px"], 1),
+                "opacity": st["opacity"],
+                "font_px": self.font_px,
+            })
+        for im in self._selected_images:
+            x, y, w, h = self._image_overlay_rect(im)
+            objects.append({
+                "type": "image",
+                "dx": round(x - x0, 2), "dy": round(y - y0, 2),
+                "w": round(w, 2), "h": round(h, 2),
+                "rotate": im.get("rotate", 0.0),
+                "png": base64.b64encode(im["data"]).decode("ascii"),
+            })
+        texture = self._render_selection(bbox)
+        if texture is None:
+            # not fatal — Sidemark's own paste still works off the objects —
+            # but every OTHER app pastes nothing, so say so out loud
+            logger.warning("copy: could not render the selection to a picture; "
+                           "other apps will see no image")
+        Gdk.Display.get_default().get_clipboard().set_content(
+            clipboard_content_for(objects, texture))
+        logger.info(f"copy: {len(objects)} object(s) "
+                    f"({len(self._selected)} ink, {len(self._selected_images)} "
+                    f"image) to the clipboard, picture={texture is not None}")
+
+    COPY_RENDER_SCALE = 3.0   # supersample the picture other apps get
+
+    def _render_selection(self, bbox):
+        """A Gdk.Texture of the selection — what OTHER apps get from a copy.
+
+        Rendered at COPY_RENDER_SCALE× the on-screen size: the screen box is
+        only ~as many pixels as you can see, which pastes into another app as a
+        small, soft image. Ink is vectors and an image keeps its own bytes, so
+        rendering bigger costs nothing but a little memory and is the only way
+        the paste looks crisp (and lands at a useful size)."""
+        x0, y0, x1, y1 = bbox
+        pad = 4
+        s = self.COPY_RENDER_SCALE
+        w = int(((x1 - x0) + 2 * pad) * s)
+        h = int(((y1 - y0) + 2 * pad) * s)
+        if w < 1 or h < 1:
+            return None
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        ctx = cairo.Context(surf)
+        ctx.scale(s, s)
+        ctx.translate(-x0 + pad, -y0 + pad)
+        for im in self._selected_images:
+            draw_image(ctx, im["texture"], *self._image_overlay_rect(im),
+                       rotate=im.get("rotate", 0.0))
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        for st in self._selected:
+            pts = self._stroke_overlay_pts(st)
+            if len(pts) < 2:
+                continue
+            ctx.set_source_rgba(*st["color"], st["opacity"])
+            ctx.set_line_width(st["width"] * self.font_px
+                               / max(st["font_px"], 1))
+            ctx.move_to(*pts[0])
+            for p in pts[1:]:
+                ctx.line_to(*p)
+            ctx.stroke()
+        surf.flush()
+        buf = io.BytesIO()
+        surf.write_to_png(buf)
+        return _texture_from_png(buf.getvalue())
+
+    def wants_paste(self):
+        """Should Ctrl+V paste onto the sheet rather than into the text?
+
+        Decided from the clipboard's ADVERTISED formats, which are readable
+        synchronously; the payload itself is not, and a key handler must say
+        yes or no now. The rule is "only take what the editor cannot use", so
+        copying text out of a browser still pastes as text even though the same
+        clipboard entry often carries a picture too.
+
+        NB on the image test: a FOREIGN clipboard advertises mime types, and
+        GDK unions in the deserialisable gtypes when it claims the remote — but
+        do not lean on that. Ask about the mime types we can actually decode,
+        which is true for both our own copies and any other app's."""
+        formats = Gdk.Display.get_default().get_clipboard().get_formats()
+        if formats.contain_mime_type(SIDEMARK_MIME):
+            return True
+        has_image = (formats.contain_gtype(Gdk.Texture)
+                     or any(formats.contain_mime_type(m) for m in
+                            ("image/png", "image/jpeg", "image/webp",
+                             "image/tiff", "image/bmp", "image/gif")))
+        if not has_image:
+            return False        # nothing we could paint — let the editor go
+        if (self.tool == "text"
+                and formats.contain_mime_type("text/plain;charset=utf-8")):
+            # under the caret, text wins — a browser copy carries BOTH a
+            # picture and text, and typing is what the caret is for. With
+            # any other tool there is no caret in play, so the image wins.
+            return False
+        return True
+
+    def paste_clipboard_objects(self):
+        """Paste Sidemark objects (ink stays ink, images stay images) or a
+        picture from any other app, at the caret."""
+        def add_objects(objects):
+            self._add_pasted_objects(objects)
+
+        def add_texture(texture):
+            self.add_image(_png_from_texture(texture))
+
+        paste_objects(self.get_clipboard(), add_objects, add_texture)
+
+    @staticmethod
+    def _pasted_extent(objects):
+        """(w, h) of a copied selection — its coords are rebased on its own
+        top-left by copy_selection, so this is what we centre on the paste."""
+        xs, ys = [0.0], [0.0]
+        for obj in objects:
+            if obj.get("type") == "stroke":
+                for px, py in obj.get("pts", []):
+                    xs.append(px)
+                    ys.append(py)
+            else:
+                xs.append(obj.get("dx", 0.0) + obj.get("w", 0.0))
+                ys.append(obj.get("dy", 0.0) + obj.get("h", 0.0))
+        return max(xs), max(ys)
+
+    def _add_pasted_objects(self, objects):
+        """Rebuild copied strokes/images at the paste point, keeping every
+        property (this is what makes an in-app copy lossless, not a snapshot).
+
+        The copy stored everything relative to the selection's top-left, so
+        here we place that origin such that the whole thing lands CENTRED on
+        the paste point — matching where a plain image paste goes."""
+        buf = self.view.get_buffer()
+        bx, by = self._overlay_to_buffer(*self.paste_point())
+        _over, it = self.view.get_iter_at_location(int(bx), int(by))
+        r = self.view.get_iter_location(it)
+        ew, eh = self._pasted_extent(objects)
+        # offset from the anchor's own position to where the copy's origin goes
+        ox, oy = (bx - r.x) - ew / 2.0, (by - r.y) - eh / 2.0
+        strokes, images = [], []
+        for obj in objects:
+            if obj.get("type") == "image":
+                try:
+                    png = base64.b64decode(obj.get("png", ""))
+                except (ValueError, TypeError):
+                    continue
+                texture = _texture_from_png(png)
+                if texture is None:
+                    continue
+                images.append({
+                    "mark": buf.create_mark(None, it, True),
+                    "dx": float(obj.get("dx", 0.0)) + ox,
+                    "dy": float(obj.get("dy", 0.0)) + oy,
+                    "w": float(obj.get("w", texture.get_width())),
+                    "h": float(obj.get("h", texture.get_height())),
+                    "font_px": self.font_px,
+                    "rotate": float(obj.get("rotate", 0.0)),
+                    "data": png, "texture": texture,
+                })
+            elif obj.get("type") == "stroke":
+                pts = [(p[0] + ox, p[1] + oy) for p in obj.get("pts", [])]
+                if not pts:
+                    continue
+                strokes.append({
+                    "mark": buf.create_mark(None, it, True),
+                    "pts": pts,
+                    "color": tuple(obj.get("color", (0.05, 0.05, 0.8)))[:3],
+                    "width": float(obj.get("width", 2.0)),
+                    "opacity": float(obj.get("opacity", 1.0)),
+                    "font_px": float(obj.get("font_px", self.font_px)),
+                })
+        if not strokes and not images:
+            return
+        self.strokes.extend(strokes)
+        self.images.extend(images)
+        # one undo step for the whole paste, whatever it held
+        if strokes:
+            self._undo_ops.append(("add", strokes))
+        if images:
+            self._undo_ops.append(("add_images", images))
+        self._redo_ops.clear()
+        self._images_changed()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
+
     def _on_lasso_key(self, _ctrl, keyval, _keycode, state):
-        if self.tool != "lasso" or not self._selected:
+        if self.tool != "lasso" or not self.has_lasso_selection():
             return False
         if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
             self.delete_selected_strokes()
@@ -6394,8 +7079,9 @@ class TextPageView(Gtk.Overlay):
     # ── ink undo (driven by the window's chronological timeline) ─────────────
 
     def _apply_ink_op(self, op, undo):
-        """add/erase toggle stroke membership; anchor/recolor swap the stored
-        before/after state on the strokes in place."""
+        """add/erase toggle stroke membership; add_images does the same for
+        pasted images; anchor/recolor swap the stored before/after state on the
+        strokes in place."""
         kind, payload = op
         if kind == "add" or kind == "erase":
             removing = (kind == "add") == undo
@@ -6405,11 +7091,27 @@ class TextPageView(Gtk.Overlay):
                         self.strokes.remove(st)
             else:
                 self.strokes.extend(payload)
+        elif kind == "add_images" or kind == "erase_images":
+            removing = (kind == "add_images") == undo
+            if removing:
+                for im in payload:
+                    if im in self.images:
+                        self.images.remove(im)
+            else:
+                self.images.extend(payload)
         elif kind == "anchor":
             for st, before, after in payload:
                 mark, pts, font_px, width = before if undo else after
                 st["mark"], st["font_px"], st["width"] = mark, font_px, width
                 st["pts"] = list(pts)
+        elif kind == "anchor_images":
+            for im, before, after in payload:
+                (im["mark"], im["dx"], im["dy"], im["w"], im["h"],
+                 im["font_px"], im["rotate"]) = before if undo else after
+        elif kind == "group":
+            # one gesture that touched both ink and images — undo them together
+            for sub in (reversed(payload) if undo else payload):
+                self._apply_ink_op(sub, undo)
         elif kind == "recolor":
             for st, before, after in payload:
                 st["color"], st["width"], st["opacity"] = \
@@ -6424,7 +7126,7 @@ class TextPageView(Gtk.Overlay):
         self.clear_lasso_selection()   # like the canvas: don't keep a
         if self.on_ink_changed:        # selection of strokes undo just changed
             self.on_ink_changed()
-        self.ink.queue_draw()
+        self._images_changed()
 
     def redo_ink(self):
         if not self._redo_ops:
@@ -6435,30 +7137,78 @@ class TextPageView(Gtk.Overlay):
         self.clear_lasso_selection()
         if self.on_ink_changed:
             self.on_ink_changed()
-        self.ink.queue_draw()
+        self._images_changed()
 
     # ── rendering ────────────────────────────────────────────────────────────
+
+    def _lasso_transform(self):
+        """The live move/resize/rotate map from drag-begin overlay coords to
+        now, or None when no drag is in flight. ONE definition, used for
+        strokes and images alike so they can never drift apart mid-drag."""
+        if not (self._lasso_moving or self._lasso_scaling
+                or self._lasso_rotating):
+            return None
+        if self._lasso_moving:
+            mdx, mdy = self._lasso_drag
+            return lambda p: (p[0] + mdx, p[1] + mdy)
+        if self._lasso_rotating:
+            cx, cy = self._lasso_rotate_centre
+            rad = math.radians(self._lasso_rotate_deg)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            def rotate(p):
+                dx, dy = p[0] - cx, p[1] - cy
+                return (cx + dx * cos_a - dy * sin_a,
+                        cy + dx * sin_a + dy * cos_a)
+            return rotate
+        f = self._lasso_scale_factor
+        ax, ay = self._lasso_scale_anchor
+        return lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f)
 
     def _lasso_drag_pts(self):
         """{id(stroke): transformed overlay pts} for the selection while a
         move/resize drag is in flight, else empty."""
-        if not self._lasso_orig or not (self._lasso_moving
-                                        or self._lasso_scaling):
+        fn = self._lasso_transform()
+        if not self._lasso_orig or fn is None:
             return {}
-        if self._lasso_moving:
-            mdx, mdy = self._lasso_drag
-            fn = lambda p: (p[0] + mdx, p[1] + mdy)
-        else:
-            f = self._lasso_scale_factor
-            ax, ay = self._lasso_scale_anchor
-            fn = lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f)
         return {id(st): [fn(p) for p in orig] for st, orig in self._lasso_orig}
+
+    def _lasso_drag_rects(self):
+        """{id(image): transformed overlay rect} while a drag is in flight.
+
+        An image's rect stays axis-aligned — its tilt lives in its own
+        "rotate" field (see _image_draw_rotate) — so a rotation drag moves the
+        CENTRE around the selection and leaves w/h alone. Mapping two opposite
+        corners, as move/resize do, would skew the box instead."""
+        fn = self._lasso_transform()
+        if not self._lasso_img_orig or fn is None:
+            return {}
+        out = {}
+        for im, (x, y, w, h) in self._lasso_img_orig:
+            if self._lasso_rotating:
+                ncx, ncy = fn((x + w / 2.0, y + h / 2.0))
+                out[id(im)] = (ncx - w / 2.0, ncy - h / 2.0, w, h)
+            else:
+                nx, ny = fn((x, y))
+                fx, fy = fn((x + w, y + h))
+                out[id(im)] = (nx, ny, fx - nx, fy - ny)
+        return out
+
+    def _image_draw_rotate(self, im):
+        """The angle an image is painted at right now — its stored tilt plus
+        the live rotation drag, if it is in one."""
+        extra = (self._lasso_rotate_deg
+                 if self._lasso_rotating and im in self._selected_images
+                 else 0.0)
+        return im.get("rotate", 0.0) + extra
 
     def _draw_ink(self, _area, ctx, _w, _h):
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
         ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         drag = self._lasso_drag_pts()
         wf = self._lasso_scale_factor if self._lasso_scaling else 1.0
+        # NOTE: images are NOT drawn here. They live under the text, painted by
+        # the view's BELOW_TEXT layer (_snapshot_images) — this overlay sits on
+        # top of the TextView, so anything drawn here would cover the words.
         for st in self.strokes:
             pts = drag.get(id(st)) or self._stroke_overlay_pts(st)
             if len(pts) < 2:
@@ -6511,26 +7261,41 @@ class TextPageView(Gtk.Overlay):
                 for p in pts[1:]:
                     ctx.line_to(*p)
                 ctx.stroke()
-            if sel_pts:
-                # dashed bounding box (follows the live drag) + resize handles
-                xs = [p[0] for p in sel_pts]
-                ys = [p[1] for p in sel_pts]
-                x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-                pad = 5.0
-                ctx.set_source_rgba(ar, ag, ab, 0.85)
-                ctx.set_line_width(1.0)
-                ctx.set_dash([4.0, 3.0])
-                ctx.rectangle(x0 - pad, y0 - pad,
-                              (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+        # Dashed box + handles around the WHOLE selection. This must come from
+        # _selection_bbox() — the same box _lasso_handle_at and
+        # _point_in_selection use — or the frame drifts from what a grab
+        # actually hits. It used to be recomputed here from the stroke points
+        # alone, which simply left images out of the frame.
+        bbox = self._selection_bbox()
+        if bbox:
+            x0, y0, x1, y1 = bbox
+            pad = 5.0
+            ctx.set_source_rgba(ar, ag, ab, 0.85)
+            ctx.set_line_width(1.0)
+            ctx.set_dash([4.0, 3.0])
+            ctx.rectangle(x0 - pad, y0 - pad,
+                          (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
+            ctx.stroke()
+            ctx.set_dash([])
+            for hx, hy in ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
+                           (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)):
+                ctx.rectangle(hx - 4, hy - 4, 8, 8)
+                ctx.set_source_rgba(1, 1, 1, 0.95)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(ar, ag, ab, 0.9)
                 ctx.stroke()
-                ctx.set_dash([])
-                for hx, hy in ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
-                               (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)):
-                    ctx.rectangle(hx - 4, hy - 4, 8, 8)
-                    ctx.set_source_rgba(1, 1, 1, 0.95)
-                    ctx.fill_preserve()
-                    ctx.set_source_rgba(ar, ag, ab, 0.9)
-                    ctx.stroke()
+            # rotate handle: a knob on a stalk above the box (the usual place)
+            hx, hy = (x0 + x1) / 2.0, y0 - pad - self.ROTATE_HANDLE_GAP
+            ctx.set_source_rgba(ar, ag, ab, 0.85)
+            ctx.set_line_width(1.0)
+            ctx.move_to(hx, y0 - pad)
+            ctx.line_to(hx, hy)
+            ctx.stroke()
+            ctx.arc(hx, hy, 5, 0, 2 * math.pi)
+            ctx.set_source_rgba(1, 1, 1, 0.95)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(ar, ag, ab, 0.9)
+            ctx.stroke()
         if self._lassoing and len(self._lasso_path) >= 2:
             ctx.set_source_rgba(ar, ag, ab, 0.9)
             ctx.set_line_width(1.5)
@@ -6576,13 +7341,56 @@ class TextPageView(Gtk.Overlay):
                 "opacity": st["opacity"],
                 "font_px": st["font_px"],
             })
-        return {"version": 1, "page_width": self.page_width, "strokes": out}
+        images = []
+        for im in self.images:
+            it = buf.get_iter_at_mark(im["mark"])
+            line = it.get_line()
+            src = src_lines[line] if line < len(src_lines) else ""
+            images.append({
+                "line": line,
+                "ch": it.get_line_offset(),
+                "hash": self._line_hash(src),
+                "dx": round(im["dx"], 2), "dy": round(im["dy"], 2),
+                "w": round(im["w"], 2), "h": round(im["h"], 2),
+                "font_px": im["font_px"],
+                "rotate": im.get("rotate", 0.0),
+                # base64 so the sidecar stays one plain JSON file next to the
+                # .md, rather than a scatter of loose image files to keep in
+                # sync with it
+                "png": base64.b64encode(im["data"]).decode("ascii"),
+            })
+        return {"version": 1, "page_width": self.page_width, "strokes": out,
+                "images": images}
+
+    def _anchor_from_record(self, rec, hashes):
+        """Re-attach a saved object to its paragraph: the remembered line if its
+        text still hashes the same, else the nearest line that does, else the
+        old line number clamped. ONE rule for strokes and images — they are the
+        same kind of thing to the sheet, so they must not drift apart."""
+        buf = self.view.get_buffer()
+        line = int(rec.get("line", 0))
+        want = rec.get("hash")
+        if not (0 <= line < len(hashes) and hashes[line] == want):
+            matches = [i for i, h in enumerate(hashes) if h == want]
+            if matches:
+                line = min(matches, key=lambda i: abs(i - line))
+            else:
+                line = max(0, min(line, len(hashes) - 1))
+        ok, ls = buf.get_iter_at_line(line)
+        if not ok:
+            ls = buf.get_end_iter()
+        it = ls.copy()
+        it.forward_chars(min(int(rec.get("ch", 0)), it.get_chars_in_line()))
+        return buf.create_mark(None, it, True)
 
     def load_ink(self, data):
         buf = self.view.get_buffer()
         for st in self.strokes:
             buf.delete_mark(st["mark"])
+        for im in self.images:
+            buf.delete_mark(im["mark"])
         self.strokes = []
+        self.images = []
         self._undo_ops.clear()
         self._redo_ops.clear()
         # restore the saved sheet width (set directly, not via set_page_width,
@@ -6593,32 +7401,37 @@ class TextPageView(Gtk.Overlay):
         src_lines = self.view.get_source_text().split("\n")
         hashes = [self._line_hash(t) for t in src_lines]
         for rec in data.get("strokes", []):
-            line = int(rec.get("line", 0))
-            want = rec.get("hash")
-            if not (0 <= line < len(hashes) and hashes[line] == want):
-                # the paragraph moved: take the matching line nearest the
-                # remembered position, or stay at the clamped old line
-                matches = [i for i, h in enumerate(hashes) if h == want]
-                if matches:
-                    line = min(matches, key=lambda i: abs(i - line))
-                else:
-                    line = max(0, min(line, len(hashes) - 1))
-            ok, ls = buf.get_iter_at_line(line)
-            if not ok:
-                ls = buf.get_end_iter()
-            it = ls.copy()
-            it.forward_chars(min(int(rec.get("ch", 0)),
-                                 it.get_chars_in_line()))
-            mark = buf.create_mark(None, it, True)
             self.strokes.append({
-                "mark": mark,
+                "mark": self._anchor_from_record(rec, hashes),
                 "pts": [(p[0], p[1]) for p in rec.get("pts", [])],
                 "color": tuple(rec.get("color", (0.05, 0.05, 0.8)))[:3],
                 "width": float(rec.get("width", 2.0)),
                 "opacity": float(rec.get("opacity", 1.0)),
                 "font_px": float(rec.get("font_px", 13)),
             })
-        self.ink.queue_draw()
+        for rec in data.get("images", []):
+            try:
+                png = base64.b64decode(rec.get("png", ""))
+            except (ValueError, TypeError):
+                png = b""
+            texture = _texture_from_png(png) if png else None
+            if texture is None:
+                # a corrupt image must not cost the reader their ink: drop the
+                # picture, keep the rest of the sidecar
+                logger.warning("text page: dropping an undecodable image")
+                continue
+            self.images.append({
+                "mark": self._anchor_from_record(rec, hashes),
+                "dx": float(rec.get("dx", 0.0)),
+                "dy": float(rec.get("dy", 0.0)),
+                "w": float(rec.get("w", texture.get_width())),
+                "h": float(rec.get("h", texture.get_height())),
+                "font_px": float(rec.get("font_px", 13)),
+                "rotate": float(rec.get("rotate", 0.0)),
+                "data": png,
+                "texture": texture,
+            })
+        self._images_changed()
 
 
 def _session_prop(name):
@@ -8724,6 +9537,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             # window closes once its last tab is gone.
             self._close_active_tab()
             return True
+        # Copy/paste on a text page. These live HERE, at the window's capture
+        # controller, and not on the sheet: the sheet's own controllers only
+        # see a key when focus is somewhere inside the sheet, so picking a tool
+        # from the toolbar (which focuses the BUTTON) silently killed Ctrl+C and
+        # Ctrl+V. Window capture fires no matter what has focus — the rule in
+        # CLAUDE.md. Each handler still declines the key unless it really wants
+        # it, so typing, and the editor's own copy/paste, are untouched.
+        if ctrl_held and keyval in (Gdk.KEY_c, Gdk.KEY_C) and self._text_mode:
+            tp = self._active_session._text_page
+            if tp is not None and tp.has_lasso_selection():
+                tp.copy_selection()
+                return True
+        if ctrl_held and keyval in (Gdk.KEY_v, Gdk.KEY_V) and self._text_mode:
+            tp = self._active_session._text_page
+            if tp is not None and tp.wants_paste():
+                tp.paste_clipboard_objects()
+                return True
         if ctrl_held and keyval == Gdk.KEY_backslash:
             if not self._text_mode:   # a text page has no notes panel to toggle
                 self._notes_toggle.set_active(not self._notes_toggle.get_active())
@@ -10447,15 +11277,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _save_text_ink(self):
         """Write the text-first page's ink sidecar next to its .md. Lazy like
-        the notes file: only once there is ink (or a sidecar already exists,
-        so erasing every stroke still persists)."""
+        the notes file: only once there is something to keep — ink OR a pasted
+        image (or a sidecar already exists, so erasing every stroke still
+        persists)."""
         if not self._text_mode or not self._notes_path:
             return
         tp = self._active_session._text_page
         if tp is None:
             return
         ink_file = _ink_path_for(self._notes_path)
-        if tp.strokes or os.path.exists(ink_file):
+        if tp.strokes or tp.images or os.path.exists(ink_file):
             with open(ink_file, "w", encoding="utf-8") as f:
                 json.dump(tp.ink_to_json(), f)
 

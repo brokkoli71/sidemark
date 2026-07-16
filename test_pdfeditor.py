@@ -6,6 +6,7 @@ Run with:  /usr/bin/python3 test_pdfeditor.py
 import os
 import sys
 import math
+import json
 import tempfile
 import time
 import types
@@ -18,7 +19,7 @@ os.environ["SIDEMARK_TEST"] = "1"
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib, Gdk, Gio
+from gi.repository import Gtk, Adw, GLib, Gdk, Gio, GObject
 import cairo
 import fitz
 import unittest.mock as mock
@@ -8749,6 +8750,28 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_image_only_page_still_writes_its_sidecar(self):
+        """REGRESSION: the sidecar was written only once there was INK, so a
+        page whose sole content was a pasted image saved nothing and the image
+        was gone on reload. An image is content too."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                doc = fitz.open()
+                page = doc.new_page(width=30, height=20)
+                page.draw_rect(fitz.Rect(1, 1, 29, 19), fill=(0, 1, 0))
+                tp.add_image(page.get_pixmap().tobytes("png"))
+                self.assertEqual(len(tp.strokes), 0)   # image, and NOTHING else
+                win._save_text_ink()
+                ink = sidemark._ink_path_for(os.path.join(d, "note.md"))
+                self.assertTrue(os.path.exists(ink),
+                                "an image-only page wrote no sidecar")
+                with open(ink, encoding="utf-8") as f:
+                    self.assertEqual(len(json.load(f)["images"]), 1)
+
+            self._run_in_window(body)
+
     # NOTE: the PDF export (_write_text_pdf) is exercised by the standalone
     # smoke script, not here — it needs live compositor frames for a freshly
     # mapped window, and after hundreds of suite tests weston stops ticking
@@ -9459,6 +9482,216 @@ class TestLinkCompletions(unittest.TestCase):
                 labels = [c["label"] for c in win._link_completions("alg")]
                 self.assertEqual(labels, ["algebra.pdf"])
         self._run_in_window(body)
+
+
+# ── pasted images on a text page ──────────────────────────────────────────────
+
+class TestTextPageImages(unittest.TestCase):
+    """An image on a text page behaves like a drawing: anchored to its
+    paragraph, round-tripped through the -ink.json sidecar, undoable."""
+
+    def _png(self, w=60, h=40):
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(1, 1, w - 1, h - 1), fill=(0, 0, 1))
+        return page.get_pixmap().tobytes("png")
+
+    def _sheet(self, text="alpha\nbeta\ngamma\n"):
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text(text)
+        return tp
+
+    def test_paste_adds_an_image_anchored_to_a_paragraph(self):
+        tp = self._sheet()
+        im = tp.add_image(self._png())
+        self.assertIsNotNone(im)
+        self.assertEqual(len(tp.images), 1)
+        self.assertIsNotNone(im["mark"])
+        # stored at the BASE font, not the zoom it was pasted at — so the
+        # image is a document size, like the pen width (row 116's lesson)
+        self.assertEqual(im["font_px"], tp._base_font_px)
+
+    def test_paste_point_is_the_mouse_over_the_sheet_else_the_centre(self):
+        """Paste follows the pointer, not the caret — so it works with the pen
+        or the lasso in hand, where there is no useful caret."""
+        tp = self._sheet()
+        tp._pointer_in = True
+        tp._mouse_xy = (123.0, 45.0)
+        self.assertEqual(tp.paste_point(), (123.0, 45.0))
+        tp._pointer_in = False
+        self.assertEqual(tp.paste_point(),
+                         (tp.get_width() / 2.0, tp.get_height() / 2.0))
+
+    def test_wide_image_is_fitted_to_the_paper(self):
+        tp = self._sheet()
+        im = tp.add_image(self._png(w=4000, h=2000))
+        avail = tp.page_width - 2 * tp.MARGIN_X
+        self.assertLessEqual(im["w"], avail + 0.01)
+        self.assertAlmostEqual(im["w"] / im["h"], 2.0, places=2)  # aspect kept
+
+    def test_sidecar_round_trip_keeps_the_image(self):
+        tp = self._sheet()
+        png = self._png()
+        tp.add_image(png)
+        tp.images[0]["rotate"] = 15.0
+        data = tp.ink_to_json()
+        tp2 = self._sheet()
+        tp2.load_ink(data)
+        self.assertEqual(len(tp2.images), 1)
+        self.assertEqual(tp2.images[0]["data"], png)     # bytes survive
+        self.assertEqual(tp2.images[0]["rotate"], 15.0)
+        self.assertIsNotNone(tp2.images[0]["texture"])
+
+    def test_image_rides_its_paragraph_when_text_above_is_edited(self):
+        # the whole reason an image anchors to a GtkTextMark instead of to
+        # absolute coords: inserting lines above must carry it down with its
+        # paragraph, exactly as ink does
+        tp = self._sheet()
+        buf = tp.view.get_buffer()
+        tp.add_image(self._png())
+        before = buf.get_iter_at_mark(tp.images[0]["mark"]).get_line()
+        buf.insert(buf.get_start_iter(), "new\nlines\n")
+        after = buf.get_iter_at_mark(tp.images[0]["mark"]).get_line()
+        self.assertEqual(after, before + 2)
+
+    def test_undo_removes_a_pasted_image_and_redo_brings_it_back(self):
+        tp = self._sheet()
+        tp.add_image(self._png())
+        tp.undo_ink()
+        self.assertEqual(len(tp.images), 0)
+        tp.redo_ink()
+        self.assertEqual(len(tp.images), 1)
+
+    def test_paste_from_the_clipboard_lands_on_the_sheet(self):
+        """The whole pipeline: a picture on the real clipboard -> Ctrl+V's
+        handler -> an image object on the sheet."""
+        tp = self._sheet()
+        clip = Gdk.Display.get_default().get_clipboard()
+        texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(self._png(50, 25)))
+        clip.set_content(Gdk.ContentProvider.new_for_value(
+            GObject.Value(Gdk.Texture, texture)))
+        tp.paste_clipboard_objects()
+        loop = GLib.MainLoop()
+        GLib.timeout_add(10, lambda: loop.quit() if tp.images else True)
+        GLib.timeout_add_seconds(5, loop.quit)
+        loop.run()
+        self.assertEqual(len(tp.images), 1)
+        self.assertEqual(tp.images[0]["texture"].get_width(), 50)
+
+    def test_in_app_copy_of_ink_pastes_back_as_editable_ink(self):
+        """Copying strokes and pasting inside Sidemark must give back STROKES,
+        not a flattened picture of them (the user's requirement for row 118)."""
+        tp = self._sheet()
+        objects = [{"type": "stroke", "pts": [[0, 0], [8, 9]],
+                    "color": [0.1, 0.2, 0.9], "width": 3.0, "opacity": 1.0,
+                    "font_px": 13}]
+        tp._add_pasted_objects(objects)
+        self.assertEqual(len(tp.strokes), 1)
+        self.assertEqual(len(tp.images), 0)          # NOT rasterised
+        self.assertEqual(tp.strokes[0]["width"], 3.0)
+        self.assertEqual(tp.strokes[0]["color"], (0.1, 0.2, 0.9))
+
+    def test_images_are_painted_under_the_text_by_the_view(self):
+        """Images hang off the VIEW's below-text layer, not the ink overlay.
+
+        Two things ride on this wiring: text drawn over a picture stays
+        readable, and the PDF export — which rasterises this very widget —
+        picks images up for free. Drawing them on the ink overlay instead
+        would cover the words AND silently vanish from the export."""
+        tp = self._sheet()
+        self.assertEqual(tp.view.on_snapshot_below, tp._snapshot_images)
+        tp.add_image(self._png())
+        called = []
+        tp.view.on_snapshot_below = lambda snap: called.append(True)
+        tp.view.do_snapshot_layer(Gtk.TextViewLayer.BELOW_TEXT, Gtk.Snapshot())
+        self.assertTrue(called, "below-text layer never reached the images")
+        # and the above-text layer must NOT paint them (that would cover text)
+        called.clear()
+        tp.view.do_snapshot_layer(Gtk.TextViewLayer.ABOVE_TEXT, Gtk.Snapshot())
+        self.assertFalse(called)
+
+    def test_corrupt_image_is_dropped_without_losing_the_ink(self):
+        tp = self._sheet()
+        data = {"version": 1, "strokes": [
+            {"line": 0, "ch": 0, "hash": tp._line_hash("alpha"),
+             "pts": [[0, 0], [5, 5]], "color": [0, 0, 1], "width": 2.0,
+             "opacity": 1.0, "font_px": 13}],
+            "images": [{"line": 0, "ch": 0, "png": "not-an-image"}]}
+        tp2 = self._sheet()
+        tp2.load_ink(data)
+        self.assertEqual(len(tp2.images), 0)
+        self.assertEqual(len(tp2.strokes), 1)   # the ink survived
+
+
+# ── the shared clipboard layer (ink + images, both modes) ─────────────────────
+
+class TestClipboardLayer(unittest.TestCase):
+    """Copy must carry our objects AND a picture in one entry: Sidemark pastes
+    back editable strokes/images, other apps get a PNG."""
+
+    def _texture(self, w=40, h=30):
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(2, 2, w - 2, h - 2), fill=(1, 0, 0))
+        png = page.get_pixmap().tobytes("png")
+        return Gdk.Texture.new_from_bytes(GLib.Bytes.new(png))
+
+    def _clipboard(self):
+        display = Gdk.Display.get_default()
+        self.assertIsNotNone(display, "tests need the headless compositor")
+        return display.get_clipboard()
+
+    def _pump(self, done):
+        """Spin the main loop until `done()` says the async read landed."""
+        loop = GLib.MainLoop()
+        def check():
+            if done():
+                loop.quit()
+                return False
+            return True
+        GLib.timeout_add(10, check)
+        GLib.timeout_add_seconds(5, loop.quit)
+        loop.run()
+
+    def test_copy_offers_our_objects_and_a_png_on_the_wire(self):
+        # THE regression guard for the GdkMemoryTexture boxing trap: a texture
+        # boxed as its concrete class advertises NOTHING to other apps while
+        # still pasting fine inside Sidemark — so assert on the SERIALIZABLE
+        # formats (what leaves the process), never on read_texture_async().
+        content = sidemark.clipboard_content_for(
+            [{"type": "stroke", "pts": [[0, 0]]}], self._texture())
+        wire = content.ref_formats().union_serialize_mime_types()
+        self.assertTrue(wire.contain_mime_type(sidemark.SIDEMARK_MIME),
+                        "Sidemark's own paste path lost its mime")
+        self.assertTrue(wire.contain_mime_type("image/png"),
+                        "other apps would see no image (texture boxing bug)")
+
+    def test_paste_prefers_our_objects_over_the_picture(self):
+        objects = [{"type": "stroke", "color": [0.1, 0.2, 0.9], "width": 2.0,
+                    "pts": [[0, 0], [10, 10], [20, 5]]},
+                   {"type": "image", "w": 120, "h": 80, "rotate": 15.0}]
+        clip = self._clipboard()
+        clip.set_content(sidemark.clipboard_content_for(objects, self._texture()))
+        got = {}
+        sidemark.paste_objects(clip,
+                               lambda o: got.setdefault("objects", o),
+                               lambda t: got.setdefault("texture", t))
+        self._pump(lambda: got)
+        # ink comes back as INK — points/colour/width intact, not flattened
+        self.assertEqual(got.get("objects"), objects)
+        self.assertNotIn("texture", got)
+
+    def test_paste_falls_back_to_a_picture_from_another_app(self):
+        clip = self._clipboard()
+        clip.set_content(Gdk.ContentProvider.new_for_value(
+            GObject.Value(Gdk.Texture, self._texture(24, 16))))
+        got = {}
+        sidemark.paste_objects(clip,
+                               lambda o: got.setdefault("objects", o),
+                               lambda t: got.setdefault("texture", t))
+        self._pump(lambda: got)
+        self.assertNotIn("objects", got)
+        self.assertEqual(got["texture"].get_width(), 24)
 
 
 if __name__ == "__main__":
