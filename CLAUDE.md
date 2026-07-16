@@ -49,9 +49,7 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   declared in the `_MODE_CHROME` table (widget name → modes tuple; `_mode_*`
   tool buttons drive their `_pmode_*` popover twins automatically) — when
   mode behavior changes, extend the table instead of adding per-mode `if`s.
-  This framework was ported from the `deck` branch (row 107); deck layers a
-  third `"deck"` mode and a thumbnail-provider interface on top — see "The
-  deck branch" below.
+  The table takes further modes without reshaping (row 107).
 - **`[[wiki links]]` (the linking workflow)** — this is the feature the project
   was designed around and it has shipped (ideas.csv row 99). In notes,
   `[[target]]` is a clickable link (Ctrl+click follows, hover shows a hand).
@@ -121,17 +119,19 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,
   auto-deleted on clean exit, kept on errors.
 
-## The deck branch (do not merge without asking)
+## The deck branch (parked — not a concern)
 
-A Sidemark **Deck** presentation editor lives on the experimental `deck`
-branch, checked out separately at `../pdfeditor/`. It adds `deck.py`, a `deck`
-document mode, PPTX→deck import, and deck themes, and it refactors modes into a
-`doc_mode` enum (that refactor is now ported to master — row 107 — so the
-remaining deck delta is mostly additive). Whether deck ever merges is
-undecided; the port keeps parity work independent of that decision. It may become a separate extension — **do NOT merge/push Deck
-into `master` without asking.** Its CLAUDE.md (`../pdfeditor/CLAUDE.md`) is the
-reference for that work. When master gains a feature, deck must be audited for
-impact when it next merges master.
+An experimental Sidemark **Deck** presentation editor lives on the `deck`
+branch (checked out at `../pdfeditor/`, with its own CLAUDE.md as the reference
+*if* it is ever picked up again). It adds `deck.py`, a `deck` document mode,
+PPTX→deck import and themes.
+
+**Treat it as dormant.** Do not let it shape decisions on master: don't weigh
+merge cost when designing or refactoring, and don't audit master's changes
+against it. It may be revived some day, may become a separate extension, or may
+never land at all — that call is deferred indefinitely. The one rule that
+stays, because it is free: **do NOT merge/push Deck into `master` without
+asking.**
 
 ## Current state (2026-07)
 
@@ -143,9 +143,8 @@ bug-fix batch — lasso now catches snapped straight lines, link-follow
 survives a deleted current file, display-wide CSS providers no longer leak
 per closed tab/window (row 102) — the `--fast` test tier (row 103), lasso
 resize handles + Ctrl+D duplicate (row 104), and text-page pinch zoom +
-Shift+click fit (row 105). The deck branch's `doc_mode`/`_MODE_CHROME` mode
-framework is ported to master (row 107) so parity work no longer waits on a
-deck-merge decision, and parity items 1–3 landed on it (row 108): text pages
+Shift+click fit (row 105). The `doc_mode`/`_MODE_CHROME` mode framework landed
+(row 107), and parity items 1–3 landed on it (row 108): text pages
 now have the lasso (select/move/resize/duplicate/recolour, re-anchoring the
 marks — closes row 95), straight-line snap and stroke smoothing. Text pages
 also reached tool/gesture parity with the PDF canvas (row 106 items 4–5 + a
