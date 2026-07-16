@@ -189,12 +189,32 @@ width) and the workflow model (row 113) are done.
 A July pass unified the input model into one chord grammar (row 115, see
 "Input chords" above): text pages gained the lasso chord and right-drag erase
 under the caret (a clean right-click re-pops the TextView menu itself — it
-must claim at press), Shift+middle-drag zooms to a region in both modes, the
-transient tool-button highlight now works fully in text mode and also lights
-during button gestures, and chord routing merges tracked modifiers for touch.
+must claim at press), the transient tool-button highlight works fully in text
+mode and lights during button gestures, and chord routing merges tracked
+modifiers for touch. All of row 115 is verified on real hardware.
+
+A **pdf/text parity audit** then closed row 116 and a run of bugs the same
+method found — its method is worth reusing (walk `chord_tool` × {pdf, text},
+compare sign/magnitude/**anchor**/clamping, and ask "does a test drive BOTH
+sides?"). Its lesson: every behavior where the sheet reuses a `PDFCanvas`
+pure helper held parity; the one it reimplemented (the eraser) was the one
+with a live bug. Landed: segment-based erasing on text pages (a snapped
+straight line is 2 points, so vertex-only hit-testing could never erase its
+middle), shared `zoom_factor_for_scroll` / `erase_radius` / `ZOOM_RECT_MIN_PX`
+/ `SCALE_MIN/MAX`, cursor-anchored sheet zoom, Ctrl+scroll and plain scroll
+fixed in both the sheet and the notes panel (see "Event reachability"), Ctrl+R
+in text mode (see the `_path` gotcha), the pen as a **document** width so ink
+never depends on the zoom you drew at, sheet zoom to 16×, `Alt+Shift+drag` as
+the portable keyboard zoom chord (the only one reaching zoom under the caret),
+and Escape stepping back out of a zoom-to-region (both surfaces keep a zoom
+stack).
+
+**Next up: row 118** — paste images from the clipboard, in both modes. The
+parked `deck` branch has a reference implementation worth reading first.
 
 **Open follow-ups:** text-page items in rows 92–94 (text-snapping highlighter,
 pagination/print view, margin inks that don't reflow) and row 100's link
 authoring (link-to-here + backlinks). Backlog: **row 111** (duplicate-download
-dialog), plus older rows 26/27/64. Row 115 still owes manual checks on real
-hardware: right-click menu re-pop feel, Shift+middle mouse, keyboard+touch.
+dialog), **row 117** (the suite is flaky under full-run load — one test fails
+per full run while passing in isolation and on a clean tree; parked for its own
+session), plus older rows 26/27/64.
