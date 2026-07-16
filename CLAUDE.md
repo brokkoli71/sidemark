@@ -114,6 +114,31 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   returning an action, or the drop never fires (portal transfer).
 - **GTK4 popovers**: never popdown one popover and popup a sibling on the same
   widget synchronously — defer to the "closed" signal.
+- **Event reachability — a correct handler can still never run.** When a
+  gesture "does nothing", test the PATH, not the handler (all of these tested
+  fine in isolation while being unreachable in the app):
+  - `GtkScrolledWindow` installs its OWN capture-phase scroll controller and
+    STOPS scroll it can use, so a Ctrl+scroll zoom must be captured on an
+    ancestor **above** it (`MarkdownNotesView.attach_zoom_scroll`,
+    `TextPageView._on_sheet_scroll`). The ScrolledWindow itself is too late —
+    same widget + same phase run in add order and GTK's is first.
+  - A drawing tool makes the ink overlay the event **target**
+    (`ink.set_can_target`), which cuts the ScrolledWindow out of the path
+    entirely — so `TextPageView` owns plain scrolling too, not just zoom.
+  - Window shortcuts that must beat a focused editor live in capture-phase
+    controllers (`_on_global_key`, `_on_undo_key`, the sheet's own). `_on_key`
+    is **bubble** and loses to whatever has focus — put a new app-level
+    shortcut in capture unless the editor should win (Ctrl+C, Delete, arrows).
+- **A text page has no `_path`.** A `.md` opened without a PDF lives in
+  `_notes_path`; `_path` is the PDF. Code reading `_path` alone silently
+  no-ops in text mode (this is what broke Ctrl+R) — use
+  `self._path or self._notes_path`. If a feature really is PDF-only, say so
+  loudly (`_on_export`, `_ocr_current`) rather than returning in silence.
+- **One table, not two**: `chord_tool` (chords), `zoom_factor_for_scroll`
+  (scroll→zoom rate), `erase_radius` (what counts as touching ink) are shared
+  by both canvases on purpose. Duplicating a *decision* is how the PDF and
+  text sides drift; duplicating *mechanics* is fine — they have genuinely
+  different substrates (a scale-transform canvas vs a reflowing ScrolledWindow).
 - The codebase favors long, explanatory comments about *why* (and records
   hard-won platform quirks inline) — match that style.
 - Logging: `logger` writes a per-session file under `~/.cache/sidemark/logs/`,

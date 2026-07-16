@@ -211,6 +211,42 @@ def _draw_zoom_marquee(ctx, x, y, w, h, rgb):
     ctx.set_dash([])
 
 
+ZOOM_WHEEL_STEP = 1.1     # one mouse-wheel notch, in or out (1/step)
+ZOOM_SMOOTH_RATE = 0.02   # zoom per px of touchpad scroll
+ZOOM_RECT_MIN_PX = 8      # a rubber-band smaller than this counts as a click
+ERASE_SLACK_PX = 3.0      # how far OUTSIDE the visible ink still erases it
+
+
+def zoom_factor_for_scroll(smooth, dy):
+    """The zoom multiplier one scroll event applies — ONE table for both
+    canvases, so the PDF page and the text sheet zoom at the same rate.
+
+    A touchpad sends a stream of small SURFACE-unit deltas: zoom proportionally
+    to the distance (clamped, so one fast flick can't rocket to the limit). A
+    mouse wheel sends ±1 notches: one fixed step each. Duplicating this is what
+    let the two canvases drift — the sheet used to ignore the unit entirely and
+    step chunkily under a touchpad while the PDF glided.
+
+    In and out are exact inverses (step / 1-step), so scrolling back and forth
+    returns to the zoom you started at."""
+    if smooth:
+        return max(0.5, min(2.0, 1.0 - dy * ZOOM_SMOOTH_RATE))
+    return (1.0 / ZOOM_WHEEL_STEP) if dy > 0 else ZOOM_WHEEL_STEP
+
+
+def erase_radius(width):
+    """How close to a stroke's CENTRELINE counts as touching it, for a stroke
+    drawn `width` px wide on screen. Shared by both erasers.
+
+    The eraser deletes a whole stroke on contact, so this is not a brush size:
+    it is "did I touch the ink". That is why it tracks the stroke's own width —
+    half of it reaches the visible edge, so clicking anywhere on a fat
+    highlighter erases it — plus a small fixed slack for an imperfect aim. A
+    flat radius would either miss the edges of thick ink or delete thin ink
+    from a distance."""
+    return width / 2.0 + ERASE_SLACK_PX
+
+
 def chord_tool(ctrl, shift, alt, mode, ink_active=True):
     """THE modifier-chord grammar: which tool a held (Ctrl, Shift, Alt) set
     stands in for. One table for both document modes so a chord never means
@@ -243,6 +279,7 @@ def chord_tool(ctrl, shift, alt, mode, ink_active=True):
 
 
 class PDFCanvas(Gtk.DrawingArea):
+    SCALE_MIN, SCALE_MAX = 0.1, 20.0   # zoom range of the PDF page canvas
     SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
     TOUCHPAD_FLIP_THRESHOLD = 180.0   # px of touchpad scroll past the edge before flipping
     WHEEL_PAN_STEP = 30.0         # px panned per mouse-wheel notch
@@ -1132,11 +1169,8 @@ class PDFCanvas(Gtk.DrawingArea):
             self._is_fitted = False
             self.queue_draw()
             return True
-        if smooth:
-            factor = max(0.5, min(2.0, 1.0 - dy * 0.02))
-        else:
-            factor = 0.9 if dy > 0 else 1.1
-        self._zoom_at(factor, self._mouse_x, self._mouse_y)
+        self._zoom_at(zoom_factor_for_scroll(smooth, dy),
+                      self._mouse_x, self._mouse_y)
         return True
 
     def _clamp_scroll_offset(self):
@@ -1174,7 +1208,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._zoom_start and self._zoom_end:
             dx = abs(self._zoom_end[0] - self._zoom_start[0])
             dy = abs(self._zoom_end[1] - self._zoom_start[1])
-            if dx >= 8 and dy >= 8:
+            if dx >= ZOOM_RECT_MIN_PX and dy >= ZOOM_RECT_MIN_PX:
                 self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
             else:
                 self.zoom_to_fit()   # Shift+click with no rect → fit page
@@ -1187,7 +1221,7 @@ class PDFCanvas(Gtk.DrawingArea):
         (cx, cy) fixed on screen. Shared by Ctrl+scroll, thumb-scroll zoom and
         the pinch gesture."""
         old_scale = self.scale
-        new_scale = max(0.1, min(20.0, old_scale * factor))
+        new_scale = max(self.SCALE_MIN, min(self.SCALE_MAX, old_scale * factor))
         if new_scale == old_scale:
             return
         pdf_x = (cx - self.offset_x) / old_scale
@@ -1226,7 +1260,8 @@ class PDFCanvas(Gtk.DrawingArea):
         ok, cx, cy = gesture.get_bounding_box_center()
         if not ok:
             return
-        new_scale = max(0.1, min(20.0, self._pinch_start_scale * delta))
+        new_scale = max(self.SCALE_MIN,
+                        min(self.SCALE_MAX, self._pinch_start_scale * delta))
         pdf_x, pdf_y = self._pinch_anchor_pdf
         self.scale = new_scale
         self._is_fitted = False
@@ -2206,7 +2241,7 @@ class PDFCanvas(Gtk.DrawingArea):
         kept = []
         removed = 0
         for i, s in enumerate(self.strokes):
-            if self._stroke_hits(s["pts"], px, py, s["width"] / 2 + 3.0):
+            if self._stroke_hits(s["pts"], px, py, erase_radius(s["width"])):
                 # record the index as if strokes were removed one at a time,
                 # so undo can reinsert by popping ops in reverse order
                 self._undo_stack.append(("erase", page, i - removed, s, self._erase_group))
@@ -5001,7 +5036,6 @@ class TextPageView(Gtk.Overlay):
     PAGE_WIDTH_MIN, PAGE_WIDTH_MAX = 360, 1400   # drag-to-resize clamp
     EDGE_GRAB = 7             # px either side of the paper edge that resizes it
     PAGE_GAP = 30             # surround gap around the sheet
-    ERASE_RADIUS = 9          # px hit distance for the eraser
     MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 56, 48, 96   # inner paper margins
     ZOOM_MIN, ZOOM_MAX = 0.5, 3.0
 
@@ -5220,7 +5254,7 @@ class TextPageView(Gtk.Overlay):
         # Attaching to the ScrolledWindow itself would NOT work: same widget +
         # same phase run in add order, and GTK's is added first.
         tscroll = Gtk.EventControllerScroll(
-            flags=Gtk.EventControllerScrollFlags.VERTICAL)
+            flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
         tscroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         tscroll.connect("scroll", self._on_sheet_scroll)
         self.add_controller(tscroll)
@@ -5311,15 +5345,32 @@ class TextPageView(Gtk.Overlay):
             self.set_zoom(self.zoom * (1.1 ** direction))
 
     def zoom_step_at(self, direction, vx, vy):
-        """zoom_step, but keep the sheet point under viewport (vx, vy) fixed —
-        cursor-anchored zoom for the scroll gestures (Ctrl+scroll, thumb-scroll),
-        matching the PDF canvas' _zoom_at. Same math as the pinch: the sheet
-        scales uniformly about the content origin, so a content point
-        (scroll+v) scales by f; solve for the scroll that keeps it under v.
-        Returns the new (h, v) scroll so a live thumb-pan can rebase. The
-        relayout to the new width is async — re-apply once it lands."""
+        """One keyboard/wheel STEP, anchored at viewport (vx, vy). direction 0
+        resets to 1.0 (Ctrl+0). Wheel steps come from the shared table so the
+        sheet and the PDF page move at the same rate."""
         old = self.zoom
-        self.zoom_step(direction)
+        if direction == 0:
+            self.set_zoom(1.0)
+        else:
+            self.set_zoom(self.zoom * (ZOOM_WHEEL_STEP ** direction))
+        return self._reanchor_zoom(old, vx, vy)
+
+    def zoom_by_at(self, factor, vx, vy):
+        """Multiply the zoom by `factor`, anchored at viewport (vx, vy) — the
+        continuous form, so a touchpad can zoom proportionally to the scroll
+        distance instead of in fixed steps (PDF-canvas parity, _zoom_at)."""
+        old = self.zoom
+        self.set_zoom(self.zoom * factor)
+        return self._reanchor_zoom(old, vx, vy)
+
+    def _reanchor_zoom(self, old, vx, vy):
+        """Keep the sheet point under viewport (vx, vy) fixed across a zoom
+        from `old` — the anchored core behind every sheet zoom gesture, and the
+        mirror of the PDF canvas' _zoom_at. Same math as the pinch: the sheet
+        scales uniformly about the content origin, so a content point (scroll+v)
+        scales by f; solve for the scroll that keeps it under v. Returns the new
+        (h, v) scroll so a live thumb-pan can rebase. The relayout to the new
+        width is async — re-apply once it lands."""
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
         f = self.zoom / old
         if f == 1.0:
@@ -5620,28 +5671,44 @@ class TextPageView(Gtk.Overlay):
                             if self.tool == "pan" else None)
         return False
 
-    def _on_sheet_scroll(self, ctrl, _dx, dy):
-        """Zoom the sheet toward the cursor on Ctrl+scroll, or on a plain scroll
-        while the thumb button latches pan+zoom navigation — PDF-canvas parity
-        (see _on_scroll there, which pairs the same two triggers).
+    def _on_sheet_scroll(self, ctrl, dx, dy):
+        """EVERY scroll on the sheet — zoom and plain scrolling alike — in one
+        place, so it behaves the same whatever the tool. Ctrl+scroll (or a
+        scroll while the thumb button latches navigation) zooms toward the
+        cursor; anything else pans. Mirrors PDFCanvas._on_scroll, which pairs
+        the same triggers and likewise hand-rolls its scroll-pan.
 
-        Claiming (True) is what stops the ScrolledWindow underneath from
-        scrolling instead; returning False leaves ordinary scrolling alone.
+        Plain scrolling has to be owned here, NOT left to the ScrolledWindow:
+        a drawing tool makes the ink overlay the event target (set_tool ->
+        ink.set_can_target), which cuts the ScrolledWindow out of the
+        propagation path entirely — so GTK's own scrolling silently stopped
+        working with the pen selected and worked with the caret. This
+        controller is on the TextPageView, above both, so it always fires.
+
         A thumb-pan rebases its origin to the post-zoom scroll so the next
         motion event doesn't jump."""
-        if not dy:
+        if not dx and not dy:
             return False
         ev = ctrl.get_current_event()
         ctrl_held = bool(ev and (ev.get_modifier_state()
                                  & Gdk.ModifierType.CONTROL_MASK))
         if not ctrl_held and self.get_held_mods is not None:
             ctrl_held = self.get_held_mods()[0]   # (ctrl, shift, alt)
-        if not (ctrl_held or self._thumb_panning):
-            return False
-        new_scroll = self.zoom_step_at(-1 if dy > 0 else 1, *self._mouse_xy)
-        if self._thumb_panning:
-            self._thumb_start = new_scroll
-            self._thumb_origin = self._mouse_xy
+        smooth = ctrl.get_unit() == Gdk.ScrollUnit.SURFACE
+        if ctrl_held or self._thumb_panning:
+            new_scroll = self.zoom_by_at(zoom_factor_for_scroll(smooth, dy),
+                                         *self._mouse_xy)
+            if self._thumb_panning:
+                self._thumb_start = new_scroll
+                self._thumb_origin = self._mouse_xy
+            return True
+        # plain scroll → pan. Touchpad deltas are ~1px each; a wheel notch is
+        # ±1 and needs the same step the PDF canvas pans by, so the two modes
+        # scroll at one speed.
+        step = 1.0 if smooth else PDFCanvas.WHEEL_PAN_STEP
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        ha.set_value(ha.get_value() + dx * step)
+        va.set_value(va.get_value() + dy * step)
         return True
 
     def _apply_zoom(self):
@@ -5894,7 +5961,7 @@ class TextPageView(Gtk.Overlay):
         if start and end:
             rw = abs(end[0] - start[0])
             rh = abs(end[1] - start[1])
-            if rw >= 8 and rh >= 8:
+            if rw >= ZOOM_RECT_MIN_PX and rh >= ZOOM_RECT_MIN_PX:
                 self._zoom_to_region(start, end)
             else:
                 self.fit_width()   # Shift+click with no rect → fit page
@@ -6036,13 +6103,12 @@ class TextPageView(Gtk.Overlay):
             self.on_ink_changed()
 
     def _erase_radius(self, st):
-        """Overlay-space hit radius for `st`: its on-screen half-width plus a
-        little slack — the PDF canvas' model, so thick ink is as easy to hit
-        as it looks — with ERASE_RADIUS as a floor to keep thin ink forgiving.
-        The sheet draws a stroke at width*f (see _draw_ink), so the radius has
-        to carry the same font scale."""
+        """Overlay-space hit radius for `st`, from the shared erase_radius()
+        policy. The sheet draws a stroke at width*f (see _draw_ink), so the
+        radius carries the same font scale — erasing tracks the ink you can
+        actually see, at every zoom."""
         f = self.font_px / max(st["font_px"], 1)
-        return max(self.ERASE_RADIUS, st["width"] * f / 2 + 3.0)
+        return erase_radius(st["width"] * f)
 
     def _erase_at(self, x, y):
         # Hit-test every SEGMENT, not just the stored vertices, reusing the PDF
@@ -11099,16 +11165,21 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             after()
 
     def _reload(self):
-        if not self._path:
+        # A text-first page has no PDF — its document IS the .md — so follow
+        # whichever file this tab actually holds, the same way _update_tab_title
+        # does. Reading only _path made Ctrl+R silently do nothing in text mode.
+        path = self._path or self._notes_path
+        if not path:
             return
-        page = self.canvas.current_page_idx
         def do_reload():
             # Spawn a *standalone* process (SIDEMARK_STANDALONE bypasses the
             # single instance) so the reload actually re-reads the code from
             # disk instead of forwarding to this still-running process.
             env = dict(os.environ, SIDEMARK_STANDALONE="1")
-            subprocess.Popen([sys.executable, os.path.abspath(__file__),
-                              self._path, "--page", str(page)], env=env)
+            argv = [sys.executable, os.path.abspath(__file__), path]
+            if self._path:   # only a PDF has a page to come back to
+                argv += ["--page", str(self.canvas.current_page_idx)]
+            subprocess.Popen(argv, env=env)
             self.destroy()
         if self._dirty:
             self._ask_save_then(do_reload)

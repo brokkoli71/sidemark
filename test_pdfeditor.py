@@ -2929,12 +2929,15 @@ class TestPageDragExport(unittest.TestCase):
         doc.close()
 
 
-def _scroll_ctrl(ctrl_held=False):
+def _scroll_ctrl(ctrl_held=False, smooth=False):
     """Stand-in for the Gtk.EventControllerScroll handed to a "scroll" handler,
-    reporting the modifiers held on the event (real GTK always passes one)."""
+    reporting the modifiers held and the scroll unit (a mouse wheel sends
+    ±1 WHEEL notches, a touchpad a stream of small SURFACE deltas)."""
     mods = (Gdk.ModifierType.CONTROL_MASK if ctrl_held else Gdk.ModifierType(0))
+    unit = Gdk.ScrollUnit.SURFACE if smooth else Gdk.ScrollUnit.WHEEL
     ev = types.SimpleNamespace(get_modifier_state=lambda: mods)
-    return types.SimpleNamespace(get_current_event=lambda: ev)
+    return types.SimpleNamespace(get_current_event=lambda: ev,
+                                 get_unit=lambda: unit)
 
 
 class _FakeDrag:
@@ -6062,7 +6065,10 @@ class TestThumbScrollZoom(unittest.TestCase):
             self.assertEqual(canvas._thumb_start_offset,
                              (canvas.offset_x, canvas.offset_y))
             canvas._on_scroll(ctrl, 0, 1)   # zoom back out, no page flip
-            self.assertAlmostEqual(canvas.scale, scale * 1.1 * 0.9)
+            # in and out are exact inverses (shared zoom_factor_for_scroll), so
+            # a notch each way lands back on the zoom you started at — it used
+            # to drift, 1.1 in but 0.9 out
+            self.assertAlmostEqual(canvas.scale, scale)
             self.assertEqual(canvas.current_page_idx, 0)
         finally:
             os.unlink(tmp)
@@ -8327,8 +8333,10 @@ class TestTextFirstMode(unittest.TestCase):
             self._run_in_window(body)
 
     def test_eraser_radius_follows_stroke_width_and_zoom(self):
-        """Thick ink is as easy to hit as it looks (the PDF canvas' model),
-        and the radius carries the same font scale the sheet draws it at."""
+        """The eraser deletes a whole stroke on contact, so the radius is only
+        "did I touch the ink": half the stroke's ON-SCREEN width (so the edge
+        of fat ink counts) plus a small slack for an imperfect aim — no
+        generous flat radius that would delete thin ink from a distance."""
         with tempfile.TemporaryDirectory() as d:
             def body(win):
                 self._open_md(win, d)
@@ -8338,16 +8346,89 @@ class TestTextFirstMode(unittest.TestCase):
                 st = tp.strokes[0]
                 st["font_px"] = tp.font_px          # drawn 1:1
 
-                st["width"] = 2                     # thin ink keeps the floor
-                self.assertEqual(tp._erase_radius(st), tp.ERASE_RADIUS)
+                st["width"] = 2                     # thin ink: tight, just slack
+                self.assertAlmostEqual(tp._erase_radius(st),
+                                       1.0 + sidemark.ERASE_SLACK_PX)
 
                 st["width"] = 30                    # fat ink: visible edge + slack
-                self.assertAlmostEqual(tp._erase_radius(st), 30 / 2 + 3.0)
+                self.assertAlmostEqual(tp._erase_radius(st),
+                                       15.0 + sidemark.ERASE_SLACK_PX)
 
                 st["font_px"] = tp.font_px / 2      # sheet zoomed → drawn 2x
-                self.assertAlmostEqual(tp._erase_radius(st), 30 * 2 / 2 + 3.0)
+                self.assertAlmostEqual(tp._erase_radius(st),
+                                       30.0 + sidemark.ERASE_SLACK_PX)
 
             self._run_in_window(body)
+
+    def test_both_erasers_share_one_radius_policy(self):
+        """The sheet and the PDF canvas must agree on what counts as touching
+        a stroke — a duplicated formula is what let the erasers drift apart."""
+        self.assertAlmostEqual(sidemark.erase_radius(30), 15.0 + 3.0)
+        self.assertAlmostEqual(sidemark.erase_radius(2), 1.0 + 3.0)
+
+    def test_ctrl_r_reloads_a_text_page(self):
+        """Ctrl+R silently did nothing in text mode: _reload() read only
+        _path (the PDF), which a text-first page never has — its document is
+        the .md in _notes_path. The key was always reaching the handler."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                md = self._open_md(win, d)
+                self.assertEqual(win._active_session.doc_mode, "text")
+                self.assertIsNone(win._path)          # no PDF behind this tab
+                self.assertEqual(win._notes_path, md)
+
+                spawned = []
+                with mock.patch.object(sidemark.subprocess, "Popen",
+                                       lambda argv, **kw: spawned.append(argv)), \
+                     mock.patch.object(win, "destroy", lambda: None):
+                    win._dirty = False
+                    win._reload()
+
+                self.assertTrue(spawned, "Ctrl+R spawned no reload process")
+                self.assertIn(md, spawned[0])         # reopens THIS document
+                # a text page has no page number to return to
+                self.assertNotIn("--page", spawned[0])
+
+            self._run_in_window(body)
+
+    def test_plain_scroll_pans_the_sheet_with_every_tool(self):
+        """A drawing tool makes the ink overlay the event target, which cuts
+        the ScrolledWindow out of the propagation path — GTK's own scrolling
+        then never runs. Scrolling must not depend on the active tool."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d, text="para\n\n" * 200)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                for tool in ("text", "pen", "highlighter", "eraser", "lasso",
+                             "zoom", "pan"):
+                    win._set_tool_mode(tool if tool != "text" else "select")
+                    va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                    va.set_value(0.0)
+                    self.assertTrue(
+                        tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0),
+                        f"plain scroll not handled with tool={tool}")
+                    self.assertGreater(
+                        va.get_value(), 0.0,
+                        f"sheet did not scroll with tool={tool}")
+
+            self._run_in_window(body)
+
+    def test_touchpad_zoom_is_proportional_not_stepped(self):
+        """A touchpad sends many small SURFACE deltas; the sheet used to ignore
+        the unit and jump a full wheel step per event while the PDF canvas
+        glided. Both now read the same zoom_factor_for_scroll table."""
+        # a small smooth delta must zoom far less than a full wheel notch
+        smooth = sidemark.zoom_factor_for_scroll(True, -1.0)
+        wheel = sidemark.zoom_factor_for_scroll(False, -1.0)
+        self.assertLess(smooth - 1.0, (wheel - 1.0) / 2)
+        # ...and a wheel notch in then out returns exactly where it started
+        self.assertAlmostEqual(
+            sidemark.zoom_factor_for_scroll(False, -1.0)
+            * sidemark.zoom_factor_for_scroll(False, 1.0), 1.0)
+        # a violent touchpad flick is clamped, not a rocket
+        self.assertLessEqual(sidemark.zoom_factor_for_scroll(True, -500.0), 2.0)
+        self.assertGreaterEqual(sidemark.zoom_factor_for_scroll(True, 500.0), 0.5)
 
     def test_save_keeps_md_pure_and_writes_sidecar(self):
         with tempfile.TemporaryDirectory() as d:
@@ -8952,9 +9033,16 @@ class TestTextPageLasso(unittest.TestCase):
                 self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0))
                 tp._on_thumb_event(None, self._thumb_event(
                     Gdk.EventType.BUTTON_RELEASE))
-                # without the thumb held, a plain scroll is left alone so the
-                # ScrolledWindow underneath scrolls as usual
-                self.assertFalse(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0))
+                # thumb released: the same scroll now pans instead of zooming
+                # (the sheet owns plain scrolling too — it cannot be left to
+                # the ScrolledWindow, which a drawing tool cuts out of the path)
+                z1 = tp.zoom
+                va = tp.scroll.get_vadjustment()
+                va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(0.0)
+                self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0))
+                self.assertAlmostEqual(tp.zoom, z1)      # no longer zooming
+                self.assertGreater(va.get_value(), 0.0)  # panned instead
 
             self._run_in_window(body)
 
