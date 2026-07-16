@@ -7949,6 +7949,40 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_scroll_zoom_anchors_to_cursor(self):
+        """Ctrl/thumb-scroll zoom keeps the sheet point under the cursor fixed
+        (zoom toward the cursor, not the top-left) — parity with the PDF
+        canvas' _zoom_at."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                va = tp.scroll.get_vadjustment()
+                ha = tp.scroll.get_hadjustment()
+                for adj in (va, ha):
+                    adj.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(100.0)
+                ha.set_value(40.0)
+                # zoom in one step centred on viewport (300, 200)
+                z0 = tp.zoom
+                new = tp.zoom_step_at(1, 300.0, 200.0)
+                f = tp.zoom / z0
+                self.assertGreater(f, 1.0)                       # zoomed in
+                # content point under the cursor is unchanged on screen:
+                # (scroll + v)*f - v  ==  new scroll
+                self.assertAlmostEqual(new[0], (40.0 + 300.0) * f - 300.0, places=3)
+                self.assertAlmostEqual(new[1], (100.0 + 200.0) * f - 200.0, places=3)
+                self.assertAlmostEqual(ha.get_value(), new[0], places=3)
+                self.assertAlmostEqual(va.get_value(), new[1], places=3)
+                # a live thumb-pan rebases off the returned scroll
+                tp._thumb_panning = True
+                tp._mouse_xy = (300.0, 200.0)
+                tp._on_thumb_scroll(mock.Mock(), 0, -1)
+                self.assertEqual(tp._thumb_origin, (300.0, 200.0))
+                self.assertEqual(tp._thumb_start, (ha.get_value(), va.get_value()))
+
+            self._run_in_window(body)
+
     def test_ctrl_shift_drag_temp_highlighter(self):
         """Ctrl+Shift+drag lays down a one-off highlighter stroke regardless of
         the active tool, then restores it (PDF-canvas parity, #106 item 6)."""

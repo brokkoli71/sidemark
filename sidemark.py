@@ -5283,6 +5283,27 @@ class TextPageView(Gtk.Overlay):
         else:
             self.set_zoom(self.zoom * (1.1 ** direction))
 
+    def zoom_step_at(self, direction, vx, vy):
+        """zoom_step, but keep the sheet point under viewport (vx, vy) fixed —
+        cursor-anchored zoom for the scroll gestures (Ctrl+scroll, thumb-scroll),
+        matching the PDF canvas' _zoom_at. Same math as the pinch: the sheet
+        scales uniformly about the content origin, so a content point
+        (scroll+v) scales by f; solve for the scroll that keeps it under v.
+        Returns the new (h, v) scroll so a live thumb-pan can rebase. The
+        relayout to the new width is async — re-apply once it lands."""
+        old = self.zoom
+        self.zoom_step(direction)
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        f = self.zoom / old
+        if f == 1.0:
+            return (ha.get_value(), va.get_value())
+        hv = (ha.get_value() + vx) * f - vx
+        vv = (va.get_value() + vy) * f - vy
+        ha.set_value(hv)
+        va.set_value(vv)
+        GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
+        return (hv, vv)
+
     def fit_width(self):
         """Zoom so the paper spans the viewport — Shift+click parity with the
         PDF canvas' fit-page (available while a drawing tool is active; with
@@ -5573,15 +5594,14 @@ class TextPageView(Gtk.Overlay):
         return False
 
     def _on_thumb_scroll(self, ctrl, _dx, dy):
-        """Scroll while the thumb button pans zooms the sheet (PDF-canvas
-        parity: the thumb hold latches a pan+zoom navigation mode). Rebase the
-        pan origin afterwards so the next motion event doesn't jump."""
+        """Scroll while the thumb button pans zooms the sheet toward the cursor
+        (PDF-canvas parity: the thumb hold latches a pan+zoom navigation mode).
+        Rebase the pan origin to the post-zoom scroll so the next motion event
+        doesn't jump."""
         if not self._thumb_panning or not dy:
             return False
-        self.zoom_step(-1 if dy > 0 else 1)
+        self._thumb_start = self.zoom_step_at(-1 if dy > 0 else 1, *self._mouse_xy)
         self._thumb_origin = self._mouse_xy
-        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-        self._thumb_start = (ha.get_value(), va.get_value())
         return True
 
     def _apply_zoom(self):
@@ -7602,7 +7622,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tp.accent = lambda s=s: s.canvas.zoom_accent
         # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
         # and margins together), not the persistent notes-font setting
-        tp.view.font_zoom_cb = lambda d: tp.zoom_step(d)
+        # Ctrl+scroll (and Ctrl+=/-/0) zoom the sheet toward the pointer, the
+        # same cursor-anchored feel as the PDF canvas and the thumb-scroll zoom
+        tp.view.font_zoom_cb = lambda d: tp.zoom_step_at(d, *tp._mouse_xy)
         tp.view.on_follow_link = lambda link: s.win._follow_note_link(link)
         tp.view.link_candidates_cb = lambda q: s.win._link_completions(q)
         tp.view.get_buffer().connect(
