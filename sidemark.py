@@ -5190,12 +5190,19 @@ class TextPageView(Gtk.Overlay):
         thumb = Gtk.EventControllerLegacy()
         thumb.connect("event", self._on_thumb_event)
         self.add_controller(thumb)
-        # scroll-while-thumb-held zooms the sheet (capture phase, so it wins
-        # over the ScrolledWindow's own scrolling only while the pan is live)
+        # Sheet scroll-zoom (Ctrl+scroll, and scroll-while-thumb-held). This
+        # MUST live here — capture phase, on an ancestor of the ScrolledWindow.
+        # GtkScrolledWindow installs its OWN capture-phase scroll controller
+        # (BOTH_AXES|KINETIC) in its init and returns STOP whenever it can
+        # scroll, so a handler on the sheet itself never sees Ctrl+scroll once
+        # the page is long enough to scroll (it only "works" on a short sheet).
+        # Capture runs top-down, so this controller is the first to see scroll.
+        # Attaching to the ScrolledWindow itself would NOT work: same widget +
+        # same phase run in add order, and GTK's is added first.
         tscroll = Gtk.EventControllerScroll(
             flags=Gtk.EventControllerScrollFlags.VERTICAL)
         tscroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        tscroll.connect("scroll", self._on_thumb_scroll)
+        tscroll.connect("scroll", self._on_sheet_scroll)
         self.add_controller(tscroll)
 
         # right-click aborts an in-progress zoom-region drag (same escape hatch
@@ -5562,7 +5569,7 @@ class TextPageView(Gtk.Overlay):
         if t == Gdk.EventType.BUTTON_PRESS and event.get_button() == 10:
             # thumb mirrors the middle (navigation) button, as the more
             # ergonomic reach: hold to pan, Shift+hold to zoom-to-region,
-            # scroll-while-held to zoom (see _on_thumb_scroll)
+            # scroll-while-held to zoom (see _on_sheet_scroll)
             shift = bool(event.get_modifier_state()
                          & Gdk.ModifierType.SHIFT_MASK)
             if not shift and self.get_held_mods is not None:
@@ -5593,15 +5600,28 @@ class TextPageView(Gtk.Overlay):
                             if self.tool == "pan" else None)
         return False
 
-    def _on_thumb_scroll(self, ctrl, _dx, dy):
-        """Scroll while the thumb button pans zooms the sheet toward the cursor
-        (PDF-canvas parity: the thumb hold latches a pan+zoom navigation mode).
-        Rebase the pan origin to the post-zoom scroll so the next motion event
-        doesn't jump."""
-        if not self._thumb_panning or not dy:
+    def _on_sheet_scroll(self, ctrl, _dx, dy):
+        """Zoom the sheet toward the cursor on Ctrl+scroll, or on a plain scroll
+        while the thumb button latches pan+zoom navigation — PDF-canvas parity
+        (see _on_scroll there, which pairs the same two triggers).
+
+        Claiming (True) is what stops the ScrolledWindow underneath from
+        scrolling instead; returning False leaves ordinary scrolling alone.
+        A thumb-pan rebases its origin to the post-zoom scroll so the next
+        motion event doesn't jump."""
+        if not dy:
             return False
-        self._thumb_start = self.zoom_step_at(-1 if dy > 0 else 1, *self._mouse_xy)
-        self._thumb_origin = self._mouse_xy
+        ev = ctrl.get_current_event()
+        ctrl_held = bool(ev and (ev.get_modifier_state()
+                                 & Gdk.ModifierType.CONTROL_MASK))
+        if not ctrl_held and self.get_held_mods is not None:
+            ctrl_held = self.get_held_mods()[0]   # (ctrl, shift, alt)
+        if not (ctrl_held or self._thumb_panning):
+            return False
+        new_scroll = self.zoom_step_at(-1 if dy > 0 else 1, *self._mouse_xy)
+        if self._thumb_panning:
+            self._thumb_start = new_scroll
+            self._thumb_origin = self._mouse_xy
         return True
 
     def _apply_zoom(self):

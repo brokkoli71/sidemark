@@ -2929,6 +2929,14 @@ class TestPageDragExport(unittest.TestCase):
         doc.close()
 
 
+def _scroll_ctrl(ctrl_held=False):
+    """Stand-in for the Gtk.EventControllerScroll handed to a "scroll" handler,
+    reporting the modifiers held on the event (real GTK always passes one)."""
+    mods = (Gdk.ModifierType.CONTROL_MASK if ctrl_held else Gdk.ModifierType(0))
+    ev = types.SimpleNamespace(get_modifier_state=lambda: mods)
+    return types.SimpleNamespace(get_current_event=lambda: ev)
+
+
 class _FakeDrag:
     """Minimal stand-in for a Gtk drag gesture so the canvas drag handlers can be
     driven without a real pointer (headless: scale 1.0, offset 0 → screen==PDF)."""
@@ -7977,7 +7985,7 @@ class TestTextFirstMode(unittest.TestCase):
                 # a live thumb-pan rebases off the returned scroll
                 tp._thumb_panning = True
                 tp._mouse_xy = (300.0, 200.0)
-                tp._on_thumb_scroll(mock.Mock(), 0, -1)
+                tp._on_sheet_scroll(_scroll_ctrl(), 0, -1)
                 self.assertEqual(tp._thumb_origin, (300.0, 200.0))
                 self.assertEqual(tp._thumb_start, (ha.get_value(), va.get_value()))
 
@@ -8837,13 +8845,41 @@ class TestTextPageLasso(unittest.TestCase):
                     Gdk.EventType.BUTTON_PRESS))
                 self.assertTrue(tp._thumb_panning)
                 z0 = tp.zoom
-                self.assertTrue(tp._on_thumb_scroll(None, 0.0, -1.0))
+                self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, -1.0))
                 self.assertGreater(tp.zoom, z0)      # scroll up → zoom in
-                self.assertTrue(tp._on_thumb_scroll(None, 0.0, 1.0))
+                self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0))
                 tp._on_thumb_event(None, self._thumb_event(
                     Gdk.EventType.BUTTON_RELEASE))
-                # without the thumb held, the controller stays out of the way
-                self.assertFalse(tp._on_thumb_scroll(None, 0.0, 1.0))
+                # without the thumb held, a plain scroll is left alone so the
+                # ScrolledWindow underneath scrolls as usual
+                self.assertFalse(tp._on_sheet_scroll(_scroll_ctrl(), 0.0, 1.0))
+
+            self._run_in_window(body)
+
+    def test_ctrl_scroll_zooms_the_sheet(self):
+        """Ctrl+scroll zooms the sheet. It must be handled in the CAPTURE phase
+        above the ScrolledWindow: GtkScrolledWindow's own capture controller
+        eats scroll to scroll its content, so a handler on the sheet itself
+        never sees Ctrl+scroll once the page is long enough to scroll."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d)
+                tp = win._active_session._text_page
+                tp._mouse_xy = (100.0, 100.0)
+                self.assertFalse(tp._thumb_panning)   # no thumb button involved
+
+                z0 = tp.zoom
+                self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(True), 0.0, -1.0))
+                self.assertGreater(tp.zoom, z0)       # Ctrl+scroll up → zoom in
+                self.assertTrue(tp._on_sheet_scroll(_scroll_ctrl(True), 0.0, 1.0))
+                self.assertAlmostEqual(tp.zoom, z0, places=6)   # and back out
+
+                # the controller must sit in the capture phase on the
+                # TextPageView, above the ScrolledWindow, or it never fires
+                phases = [c.get_propagation_phase()
+                          for c in tp.observe_controllers()
+                          if isinstance(c, Gtk.EventControllerScroll)]
+                self.assertIn(Gtk.PropagationPhase.CAPTURE, phases)
 
             self._run_in_window(body)
 
