@@ -8393,6 +8393,43 @@ class TestTextFirstMode(unittest.TestCase):
 
             self._run_in_window(body)
 
+    def test_escape_steps_back_out_of_a_zoom_region(self):
+        """Every zoom-to-region remembers the view it left; Escape pops it.
+        The sheet's view is (zoom, scroll) where the canvas' is
+        (scale, offset), but the behaviour is the same in both modes."""
+        with tempfile.TemporaryDirectory() as d:
+            def body(win):
+                self._open_md(win, d, text="para\n\n" * 200)
+                tp = win._active_session._text_page
+                self.assertFalse(tp.can_zoom_back())     # nothing to go back to
+
+                va = tp.scroll.get_vadjustment()
+                va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
+                va.set_value(120.0)
+                z0, v0 = tp.zoom, va.get_value()
+
+                tp._zoom_to_region((40.0, 40.0), (140.0, 140.0))
+                self.assertNotAlmostEqual(tp.zoom, z0)   # zoomed in
+                self.assertTrue(tp.can_zoom_back())
+
+                self.assertTrue(win._on_key(None, Gdk.KEY_Escape, 0,
+                                            Gdk.ModifierType(0)))
+                self.assertAlmostEqual(tp.zoom, z0)      # exactly where we were
+                self.assertAlmostEqual(va.get_value(), v0, places=3)
+                self.assertFalse(tp.can_zoom_back())
+
+                # with nothing left, Escape is NOT claimed — the key stays free
+                self.assertFalse(win._on_key(None, Gdk.KEY_Escape, 0,
+                                             Gdk.ModifierType(0)))
+
+                # fitting is a fresh start: it drops the history
+                tp._zoom_to_region((40.0, 40.0), (140.0, 140.0))
+                self.assertTrue(tp.can_zoom_back())
+                tp.fit_width()
+                self.assertFalse(tp.can_zoom_back())
+
+            self._run_in_window(body)
+
     def test_alt_shift_drag_zooms_to_region_under_the_caret(self):
         """Alt+Shift is THE portable keyboard zoom chord: under the caret,
         Shift alone is text selection, so it was impossible to reach

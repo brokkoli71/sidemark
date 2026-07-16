@@ -2561,6 +2561,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
         self._schedule_rerender()
 
+    def can_zoom_back(self):
+        """True when zoom_back() has a view to return to — so Escape only
+        claims the key when it would actually do something."""
+        return bool(self._zoom_stack)
+
     def zoom_back(self):
         if self._zoom_stack:
             self.scale, self.offset_x, self.offset_y = self._zoom_stack.pop()
@@ -5091,6 +5096,7 @@ class TextPageView(Gtk.Overlay):
         # keep riding with the paragraph they now sit on.
         self._selected = []
         self._lassoing = False
+        self._zoom_stack = []          # [(zoom, scroll_h, scroll_v), ...] for Escape
         self._lasso_path = []          # overlay coords of the loop in progress
         self._lasso_moving = False
         self._lasso_moved = False
@@ -5393,10 +5399,30 @@ class TextPageView(Gtk.Overlay):
     def fit_width(self):
         """Zoom so the paper spans the viewport — Shift+click parity with the
         PDF canvas' fit-page (available while a drawing tool is active; with
-        the text tool, Shift+click keeps its editing meaning)."""
+        the text tool, Shift+click keeps its editing meaning). Fitting is a
+        fresh start, so it drops the zoom history (PDFCanvas.zoom_to_fit)."""
+        self._zoom_stack.clear()
         vw = self.scroll.get_width()
         if vw > 0:
             self.set_zoom((vw - 2 * self.PAGE_GAP) / self.page_width)
+
+    def can_zoom_back(self):
+        """True when zoom_back() has a view to return to (PDF-canvas twin)."""
+        return bool(self._zoom_stack)
+
+    def zoom_back(self):
+        """Step back to the view before the last zoom-to-region — the sheet's
+        twin of PDFCanvas.zoom_back. The sheet's view is (zoom, scroll), where
+        the canvas' is (scale, offset)."""
+        if not self._zoom_stack:
+            return
+        z, hv, vv = self._zoom_stack.pop()
+        self.set_zoom(z)
+        ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        ha.set_value(hv)
+        va.set_value(vv)
+        # the relayout to the new width is async — re-apply once it lands
+        GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
 
     def set_page_width(self, px):
         """Set the per-document sheet width (the wrap column), clamped. Marks
@@ -5476,9 +5502,13 @@ class TextPageView(Gtk.Overlay):
         x1, y1 = min(start[0], end[0]), min(start[1], end[1])
         rw, rh = abs(end[0] - start[0]), abs(end[1] - start[1])
         vw, vh = self.scroll.get_width(), self.scroll.get_height()
-        if rw < 8 or rh < 8 or vw <= 0 or vh <= 0:
+        if rw < ZOOM_RECT_MIN_PX or rh < ZOOM_RECT_MIN_PX or vw <= 0 or vh <= 0:
             return
         old = self.zoom
+        # remember where we came from so Escape can step back out (the canvas
+        # pushes the same way in _execute_zoom_to_rect)
+        ha0, va0 = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
+        self._zoom_stack.append((old, ha0.get_value(), va0.get_value()))
         # fit both axes (like the PDF canvas), leaving a hair of margin
         self.set_zoom(old * min(vw / rw, vh / rh) * 0.97)
         f = self.zoom / old
@@ -7915,6 +7945,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Alt+Shift+Drag", "Zoom to region (works under the text caret too)"),
             ("Shift+Middle/Thumb-drag", "Zoom to region (works on text pages too)"),
             ("Shift+Click",   "Fit page"),
+            ("Escape",        "Step back out of the last zoom-to-region"),
             ("File",          None),
             ("Ctrl+O",        "Open file…"),
             ("Ctrl+N",        "New blank PDF"),
@@ -11290,6 +11321,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     and state & Gdk.ModifierType.CONTROL_MASK):
                 surface.duplicate_selected()
                 return True
+        # Escape steps BACK one zoom-to-region, in whichever mode is showing:
+        # every zoom-to-region remembers the view it left, so you can dive into
+        # a figure and step back out through the views you came from instead of
+        # fitting the page and hunting for your place again. It comes AFTER the
+        # lasso branch above (dropping a selection is the more immediate
+        # "cancel") and only claims Escape when there is somewhere to go back
+        # to, so the key stays free for everything else.
+        zoom_surface = tp if tp is not None else self.canvas
+        if keyval == Gdk.KEY_Escape and zoom_surface.can_zoom_back():
+            zoom_surface.zoom_back()
+            return True
         # PageUp/PageDown and Ctrl+\ are handled in _on_global_key (capture phase)
         # so they work even when the notes editor has focus.
         return False
