@@ -6,6 +6,7 @@ Run with:  /usr/bin/python3 test_pdfeditor.py
 import os
 import sys
 import math
+import re
 import base64
 import json
 import tempfile
@@ -9523,12 +9524,76 @@ class TestTextPageImages(unittest.TestCase):
         self.assertEqual(tp.paste_point(),
                          (tp.get_width() / 2.0, tp.get_height() / 2.0))
 
-    def test_wide_image_is_fitted_to_the_paper(self):
+    def test_wide_image_is_capped_at_a_third_of_the_paper(self):
+        """Same cap as the PDF page — paste_scale() is one decision for both."""
         tp = self._sheet()
         im = tp.add_image(self._png(w=4000, h=2000))
-        avail = tp.page_width - 2 * tp.MARGIN_X
-        self.assertLessEqual(im["w"], avail + 0.01)
+        self.assertAlmostEqual(im["w"], tp.page_width / 3.0, places=1)
         self.assertAlmostEqual(im["w"] / im["h"], 2.0, places=2)  # aspect kept
+
+    def test_tall_image_is_capped_by_the_A4_page_height(self):
+        """The sheet scrolls forever, but its paper is A4 — so a tall paste is
+        still capped per-axis rather than running down the page."""
+        tp = self._sheet()
+        im = tp.add_image(self._png(w=200, h=4000))
+        self.assertAlmostEqual(im["h"],
+                               tp.page_width * tp.A4_ASPECT / 3.0, places=1)
+        self.assertAlmostEqual(im["w"] / im["h"], 200 / 4000, places=3)
+
+    def test_a_pasted_image_is_selected_and_grabbable_with_the_caret(self):
+        """A paste is immediately editable: it comes back selected, and the
+        selection is grabbable with ANY tool — the caret included, which is the
+        hard case (with the caret the ink overlay is not targetable, so the
+        press must be claimed above it)."""
+        tp = self._sheet()
+        tp.set_tool("text")
+        im = tp.add_image(self._png(), at=(300, 200))
+        self.assertTrue(tp.has_lasso_selection())
+        self.assertIn(im, tp._selected_images)
+        x0, y0, x1, y1 = tp._selection_bbox()
+        self.assertTrue(tp.selection_grab_at((x0 + x1) / 2, (y0 + y1) / 2))
+
+        g = _FakeDrag((x0 + x1) / 2, (y0 + y1) / 2)
+        tp._on_chord_lasso_begin(g, (x0 + x1) / 2, (y0 + y1) / 2)
+        self.assertEqual(g.claimed, Gtk.EventSequenceState.CLAIMED)
+        self.assertTrue(tp._lasso_moving, "the caret did not grab the paste")
+
+    def test_clicking_an_image_with_the_lasso_selects_it(self):
+        """Click-to-select, the PDF canvas's contract on the sheet."""
+        tp = self._sheet()
+        tp.set_tool("lasso")
+        im = tp.add_image(self._png(), at=(300, 200))
+        tp.clear_lasso_selection()
+        x, y, w, h = tp._image_overlay_rect(im)
+        cx, cy = x + w / 2, y + h / 2
+        tp._on_ink_begin(_FakeDrag(cx, cy), cx, cy)
+        tp._on_ink_end(_FakeDrag(cx, cy), 0, 0)
+        self.assertEqual(tp._selected_images, [im])
+
+    def test_shift_click_adds_to_the_selection_on_the_sheet(self):
+        tp = self._sheet()
+        tp.set_tool("lasso")
+        a = tp.add_image(self._png(), at=(200, 150))
+        b = tp.add_image(self._png(), at=(500, 400))
+        tp.clear_lasso_selection()
+        for im in (a, b):
+            x, y, w, h = tp._image_overlay_rect(im)
+            cx, cy = x + w / 2, y + h / 2
+            g = _FakeDrag(cx, cy, state=Gdk.ModifierType.SHIFT_MASK)
+            tp._on_ink_begin(g, cx, cy)
+            tp._on_ink_end(g, 0, 0)
+        self.assertEqual(len(tp._selected_images), 2)
+
+    def test_a_press_off_the_selection_is_left_to_the_text(self):
+        """The grab claims ONLY the selection: typing and clicking elsewhere
+        must be untouched, or the caret loses its own sheet."""
+        tp = self._sheet()
+        tp.set_tool("text")
+        tp.add_image(self._png(), at=(300, 200))
+        x0, y0, _x1, _y1 = tp._selection_bbox()
+        g = _FakeDrag(x0 - 200, y0 - 150)
+        tp._on_chord_lasso_begin(g, x0 - 200, y0 - 150)
+        self.assertEqual(g.claimed, Gtk.EventSequenceState.DENIED)
 
     def test_sidecar_round_trip_keeps_the_image(self):
         tp = self._sheet()
@@ -9657,6 +9722,129 @@ class TestPDFImages(unittest.TestCase):
     def _image(self, canvas, at=(100, 100), w=60, h=40):
         return canvas.add_image(self._png(w, h), at=at)
 
+    def test_a_pasted_image_is_selected_so_it_is_immediately_editable(self):
+        canvas = self._canvas()
+        canvas.tool = "pen"
+        im = self._image(canvas)
+        self.assertTrue(canvas.has_lasso_selection())
+        self.assertIn(im, canvas._selected_images)
+
+    def test_a_live_selection_is_grabbable_with_any_tool(self):
+        """The contract: once something is selected you move/resize/rotate it
+        with whatever tool is in hand — no trip to the lasso first. Driven per
+        tool, because the regression is a tool-gated press, not a broken
+        _lasso_press."""
+        for tool in ("pen", "highlighter", "eraser", "select", "anchor",
+                     "lasso"):
+            with self.subTest(tool=tool):
+                canvas = self._canvas()
+                canvas.tool = tool
+                im = self._image(canvas, at=(200, 150))   # selects it
+                x, y, w, h = im["rect"]
+                cx, cy = canvas._pdf_to_screen(x + w / 2, y + h / 2)
+                self.assertTrue(canvas.selection_grab_at(cx, cy))
+                canvas._on_drag_begin(_FakeDrag(cx, cy), cx, cy)
+                self.assertTrue(canvas._lasso_moving,
+                                f"{tool} did not grab the selection")
+
+    def test_the_pen_still_draws_away_from_a_selection(self):
+        """The grab claims ONLY the selection — a tool must not lose its own
+        surface everywhere else, and with nothing selected nothing changes."""
+        canvas = self._canvas()
+        canvas.tool = "pen"
+        im = self._image(canvas, at=(200, 150))
+        far_x, far_y = canvas._pdf_to_screen(im["rect"][0] + 400,
+                                             im["rect"][1] + 400)
+        self.assertFalse(canvas.selection_grab_at(far_x, far_y))
+        canvas.clear_lasso_selection()
+        cx, cy = canvas._pdf_to_screen(im["rect"][0] + 1, im["rect"][1] + 1)
+        self.assertFalse(canvas.selection_grab_at(cx, cy),
+                         "nothing is selected — the press belongs to the pen")
+
+    def _click_lasso(self, canvas, x, y, shift=False):
+        """A lasso press+release that never moves — a plain click."""
+        state = (Gdk.ModifierType.SHIFT_MASK if shift
+                 else Gdk.ModifierType(0))
+        canvas._on_drag_begin(_FakeDrag(x, y, state=state), x, y)
+        canvas._on_drag_end(_FakeDrag(x, y, state=state), 0, 0)
+
+    def test_clicking_an_image_with_the_lasso_selects_it(self):
+        """No need to circle a single object — a click picks it up."""
+        canvas = self._canvas()
+        im = self._image(canvas, at=(200, 150))
+        canvas.clear_lasso_selection()
+        x, y, w, h = im["rect"]
+        self._click_lasso(canvas, *canvas._pdf_to_screen(x + w / 2, y + h / 2))
+        self.assertEqual(canvas._selected_images, [im])
+
+    def test_clicking_empty_space_with_the_lasso_clears_the_selection(self):
+        canvas = self._canvas()
+        im = self._image(canvas, at=(200, 150))
+        x, y, _w, _h = im["rect"]
+        self._click_lasso(canvas, *canvas._pdf_to_screen(x - 300, y - 200))
+        self.assertFalse(canvas.has_lasso_selection())
+
+    def test_shift_click_adds_objects_to_the_selection(self):
+        """Build a selection up by clicking things in turn."""
+        canvas = self._canvas()
+        a = self._image(canvas, at=(120, 120))
+        b = self._image(canvas, at=(400, 400))
+        canvas.clear_lasso_selection()
+        for im in (a, b):
+            x, y, w, h = im["rect"]
+            self._click_lasso(canvas, *canvas._pdf_to_screen(x + w / 2,
+                                                             y + h / 2),
+                              shift=True)
+        self.assertEqual(len(canvas._selected_images), 2)
+        self.assertIn(a, canvas._selected_images)
+        self.assertIn(b, canvas._selected_images)
+
+    def test_a_plain_click_replaces_the_selection(self):
+        """Without Shift the previous selection goes — additive is opt-in."""
+        canvas = self._canvas()
+        a = self._image(canvas, at=(120, 120))
+        b = self._image(canvas, at=(400, 400))
+        for im, shift in ((a, False), (b, False)):
+            x, y, w, h = im["rect"]
+            self._click_lasso(canvas, *canvas._pdf_to_screen(x + w / 2,
+                                                             y + h / 2),
+                              shift=shift)
+        self.assertEqual(canvas._selected_images, [b])
+
+    def test_shift_lasso_adds_and_does_not_zoom(self):
+        """Shift+drag with the LASSO in hand adds to the selection instead of
+        zooming to a region — the tool wins over the Shift chord, and
+        Alt+Shift+drag stays the portable zoom chord."""
+        canvas = self._canvas()
+        a = self._image(canvas, at=(120, 120))
+        b = self._image(canvas, at=(400, 400))
+        canvas._set_selected([], [a])
+        # circle b with Shift held
+        x, y, w, h = b["rect"]
+        sx, sy = canvas._pdf_to_screen(x - 20, y - 20)
+        g = _FakeDrag(sx, sy, state=Gdk.ModifierType.SHIFT_MASK)
+        canvas._on_drag_begin(g, sx, sy)
+        self.assertFalse(canvas._zoom_selecting, "Shift+lasso started a zoom")
+        for px, py in ((x + w + 20, y - 20), (x + w + 20, y + h + 20),
+                       (x - 20, y + h + 20), (x - 20, y - 20)):
+            ex, ey = canvas._pdf_to_screen(px, py)
+            canvas._on_drag_update(g, ex - sx, ey - sy)
+        canvas._on_drag_end(g, 0, 0)
+        self.assertIn(a, canvas._selected_images, "the Shift+loop dropped a")
+        self.assertIn(b, canvas._selected_images, "the Shift+loop missed b")
+
+    def test_merge_selection_is_by_identity_not_value(self):
+        """Two equal-but-distinct dicts must both survive a merge: strokes and
+        images are plain dicts, so `in`/`==` compares them BY VALUE and would
+        silently collapse a duplicate into one."""
+        a = {"data": b"x", "rect": (0, 0, 1, 1)}
+        b = dict(a)                       # equal by value, a different object
+        self.assertEqual(a, b)
+        _s, images = sidemark._merge_selection(([], [a]), [], [b])
+        self.assertEqual(len(images), 2)
+        self.assertIs(images[0], a)
+        self.assertIs(images[1], b)
+
     def test_paste_lands_centred_on_the_paste_point(self):
         canvas = self._canvas()
         im = self._image(canvas, at=(200, 150))
@@ -9685,13 +9873,58 @@ class TestPDFImages(unittest.TestCase):
         self.assertAlmostEqual(im["rect"][2], 200 / 4.0, places=6)
         self.assertAlmostEqual(im["rect"][3], 100 / 4.0, places=6)
 
-    def test_a_huge_paste_is_never_wider_than_the_page(self):
+    def test_a_huge_paste_is_capped_at_a_third_of_the_page(self):
+        """A default paste lands as a FIGURE you then place, not a slab that
+        fills the page and must be resized every single time."""
         canvas = self._canvas()
         im = self._image(canvas, w=4000, h=2000)
         _x, _y, w, h = im["rect"]
-        self.assertLessEqual(w, canvas.page_width + 0.01)
-        self.assertLessEqual(h, canvas.page_height + 0.01)
+        self.assertLessEqual(w, canvas.page_width / 3.0 + 0.01)
+        self.assertLessEqual(h, canvas.page_height / 3.0 + 0.01)
         self.assertAlmostEqual(w / h, 2.0, places=2)      # aspect kept
+        # the width is what bites for a landscape shot: it is AT the cap, not
+        # merely under it (a cap that always over-shrinks is also wrong)
+        self.assertAlmostEqual(w, canvas.page_width / 3.0, places=1)
+
+    def test_paste_is_contained_in_the_visible_window_when_zoomed_in(self):
+        """The page caps are useless when zoomed in — a third of the page can
+        be several screens wide. The window cap is what keeps a paste on
+        screen, and it is what bites here."""
+        for zoom in (2.0, 8.0, 16.0):
+            with self.subTest(zoom=zoom):
+                w = sidemark.paste_scale(4000, 3000, zoom, 595, 842,
+                                         view_w=800, view_h=600) * 4000
+                # the stored size is a DOCUMENT size; on screen it is w × zoom
+                self.assertLessEqual(w * zoom, 800 + 0.01,
+                                     "the paste is wider than the window")
+
+    def test_paste_size_takes_the_smallest_cap_not_the_last_one(self):
+        """Whichever cap is tightest wins — checked by moving each one in turn
+        into being the binding constraint."""
+        # window huge, page tight -> the page caps
+        self.assertAlmostEqual(
+            sidemark.paste_scale(4000, 2000, 1.0, 595, 842,
+                                 view_w=99999, view_h=99999) * 4000,
+            595 / 3.0, places=1)
+        # window tight, page huge -> the window caps
+        self.assertAlmostEqual(
+            sidemark.paste_scale(4000, 2000, 1.0, 99999, 99999,
+                                 view_w=800, view_h=600) * 4000,
+            800 / 2.0, places=1)
+        # everything huge -> the image's own pixels cap it (no blow-up)
+        self.assertAlmostEqual(
+            sidemark.paste_scale(50, 40, 1.0, 99999, 99999,
+                                 view_w=99999, view_h=99999) * 50,
+            50, places=1)
+
+    def test_a_tall_paste_is_capped_by_the_page_HEIGHT(self):
+        """Per-axis, not by area: a tall shot is capped by the height it would
+        otherwise overflow, and keeps its aspect doing it."""
+        canvas = self._canvas()
+        im = self._image(canvas, w=200, h=4000)
+        _x, _y, w, h = im["rect"]
+        self.assertAlmostEqual(h, canvas.page_height / 3.0, places=1)
+        self.assertAlmostEqual(w / h, 200 / 4000, places=3)
 
     def test_sidecar_round_trip_keeps_bytes_rect_and_rotation(self):
         canvas = self._canvas()
@@ -9933,6 +10166,333 @@ class TestPDFImages(unittest.TestCase):
         canvas = self._canvas()
         im = self._image(canvas)
         self.assertEqual(canvas._selected_images, [im])
+
+
+class TestPDFImageLayer(unittest.TestCase):
+    """The optional-content render layer written into the PDF for other
+    viewers. Row 118's traps all silently CORRUPT documents, and the one
+    invariant every one of them violates is: several save/reopen/move cycles
+    keep the placement count constant and leave the document's own images
+    untouched. That is what these drive."""
+
+    def _png(self, w=40, h=30, fill=(0, 1, 0)):
+        doc = fitz.open()
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(1, 1, w - 1, h - 1), fill=fill)
+        return page.get_pixmap().tobytes("png")
+
+    def _doc_with_own_figure(self, path, png):
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_image(fitz.Rect(10, 10, 60, 50), stream=png)
+        doc.save(path)
+        doc.close()
+
+    def _canvas(self, path):
+        canvas = PDFCanvas()
+        canvas.load(path)
+        return canvas
+
+    @staticmethod
+    def _placements(path):
+        """(total images, total `Do` placements) as the FILE actually holds
+        them — read from the content stream, never from get_image_info(), which
+        resolves by visual match and lies about xrefs."""
+        d = fitz.open(path)
+        n_imgs = len(d.get_page_images(0))
+        n_place = len(re.findall(rb"/[^\s/]+\s+Do\b", d[0].read_contents()))
+        d.close()
+        return n_imgs, n_place
+
+    def test_save_leaves_no_image_baked_into_the_page_we_render(self):
+        """save() rebinds self.document to the reopened file — and self.page
+        must follow it. It used to keep pointing into the ORPHANED document,
+        which _write_image_layer had just baked the layer into, so the page
+        render (_rerender_now renders self.page) painted every image a second
+        time. It hid until you moved one, because until then the object sits
+        exactly on top of its own stale render, and a reload cleared it because
+        _load_page rebinds self.page. The file on disk was correct throughout —
+        which is why checking the FILE was not enough."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            fitz.open().new_page().parent.save(pdf)
+            canvas = self._canvas(pdf)
+            canvas.attach_images(None)
+            canvas.add_image(self._png(), at=(200, 200))
+            canvas.save(pdf)
+
+            self.assertIs(canvas.page.parent, canvas.document,
+                          "self.page still belongs to the pre-save document")
+            self.assertEqual(
+                len(re.findall(rb"/[^\s/]+\s+Do\b", canvas.page.read_contents())),
+                0, "the page we render still has an image baked in — it will "
+                   "render doubled the moment the image is moved")
+            # and the layer is still in the FILE, for other viewers
+            self.assertEqual(self._placements(pdf)[1], 1)
+
+    def test_layer_marks_our_image_and_leaves_the_documents_own_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            png = self._png()
+            self._doc_with_own_figure(pdf, png)
+            canvas = self._canvas(pdf)
+            # paste the document's OWN figure back in, byte for byte: this is
+            # the real workflow that dedup destroys (copy a figure out, paste
+            # it back), so it must be the case under test.
+            canvas.add_image(png, at=(200, 200))
+            canvas.save(pdf)
+
+            check = fitz.open(pdf)
+            page = check[0]
+            ocgs = [x for x, i in check.get_ocgs().items()
+                    if i.get("name") == PDFCanvas.IMAGE_OCG_NAME]
+            self.assertEqual(len(ocgs), 1)
+            key = check.xref_get_key(page.xref, "Resources/XObject")
+            owned = [int(x) for _n, x in
+                     re.findall(r"/([^\s/]+)\s+(\d+) 0 R", key[1])
+                     if check.xref_get_key(int(x), "OC")[1] == f"{ocgs[0]} 0 R"]
+            # exactly ONE image is ours; the document's own figure is untouched
+            self.assertEqual(len(owned), 1,
+                             "ownership was lost (insert-time dedup?)")
+            self.assertEqual(len(check.get_page_images(0)), 2,
+                             "our image was deduplicated onto the document's")
+            check.close()
+
+    def test_save_reopen_move_cycles_reach_a_steady_state(self):
+        """THE regression guard. delete_image() leaks a ghost placement per
+        cycle (2→4→6→8→10 images over five nudges of ONE image); losing
+        ownership makes the placement unremovable and it piles up the same
+        way. Constant counts across cycles is the only thing that catches
+        either, and it is the invariant every trap in row 118 violates."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            baseline = self._placements(pdf)
+            self.assertEqual(baseline, (2, 2))
+
+            sizes = []
+            for i in range(5):
+                # nudge the image and save again, as a user dragging it would
+                x, y, w, h = canvas.all_images[0][0]["rect"]
+                canvas.all_images[0][0]["rect"] = (x + 5, y, w, h)
+                canvas.save(pdf)
+                self.assertEqual(self._placements(pdf), baseline,
+                                 f"cycle {i} leaked a placement or an image")
+                sizes.append(os.path.getsize(pdf))
+            # and the file does not creep either
+            self.assertLess(max(sizes) - min(sizes), 2000, f"file grew: {sizes}")
+
+    def test_reopening_reads_the_sidecar_and_still_owns_the_layer(self):
+        """A fresh session (new canvas, sidecar-loaded images) must recognise
+        the placements it wrote last time — otherwise every save would strand
+        a copy of every image on the page."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            sidecar = canvas.images_to_json()
+
+            fresh = self._canvas(pdf)          # a new session
+            fresh.load_images(sidecar)
+            fresh.save(pdf)
+            self.assertEqual(self._placements(pdf), (2, 2))
+
+    def test_deleting_an_image_removes_it_from_the_layer(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            canvas.all_images[0] = []
+            canvas.save(pdf)
+            # back to the document's own figure alone — and no ghost `Do`
+            self.assertEqual(self._placements(pdf), (1, 1))
+
+    def test_an_unchanged_image_is_replaced_by_reference(self):
+        """Re-placing by xref is what keeps Ctrl+S from re-compressing every
+        image in the document on every save."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            im = canvas.all_images[0][0]
+            self.assertTrue(im.get("_xref"), "no xref cached to re-place with")
+            with mock.patch.object(sidemark, "uniquify_png",
+                                   side_effect=AssertionError(
+                                       "re-encoded an unchanged image")):
+                canvas.save(pdf)      # must re-place by reference only
+
+    def test_a_rotation_is_rendered_into_the_layer_not_into_the_model(self):
+        """The PDF cannot carry a free angle, so the layer gets rotated bytes —
+        while the model keeps the original, which is what makes the tilt
+        adjustable forever."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            png = self._png(w=80, h=40, fill=(1, 0, 0))
+            im = canvas.add_image(png, at=(200, 200))
+            im["rotate"] = 90.0
+            data, rect = canvas._layer_bytes_for(im)
+            self.assertNotEqual(data, png)                  # rotated bytes
+            self.assertEqual(im["data"], png)               # model untouched
+            # a quarter turn swaps the placement's width and height
+            x, y, w, h = im["rect"]
+            self.assertAlmostEqual(rect.width, h, places=3)
+            self.assertAlmostEqual(rect.height, w, places=3)
+            canvas.save(pdf)
+            self.assertEqual(self._placements(pdf), (2, 2))
+
+    def test_other_viewers_see_the_layer_switched_on(self):
+        """on=True: Zathura/Firefox/Acrobat render our images normally rather
+        than hiding them behind a layer toggle."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            check = fitz.open(pdf)
+            info = [i for i in check.get_ocgs().values()
+                    if i.get("name") == PDFCanvas.IMAGE_OCG_NAME][0]
+            self.assertTrue(info.get("on"))
+            check.close()
+
+    def test_attaching_takes_the_layer_out_of_the_live_document(self):
+        """The layer lives in the FILE, never in the open document: the page
+        render would otherwise paint each image once as page content and once
+        as an object — doubled, and a moved image would leave a ghost of
+        itself behind until the next save."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            sidecar = canvas.images_to_json()
+
+            fresh = self._canvas(pdf)
+            self.assertEqual(self._our_count(fresh), 1)   # the file has it
+            fresh.attach_images(sidecar)
+            self.assertEqual(len(fresh.all_images[0]), 1)  # the model has it
+            self.assertEqual(self._our_count(fresh), 0,
+                             "the open document still holds the layer — the "
+                             "page renders our image a second time")
+            # and it still knows the object, so the next save re-places it
+            self.assertTrue(fresh.all_images[0][0].get("_xref"))
+            fresh.save(pdf)
+            self.assertEqual(self._placements(pdf), (2, 2))
+
+    @staticmethod
+    def _our_count(canvas):
+        ocg = canvas._image_ocg()
+        if ocg is None:
+            return 0
+        return sum(len(canvas._our_placements(canvas.document[i], ocg))
+                   for i in range(canvas.n_pages))
+
+    def test_saving_leaves_the_live_document_without_the_layer(self):
+        """save() reopens the file it just wrote — which brings the layer back
+        in, so from the first Ctrl+S onward every image renders twice (once as
+        page content, once as the object on top) until you reopen the file.
+        The reopen must detach again."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.save(pdf)
+            self.assertEqual(self._placements(pdf), (2, 2))   # the FILE has it
+            self.assertEqual(self._our_count(canvas), 0,
+                             "the reopened document still paints our image")
+            # and the xrefs survived the renumbering, so the next save
+            # re-places rather than re-encoding
+            im = canvas.all_images[0][0]
+            self.assertTrue(canvas._is_image_xref(im.get("_xref", 0)))
+            with mock.patch.object(sidemark, "uniquify_png",
+                                   side_effect=AssertionError(
+                                       "re-encoded after a save+reopen")):
+                canvas.save(pdf)
+            self.assertEqual(self._placements(pdf), (2, 2))
+
+    def test_a_lost_sidecar_adopts_the_layer_instead_of_deleting_it(self):
+        """Sidecar gone, PDF survives: the images come back as editable objects
+        rather than being stripped into oblivion by the next save."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(w=80, h=40, fill=(1, 0, 0)),
+                             at=(200, 300))
+            canvas.save(pdf)
+            rect = canvas.all_images[0][0]["rect"]
+
+            fresh = self._canvas(pdf)
+            fresh.attach_images(None)          # no sidecar to be found
+            self.assertEqual(len(fresh.all_images.get(0, [])), 1,
+                             "the image was stranded")
+            got = fresh.all_images[0][0]
+            self.assertIsNotNone(got["texture"])
+            for a, b in zip(got["rect"], rect):
+                self.assertAlmostEqual(a, b, places=1)   # placed where it was
+            # and pasting alongside it does not delete it
+            fresh.add_image(self._png(fill=(0, 0, 1)), at=(100, 100))
+            fresh.save(pdf)
+            self.assertEqual(self._placements(pdf), (3, 3))
+
+    def test_page_edits_carry_images_with_their_page(self):
+        """all_strokes is reindexed on every structural edit; all_images must
+        move with it or images land on the wrong page."""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf, n_pages=3)
+            canvas = self._canvas(pdf)
+            canvas.go_to_page(2)
+            im = canvas.add_image(self._png(), at=(100, 100))
+
+            canvas.go_to_page(0)
+            canvas.add_blank_page()            # inserts at index 1
+            self.assertEqual(canvas.all_images.get(3), [im])
+            canvas.go_to_page(0)
+            canvas.delete_current_page()
+            self.assertEqual(canvas.all_images.get(2), [im])
+            canvas.move_page(2, 0)
+            self.assertEqual(canvas.all_images.get(0), [im])
+
+    def test_an_exported_page_carries_its_images_and_no_dangling_layer(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            out = os.path.join(d, "out.pdf")
+            self._doc_with_own_figure(pdf, self._png())
+            canvas = self._canvas(pdf)
+            canvas.add_image(self._png(fill=(1, 0, 0)), at=(200, 200))
+            canvas.export_pages([0], out)
+
+            check = fitz.open(out)
+            self.assertEqual(len(check.get_page_images(0)), 2)
+            for info in check.get_page_images(0):
+                self.assertEqual(check.xref_get_key(info[0], "OC")[0], "null",
+                                 "exported image kept a layer mark that "
+                                 "points nowhere")
+            check.close()
+            # exporting must not leave the layer painted into the live document
+            self.assertEqual(self._our_count(canvas), 0)
+
+    def test_uniquify_png_changes_bytes_but_not_pixels(self):
+        png = self._png()
+        out = sidemark.uniquify_png(png)
+        self.assertNotEqual(out, png)
+        self.assertNotEqual(sidemark.uniquify_png(png), out)   # fresh each time
+        self.assertEqual(fitz.Pixmap(out).samples, fitz.Pixmap(png).samples)
+        self.assertEqual(sidemark.uniquify_png(b"not a png"), b"not a png")
 
 
 class TestPDFImageSidecarInWindow(unittest.TestCase):

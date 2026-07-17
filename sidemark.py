@@ -19,6 +19,7 @@ import datetime
 import base64
 import struct
 import zlib
+import uuid
 
 RECENT_PATH = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -250,6 +251,25 @@ def erase_radius(width):
     return width / 2.0 + ERASE_SLACK_PX
 
 
+LASSO_CLICK_SLOP_PX = 4
+"""Movement under this makes a lasso drag a CLICK (select what is under it)."""
+
+
+def _merge_selection(base, strokes, images):
+    """Add a lasso's catch to the selection it started from — Shift+lasso, in
+    both modes.
+
+    By IDENTITY, never `in`: strokes and images are plain dicts, so `==`
+    compares them by VALUE and two genuinely different objects that happen to
+    match (a duplicated stroke, the same photo pasted twice) would collapse
+    into one, silently dropping one from the selection."""
+    base_s, base_i = base
+    seen_s = {id(s) for s in base_s}
+    seen_i = {id(i) for i in base_i}
+    return (list(base_s) + [s for s in strokes if id(s) not in seen_s],
+            list(base_i) + [i for i in images if id(i) not in seen_i])
+
+
 def chord_tool(ctrl, shift, alt, mode, ink_active=True):
     """THE modifier-chord grammar: which tool a held (Ctrl, Shift, Alt) set
     stands in for. One table for both document modes so a chord never means
@@ -375,6 +395,46 @@ def pasted_extent(objects):
     return max(xs), max(ys)
 
 
+PASTE_MAX_PAGE_FRAC = 1 / 3.0
+"""How much of the page a freshly pasted image may fill, per axis."""
+
+PASTE_MAX_VIEW_FRAC = 1 / 2.0
+"""How much of the VISIBLE window a freshly pasted image may fill, per axis."""
+
+
+def paste_scale(iw, ih, zoom, page_w, page_h, view_w=0, view_h=0):
+    """Factor from an image's own pixels to DOCUMENT units when pasted.
+
+    One decision for both modes (the "one table, not two" rule): the PDF page
+    and the text sheet have different substrates, but "how big is a pasted
+    picture" is a single answer and drifts the moment it is written twice.
+
+    The smallest of four caps wins, and the aspect never changes because it is
+    one factor for both axes:
+      * a third of the PAGE, per axis — the default that makes a paste land as
+        a FIGURE you then place, not a page-filling slab you resize every time.
+        Per-axis (not by area) so a panorama is capped by its width and a tall
+        shot by its height.
+      * half of the VISIBLE window, per axis — the page caps are useless when
+        you are zoomed in, where a third of the page can be several screens
+        wide: you would paste a picture you cannot even see the edges of. This
+        cap is what guarantees a paste lands fully on screen, whatever the
+        zoom. It is in document units (`view_px / zoom`) like everything
+        stored. Pass 0 (headless, unallocated) to skip it.
+      * the image's own pixels on screen (`native / zoom`) — never blow a
+        screenshot up past its own resolution just because there is room.
+    All four are DOCUMENT sizes: what is stored never depends on the zoom you
+    happened to paste at (row 116's pen-width lesson)."""
+    caps = [1.0 / max(zoom, 0.01),
+            page_w * PASTE_MAX_PAGE_FRAC / max(iw, 1),
+            page_h * PASTE_MAX_PAGE_FRAC / max(ih, 1)]
+    if view_w and view_h:
+        vw = view_w / max(zoom, 0.01) * PASTE_MAX_VIEW_FRAC
+        vh = view_h / max(zoom, 0.01) * PASTE_MAX_VIEW_FRAC
+        caps += [vw / max(iw, 1), vh / max(ih, 1)]
+    return min(caps)
+
+
 _CLIP_MAX_BYTES = 256 * 1024 * 1024   # a paste this big is a bug, not a note
 
 
@@ -390,6 +450,31 @@ def _texture_from_png(data):
 def _png_from_texture(texture):
     """PNG bytes for a texture — the storage form for both modes' sidecars."""
     return bytes(texture.save_to_png_bytes().get_data())
+
+
+def uniquify_png(data):
+    """The same picture, with unique bytes — a PNG tEXt chunk carrying a fresh
+    id spliced in after IHDR.
+
+    Needed for exactly one reason, and it is load-bearing (row 118): PyMuPDF
+    DEDUPLICATES byte-identical images onto a single xref at insert time, and
+    when that happens our /OC ownership mark is LOST — the placement becomes
+    permanently unrecognisable AND unremovable, a ghost on the page forever.
+    It is a real workflow, not a corner case: copy a figure out of the PDF and
+    paste it back, and our copy is byte-identical to the document's own.
+
+    insert_image TRANSCODES to FlateDecode, so the chunk does not survive into
+    the PDF — it only has to defeat insert-time dedup. The pixels are
+    untouched; tEXt is metadata."""
+    sig = b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(sig):
+        return data      # not a PNG (we only ever store PNG, but be safe)
+    ihdr_len = struct.unpack(">I", data[len(sig):len(sig) + 4])[0]
+    end = len(sig) + 12 + ihdr_len      # sig + (len + type + data + crc)
+    text = b"Sidemark\x00" + uuid.uuid4().hex.encode("ascii")
+    chunk = (struct.pack(">I", len(text)) + b"tEXt" + text
+             + struct.pack(">I", zlib.crc32(b"tEXt" + text) & 0xffffffff))
+    return data[:end] + chunk + data[end:]
 
 
 def draw_image(ctx, texture, x, y, w, h, rotate=0.0):
@@ -582,6 +667,8 @@ class PDFCanvas(Gtk.DrawingArea):
         # lasso stroke selection (the "lasso" tool): a freehand loop selects
         # ink strokes on the page, which can then be moved / deleted / recoloured.
         self._lassoing = False
+        self._lasso_additive = False   # Shift: add this loop's catch to the selection
+        self._lasso_base = ([], [])    # the selection an additive loop started from
         self._lasso_path = []          # screen-space points of the loop in progress
         self._selected_strokes = []    # references into self.strokes, selected
         self._lasso_moving = False
@@ -1235,13 +1322,9 @@ class PDFCanvas(Gtk.DrawingArea):
         """The PDF-unit rect a `iw`×`ih` px image pastes into, centred on `at`
         (screen coords; defaults to paste_point()).
 
-        Size follows the ZOOM: capped at the image's own pixels on screen
-        (stored size = native / scale), so pasting a screenshot while zoomed
-        into a figure gives a small figure, not a wall — and never bigger than
-        the page. The aspect never changes."""
-        f = min(1.0 / max(self.scale, 0.01),
-                self.page_width / max(iw, 1),
-                self.page_height / max(ih, 1))
+        Sizing is paste_scale()'s call, shared with the text sheet."""
+        f = paste_scale(iw, ih, self.scale, self.page_width, self.page_height,
+                        self.get_width(), self.get_height())
         w, h = iw * f, ih * f
         cx, cy = self._screen_to_pdf(*(at or self.paste_point()))
         return (cx - w / 2.0, cy - h / 2.0, w, h)
@@ -1299,6 +1382,83 @@ class PDFCanvas(Gtk.DrawingArea):
                 "png": base64.b64encode(im["data"]).decode("ascii"),
             } for im in images]
         return {"version": 1, "images": pages}
+
+    def attach_images(self, data):
+        """Bind this document's pasted images: `data` is its sidecar, or None
+        when there isn't one. THE entry point after load() — call it always.
+
+        It ends with the in-memory document holding NO image layer of ours.
+        That is not tidiness, it is the design: the layer lives in the FILE for
+        other viewers, and the page render would otherwise paint our images
+        once as page content and once as objects — doubled, and a moved image
+        would leave its own ghost behind until the next save."""
+        if data is not None:
+            self.load_images(data)
+        else:
+            self._adopt_image_layer()
+        self._detach_image_layer()
+
+    def _adopt_image_layer(self):
+        """No sidecar, but the document carries a layer we once wrote: take its
+        images back into the model instead of stripping them into oblivion.
+
+        Reached when the .json is lost but the .pdf survives (or it came back
+        from someone else). The tilt is already baked into those pixels and
+        cannot be recovered, so they come back upright — everything else is
+        editable again. Without this, the first paste into such a document
+        would silently delete the images already in it."""
+        ocg = self._image_ocg()
+        if ocg is None:
+            return
+        for i in range(self.n_pages):
+            page = self.document[i]
+            content = page.read_contents()
+            names = {n: x for n, x in self._our_placements(page, ocg)}
+            found = []
+            # our own placements, in the shape we write them: "q w 0 0 h x y cm
+            # /Name Do Q". The cm matrix is ground truth — get_image_rects()
+            # resolves by visual match and lies when two images look alike.
+            for m in re.finditer(
+                    rb"q\s+([-\d.]+)\s+0\s+0\s+([-\d.]+)\s+([-\d.]+)\s+"
+                    rb"([-\d.]+)\s+cm\s*/([^\s/]+)\s+Do\s*Q", content):
+                w, h, x, y, name = m.groups()
+                xref = names.get(name.decode("latin-1"))
+                if xref is None:
+                    continue
+                try:
+                    png = self.document.extract_image(xref)["image"]
+                except (RuntimeError, KeyError, TypeError):
+                    continue
+                texture = _texture_from_png(png)
+                if texture is None:
+                    continue
+                w, h = float(w), float(h)
+                # PDF places from the BOTTOM-left, our rects are top-left down
+                top = page.rect.height - float(y) - h
+                found.append({"data": png, "texture": texture,
+                              "rect": (float(x), top, w, h), "rotate": 0.0,
+                              "_xref": xref})
+            if found:
+                self.all_images[i] = found
+                logger.info(f"images: adopted {len(found)} from the layer on "
+                            f"page {i + 1} (no sidecar)")
+
+    def _detach_image_layer(self):
+        """Take our placements out of the IN-MEMORY document, remembering each
+        xref so the next save can re-place it by reference (no re-encode)."""
+        ocg = self._image_ocg()
+        if ocg is None:
+            return
+        for i in range(self.n_pages):
+            free = self._strip_image_layer(self.document[i], ocg)
+            for im, xref in zip(self.all_images.get(i, []), free):
+                im["_xref"] = xref
+                # whoever wrote the layer baked THIS tilt into those bytes, so
+                # they are still good: the next save re-places, it re-encodes
+                # only once the rotation actually changes
+                im["_baked"] = im.get("rotate", 0.0)
+        self._page_surface = None    # the page render still has them painted in
+        self.queue_draw()
 
     def load_images(self, data):
         """Restore the image sidecar written by images_to_json()."""
@@ -2057,10 +2217,19 @@ class PDFCanvas(Gtk.DrawingArea):
             self._panning = False
             self._zoom_selecting = False
             self.grab_focus()
-        elif state & Gdk.ModifierType.SHIFT_MASK:
+        elif state & Gdk.ModifierType.SHIFT_MASK and self.tool != "lasso":
             # Shift, or Alt+Shift — the portable keyboard zoom chord, which
             # means zoom in BOTH modes (chord_tool), so it does the same here
-            # as it does under the text caret
+            # as it does under the text caret.
+            #
+            # …except with the LASSO in hand, where Shift adds to the selection
+            # (the universal convention, and the whole point of a lasso is
+            # building a selection up). This does not fork chord_tool: that
+            # table answers "which TOOL does this chord stand in for", and
+            # Shift+lasso is still the lasso — Shift modifies it, it does not
+            # replace it. Nothing is lost, because Alt+Shift+drag remains THE
+            # portable zoom chord in both modes, which is exactly why the
+            # grammar says Shift-alone must never be load-bearing.
             self._zoom_selecting = True
             self._zoom_start = (start_x, start_y)
             self._zoom_end = (start_x, start_y)
@@ -2072,6 +2241,13 @@ class PDFCanvas(Gtk.DrawingArea):
             self._text_selecting = False
             self._panning = False
             self._selected_words = []
+            # A LIVE selection is grabbable with any tool in hand — see
+            # selection_grab_at(). Ahead of the tool dispatch (a press on the
+            # selection edits it rather than drawing), behind the chords (an
+            # explicit Ctrl+drag still pans over a selection).
+            if self.selection_grab_at(start_x, start_y):
+                self._lasso_press(start_x, start_y)
+                return
             # the active tool is the modifier-free shortcut for a gesture: pan
             # mirrors Ctrl, zoom mirrors Shift, anchor mirrors Ctrl+Alt (the
             # anchor itself is dropped at press by _on_click_pressed).
@@ -2097,7 +2273,9 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._erase_at(start_x, start_y)
                 return
             if self.tool == "lasso":
-                self._lasso_press(start_x, start_y)
+                self._lasso_press(
+                    start_x, start_y,
+                    additive=bool(state & Gdk.ModifierType.SHIFT_MASK))
                 return
             hit = self._anchor_hit_test(start_x, start_y)
             if hit is not None:
@@ -2147,10 +2325,35 @@ class PDFCanvas(Gtk.DrawingArea):
             self._straight_mode = False
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
-    def _lasso_press(self, start_x, start_y):
-        """A lasso press — shared by the lasso tool and its Ctrl+Shift+Alt
-        chord so both behave identically: a press on a corner handle scales
-        the selection, inside it moves, elsewhere starts a fresh loop."""
+    def selection_grab_at(self, sx, sy):
+        """Would a press at (sx, sy) grab the LIVE selection — its rotate knob,
+        a resize handle, or inside the box?
+
+        THE contract (both modes implement it, coords differ): once something
+        is selected you can move / resize / rotate it **with any tool in hand**.
+        A freshly pasted image is selected, so it is immediately editable
+        without first going to fetch the lasso — reaching for a tool to touch
+        the thing you just pasted is the whole friction this removes.
+
+        Only a LIVE selection claims the press, so no tool loses anything: with
+        nothing selected, or anywhere outside the box, the pen still draws."""
+        if not self.has_lasso_selection():
+            return False
+        # `is not None` — handle 0 is a real corner and falsy, the same trap
+        # that gating on self._selected fell into (row 118).
+        if (self._lasso_rotate_handle_at(sx, sy)
+                or self._lasso_handle_at(sx, sy) is not None):
+            return True
+        return self._point_in_selection(*self._screen_to_pdf(sx, sy))
+
+    def _lasso_press(self, start_x, start_y, additive=False):
+        """A lasso press — shared by the lasso tool, its Ctrl+Shift+Alt chord
+        and any tool grabbing a live selection (selection_grab_at) so all three
+        behave identically: a press on a corner handle scales the selection,
+        inside it moves, elsewhere starts a fresh loop (or, if it never moves,
+        clicks whatever is under it).
+
+        `additive` (Shift) keeps the current selection and adds to it."""
         px, py = self._screen_to_pdf(start_x, start_y)
         # NB: every gate here asks has_lasso_selection(), never
         # self._selected_strokes — that list is STROKES, and reading it as
@@ -2190,9 +2393,16 @@ class PDFCanvas(Gtk.DrawingArea):
             self._lasso_moved = False
             self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
         else:
-            # otherwise start a fresh loop, dropping any prior selection
+            # otherwise start a fresh loop, dropping any prior selection —
+            # unless Shift is adding to it, in which case the loop's catch is
+            # merged into this base when it closes (_finish_lasso)
             self._lassoing = True
-            self._set_selected([], [])
+            self._lasso_additive = additive
+            self._lasso_base = ((list(self._selected_strokes),
+                                 list(self._selected_images))
+                                if additive else ([], []))
+            if not additive:
+                self._set_selected([], [])
             self._lasso_path = [(start_x, start_y)]
 
     def _end_lasso_edit(self):
@@ -2905,29 +3115,68 @@ class PDFCanvas(Gtk.DrawingArea):
                     return True
         return False
 
+    def _object_at(self, px, py):
+        """The topmost object at a PDF point as (strokes, images) — what a
+        CLICK selects. Strokes are tried before images, and both back to front,
+        because that is the paint order: ink draws ON TOP of images, so where
+        they overlap the click means the ink.
+
+        Reuses _stroke_hits/erase_radius — "did I touch this ink" is one
+        question and one answer, the eraser's. An image is caught by its rect;
+        a tilt is not accounted for (its selection box is not either — one box,
+        used by the frame AND the hit-tests, or they drift)."""
+        for s in reversed(self.strokes):
+            if self._stroke_hits(s["pts"], px, py, erase_radius(s["width"])):
+                return [s], []
+        for im in reversed(self.images):
+            x, y, w, h = im["rect"]
+            if x <= px <= x + w and y <= py <= y + h:
+                return [], [im]
+        return [], []
+
+    @staticmethod
+    def _lasso_was_click(path):
+        """Did this lasso drag never really move? A click is a press+release
+        with jitter, not a zero-length path — a real loop is worlds bigger, so
+        the slop can be generous."""
+        if not path:
+            return True
+        xs = [p[0] for p in path]
+        ys = [p[1] for p in path]
+        return (max(xs) - min(xs) < LASSO_CLICK_SLOP_PX
+                and max(ys) - min(ys) < LASSO_CLICK_SLOP_PX)
+
     def _finish_lasso(self):
         """Close the in-progress loop and select every stroke and image on the
         page that touches it: any point inside the loop (the common freehand
         case), or — for sparse strokes like snapped straight lines — any
         segment crossing the loop's boundary. An image is caught by its box,
-        so a loop that grazes a photo picks it up like a stroke."""
+        so a loop that grazes a photo picks it up like a stroke.
+
+        A drag that never moved is a CLICK: it selects the object under the
+        pointer (_object_at) — circling a single stroke to pick it up is busy
+        work. Either way, a Shift-press ADDS to the selection instead of
+        replacing it (_lasso_additive), so you can build one up by clicking or
+        circling things in turn."""
         path = self._lasso_path
         self._lasso_path = []
-        if len(path) < 3:
-            self._set_selected([], [])
-            return
-        poly = [self._screen_to_pdf(x, y) for x, y in path]
-        sel = [s for s in self.strokes
-               if any(self._point_in_polygon(px, py, poly) for px, py in s["pts"])
-               or self._polyline_crosses_polygon(s["pts"], poly)]
-        images = []
-        for im in self.images:
-            x, y, w, h = im["rect"]
-            box = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-            if (any(self._point_in_polygon(cx, cy, poly) for cx, cy in box)
-                    or any(self._point_in_polygon(px, py, box) for px, py in poly)
-                    or self._polyline_crosses_polygon(box + box[:1], poly)):
-                images.append(im)
+        if self._lasso_was_click(path):
+            sel, images = self._object_at(*self._screen_to_pdf(*path[0]))
+        else:
+            poly = [self._screen_to_pdf(x, y) for x, y in path]
+            sel = [s for s in self.strokes
+                   if any(self._point_in_polygon(px, py, poly) for px, py in s["pts"])
+                   or self._polyline_crosses_polygon(s["pts"], poly)]
+            images = []
+            for im in self.images:
+                x, y, w, h = im["rect"]
+                box = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+                if (any(self._point_in_polygon(cx, cy, poly) for cx, cy in box)
+                        or any(self._point_in_polygon(px, py, box) for px, py in poly)
+                        or self._polyline_crosses_polygon(box + box[:1], poly)):
+                    images.append(im)
+        if self._lasso_additive:
+            sel, images = _merge_selection(self._lasso_base, sel, images)
         self._set_selected(sel, images)
 
     def _selection_bbox(self):
@@ -3432,15 +3681,182 @@ class PDFCanvas(Gtk.DrawingArea):
                 total_written += 1
         return total_written
 
+    # ── the image render layer ───────────────────────────────────────────────
+    #
+    # The sidecar is the truth; this layer is what OTHER PDF viewers see, and
+    # it is REGENERATED from scratch on every save (row 118). Three ingredients
+    # hold it together, each one proven necessary by experiment:
+    #
+    #   * /OC ownership — an optional content group marks our images. It is the
+    #     only per-image marker that survives a save/reopen round-trip, so it
+    #     is what tells our pictures from the document's own figures. `on=True`
+    #     means every other viewer just renders them normally.
+    #   * uniquify_png() before an insert, or dedup silently eats the mark.
+    #   * strip-and-regenerate, never delete_image(): delete_image() only
+    #     BLANKS the xref and leaves its `Do` operator in the content stream,
+    #     so every save leaks a ghost placement (measured: 2→4→6→8→10 images
+    #     over five nudges of ONE image). Stripping reaches a true steady state.
+    #
+    # NB: get_image_info(xrefs=True) and get_image_rects() LIE — they resolve
+    # placements by VISUAL match and report the same xref for two look-alike
+    # images. The content stream plus the Resources dict are the ground truth.
+
+    IMAGE_OCG_NAME = "Sidemark images"
+
+    def _image_ocg(self, create=False):
+        """Our optional content group's xref — reused if the document already
+        carries it, so re-saving never piles up layers."""
+        for xref, info in self.document.get_ocgs().items():
+            if info.get("name") == self.IMAGE_OCG_NAME:
+                return xref
+        if not create:
+            return None
+        return self.document.add_ocg(self.IMAGE_OCG_NAME, on=True)
+
+    def _our_placements(self, page, ocg):
+        """[(resource name, xref)] of the page's images that are OURS, in
+        content-stream order — read from the Resources dict and the stream,
+        the only things that don't lie about which xref a name means."""
+        key = self.document.xref_get_key(page.xref, "Resources/XObject")
+        if key[0] != "dict":
+            return []
+        # the Resources dict is cheap; settle "are any of these ours?" on it
+        # before reading the content stream, so a save walking a 500-page
+        # document only pays for the handful of pages that hold our images
+        mine = {n: int(x) for n, x in
+                re.findall(r"/([^\s/]+)\s+(\d+) 0 R", key[1])
+                if self.document.xref_get_key(int(x), "OC")[1] == f"{ocg} 0 R"}
+        if not mine:
+            return []
+        out = []
+        for name in re.findall(rb"/([^\s/]+)\s+Do\b", page.read_contents()):
+            name = name.decode("latin-1")
+            if name in mine and (name, mine[name]) not in out:
+                out.append((name, mine[name]))
+        return out
+
+    def _strip_image_layer(self, page, ocg):
+        """Remove our placements from the page, leaving the document's own
+        images strictly alone. Returns our xrefs, in order, for reuse."""
+        if not self._our_placements(page, ocg):
+            return []           # nothing of ours here: don't rewrite the page
+        page.clean_contents()   # one normalised stream; re-read names after it
+        mine = self._our_placements(page, ocg)
+        if not mine:
+            return []
+        content = page.read_contents()
+        for name, _xref in mine:
+            # our own insert_image blocks, and only ours: "q <matrix> cm
+            # /Name Do Q". Anchored on a name we have already proved is /OC-ours
+            content = re.sub(
+                (r"q\s+[-\d.\s]+cm\s*/%s\s+Do\s*Q\s*" % re.escape(name)).encode(),
+                b"", content)
+            self.document.xref_set_key(page.xref,
+                                       f"Resources/XObject/{name}", "null")
+        streams = page.get_contents()
+        if streams:
+            self.document.update_stream(streams[0], content)
+        return [xref for _name, xref in mine]
+
+    def _layer_bytes_for(self, im):
+        """(PNG bytes, rect) to place for `im` — the rotation applied.
+
+        A PDF placement cannot carry a free angle (insert_image turns only in
+        90° steps), so a tilted image is rendered into the bytes we hand the
+        layer, at native resolution, and placed in its rotated bounding box.
+        That is NOT destructive: im["data"] keeps the original, so the tilt
+        stays adjustable forever and repeat rotations never degrade it — which
+        is the whole reason the sidecar, not the PDF, is the truth."""
+        x, y, w, h = im["rect"]
+        rot = im.get("rotate", 0.0) % 360.0
+        if abs(rot) < 1e-6:
+            return im["data"], fitz.Rect(x, y, x + w, y + h)
+        rad = math.radians(rot)
+        cos_a, sin_a = abs(math.cos(rad)), abs(math.sin(rad))
+        bw, bh = w * cos_a + h * sin_a, w * sin_a + h * cos_a
+        # render at the picture's own resolution, not the page's
+        px_per_unit = im["texture"].get_width() / max(w, 1e-6)
+        sw, sh = max(int(bw * px_per_unit), 1), max(int(bh * px_per_unit), 1)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
+        ctx = cairo.Context(surf)
+        ctx.scale(sw / bw, sh / bh)
+        draw_image(ctx, im["texture"], (bw - w) / 2.0, (bh - h) / 2.0, w, h,
+                   rotate=rot)
+        surf.flush()
+        buf = io.BytesIO()
+        surf.write_to_png(buf)
+        cx, cy = x + w / 2.0, y + h / 2.0
+        return buf.getvalue(), fitz.Rect(cx - bw / 2.0, cy - bh / 2.0,
+                                         cx + bw / 2.0, cy + bh / 2.0)
+
+    def _is_image_xref(self, xref):
+        """Does `xref` still name an image object in THIS document?
+
+        A cached xref outlives its object (a reload, a fresh document), and
+        re-placing by a stale number would stamp some unrelated object onto the
+        page. NB the object is normally not referenced by any page when we ask:
+        the layer is detached while you edit, and its xrefs stay valid until
+        the next compacting save."""
+        if xref <= 0 or xref >= self.document.xref_length():
+            return False
+        try:
+            return self.document.xref_get_key(xref, "Subtype")[1] == "/Image"
+        except (RuntimeError, ValueError):
+            return False
+
+    def _write_image_layer(self):
+        """Regenerate the whole image layer. Returns how many we placed."""
+        ocg = self._image_ocg(create=any(self.all_images.values()))
+        if ocg is None:
+            return 0        # no images, and no layer of ours to clean up
+        placed = 0
+        for i in range(self.n_pages):
+            page = self.document[i]
+            self._strip_image_layer(page, ocg)
+            for im in self.all_images.get(i, []):
+                data, rect = self._layer_bytes_for(im)
+                # Re-place an unchanged picture BY REFERENCE: no re-encode, and
+                # the difference is the whole save (0.005 s vs compressing the
+                # image again). Only genuinely new bytes get encoded.
+                xref = im.get("_xref") or 0
+                if xref and not self._is_image_xref(xref):
+                    xref = 0    # its object is gone (a new document, a reload)
+                if xref and im.get("_baked") != im.get("rotate", 0.0):
+                    xref = 0    # the tilt changed, so the BYTES changed
+                new = page.insert_image(
+                    rect, xref=xref, stream=None if xref else uniquify_png(data),
+                    oc=ocg)
+                im["_xref"] = new or xref
+                im["_baked"] = im.get("rotate", 0.0)
+                placed += 1
+        return placed
+
     def save(self, path):
         """Save via self.document so structural changes (inserted pages) are preserved."""
         tmp = path + ".tmp"
         total_written = self._write_ink_annotations()
-        logger.info(f"save: {path} — wrote {total_written} ink annotation(s)")
+        placed = self._write_image_layer()
+        logger.info(f"save: {path} — wrote {total_written} ink annotation(s), "
+                    f"{placed} image(s)")
         self.document.save(tmp, garbage=4, deflate=True)
         os.replace(tmp, path)
         # Reopen so self.document reflects the saved state cleanly
         self.document = fitz.open(path)
+        # self.page belonged to the document we just replaced, and _rerender_now
+        # renders THAT object — so without this the page render keeps painting
+        # the orphaned document, which still has the image layer baked in by
+        # _write_image_layer above. The ghost only shows once you move an image
+        # (until then the object sits exactly on top of its own render) and a
+        # reload "fixes" it, because _load_page rebinds this.
+        self.page = self.document[self.current_page_idx]
+        self._stack_surface = None    # the next page's render is stale the same way
+        # …which brings the layer we just wrote back in, and a compacting save
+        # renumbered every object, so the cached xrefs are now lies. Detaching
+        # fixes both at once: it strips the layer back out of the live document
+        # (or the page would render each image a second time, under the object)
+        # and hands each image the xref it now has, for the next save's
+        # re-place-by-reference.
+        self._detach_image_layer()
 
     def save_copy(self, path):
         """Write the current state (including unsaved strokes and structural
@@ -3451,30 +3867,59 @@ class PDFCanvas(Gtk.DrawingArea):
         self.document.save(tmp)
         os.replace(tmp, path)
 
+    @staticmethod
+    def _settle_ocg_refs(doc):
+        """Repair /OC marks that point nowhere in a DERIVED document.
+
+        insert_pdf copies an image's /OC but not the catalog's OCProperties, so
+        every layer reference in the copy dangles. MuPDF still draws them, but
+        a dangling /OC is undefined and a stricter viewer may hide the image.
+        An export is a leaf — nobody edits it, so nothing needs owning: drop
+        the mark and the pictures become plain page content that every viewer
+        renders."""
+        live = set(doc.get_ocgs())
+        for i in range(len(doc)):
+            for info in doc.get_page_images(i):
+                xref = info[0]
+                oc = doc.xref_get_key(xref, "OC")
+                if oc[0] == "xref" and int(oc[1].split()[0]) not in live:
+                    doc.xref_set_key(xref, "OC", "null")
+
     def export_pages(self, indices, path):
-        """Write the given page indices (with current ink strokes baked in) to a
-        standalone PDF at path. Used by thumbnail drag-to-export."""
+        """Write the given page indices (with current ink strokes and pasted
+        images baked in) to a standalone PDF at path. Used by thumbnail
+        drag-to-export."""
         self._write_ink_annotations()
+        self._write_image_layer()
         out = fitz.open()
         try:
             for i in sorted(set(indices)):
                 if 0 <= i < self.n_pages:
                     out.insert_pdf(self.document, from_page=i, to_page=i)
+            self._settle_ocg_refs(out)
             tmp = path + ".tmp"
             out.save(tmp, garbage=4, deflate=True)
             os.replace(tmp, path)
         finally:
             out.close()
+        # the layer we just wrote is a render target, not state: take it back
+        # out of the live document so the canvas doesn't paint it twice
+        self._detach_image_layer()
 
     def add_blank_page(self):
         """Insert a blank page with the same dimensions as the current page, after it."""
         idx = self.current_page_idx + 1
         pw, ph = self.page_width, self.page_height
         self.document.insert_page(idx, width=pw, height=ph)
-        # Shift all stroke and anchor entries at or beyond the insertion point up by one
+        # Shift all stroke, image and anchor entries at or beyond the insertion
+        # point up by one
         self.all_strokes = {
             (k + 1 if k >= idx else k): v
             for k, v in self.all_strokes.items()
+        }
+        self.all_images = {
+            (k + 1 if k >= idx else k): v
+            for k, v in self.all_images.items()
         }
         self._anchors = {
             (k + 1 if k >= idx else k): v
@@ -3511,6 +3956,10 @@ class PDFCanvas(Gtk.DrawingArea):
             (k + count if k >= at_idx else k): v
             for k, v in self.all_strokes.items()
         }
+        self.all_images = {
+            (k + count if k >= at_idx else k): v
+            for k, v in self.all_images.items()
+        }
         self._anchors = {
             (k + count if k >= at_idx else k): v
             for k, v in self._anchors.items()
@@ -3534,10 +3983,16 @@ class PDFCanvas(Gtk.DrawingArea):
             return False
         idx = self.current_page_idx
         self.document.delete_page(idx)
-        # Remove strokes/anchors for deleted page; shift later pages down by one
+        # Remove strokes/images/anchors for the deleted page; shift later pages
+        # down by one
         self.all_strokes = {
             (k - 1 if k > idx else k): v
             for k, v in self.all_strokes.items()
+            if k != idx
+        }
+        self.all_images = {
+            (k - 1 if k > idx else k): v
+            for k, v in self.all_images.items()
             if k != idx
         }
         self._anchors = {
@@ -3582,6 +4037,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.document.select(order)        # reorder underlying pages
         old_to_new = {old: new for new, old in enumerate(order)}
         self.all_strokes = {old_to_new[k]: v for k, v in self.all_strokes.items()}
+        self.all_images = {old_to_new[k]: v for k, v in self.all_images.items()}
         self._anchors = {old_to_new[k]: v for k, v in self._anchors.items()}
         self._undo_stack = [
             (op[0], old_to_new[op[1]]) + op[2:] for op in self._undo_stack]
@@ -4596,6 +5052,10 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
                     wr.paragraph(b)
                     wr.gap()
 
+    # insert_pdf copies each pasted image's /OC layer mark but not the catalog
+    # entry it points at, so every one of them dangles in the export — settle
+    # them into plain images, which every viewer renders (see _settle_ocg_refs)
+    PDFCanvas._settle_ocg_refs(out_doc)
     out_doc.save(out_path, garbage=4, deflate=True)
     out_doc.close()
     src_doc.close()
@@ -5787,6 +6247,9 @@ class TextPageView(Gtk.Overlay):
     drawings."""
 
     PAGE_WIDTH = 794          # ≈ A4 width at 96 dpi (default sheet width)
+    A4_ASPECT = 1123 / 794.0  # the sheet scrolls forever, but its paper is A4:
+    # this is the height a page-proportional decision (paste_scale) reasons
+    # about, and it tracks a resized sheet because it is a ratio, not a size.
     PAGE_WIDTH_MIN, PAGE_WIDTH_MAX = 360, 1400   # drag-to-resize clamp
     EDGE_GRAB = 7             # px either side of the paper edge that resizes it
     PAGE_GAP = 30             # surround gap around the sheet
@@ -5856,6 +6319,8 @@ class TextPageView(Gtk.Overlay):
         # (recolour — there is no pen colour on a photograph).
         self._selected_images = []
         self._lassoing = False
+        self._lasso_additive = False   # Shift: add this loop's catch to the selection
+        self._lasso_base = ([], [])    # the selection an additive loop started from
         self._zoom_stack = []          # [(zoom, scroll_h, scroll_v), ...] for Escape
         self._lasso_path = []          # overlay coords of the loop in progress
         self._lasso_moving = False
@@ -5980,6 +6445,11 @@ class TextPageView(Gtk.Overlay):
         rerase.connect("drag-end", self._on_rerase_end)
         self.add_controller(rerase)
         self._rerase_drag = rerase
+
+        # Escape steps back out of a zoom-to-region: each one pushes the view
+        # it came from, exactly like PDFCanvas._zoom_stack. The sheet's view is
+        # (zoom, scroll_h, scroll_v) where the canvas' is (scale, offsets).
+        self._zoom_stack = []
 
         # Two-finger pinch zooms the sheet, mirroring the PDF canvas. Capture
         # phase on the overlay so the gesture wins over text-view scrolling.
@@ -6673,15 +7143,12 @@ class TextPageView(Gtk.Overlay):
             return None
         iw = width or texture.get_width()
         ih = height or texture.get_height()
-        # Size it against the ZOOM you are working at, not just the paper.
-        # Stored sizes are document units (displayed = w × zoom, like the pen
-        # width), so a plain fit-to-paper pasted a screenshot at full column
-        # width no matter how far in you were — enormous. Dividing by the zoom
-        # caps it at its OWN pixels on screen: paste while zoomed in and you get
-        # a small figure in the document, not a wall. Still never wider than the
-        # paper, and the aspect never changes.
-        avail = max(self.page_width - 2 * self.MARGIN_X, 40)
-        scale = min(1.0 / max(self.zoom, 0.01), avail / max(iw, 1))
+        # Sizing is paste_scale()'s call, shared with the PDF canvas. The sheet
+        # is endless, so it has no page_height to cap against — but the paper
+        # metaphor is A4, so that is the height the cap reasons about.
+        scale = paste_scale(iw, ih, self.zoom, self.page_width,
+                            self.page_width * self.A4_ASPECT,
+                            self.get_width(), self.get_height())
         w, h = iw * scale, ih * scale
         buf = self.view.get_buffer()
         bx, by = self._overlay_to_buffer(*(at or self.paste_point()))
@@ -6705,6 +7172,10 @@ class TextPageView(Gtk.Overlay):
         self.images.append(im)
         self._undo_ops.append(("add_images", [im]))
         self._redo_ops.clear()
+        # select it, exactly as PDFCanvas._add_images does: a paste you can
+        # immediately move/resize/rotate is the point (selection_grab_at lets
+        # any tool do it, so this needs no tool switch)
+        self._set_selected(self._selected, [im])
         self._images_changed()
         if self.on_ink_action:
             self.on_ink_action()
@@ -6817,11 +7288,32 @@ class TextPageView(Gtk.Overlay):
 
     # ── lasso chord (Ctrl+Shift+Alt+drag, PDF-canvas parity) ─────────────────
 
+    def selection_grab_at(self, x, y):
+        """Would a press at (x, y) (overlay coords) grab the LIVE selection?
+        The PDF canvas's twin — see PDFCanvas.selection_grab_at for the
+        contract: a selection is editable with any tool, a fresh paste
+        included."""
+        if not self.has_lasso_selection():
+            return False
+        # `is not None`: handle 0 is a real corner and falsy (row 118's trap).
+        if (self._lasso_rotate_handle_at(x, y)
+                or self._lasso_handle_at(x, y) is not None):
+            return True
+        return self._point_in_selection(x, y)
+
     def _on_chord_lasso_begin(self, gesture, x, y):
         state = self._chord_state(gesture)
         need = (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
                 | Gdk.ModifierType.ALT_MASK)
-        if (state & need) != need:
+        # Two ways in: the chord, or a press that grabs a live selection with
+        # ANY tool. The latter MUST be claimed here rather than in
+        # _on_ink_begin: with the caret the ink overlay is not targetable
+        # (set_tool -> ink.set_can_target), so _on_ink_begin never fires and a
+        # pasted image was unmovable until you fetched the lasso. This gesture
+        # is on the TextPageView in the CAPTURE phase, above both the overlay
+        # and the TextView, so it fires whatever owns the press — and it claims
+        # ONLY on the selection, so plain typing and clicking are untouched.
+        if (state & need) != need and not self.selection_grab_at(x, y):
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
@@ -6903,7 +7395,11 @@ class TextPageView(Gtk.Overlay):
         # zoom here.
         shift_only = (state & Gdk.ModifierType.SHIFT_MASK
                       and not state & Gdk.ModifierType.CONTROL_MASK)
-        if shift_only or self.tool == "zoom":
+        # …but with the LASSO in hand Shift adds to the selection instead of
+        # zooming (PDF-canvas parity — see PDFCanvas._on_drag_begin for why
+        # this does not fork chord_tool: Shift+lasso is still the lasso, and
+        # Alt+Shift+drag remains the portable zoom chord in both modes).
+        if (shift_only and self.tool != "lasso") or self.tool == "zoom":
             # Shift (or the modifier-free zoom tool) starts a zoom-to-region
             # rubber-band (PDF-canvas parity); a click that never grows into a
             # rect falls back to fit-width on end
@@ -6916,7 +7412,8 @@ class TextPageView(Gtk.Overlay):
         button = gesture.get_current_button()
         self._erased_now = []
         if self.tool == "lasso" and button != 3:
-            self._lasso_begin(x, y)
+            self._lasso_begin(
+                x, y, additive=bool(state & Gdk.ModifierType.SHIFT_MASK))
         elif self.tool == "eraser" or button == 3:
             self._erase_at(x, y)
         else:
@@ -7145,7 +7642,7 @@ class TextPageView(Gtk.Overlay):
     # already follow its mark and font scale, so a selection stays honest even
     # when text edits move the paragraphs underneath it.
 
-    def _lasso_begin(self, x, y):
+    def _lasso_begin(self, x, y, additive=False):
         # NB: gate on has_lasso_selection(), NOT self._selected — an
         # images-only selection has no strokes, and gating on strokes made a
         # lone photo impossible to grab or resize (it started a new loop
@@ -7190,18 +7687,46 @@ class TextPageView(Gtk.Overlay):
                                     for im in self._selected_images]
             self.ink.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
         else:
-            # otherwise start a fresh loop, dropping any prior selection
+            # otherwise start a fresh loop, dropping any prior selection —
+            # unless Shift is adding to it (PDF-canvas parity: the loop's catch
+            # is merged into this base when it closes)
             self._lassoing = True
-            self._set_selected([])
+            self._lasso_additive = additive
+            self._lasso_base = ((list(self._selected),
+                                 list(self._selected_images))
+                                if additive else ([], []))
+            if not additive:
+                self._set_selected([])
             self._lasso_path = [(x, y)]
+
+    def _object_at(self, x, y):
+        """The topmost object at an overlay point as (strokes, images) — what a
+        CLICK selects. The PDF canvas's twin (see PDFCanvas._object_at): ink is
+        tried before images because ink draws on top of them."""
+        for st in reversed(self.strokes):
+            if PDFCanvas._stroke_hits(self._stroke_overlay_pts(st), x, y,
+                                      self._erase_radius(st)):
+                return [st], []
+        for im in reversed(self.images):
+            ix, iy, iw, ih = self._image_overlay_rect(im)
+            if ix <= x <= ix + iw and iy <= y <= iy + ih:
+                return [], [im]
+        return [], []
 
     def _finish_lasso(self):
         """Close the loop and select every stroke that touches it: any point
         inside (the common freehand case), or — for sparse strokes like
-        snapped straight lines — any segment crossing the boundary."""
+        snapped straight lines — any segment crossing the boundary.
+
+        A drag that never moved is a CLICK and selects what is under it; Shift
+        adds to the selection rather than replacing it. Both are the PDF
+        canvas's contract — see PDFCanvas._finish_lasso."""
         path, self._lasso_path = self._lasso_path, []
-        if len(path) < 3:
-            self._set_selected([])
+        if PDFCanvas._lasso_was_click(path):
+            sel, images = self._object_at(*path[0])
+            if self._lasso_additive:
+                sel, images = _merge_selection(self._lasso_base, sel, images)
+            self._set_selected(sel, images)
             return
         sel = []
         for st in self.strokes:
@@ -7224,6 +7749,8 @@ class TextPageView(Gtk.Overlay):
                     or PDFCanvas._point_in_polygon(path[0][0], path[0][1],
                                                    corners)):
                 images.append(im)
+        if self._lasso_additive:
+            sel, images = _merge_selection(self._lasso_base, sel, images)
         self._set_selected(sel, images)
 
     def _set_selected(self, strokes, images=None):
@@ -9362,6 +9889,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Shift+Middle/Thumb-drag", "Zoom to region (works on text pages too)"),
             ("Shift+Click",   "Fit page"),
             ("Escape",        "Step back out of the last zoom-to-region"),
+            ("Escape",        "Step back out of the last zoom-to-region"),
             ("File",          None),
             ("Ctrl+O",        "Open file…"),
             ("Ctrl+N",        "New blank PDF"),
@@ -9794,6 +10322,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.save_copy(os.path.join(d, "doc.pdf"))
         self._commit_note_for(s)
         s.notes_model.save(os.path.join(d, "notes.md"))
+        # pasted images live in the sidecar, not in the PDF — snapshot them
+        # beside it or a recovery silently comes back without them (the same
+        # shape the text side uses for its ink)
+        tmp = os.path.join(d, "images.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s.canvas.images_to_json(), f)
+        os.replace(tmp, os.path.join(d, "images.json"))
         meta = {"path": os.path.abspath(s._path), "saved_at": time.time()}
         tmp = os.path.join(d, "meta.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -9900,6 +10435,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 if snap_notes:
                     self.notes_model.load(snap_notes)
                 self.canvas.load(snap_pdf)   # _path stays the original file
+                snap_images = os.path.join(os.path.dirname(snap_pdf),
+                                           "images.json")
+                data = None
+                if os.path.exists(snap_images):
+                    try:
+                        with open(snap_images, encoding="utf-8") as f:
+                            data = json.load(f)
+                    except (OSError, ValueError) as e:
+                        logger.warning("Could not load image snapshot %s: %s",
+                                       snap_images, e)
+                self.canvas.attach_images(data)
                 self._populate_toc()
                 self._mark_dirty()
             elif r == "discard":
@@ -11894,21 +12440,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._clear_dirty()
 
     def _load_pdf_images(self, pdf_path):
-        """Read the PDF's pasted images back from its sidecar.
+        """Hand the PDF's pasted images to the canvas, from its sidecar.
 
         The sidecar is the truth; the layer inside the PDF is only what other
-        viewers see (row 118). Reading the PDF's own image layer back instead
-        would lose every rotation and crop, which the PDF format cannot
-        express."""
+        viewers see (row 118) — reading the layer back instead would lose every
+        rotation and crop, which the PDF format cannot express. With no sidecar
+        the canvas falls back to adopting the layer, so images are never
+        stranded; either way it is attach_images that decides."""
         ink_file = _ink_path_for(pdf_path)
-        if not os.path.exists(ink_file):
-            return
-        try:
-            with open(ink_file, encoding="utf-8") as f:
-                self.canvas.load_images(json.load(f))
-        except (OSError, ValueError) as e:
-            # a broken sidecar must not stop you opening the document
-            logger.warning(f"images: cannot read {ink_file}: {e}")
+        data = None
+        if os.path.exists(ink_file):
+            try:
+                with open(ink_file, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as e:
+                # a broken sidecar must not stop you opening the document
+                logger.warning(f"images: cannot read {ink_file}: {e}")
+        self.canvas.attach_images(data)
 
     def _save_pdf_images(self):
         """Write the PDF's image sidecar. Lazy like the notes file: only once
@@ -12466,10 +13014,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         the export. Runs on the main thread (fitz objects belong to the UI) and
         works on a one-page *copy* so the live document is never modified."""
         canvas._write_ink_annotations()          # sync live strokes into the page
+        canvas._write_image_layer()              # …and pasted images
         idx = canvas.current_page_idx
         out = fitz.open()
         try:
             out.insert_pdf(canvas.document, from_page=idx, to_page=idx)
+            canvas._settle_ocg_refs(out)
             page = out[0]
             _draw_page_marks(page, _symbolize(notes_model.get(idx)), accent)
             zoom = 1500.0 / max(page.rect.width, 1)   # ~1500px is crisp on phones

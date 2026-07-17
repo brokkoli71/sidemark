@@ -27,7 +27,8 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
 - **Straight-line snap** — hold still mid-stroke to lock to a straight line; move while holding to aim, release to commit
 - **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width, saved like any annotation. Long-press the tool for **mark text**, which lays clean highlight bands over the words you drag across — still ink, so erase and undo work unchanged
-- **Lasso ink** (lasso tool, or `Ctrl+Shift+Alt+drag`) — loop around strokes to select them (GoodNotes-style), then drag to **move**, drag a corner handle to **resize**, `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step
+- **Lasso ink** (lasso tool, or `Ctrl+Shift+Alt+drag`) — loop around strokes to select them (GoodNotes-style), or just click one; `Shift` adds more to the selection. Then drag to **move**, drag a corner handle to **resize**, the knob above to **rotate**, `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step
+- **Paste images** (`Ctrl+V`) — drop a picture from the clipboard onto a PDF page or a text page and it behaves like ink: move, resize and rotate it with the lasso, forever — never a flattened stamp. Whatever tool you're holding, a fresh paste is ready to drag straight away. `Ctrl+C` copies a selection back out — Sidemark gets the real strokes and images, every other app gets a picture
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
 ### Notes

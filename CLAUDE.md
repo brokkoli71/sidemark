@@ -35,6 +35,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **Input chords**: module-level `chord_tool()` is THE modifier-chord grammar
   (Ctrl=pan, Alt=ink↔text flip, Ctrl+Shift=highlighter, Ctrl+Shift+Alt=lasso,
   Ctrl+Alt=anchor pdf-only, Shift=zoom pdf/ink-only; Shift+Alt unassigned).
+  **One exception, and it is not a fork**: with the *lasso tool* in hand Shift
+  ADDS to the selection instead of zooming. `chord_tool` answers "which TOOL
+  does this chord stand in for", and Shift+lasso is still the lasso — Shift
+  modifies it. Nothing is lost because `Alt+Shift+drag` stays the portable zoom
+  chord, which is exactly why the grammar says Shift-alone must never be
+  load-bearing. Both press routers special-case `tool != "lasso"`.
   Buttons: left=tool, right=eraser, middle=navigation (Shift+middle=zoom
   region — the portable zoom chord), thumb=middle's ergonomic stand-in
   (hold=pan, Shift+hold=zoom region, scroll-while-held=zoom). Gesture
@@ -54,8 +60,12 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   bytes + rect + `rotate` (+ a crop rect one day, row 119), anchored the same
   way its surface anchors ink, editable forever, never a flattened stamp. The
   clipboard is one shared layer (`SIDEMARK_MIME`, `clipboard_content_for`,
-  `paste_objects`). Text pages ship (row 118); the PDF side does not exist yet
-  — **read "Image UX is one contract" below before building it.**
+  `paste_objects`, `pasted_extent`). Both modes ship (row 118) — **read "Image
+  UX is one contract" below before touching either.** On a PDF the
+  `<name>-ink.json` sidecar is the truth and the PDF's optional-content layer
+  is a render target regenerated on save; `attach_images()` is THE entry point
+  after `canvas.load()` (it loads or adopts, then takes the layer back OUT of
+  the open document — leave it in and every image renders twice).
 - **`[[wiki links]]` (the linking workflow)** — this is the feature the project
   was designed around and it has shipped (ideas.csv row 99). In notes,
   `[[target]]` is a clickable link (Ctrl+click follows, hover shows a hand).
@@ -143,6 +153,16 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     belong on the WINDOW's capture controller, which fires whatever has focus;
     let it ask the surface (`wants_paste()`, `has_lasso_selection()`) instead
     of the surface owning the key.
+- **`save()` rebinds `self.document` — anything holding the OLD one is stale.**
+  `save()` reopens the file, so every cached PyMuPDF object from before it
+  belongs to an orphaned document. `self.page` is the one that bites: the page
+  render (`_rerender_now`) renders `self.page`, so a stale one kept painting
+  the layer `_write_image_layer` had just baked in — an image rendered twice,
+  invisible until you moved it (the object sits on its own ghost) and cleared
+  by a reload (`_load_page` rebinds). **The file on disk was correct the whole
+  time**, so neither the tests nor another viewer could see it. If you cache a
+  `Page`/xref across a save, rebind it there, and test the RENDER path
+  (`canvas.page.read_contents()`), not just the file.
 - **A text page has no `_path`.** A `.md` opened without a PDF lives in
   `_notes_path`; `_path` is the PDF. Code reading `_path` alone silently
   no-ops in text mode (this is what broke Ctrl+R) — use
@@ -165,26 +185,40 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
   hit-testing only. Symptom to recognise: shapes degrade a little per edit.
 - The codebase favors long, explanatory comments about *why* (and records
   hard-won platform quirks inline) — match that style.
-- **Image UX is one contract, not two implementations.** Text pages define it
-  (row 118); the PDF side must MATCH, not re-decide. Reuse the shared pieces
-  (`clipboard_content_for` / `paste_objects` / `SIDEMARK_MIME`, `draw_image`,
-  `_texture_from_png` / `_png_from_texture`) and copy the *decisions* below.
+- **Image UX is one contract, not two implementations.** Text pages defined it
+  and the PDF side matches it (row 118); anything new (crop, row 119) lands
+  ONCE, for both. Reuse the shared pieces (`clipboard_content_for` /
+  `paste_objects` / `SIDEMARK_MIME` / `pasted_extent`, `draw_image`,
+  `_texture_from_png` / `_png_from_texture`) and keep the *decisions* below.
   The row 116 audit's lesson applies exactly: every behavior that reused a
   shared helper held parity; the one place that reimplemented (the eraser) was
-  the one with a live bug. If PDF genuinely cannot do one of these, say so
+  the one with a live bug. If one mode genuinely cannot do one of these, say so
   loudly in `ideas.csv` — do not let it drift silently.
   - **Ctrl+V pastes at the POINTER** when it is over the surface, else the
     centre of the view — never at the caret. Pasting must work with any tool;
     with a pen or lasso in hand there is no useful caret (`paste_point()`).
-  - **Paste size follows the ZOOM**: capped at the image's own pixels on
-    screen (stored size = native / zoom) and never wider than the page. A
-    plain fit-to-page pastes a screenshot as a wall when you are zoomed in.
+  - **Paste size is `paste_scale()`** — the smallest of four caps: a third of
+    the page per axis, half the VISIBLE window per axis, and the image's own
+    pixels on screen (`native / zoom`). The window cap is the one that matters
+    when zoomed in, where a third of the page can be several screens wide; the
+    page caps are what stop a screenshot landing as a page-filling slab.
+  - **A selection is editable with ANY tool** (`selection_grab_at()`), and a
+    paste comes back selected — so a fresh paste drags immediately, with the
+    pen or the caret still in hand. On the sheet this MUST be claimed on the
+    capture-phase gesture above the overlay: with the caret the ink overlay is
+    not targetable, so `_on_ink_begin` never runs (the reachability trap).
+  - **A lasso click selects what is under it** (`_object_at`, ink before
+    images — ink paints on top); **Shift adds** to the selection, by clicking
+    or circling (`_merge_selection`, which merges by IDENTITY: strokes and
+    images are plain dicts, so `==`/`in` compare by VALUE and would silently
+    collapse a duplicate).
   - **Sizes are DOCUMENT units** — store at the base scale, never the zoom you
     happened to paste at (the pen-width lesson, row 116).
   - **Ink draws ON TOP of images; text is not covered by them.** On a text page
     that means images live on the view's `BELOW_TEXT` layer, not the ink
     overlay. Get this wrong and it also breaks the PDF export, which
-    rasterises the view (one cause, two symptoms).
+    rasterises the view (one cause, two symptoms). On a PDF page it means
+    `_draw_images` runs between the page blit and the strokes.
   - **Ctrl+C on a lasso selection wins over text copy** (text selection keeps
     it otherwise) and publishes BOTH: our objects (private mime) and a
     `COPY_RENDER_SCALE`× supersampled PNG. In-app paste is lossless — ink
@@ -219,7 +253,7 @@ never land at all — that call is deferred indefinitely. The one rule that
 stays, because it is free: **do NOT merge/push Deck into `master` without
 asking.**
 
-## Current state (2026-07)
+## Current state (2026-07-17)
 
 The `[[wiki links]]` linking workflow shipped (row 99) along with verbatim
 `code` spans (row 96), a per-version single-instance id (row 97), and
@@ -270,33 +304,52 @@ the portable keyboard zoom chord (the only one reaching zoom under the caret),
 and Escape stepping back out of a zoom-to-region (both surfaces keep a zoom
 stack).
 
-**Row 118 (pasted images) is HALF done — text pages ship, PDF pages do not.**
-A text page can paste (Ctrl+V, any tool, at the pointer), and lasso-select /
-move / resize / rotate / duplicate / delete / copy images; they sit under the
-text, ride their paragraph on a `GtkTextMark`, round-trip through the
-`-ink.json` sidecar as base64, and reach the PDF export. Ctrl+C publishes the
-real objects plus a supersampled PNG, so an in-app paste is lossless and other
-apps get a picture. Along the way it fixed a latent bug in ALL ink editing: the
-coord helpers truncated stored geometry to whole pixels (see the gotcha above).
+**Row 118 (pasted images) is DONE — both halves, verified in the app.** A text
+page's images sit under the text, ride their paragraph on a `GtkTextMark`, and
+round-trip through the `-ink.json` sidecar as base64. A PDF page's images live
+in a `-ink.json` sidecar beside the PDF (the **truth**) and are rendered into
+an optional content group (OCG) layer inside the PDF on save (a **regenerated
+render target**, for other viewers). Both paste with Ctrl+V (any tool, at the
+pointer), lasso-select / move / resize / rotate / duplicate / delete, and copy
+with Ctrl+C as the real objects plus a supersampled PNG. Row 120 then tuned the
+UX on top: `paste_scale()` caps a paste at a third of the page *and* half the
+visible window, a selection is editable with any tool, a lasso click selects
+what is under it and Shift adds to the selection. Along the way row 118 fixed a
+latent bug in ALL ink editing (the coord helpers truncated stored geometry to
+whole pixels) and a doubled-render bug whose cause is worth knowing: `save()`
+rebinds `self.document`, and anything still holding the old one — `self.page`
+above all — renders a dead document (see the gotcha above).
 
-**Next up: the PDF half of row 118.** Read that row FIRST — it carries the
-validated design and the measurements, and its traps all silently corrupt
-documents. In short: the sidecar is the source of truth and the PDF optional
-content group (OCG) layer is a **regenerated render target**. Three
-ingredients, each proven necessary by experiment: `/OC` for per-image
-ownership (the only marker that survives a round-trip — it is what tells our
-images from the document's own); a unique PNG `tEXt` chunk before insert, or
-PyMuPDF DEDUPLICATES byte-identical images onto one xref and ownership dies on
-the first reopen (real workflow: copy a figure out of the PDF, paste it back);
-and strip-and-regenerate over `page.clean_contents()`, never `delete_image()`,
-which only blanks the xref and LEAKS a ghost placement per save. Re-place
-unchanged images with `insert_image(xref=...)` (no re-encode; ~0.45 s/save at
-100 heavy images). Do NOT trust `get_image_info(xrefs=True)` or
-`get_image_rects()` — they resolve placements by visual match and lie about
-xrefs; the content stream + Resources dict are ground truth. **And match the
-UX contract above** — the PDF side re-deciding any of it is the failure mode
-this whole feature is shaped to avoid. Row **119** (crop) is deliberately
-deferred and should land once, for both modes.
+**If you touch the PDF image layer, read row 118 first** — its traps silently
+corrupt documents and every one is now guarded by a test that was checked to
+fail when the trap is reintroduced. The short version: `/OC` marks ownership
+(the only marker that survives a round-trip — it is what tells our images from
+the document's own); `uniquify_png()` before an insert, or PyMuPDF DEDUPLICATES
+byte-identical images onto one xref and ownership dies on the first reopen
+(real workflow: copy a figure out of the PDF, paste it back); strip-and-
+regenerate over `clean_contents()`, never `delete_image()`, which only blanks
+the xref and LEAKS a ghost placement per save; re-place unchanged images with
+`insert_image(xref=...)` (no re-encode; ~0.45 s/save at 100 heavy images).
+`attach_images()` after `load()` also takes the layer back OUT of the open
+document — it is a render target, and left in it renders every image twice.
+Do NOT trust `get_image_info(xrefs=True)` or `get_image_rects()` — they resolve
+placements by visual match and lie about xrefs; the content stream + Resources
+dict are ground truth.
+
+## Next session (2026-07-17 handoff)
+
+**Row 118 (pasted images) is DONE and verified** — the OCG layer's tests were
+re-run after the refactor, the save/reopen/move round-trip was driven
+end-to-end, and the user confirmed it in the real app. Row 120 (the image UX
+pass: paste-size caps, any-tool editing of a selection, lasso click-select,
+Shift multi-select) landed on top of it and is verified too. Both are written
+up; the README gained a line for image paste and one for the grown lasso.
+
+**Next up: row 119 (crop)** — the last piece of the image feature. Its design
+is settled in row 118 and must not be re-litigated: a field on the model
+applied at render, never a destructive re-encode. It lands ONCE for both modes
+(the model and draw path are shared). Read row 118's traps first if you touch
+the PDF layer at all.
 
 **Open follow-ups:** text-page items in rows 92–94 (text-snapping highlighter,
 pagination/print view, margin inks that don't reflow) and row 100's link
@@ -304,3 +357,10 @@ authoring (link-to-here + backlinks). Backlog: **row 111** (duplicate-download
 dialog), **row 117** (the suite is flaky under full-run load — one test fails
 per full run while passing in isolation and on a clean tree; parked for its own
 session), plus older rows 26/27/64.
+
+**Verifying GUI work here:** there is no key-injection tool on this machine
+(no `wtype`/`ydotool`), so gestures, Ctrl+Z and Ctrl+V cannot be driven by an
+agent — script what you can against the model, prefer setups that make a bug
+visible in a plain screenshot, and hand the user a short numbered checklist for
+the rest. Don't close app windows with `hyprctl dispatch closewindow`: it can
+raise an unsaved-changes dialog you then cannot dismiss.
