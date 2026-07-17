@@ -1,4 +1,64 @@
-## [0.4.0] - 2026-07-03 — Text-First Mode
+## [0.5.0] - 2026-07-17 — Pictures, Copy, Paste
+
+### 🚀 Features
+
+- *(aur)* Add a fixed-release 'sidemark' package next to sidemark-git
+- *(text)* Open the startup scratchpad as a text-first page
+- *(ideas)* Rejected status closes issues as not planned
+- *(text)* Dedicated caret tool, Alt+drag pen, PDF-only style menus
+- *(text)* Export as PDF and sheet zoom for text pages
+- *(notes,app)* Verbatim code spans and per-version instance id
+- *(app)* Open launched files as a tab in the last-used window
+- *(notes)* Wiki-style [[links]] that jump between slides and documents
+- *(notes)* [[link]] autocomplete popup and display aliases
+- *(app)* July review pass — text-page autosave, lasso resize/duplicate, pinch zoom, fix batch, --fast test tier
+- *(notes)* Text-page lasso, straight-line snap and stroke smoothing (parity 1-3)
+- *(notes)* Text-page pan gesture (Ctrl+drag / middle-drag) — parity item 4
+- *(notes)* Text-page Shift+drag zoom-to-region — parity item 5
+- *(notes)* Add zoom-to-region as a text-mode toolbar tool (parity fix)
+- *(notes)* Alt+right-drag erases on text pages (quick-ink pairing)
+- *(notes)* Text-mode pan tool + thumb/two-finger pan + tooltip cleanup
+- *(zoom)* Unify zoom-to-region rectangle across PDF and text modes
+- *(notes)* Per-document width for text-first sheets (drag the paper edge)
+- *(notes)* Ctrl+Shift+drag temp-highlighter on text pages (parity item 6)
+- *(input)* One chord grammar across pdf and text modes (row 115)
+- *(input)* Thumb button fully mirrors middle-button navigation
+- *(input)* Alt+Shift is the portable keyboard zoom chord; zoom to 16x
+- *(nav)* Escape steps back out of the last zoom-to-region
+- *(images)* Paste, place and copy images on text pages (row 118, text half)
+- *(images)* Paste, place and copy images on PDF pages (row 118, PDF half)
+- *(images)* Finish the PDF image layer; size, select and edit pastes (rows 118, 120)
+
+### 🐛 Bug Fixes
+
+- *(zoom)* Make text-mode right-click zoom-cancel actually fire
+- *(notes)* Word-level Ctrl+Z granularity in the unified undo timeline
+- *(input)* Scroll-zoom the text sheet toward the cursor, not the top-left
+- *(input)* Ctrl+scroll never zoomed the text sheet (ScrolledWindow ate it)
+- *(input)* Two hit-test/routing bugs on the notes panel and text sheet
+- *(input)* Text-mode scroll + Ctrl+R, and share the zoom/erase policy
+- *(ink)* Pen width is a document width, and let the sheet zoom in close
+
+### 🚜 Refactor
+
+- *(app)* Port the deck branch's doc_mode/_MODE_CHROME mode framework
+
+### 📚 Documentation
+
+- Add CLAUDE.md project guide
+- Record text-mode gesture/workflow pass and reprioritise backlog
+- *(notes)* Close #113 — audit text-mode shortcuts + document the model
+- *(claude)* Park the deck branch — no longer a design concern
+- Close out the July input/parity pass; queue image paste and the flake
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to 0.4.0.r0.g4398e33
+- *(aur)* Track .SRCINFO for the fixed-release package
+- *(aur)* Bump pkgver to 0.4.0.r3.g9fa45aa
+- *(ideas)* Sync issue numbers for #89-95
+- *(ideas)* Backfill issue/hash metadata for this session's rows
+## [0.4.0] - 2026-07-03
 
 ### 🚀 Features
 
