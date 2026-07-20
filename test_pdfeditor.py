@@ -651,14 +651,15 @@ class TestStraightLineSnap(unittest.TestCase):
     def test_snap_collapses_squiggle_to_line(self):
         c = self._canvas()
         c.current_stroke = [(0, 0), (5, 3), (8, 1), (12, 9)]
-        c._snap_to_straight()
+        c._snap_to_shape()
         self.assertTrue(c._straight_mode)
+        self.assertEqual(c._snap_kind, "line")
         self.assertEqual(c.current_stroke, [(0, 0), (12, 9)])
 
     def test_snap_noop_for_single_point(self):
         c = self._canvas()
         c.current_stroke = [(2, 2)]
-        c._snap_to_straight()
+        c._snap_to_shape()
         self.assertFalse(c._straight_mode)
         self.assertEqual(c.current_stroke, [(2, 2)])
 
@@ -666,6 +667,7 @@ class TestStraightLineSnap(unittest.TestCase):
         c = self._canvas()
         c.current_stroke = [(0, 0), (10, 10)]
         c._straight_mode = True
+        c._snap_kind = "line"
         c._on_drag_update(self._drag(0, 0), 30, 5)
         self.assertEqual(len(c.current_stroke), 2)   # stays a line
         self.assertEqual(tuple(c.current_stroke[0]), (0, 0))
@@ -688,6 +690,88 @@ class TestStraightLineSnap(unittest.TestCase):
         c._on_drag_end(None, 5, 5)
         self.assertFalse(c._straight_mode)
         self.assertIsNone(c._straight_timer)
+
+
+# ── shape & grid recognition (the extended dwell) ──────────────────────────────
+
+class TestShapeRecognition(unittest.TestCase):
+    def test_open_squiggle_stays_line(self):
+        pts = [(0, 0), (5, 3), (8, 1), (12, 9)]
+        kind, new = sidemark.recognize_shape(pts)
+        self.assertEqual(kind, "line")
+        self.assertEqual(new, [(0, 0), (12, 9)])
+
+    def test_closed_box_becomes_rectangle(self):
+        # a wobbly loop hugging a rectangle perimeter
+        pts = [(0, 0), (40, 1), (81, 0), (80, 30), (79, 61),
+               (40, 60), (1, 59), (0, 30), (0, 0)]
+        kind, new = sidemark.recognize_shape(pts)
+        self.assertEqual(kind, "rect")
+        self.assertEqual(new[0], (0, 0))
+        self.assertEqual(new[2], (81, 61))       # opposite corner = bbox
+        self.assertEqual(new[0], new[-1])        # closed
+
+    def test_round_loop_becomes_ellipse(self):
+        pts = [(50 + 50 * math.cos(t / 12 * math.pi),
+                30 + 30 * math.sin(t / 12 * math.pi)) for t in range(25)]
+        kind, _new = sidemark.recognize_shape(pts)
+        self.assertEqual(kind, "ellipse")
+
+    def test_rect_bbox_of_detects_generated_rect(self):
+        rect = [(10, 20), (110, 20), (110, 80), (10, 80), (10, 20)]
+        self.assertEqual(sidemark.rect_bbox_of(rect), (10, 20, 110, 80))
+        self.assertIsNone(sidemark.rect_bbox_of([(0, 0), (10, 10)]))
+
+    def test_even_divider_positions(self):
+        # two dividers cut [0, 90] into three equal cells at 30 and 60
+        self.assertEqual(sidemark.even_divider_positions(0, 90, 2), [30, 60])
+        self.assertEqual(sidemark.even_divider_positions(0, 100, 1), [50])
+
+
+class TestGridDivider(unittest.TestCase):
+    def _canvas_with_rect(self):
+        c = PDFCanvas()
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c.all_strokes[0] = []
+        c.current_page_idx = 0
+        rect = {"pts": [(0, 0), (90, 0), (90, 60), (0, 60), (0, 0)],
+                "color": (0, 0, 0), "width": 2.0, "opacity": 1.0}
+        c.all_strokes[0].append(rect)
+        return c
+
+    def test_line_inside_rect_snaps_to_full_span_divider(self):
+        c = self._canvas_with_rect()
+        kind, pts = c._snap_grid_divider((40, 20), (50, 45))   # roughly vertical
+        self.assertEqual(kind, "vdiv")
+        # first (only) divider lands at the centre, spanning the full height
+        self.assertAlmostEqual(pts[0][0], 45.0)
+        self.assertEqual((pts[0][1], pts[1][1]), (0, 60))
+
+    def test_line_outside_any_rect_is_not_a_divider(self):
+        c = self._canvas_with_rect()
+        self.assertIsNone(c._snap_grid_divider((200, 200), (200, 240)))
+
+    def test_second_divider_respaces_evenly_and_undoes_as_one(self):
+        c = self._canvas_with_rect()
+        # commit a first vertical divider via the snap+commit path
+        for mid in (30, 60):
+            c.current_stroke = [(mid, 15), (mid, 45)]
+            c._snap_kind = "vdiv"
+            c.current_stroke = c._snap_grid_divider(
+                (mid, 15), (mid, 45))[1]
+            c._on_drag_end(None, 0, 0)
+        divs = [s for s in c.all_strokes[0] if len(s["pts"]) == 2]
+        xs = sorted(s["pts"][0][0] for s in divs)
+        self.assertEqual(len(divs), 2)
+        self.assertEqual(xs, [30.0, 60.0])        # even thirds of the 90-wide box
+        # one Ctrl+Z removes the last divider AND restores the first's position
+        c.undo_last()
+        divs = [s for s in c.all_strokes[0] if len(s["pts"]) == 2]
+        self.assertEqual(len(divs), 1)
+        self.assertAlmostEqual(divs[0]["pts"][0][0], 45.0)   # back to a lone centre line
+        c.redo_last()
+        divs = [s for s in c.all_strokes[0] if len(s["pts"]) == 2]
+        self.assertEqual(len(divs), 2)
 
 
 # ── stroke smoothing ───────────────────────────────────────────────────────────
@@ -3095,7 +3179,7 @@ class TestLassoSelect(unittest.TestCase):
         # drag the handle to double the diagonal distance from the anchor
         canvas._on_drag_update(_FakeDrag(205, 205), 105, 105)
         canvas._on_drag_end(_FakeDrag(205, 205), 105, 105)
-        f = canvas._undo_stack[-1][4]   # ("lasso_scale", page, strokes, images, f, …)
+        f = canvas._undo_stack[-1][4]   # (…, strokes, images, fx, fy, ax, ay)
         self.assertAlmostEqual(a["pts"][1][0], 100 + 100 * f, places=6)
         self.assertAlmostEqual(a["width"], 4.0 * f, places=6)
         self.assertGreater(f, 1.5)   # clearly grew
@@ -3104,6 +3188,48 @@ class TestLassoSelect(unittest.TestCase):
         self.assertAlmostEqual(a["width"], 4.0, places=6)
         canvas.redo_last()
         self.assertAlmostEqual(a["width"], 4.0 * f, places=6)
+
+    def test_side_handle_stretches_one_axis(self):
+        """The right-edge midpoint handle stretches X only (aspect changes),
+        anchored on the LEFT edge; Y is untouched."""
+        canvas = self._canvas()
+        a = self._stroke([(100, 100), (200, 200)], width=4.0)
+        canvas.all_strokes[0] = [a]
+        canvas._set_selected([a])
+        # bbox (100,100)-(200,200); handle 5 = right midpoint at (205, 150)
+        self.assertEqual(canvas._lasso_handle_at(205, 150), 5)
+        canvas._on_drag_begin(_FakeDrag(205, 150), 205, 150)
+        self.assertTrue(canvas._lasso_scaling)
+        self.assertEqual(canvas._lasso_scale_mode, "x")
+        self.assertEqual(canvas._lasso_scale_anchor, (100, 150))   # left edge
+        # push the right edge out so X-distance from the anchor doubles
+        canvas._on_drag_update(_FakeDrag(205, 150), 100, 0)
+        canvas._on_drag_end(_FakeDrag(205, 150), 100, 0)
+        op = canvas._undo_stack[-1]
+        self.assertEqual(op[0], "lasso_scale")
+        self.assertAlmostEqual(op[4], 2.0, delta=0.06)   # fx ~doubled
+        self.assertAlmostEqual(op[5], 1.0, places=6)     # fy unchanged
+        stretched = a["pts"][1][0]
+        self.assertGreater(stretched, 280.0)             # x clearly stretched
+        self.assertAlmostEqual(a["pts"][1][1], 200.0, places=6)   # y untouched
+        canvas.undo_last()
+        self.assertAlmostEqual(a["pts"][1][0], 200.0, places=6)
+        canvas.redo_last()
+        self.assertAlmostEqual(a["pts"][1][0], stretched, places=6)
+
+    def test_bottom_handle_stretches_y_only(self):
+        canvas = self._canvas()
+        a = self._stroke([(100, 100), (200, 200)], width=4.0)
+        canvas.all_strokes[0] = [a]
+        canvas._set_selected([a])
+        # handle 6 = bottom midpoint at (150, 205); anchor = top edge
+        self.assertEqual(canvas._lasso_handle_at(150, 205), 6)
+        canvas._on_drag_begin(_FakeDrag(150, 205), 150, 205)
+        self.assertEqual(canvas._lasso_scale_mode, "y")
+        self.assertEqual(canvas._lasso_scale_anchor, (150, 100))
+        canvas._on_drag_update(_FakeDrag(150, 205), 0, 100)
+        self.assertAlmostEqual(canvas._lasso_scale_fx, 1.0, places=6)
+        self.assertGreater(canvas._lasso_scale_fy, 1.5)
 
     def test_resize_handle_beats_move_grab(self):
         """A press on the corner handle scales even though the point is also
@@ -8302,7 +8428,7 @@ class TestTextFirstMode(unittest.TestCase):
             self._run_in_window(body)
 
     def test_eraser_catches_the_middle_of_a_straight_line(self):
-        """_snap_to_straight stores a line as just its two endpoints, so a
+        """_snap_to_shape stores a line as just its two endpoints, so a
         vertex-only hit test could never erase its middle — you had to hit
         within a few px of an end. The PDF canvas always handled this
         (TestEraser.test_erase_removes_hit_stroke erases a 2-point line at
@@ -8930,7 +9056,8 @@ class TestTextPageLasso(unittest.TestCase):
                 # drag the handle to double its distance from the anchor
                 dx, dy = (hx - ax), (hy - ay)
                 tp._on_ink_update(g, dx, dy)
-                self.assertAlmostEqual(tp._lasso_scale_factor, 2.0, delta=0.01)
+                self.assertAlmostEqual(tp._lasso_scale_fx, 2.0, delta=0.01)
+                self.assertAlmostEqual(tp._lasso_scale_fy, 2.0, delta=0.01)
                 tp._on_ink_end(g, dx, dy)
                 span = tp._stroke_overlay_pts(st)
                 w = abs(span[1][0] - span[0][0])
@@ -9022,8 +9149,9 @@ class TestTextPageLasso(unittest.TestCase):
                     tp._on_ink_update(g, i * 10.0, i * 7.0)
                 self.assertIsNotNone(tp._straight_timer)
                 tp._cancel_straight_timer()
-                tp._snap_to_straight()   # the rest timer firing
+                tp._snap_to_shape()   # the rest timer firing
                 self.assertTrue(tp._straight_mode)
+                self.assertEqual(tp._snap_kind, "line")
                 self.assertEqual(tp.current_stroke,
                                  [(300.0, 100.0), (350.0, 135.0)])
                 # locked to a line: only the endpoint follows further motion
@@ -10009,7 +10137,7 @@ class TestPDFImages(unittest.TestCase):
         self.assertTrue(canvas._lasso_scaling)
         canvas._on_drag_update(_FakeDrag(x1 + 5, y1 + 5), 50, 50)
         canvas._on_drag_end(_FakeDrag(x1 + 5, y1 + 5), 50, 50)
-        f = canvas._lasso_scale_factor
+        f = canvas._lasso_scale_fx
         self.assertGreater(f, 1.2)
         self.assertAlmostEqual(im["rect"][2], 100 * f, places=6)
         canvas.undo_last()

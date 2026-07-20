@@ -251,8 +251,153 @@ def erase_radius(width):
     return width / 2.0 + ERASE_SLACK_PX
 
 
+# ── shape recognition (the extended dwell) ─────────────────────────────────────
+# The straight-line snap (hold still mid-stroke → the stroke becomes a line) is
+# generalised here: on the same dwell, a closed loop is recognised as a clean
+# axis-aligned RECTANGLE or ELLIPSE, and a straight line drawn inside a
+# rectangle becomes an evenly-spaced GRID DIVIDER (see snap_grid_divider). These
+# are PURE geometry so the PDF canvas and the text sheet share one classifier
+# and can never drift (the row 116 lesson). Everything stays an ordinary stroke
+# (a polyline), so a recognised shape round-trips through the sidecar, lassoes,
+# erases and re-colours with no new object kind. The LINE is always the
+# fallback — an open or ambiguous stroke stays exactly the old dwell line, so
+# turning recognition off (which forces "line") can never regress.
+
+def recognize_shape(pts):
+    """Classify a freehand polyline into a clean primitive. Returns
+    (kind, new_pts) with kind "line" | "rect" | "ellipse" and new_pts the
+    canonical geometry, in the same units as the input."""
+    if len(pts) < 2:
+        return "line", list(pts)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    w, h = maxx - minx, maxy - miny
+    diag = math.hypot(w, h)
+    start, end = pts[0], pts[-1]
+    gap = math.hypot(end[0] - start[0], end[1] - start[1])
+    plen = sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+               for i in range(1, len(pts)))
+    # A shape is "closed" when the ends meet (relative to its size) AND the pen
+    # travelled much further than the straight-line distance — a loop, not a
+    # near-straight scribble that merely wandered back near its start.
+    closed = diag > 1e-6 and gap < 0.30 * diag and plen > 1.4 * diag
+    if not closed:
+        return "line", [start, end]
+    cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+    rx, ry = max(w / 2, 1e-6), max(h / 2, 1e-6)
+    # Fit both candidates and keep the smaller mean residual. For a rectangle
+    # every point hugs a bbox edge (small min-edge distance); an ellipse's
+    # corners bow inward, so its points sit far from every edge there. For an
+    # ellipse the normalised radius is ~1 everywhere; a rectangle's corners
+    # push it out to ~sqrt(2). The two errors disagree exactly at the corners,
+    # which is what separates the shapes.
+    rect_err = ell_err = 0.0
+    for x, y in pts:
+        rect_err += min(abs(x - minx), abs(x - maxx),
+                        abs(y - miny), abs(y - maxy))
+        ell_err += abs(math.hypot((x - cx) / rx, (y - cy) / ry) - 1.0) * (rx + ry) / 2
+    if rect_err <= ell_err:
+        return "rect", [(minx, miny), (maxx, miny), (maxx, maxy),
+                        (minx, maxy), (minx, miny)]
+    n = max(24, len(pts))
+    return "ellipse", [(cx + rx * math.cos(2 * math.pi * i / n),
+                        cy + ry * math.sin(2 * math.pi * i / n))
+                       for i in range(n + 1)]
+
+
+def rect_bbox_of(pts, tol_frac=0.10):
+    """(minx, miny, maxx, maxy) if `pts` traces an axis-aligned rectangle
+    perimeter (closed, every point on a bbox edge within tolerance), else None.
+    Detected geometrically, not from a stored tag, so it survives a save/reload
+    and works on any rectangle-like stroke — the recognised ones hit it exactly
+    (5 corner points)."""
+    if len(pts) < 4:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    w, h = maxx - minx, maxy - miny
+    if w < 1e-6 or h < 1e-6:
+        return None
+    tol = tol_frac * math.hypot(w, h)
+    if math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) > tol:
+        return None
+    for x, y in pts:
+        if min(abs(x - minx), abs(x - maxx), abs(y - miny), abs(y - maxy)) > tol:
+            return None
+    return (minx, miny, maxx, maxy)
+
+
+def even_divider_positions(lo, hi, count):
+    """`count` evenly-spaced interior positions across [lo, hi] — the lines that
+    cut the span into count+1 equal cells."""
+    return [lo + (hi - lo) * (i + 1) / (count + 1) for i in range(count)]
+
+
 LASSO_CLICK_SLOP_PX = 4
 """Movement under this makes a lasso drag a CLICK (select what is under it)."""
+
+
+# ── lasso resize handles ───────────────────────────────────────────────────────
+# Eight handles, one policy for both canvases (the "one table" rule): four
+# CORNERS scale uniformly (aspect preserved, as they always have), four SIDE
+# midpoints stretch ONE axis so the aspect ratio can change. A stroke or shape
+# is just points, an image is a rect — both transform by the same per-axis
+# (fx, fy) about a fixed anchor, so a side handle stretches ink and photos
+# alike. Indices: 0-3 corners TL/TR/BR/BL, 4-7 sides T/R/B/L.
+
+def lasso_handle_points(x0, y0, x1, y1, pad):
+    """The eight handle centres for a box drawn with `pad` slack, in the same
+    space as the box — shared by the hit-test and the painter so a handle is
+    grabbed exactly where it is drawn."""
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    return [(x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
+            (x1 + pad, y1 + pad), (x0 - pad, y1 + pad),
+            (cx, y0 - pad), (x1 + pad, cy), (cx, y1 + pad), (x0 - pad, cy)]
+
+
+def lasso_handle_anchor(handle, bbox):
+    """(mode, anchor) for a handle: a corner is "uniform" anchored at the
+    opposite corner; a side is "x"/"y" anchored on the opposite edge, in
+    document/overlay coords."""
+    x0, y0, x1, y1 = bbox
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    if handle < 4:
+        return "uniform", corners[(handle + 2) % 4]
+    return {4: ("y", (cx, y1)), 5: ("x", (x0, cy)),
+            6: ("y", (cx, y0)), 7: ("x", (x1, cy))}[handle]
+
+
+def lasso_scale_factors(mode, anchor, start, cur, lo=0.05, hi=20.0):
+    """Per-axis (fx, fy) for a resize drag from `start` to `cur` about `anchor`.
+    A corner ("uniform") scales both axes by the diagonal distance ratio so the
+    aspect never changes; a side ("x"/"y") scales one axis and leaves the other
+    at 1. Clamped so a drag through the anchor can't invert or vanish it."""
+    ax, ay = anchor
+    sx, sy = start
+    px, py = cur
+
+    def axis(c, s, a):
+        return max(lo, min(hi, (c - a) / (s - a))) if abs(s - a) > 1e-6 else 1.0
+
+    if mode == "x":
+        return axis(px, sx, ax), 1.0
+    if mode == "y":
+        return 1.0, axis(py, sy, ay)
+    d0 = math.hypot(sx - ax, sy - ay)
+    d1 = math.hypot(px - ax, py - ay)
+    f = max(lo, min(hi, d1 / d0)) if d0 > 1e-6 else 1.0
+    return f, f
+
+
+def lasso_handle_cursor(handle):
+    """The resize cursor name for each handle."""
+    return ("nwse-resize", "nesw-resize", "nwse-resize", "nesw-resize",
+            "ns-resize", "ew-resize", "ns-resize", "ew-resize")[handle]
 
 
 def _merge_selection(base, strokes, images):
@@ -501,6 +646,29 @@ def draw_image(ctx, texture, x, y, w, h, rotate=0.0):
     ctx.restore()
 
 
+def draw_snap_label(ctx, sx, sy, text, accent):
+    """A small pill naming what the dwell recognised ("rectangle", "grid", …),
+    at screen point (sx, sy). Shared by both canvases so the feedback reads the
+    same everywhere. It is what makes the extended dwell discoverable — without
+    it users never learn the dwell does more than lines."""
+    ctx.save()
+    ctx.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL,
+                         cairo.FONT_WEIGHT_NORMAL)
+    ctx.set_font_size(12)
+    ext = ctx.text_extents(text)
+    pad = 5
+    bw, bh = ext.width + 2 * pad, ext.height + 2 * pad
+    bx, by = sx + 8, sy - bh - 8
+    r, g, b = accent
+    ctx.set_source_rgba(r, g, b, 0.92)
+    ctx.rectangle(bx, by, bw, bh)
+    ctx.fill()
+    ctx.set_source_rgb(1, 1, 1)
+    ctx.move_to(bx + pad - ext.x_bearing, by + pad - ext.y_bearing)
+    ctx.show_text(text)
+    ctx.restore()
+
+
 class PDFCanvas(Gtk.DrawingArea):
     SCALE_MIN, SCALE_MAX = 0.1, 20.0   # zoom range of the PDF page canvas
     SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
@@ -555,6 +723,15 @@ class PDFCanvas(Gtk.DrawingArea):
         self.pen_width = 2.0
         # freehand smoothing strength 0..1 (Laplacian passes applied on commit)
         self.smoothing = 0.5
+        # extended dwell → shape recognition: "shapes" (line + rectangle +
+        # ellipse + grid divider), "lines" (line only, the classic straight
+        # snap) or "off" (never snap). See recognize_shape / the pen popover.
+        self.shape_snap = "shapes"
+        # what the last dwell recognised, shown as a glyph at the cursor while
+        # the stroke is still in flight (None once committed / never snapped)
+        self._snap_kind = None
+        self._snap_label = None
+        self._snap_at = (0.0, 0.0)   # PDF-unit anchor for that glyph
         # highlighter mode: wide translucent strokes (PDF CA key via annot.set_opacity)
         self.highlighter = False
         self.hl_color = (1.0, 0.85, 0.0)
@@ -675,11 +852,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self._lasso_move_start = None
         self._lasso_moved = False
         self._lasso_scaling = False    # dragging a corner handle resizes the selection
-        self._lasso_scale_anchor = None   # PDF-space fixed point (opposite corner)
+        self._lasso_scale_anchor = None   # PDF-space fixed point (edge/corner)
         self._lasso_scale_start = None    # PDF-space grab point at drag begin
         self._lasso_scale_orig = []       # (stroke, pts, width) snapshots at drag begin
         self._lasso_image_orig = []       # (image, rect) snapshots at drag begin
-        self._lasso_scale_factor = 1.0
+        self._lasso_scale_mode = "uniform"  # "uniform" (corner) | "x" | "y" (side)
+        self._lasso_scale_fx = 1.0        # live per-axis resize factors
+        self._lasso_scale_fy = 1.0
         # rotation: a knob on a stalk above the selection box. The angle is
         # live while the knob is dragged and only lands on the objects at
         # drag end — an image stores it as a field applied at render, so
@@ -1157,6 +1336,11 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.line_to(*pt)
             ctx.stroke()
         ctx.restore()
+
+        if self._snap_label:
+            self._draw_snap_label(
+                ctx, self.offset_x + self._snap_at[0] * self.scale,
+                self.offset_y + self._snap_at[1] * self.scale)
 
         self._draw_lasso(ctx)
 
@@ -2200,6 +2384,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._selected_words = []
             self._cancel_straight_timer()
             self._straight_mode = False
+            self._snap_kind = self._snap_label = None
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
             return
         if state & Gdk.ModifierType.CONTROL_MASK:
@@ -2323,6 +2508,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 return
             self._cancel_straight_timer()
             self._straight_mode = False
+            self._snap_kind = self._snap_label = None
             self.current_stroke = [self._screen_to_pdf(start_x, start_y)]
 
     def selection_grab_at(self, sx, sy):
@@ -2373,17 +2559,17 @@ class PDFCanvas(Gtk.DrawingArea):
         handle = (self._lasso_handle_at(start_x, start_y)
                   if self.has_lasso_selection() else None)
         if handle is not None:
-            # press on a corner handle scales the selection, anchored
-            # at the opposite corner
-            corners = self._bbox_corners(self._selection_bbox())
+            # press on a corner scales uniformly (anchored at the opposite
+            # corner); a side handle stretches one axis (anchored on the
+            # opposite edge), changing the aspect ratio
             self._lasso_scaling = True
-            self._lasso_scale_anchor = corners[(handle + 2) % 4]
+            self._lasso_scale_mode, self._lasso_scale_anchor = \
+                lasso_handle_anchor(handle, self._selection_bbox())
             self._lasso_scale_start = (px, py)
             self._snapshot_selection()
-            self._lasso_scale_factor = 1.0
+            self._lasso_scale_fx = self._lasso_scale_fy = 1.0
             self.set_cursor(Gdk.Cursor.new_from_name(
-                "nwse-resize" if handle in (0, 2) else "nesw-resize",
-                None))
+                lasso_handle_cursor(handle), None))
             return
         if self.has_lasso_selection() and self._point_in_selection(px, py):
             # press inside the current selection grabs it for a move
@@ -2485,19 +2671,20 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._lasso_scaling:
             px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
             ax, ay = self._lasso_scale_anchor
-            d0 = math.hypot(self._lasso_scale_start[0] - ax,
-                            self._lasso_scale_start[1] - ay)
-            d1 = math.hypot(px - ax, py - ay)
-            # uniform scale from the anchor; clamped so a stray drag through
-            # the anchor can't invert or vanish the selection
-            f = max(0.05, min(20.0, d1 / d0)) if d0 > 1e-6 else 1.0
-            self._lasso_scale_factor = f
+            fx, fy = lasso_scale_factors(
+                self._lasso_scale_mode, self._lasso_scale_anchor,
+                self._lasso_scale_start, (px, py))
+            self._lasso_scale_fx, self._lasso_scale_fy = fx, fy
+            # width tracks the geometric mean, so a uniform scale keeps ow*f and
+            # a pure one-axis stretch barely thickens the line
+            wf = math.sqrt(fx * fy)
             for s, opts, ow in self._lasso_scale_orig:
-                s["pts"] = [(ax + (x - ax) * f, ay + (y - ay) * f)
+                s["pts"] = [(ax + (x - ax) * fx, ay + (y - ay) * fy)
                             for x, y in opts]
-                s["width"] = ow * f   # keep the drawing's look at any size
+                s["width"] = ow * wf
             for im, (x, y, w, h) in self._lasso_image_orig:
-                im["rect"] = (ax + (x - ax) * f, ay + (y - ay) * f, w * f, h * f)
+                im["rect"] = (ax + (x - ax) * fx, ay + (y - ay) * fy,
+                              w * fx, h * fy)
             self.queue_draw()
             return
         if self._lasso_rotating:
@@ -2564,8 +2751,12 @@ class PDFCanvas(Gtk.DrawingArea):
         else:
             pt = self._screen_to_pdf(sx + offset_x, sy + offset_y)
             if self._straight_mode:
-                # locked to a line: only the endpoint follows the cursor
-                self.current_stroke = [self.current_stroke[0], pt]
+                if self._snap_kind == "line":
+                    # locked to a line: only the endpoint follows the cursor
+                    self.current_stroke = [self.current_stroke[0], pt]
+                # a recognised rectangle/ellipse/divider is frozen — the dwell
+                # settled it, the pointer no longer edits it (lift and re-draw,
+                # or Ctrl+Z, to change your mind)
             else:
                 self.current_stroke.append(pt)
                 # re-arm on every motion → the snap fires once the cursor rests
@@ -2650,13 +2841,14 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._lasso_scaling:
             self._lasso_scaling = False
             self.set_cursor(self._default_cursor())
-            f = self._lasso_scale_factor
-            if abs(f - 1.0) > 1e-3 and self.has_lasso_selection():
+            fx, fy = self._lasso_scale_fx, self._lasso_scale_fy
+            if ((abs(fx - 1.0) > 1e-3 or abs(fy - 1.0) > 1e-3)
+                    and self.has_lasso_selection()):
                 ax, ay = self._lasso_scale_anchor
                 self._undo_stack.append(("lasso_scale", self.current_page_idx,
                                          list(self._selected_strokes),
                                          list(self._selected_images),
-                                         f, ax, ay))
+                                         fx, fy, ax, ay))
                 self._end_lasso_edit()
             self._clear_drag_snapshots()
             self.queue_draw()
@@ -2716,8 +2908,8 @@ class PDFCanvas(Gtk.DrawingArea):
         else:
             if self.current_stroke:
                 pts = self.current_stroke
-                # smooth freehand ink on commit; a snapped straight line and
-                # tiny strokes (dots) are left exactly as drawn
+                # smooth freehand ink on commit; a snapped straight line/shape
+                # and tiny strokes (dots) are left exactly as drawn
                 if not was_straight and len(pts) > 2:
                     pts = self._smooth_points(pts, self.smoothing)
                 color, width, opacity = self._pen_attrs()
@@ -2727,14 +2919,21 @@ class PDFCanvas(Gtk.DrawingArea):
                     "width": width,
                     "opacity": opacity,
                 }
-                self.strokes.append(stroke)
-                self._undo_stack.append(("draw", self.current_page_idx, stroke))
+                if self._snap_kind in ("vdiv", "hdiv"):
+                    # a grid divider re-spaces its rectangle's dividers evenly,
+                    # itself included — one undo entry for the whole gesture
+                    self._finish_grid_divider(stroke)
+                else:
+                    self.strokes.append(stroke)
+                    self._undo_stack.append(
+                        ("draw", self.current_page_idx, stroke))
                 self._redo_stack.clear()
                 if self.on_change:
                     self.on_change()
                 if self.on_user_action:
                     self.on_user_action()
             self.current_stroke = []
+            self._snap_kind = self._snap_label = None
             if self.on_live_draw:
                 self.on_live_draw()   # drop the live stroke from the mirror
         self._temp_highlighter = False
@@ -2742,8 +2941,10 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _arm_straight_timer(self):
         self._cancel_straight_timer()
+        if self.shape_snap == "off":
+            return
         self._straight_timer = GLib.timeout_add(
-            self.STRAIGHT_HOLD_MS, self._snap_to_straight)
+            self.STRAIGHT_HOLD_MS, self._snap_to_shape)
 
     def _cancel_straight_timer(self):
         if self._straight_timer is not None:
@@ -2770,17 +2971,131 @@ class PDFCanvas(Gtk.DrawingArea):
             cur = nxt
         return cur
 
-    def _snap_to_straight(self):
-        """Fired when the cursor has rested mid-stroke: collapse the in-progress
-        free stroke into a straight line from its start to the current point."""
+    def _snap_to_shape(self):
+        """Fired when the cursor has rested mid-stroke (the extended dwell):
+        recognise the in-progress freehand stroke as a clean line, rectangle,
+        ellipse or grid divider and replace it in place. The line is the
+        fallback, so "lines only" and the classic straight snap are the same
+        code path."""
         self._straight_timer = None
-        if len(self.current_stroke) >= 2:
-            self._straight_mode = True
-            self.current_stroke = [self.current_stroke[0], self.current_stroke[-1]]
-            self.queue_draw()
-            if self.on_live_draw:
-                self.on_live_draw()
+        if len(self.current_stroke) < 2:
+            return False
+        raw = self.current_stroke
+        if self.shape_snap == "lines":
+            kind, pts = "line", [raw[0], raw[-1]]
+        else:
+            kind, pts = recognize_shape(raw)
+        if kind == "line":
+            div = self._snap_grid_divider(pts[0], pts[-1])
+            if div is not None:
+                kind, pts = div
+        self._straight_mode = True
+        self._snap_kind = kind
+        self._snap_label = {"line": "line", "rect": "rectangle",
+                            "ellipse": "ellipse", "vdiv": "grid",
+                            "hdiv": "grid"}[kind]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        self._snap_at = (max(xs), min(ys))
+        self.current_stroke = pts
+        self.queue_draw()
+        if self.on_live_draw:
+            self.on_live_draw()
         return False   # one-shot
+
+    def _draw_snap_label(self, ctx, sx, sy):
+        draw_snap_label(ctx, sx, sy, self._snap_label, self.zoom_accent)
+
+    def _snap_grid_divider(self, p0, p1):
+        """If the straight segment p0→p1 lies inside a rectangle already on the
+        page, snap it to a full-span divider at its even grid slot and return
+        (kind, [a, b]); else None. Sibling dividers are re-spaced at commit
+        (_finish_grid_divider)."""
+        page = self.current_page_idx
+        vertical = abs(p1[1] - p0[1]) >= abs(p1[0] - p0[0])
+        mx, my = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
+        rect = self._rect_containing(page, mx, my)
+        if rect is None:
+            return None
+        minx, miny, maxx, maxy = rect
+        sibs = self._dividers_in_rect(page, rect, vertical)
+        if vertical:
+            positions = sorted([s["pts"][0][0] for s in sibs] + [mx])
+            rank = positions.index(mx) if mx in positions else len(sibs)
+            slot = even_divider_positions(minx, maxx, len(sibs) + 1)[
+                min(rank, len(sibs))]
+            return "vdiv", [(slot, miny), (slot, maxy)]
+        positions = sorted([s["pts"][0][1] for s in sibs] + [my])
+        rank = positions.index(my) if my in positions else len(sibs)
+        slot = even_divider_positions(miny, maxy, len(sibs) + 1)[
+            min(rank, len(sibs))]
+        return "hdiv", [(minx, slot), (maxx, slot)]
+
+    def _rect_containing(self, page, x, y):
+        """The smallest rectangle-stroke on `page` whose interior contains
+        (x, y), or None. Rectangles are detected geometrically (rect_bbox_of),
+        so this survives a reload and needs no stored tag."""
+        best = None
+        best_area = None
+        for st in self.all_strokes.get(page, []):
+            bb = rect_bbox_of(st["pts"])
+            if bb is None:
+                continue
+            minx, miny, maxx, maxy = bb
+            if minx < x < maxx and miny < y < maxy:
+                area = (maxx - minx) * (maxy - miny)
+                if best_area is None or area < best_area:
+                    best, best_area = bb, area
+        return best
+
+    def _dividers_in_rect(self, page, rect, vertical):
+        """Existing full-span divider strokes of the given orientation inside
+        `rect` — 2-point straight lines spanning it, sorted by position."""
+        minx, miny, maxx, maxy = rect
+        tol = 0.08 * math.hypot(maxx - minx, maxy - miny)
+        out = []
+        for st in self.all_strokes.get(page, []):
+            pts = st["pts"]
+            if len(pts) != 2:
+                continue
+            (ax, ay), (bx, by) = pts
+            if vertical:
+                if (abs(ax - bx) <= tol and minx - tol < ax < maxx + tol
+                        and abs(min(ay, by) - miny) <= tol
+                        and abs(max(ay, by) - maxy) <= tol):
+                    out.append(st)
+            else:
+                if (abs(ay - by) <= tol and miny - tol < ay < maxy + tol
+                        and abs(min(ax, bx) - minx) <= tol
+                        and abs(max(ax, bx) - maxx) <= tol):
+                    out.append(st)
+        key = (lambda s: s["pts"][0][0]) if vertical else (lambda s: s["pts"][0][1])
+        return sorted(out, key=key)
+
+    def _finish_grid_divider(self, new_stroke):
+        """Commit a grid divider: add it, then re-space every divider of its
+        orientation inside the rectangle to equal cells. The whole gesture is
+        one undo entry — remove the new divider, restore the siblings."""
+        page = self.current_page_idx
+        vertical = self._snap_kind == "vdiv"
+        a, b = new_stroke["pts"]
+        mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        rect = self._rect_containing(page, mx, my)
+        self.strokes.append(new_stroke)
+        if rect is None:
+            self._undo_stack.append(("draw", page, new_stroke))
+            return
+        minx, miny, maxx, maxy = rect
+        sibs = self._dividers_in_rect(page, rect, vertical)  # includes new
+        old = {id(s): list(s["pts"]) for s in sibs if s is not new_stroke}
+        positions = even_divider_positions(
+            minx if vertical else miny, maxx if vertical else maxy, len(sibs))
+        for s, pos in zip(sibs, positions):
+            s["pts"] = ([(pos, miny), (pos, maxy)] if vertical
+                        else [(minx, pos), (maxx, pos)])
+        entries = [(s, old[id(s)], list(s["pts"]))
+                   for s in sibs if s is not new_stroke]
+        self._undo_stack.append(("grid", page, new_stroke, entries))
 
     def _words_in_rect(self, px0, py0, px1, py1):
         """Return fitz word tuples whose bounding boxes overlap the given PDF rect."""
@@ -3219,20 +3534,18 @@ class PDFCanvas(Gtk.DrawingArea):
         return ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
 
     def _lasso_handle_at(self, sx, sy, hit=4.0):
-        """Index (0–3) of the selection's corner resize handle under the given
-        screen point, or None. Corners carry the same 5 px pad the dashed box
-        is drawn with, so the handles sit exactly where they are painted; the
-        hit box matches the drawn 8×8 handle so a grab just inside the box
-        still means move, even on tiny selections."""
+        """Index (0–7) of the selection's resize handle under the given screen
+        point, or None — 0-3 corners (uniform), 4-7 side midpoints (one-axis
+        stretch). Handles carry the same 5 px pad the dashed box is drawn with,
+        so they sit exactly where they are painted; the hit box matches the
+        drawn 8×8 handle so a grab just inside the box still means move."""
         bbox = self._selection_bbox()
         if bbox is None:
             return None
         pad = 5.0
         x0, y0 = self._pdf_to_screen(bbox[0], bbox[1])
         x1, y1 = self._pdf_to_screen(bbox[2], bbox[3])
-        corners = ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
-                   (x1 + pad, y1 + pad), (x0 - pad, y1 + pad))
-        for i, (hx, hy) in enumerate(corners):
+        for i, (hx, hy) in enumerate(lasso_handle_points(x0, y0, x1, y1, pad)):
             if abs(sx - hx) <= hit and abs(sy - hy) <= hit:
                 return i
         return None
@@ -3408,9 +3721,9 @@ class PDFCanvas(Gtk.DrawingArea):
                               (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
                 ctx.stroke()
                 ctx.set_dash([])
-                # corner resize handles (drag one to scale the selection)
-                for hx, hy in ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
-                               (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)):
+                # resize handles: 4 corners (uniform) + 4 side midpoints
+                # (one-axis stretch, so the aspect ratio can change)
+                for hx, hy in lasso_handle_points(x0, y0, x1, y1, pad):
                     ctx.rectangle(hx - 4, hy - 4, 8, 8)
                     ctx.set_source_rgba(1, 1, 1, 0.95)
                     ctx.fill_preserve()
@@ -3582,19 +3895,27 @@ class PDFCanvas(Gtk.DrawingArea):
                 x, y, w, h = im["rect"]
                 im["rect"] = (x - dx, y - dy, w, h)
         elif op[0] == "lasso_scale":
-            _, _, refs, imgs, f, ax, ay = op
+            _, _, refs, imgs, fx, fy, ax, ay = op
+            wf = math.sqrt(fx * fy)
             for s in refs:
-                s["pts"] = [(ax + (x - ax) / f, ay + (y - ay) / f)
+                s["pts"] = [(ax + (x - ax) / fx, ay + (y - ay) / fy)
                             for x, y in s["pts"]]
-                s["width"] /= f
+                s["width"] /= wf
             for im in imgs:
                 x, y, w, h = im["rect"]
-                im["rect"] = (ax + (x - ax) / f, ay + (y - ay) / f, w / f, h / f)
+                im["rect"] = (ax + (x - ax) / fx, ay + (y - ay) / fy,
+                              w / fx, h / fy)
         elif op[0] == "lasso_rotate":
             self._apply_rotate_op(op, -1)
         elif op[0] == "recolor":
             for s, oc, ow, oo in op[2]:
                 s["color"], s["width"], s["opacity"] = oc, ow, oo
+        elif op[0] == "grid":
+            _, _, new_stroke, entries = op
+            if new_stroke in strokes:
+                strokes.remove(new_stroke)
+            for s, old_pts, _new in entries:
+                s["pts"] = list(old_pts)
         else:
             self._undo_erase_op(page, op)
             group = op[4]
@@ -3631,20 +3952,27 @@ class PDFCanvas(Gtk.DrawingArea):
                 x, y, w, h = im["rect"]
                 im["rect"] = (x + dx, y + dy, w, h)
         elif ops[0][0] == "lasso_scale":
-            _, _, refs, imgs, f, ax, ay = ops[0]
+            _, _, refs, imgs, fx, fy, ax, ay = ops[0]
+            wf = math.sqrt(fx * fy)
             for s in refs:
-                s["pts"] = [(ax + (x - ax) * f, ay + (y - ay) * f)
+                s["pts"] = [(ax + (x - ax) * fx, ay + (y - ay) * fy)
                             for x, y in s["pts"]]
-                s["width"] *= f
+                s["width"] *= wf
             for im in imgs:
                 x, y, w, h = im["rect"]
-                im["rect"] = (ax + (x - ax) * f, ay + (y - ay) * f, w * f, h * f)
+                im["rect"] = (ax + (x - ax) * fx, ay + (y - ay) * fy,
+                              w * fx, h * fy)
         elif ops[0][0] == "lasso_rotate":
             self._apply_rotate_op(ops[0], 1)
         elif ops[0][0] == "recolor":
             _, _, before, nc, nw, no = ops[0]
             for s, _oc, _ow, _oo in before:
                 s["color"], s["width"], s["opacity"] = nc, nw, no
+        elif ops[0][0] == "grid":
+            _, _, new_stroke, entries = ops[0]
+            self.all_strokes.setdefault(page, []).append(new_stroke)
+            for s, _old, new_pts in entries:
+                s["pts"] = list(new_pts)
         else:
             # re-remove in the gesture's chronological order (reverse of pop order)
             for op in reversed(ops):
@@ -6302,11 +6630,16 @@ class TextPageView(Gtk.Overlay):
         # smoothing strength / accent colour follow the session's canvas the
         # same way (parity: both modes obey the one pen-settings popover)
         self.get_smoothing = lambda: 0.5
+        self.get_shape_snap = lambda: "shapes"
         self.accent = lambda: (0.52, 0.70, 0.30)
         # GoodNotes-style straight-line snap, same as the PDF canvas: holding
-        # still mid-stroke collapses the in-progress stroke to a line
+        # still mid-stroke recognises a line / rectangle / ellipse / grid
+        # divider (recognize_shape), obeying the shared shape_snap setting
         self._straight_mode = False
         self._straight_timer = None
+        self._snap_kind = None
+        self._snap_label = None
+        self._snap_at = (0.0, 0.0)   # overlay-space anchor for the glyph
         # lasso selection (PDF-canvas parity: select, move, resize, duplicate).
         # Selected strokes are ordinary strokes; a move/resize RE-ANCHORS them
         # — fresh GtkTextMark at the new spot, offsets recomputed — so they
@@ -6327,9 +6660,11 @@ class TextPageView(Gtk.Overlay):
         self._lasso_moved = False
         self._lasso_drag = (0.0, 0.0)  # live move offset while dragging
         self._lasso_scaling = False
-        self._lasso_scale_anchor = (0.0, 0.0)   # overlay-space fixed corner
+        self._lasso_scale_anchor = (0.0, 0.0)   # overlay-space fixed edge/corner
         self._lasso_scale_start = (0.0, 0.0)
-        self._lasso_scale_factor = 1.0
+        self._lasso_scale_mode = "uniform"      # "uniform" | "x" | "y"
+        self._lasso_scale_fx = 1.0
+        self._lasso_scale_fy = 1.0
         self._lasso_rotating = False
         self._lasso_rotate_deg = 0.0   # live angle while the knob is dragged
         self._lasso_rotate_from = 0.0  # pointer angle where the drag started
@@ -7419,6 +7754,7 @@ class TextPageView(Gtk.Overlay):
         else:
             self._cancel_straight_timer()
             self._straight_mode = False
+            self._snap_kind = self._snap_label = None
             self.current_stroke = [(x, y)]
         self.ink.queue_draw()
 
@@ -7462,20 +7798,19 @@ class TextPageView(Gtk.Overlay):
                 deg = round(deg / self.ROTATE_SNAP_DEG) * self.ROTATE_SNAP_DEG
             self._lasso_rotate_deg = deg
         elif self._lasso_scaling:
-            ax, ay = self._lasso_scale_anchor
-            d0 = math.hypot(self._lasso_scale_start[0] - ax,
-                            self._lasso_scale_start[1] - ay)
-            if d0 > 1e-6:
-                self._lasso_scale_factor = max(
-                    0.05, min(20.0, math.hypot(x - ax, y - ay) / d0))
+            self._lasso_scale_fx, self._lasso_scale_fy = lasso_scale_factors(
+                self._lasso_scale_mode, self._lasso_scale_anchor,
+                self._lasso_scale_start, (x, y))
         elif self._lasso_moving:
             self._lasso_drag = (dx, dy)
             if abs(dx) + abs(dy) > 1:
                 self._lasso_moved = True
         elif self.current_stroke:
             if self._straight_mode:
-                # locked to a line: only the endpoint follows the cursor
-                self.current_stroke = [self.current_stroke[0], (x, y)]
+                if self._snap_kind == "line":
+                    # locked to a line: only the endpoint follows the cursor
+                    self.current_stroke = [self.current_stroke[0], (x, y)]
+                # a recognised rectangle/ellipse/divider is frozen until release
             else:
                 self.current_stroke.append((x, y))
                 # re-arm on every motion → the snap fires once the cursor rests
@@ -7520,12 +7855,13 @@ class TextPageView(Gtk.Overlay):
         elif self._lasso_scaling:
             self._lasso_scaling = False
             self.ink.set_cursor(None)
-            f = self._lasso_scale_factor
-            if abs(f - 1.0) > 1e-3 and self.has_lasso_selection():
+            fx, fy = self._lasso_scale_fx, self._lasso_scale_fy
+            if ((abs(fx - 1.0) > 1e-3 or abs(fy - 1.0) > 1e-3)
+                    and self.has_lasso_selection()):
                 ax, ay = self._lasso_scale_anchor
                 self._reanchor_selected(
-                    lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f),
-                    width_factor=f)
+                    lambda p: (ax + (p[0] - ax) * fx, ay + (p[1] - ay) * fy),
+                    width_factor=math.sqrt(fx * fy))
             self._lasso_orig = []
             self._lasso_img_orig = []
         elif self._lasso_moving:
@@ -7540,11 +7876,15 @@ class TextPageView(Gtk.Overlay):
         elif self.current_stroke:
             pts = self.current_stroke
             # smooth freehand ink on commit (same recipe as the PDF canvas);
-            # a snapped straight line and dots are left exactly as drawn
+            # a snapped straight line/shape and dots are left exactly as drawn
             if not was_straight and len(pts) > 2:
                 pts = PDFCanvas._smooth_points(pts, self.get_smoothing())
-            self._commit_stroke(pts)
+            if self._snap_kind in ("vdiv", "hdiv"):
+                self._finish_grid_divider(pts)
+            else:
+                self._commit_stroke(pts)
             self.current_stroke = []
+            self._snap_kind = self._snap_label = None
         elif self._erased_now:
             self._undo_ops.append(("erase", self._erased_now))
             self._redo_ops.clear()
@@ -7559,24 +7899,156 @@ class TextPageView(Gtk.Overlay):
 
     def _arm_straight_timer(self):
         self._cancel_straight_timer()
+        if self.get_shape_snap() == "off":
+            return
         self._straight_timer = GLib.timeout_add(
-            self.STRAIGHT_HOLD_MS, self._snap_to_straight)
+            self.STRAIGHT_HOLD_MS, self._snap_to_shape)
 
     def _cancel_straight_timer(self):
         if self._straight_timer is not None:
             GLib.source_remove(self._straight_timer)
             self._straight_timer = None
 
-    def _snap_to_straight(self):
-        """Fired when the cursor has rested mid-stroke: collapse the in-progress
-        free stroke into a straight line from its start to the current point."""
+    def _snap_to_shape(self):
+        """The extended dwell, in overlay coords — line / rectangle / ellipse /
+        grid divider, exactly the PDF canvas' _snap_to_shape (shared classifier
+        so the two cannot drift). The line is the fallback and "lines only" maps
+        to it, keeping the classic straight snap."""
         self._straight_timer = None
-        if len(self.current_stroke) >= 2:
-            self._straight_mode = True
-            self.current_stroke = [self.current_stroke[0],
-                                   self.current_stroke[-1]]
-            self.ink.queue_draw()
+        if len(self.current_stroke) < 2:
+            return False
+        raw = self.current_stroke
+        if self.get_shape_snap() == "lines":
+            kind, pts = "line", [raw[0], raw[-1]]
+        else:
+            kind, pts = recognize_shape(raw)
+        if kind == "line":
+            div = self._snap_grid_divider(pts[0], pts[-1])
+            if div is not None:
+                kind, pts = div
+        self._straight_mode = True
+        self._snap_kind = kind
+        self._snap_label = {"line": "line", "rect": "rectangle",
+                            "ellipse": "ellipse", "vdiv": "grid",
+                            "hdiv": "grid"}[kind]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        self._snap_at = (max(xs), min(ys))
+        self.current_stroke = pts
+        self.ink.queue_draw()
         return False   # one-shot
+
+    # ── grid divider (shared logic with PDFCanvas, in overlay coords) ─────────
+
+    def _rect_strokes(self):
+        """(stroke, overlay bbox) for every stroke that traces a rectangle."""
+        out = []
+        for st in self.strokes:
+            pts = self._stroke_overlay_pts(st)
+            bb = rect_bbox_of(pts)
+            if bb is not None:
+                out.append((st, bb))
+        return out
+
+    def _rect_containing(self, x, y):
+        best = best_area = None
+        for _st, (minx, miny, maxx, maxy) in self._rect_strokes():
+            if minx < x < maxx and miny < y < maxy:
+                area = (maxx - minx) * (maxy - miny)
+                if best_area is None or area < best_area:
+                    best, best_area = (minx, miny, maxx, maxy), area
+        return best
+
+    def _dividers_in_rect(self, rect, vertical):
+        minx, miny, maxx, maxy = rect
+        tol = 0.08 * math.hypot(maxx - minx, maxy - miny)
+        out = []
+        for st in self.strokes:
+            pts = self._stroke_overlay_pts(st)
+            if len(pts) != 2:
+                continue
+            (ax, ay), (bx, by) = pts
+            if vertical:
+                if (abs(ax - bx) <= tol and minx - tol < ax < maxx + tol
+                        and abs(min(ay, by) - miny) <= tol
+                        and abs(max(ay, by) - maxy) <= tol):
+                    out.append((st, ax))
+            else:
+                if (abs(ay - by) <= tol and miny - tol < ay < maxy + tol
+                        and abs(min(ax, bx) - minx) <= tol
+                        and abs(max(ax, bx) - maxx) <= tol):
+                    out.append((st, ay))
+        return [st for st, _pos in sorted(out, key=lambda t: t[1])]
+
+    def _snap_grid_divider(self, p0, p1):
+        """A straight segment inside a rectangle → a full-span even divider,
+        returned as (kind, [a, b]) in overlay coords, else None."""
+        vertical = abs(p1[1] - p0[1]) >= abs(p1[0] - p0[0])
+        mx, my = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
+        rect = self._rect_containing(mx, my)
+        if rect is None:
+            return None
+        minx, miny, maxx, maxy = rect
+        sibs = self._dividers_in_rect(rect, vertical)
+        if vertical:
+            positions = sorted([self._stroke_overlay_pts(s)[0][0]
+                                for s in sibs] + [mx])
+            rank = min(positions.index(mx) if mx in positions else len(sibs),
+                       len(sibs))
+            slot = even_divider_positions(minx, maxx, len(sibs) + 1)[rank]
+            return "vdiv", [(slot, miny), (slot, maxy)]
+        positions = sorted([self._stroke_overlay_pts(s)[0][1]
+                            for s in sibs] + [my])
+        rank = min(positions.index(my) if my in positions else len(sibs),
+                   len(sibs))
+        slot = even_divider_positions(miny, maxy, len(sibs) + 1)[rank]
+        return "hdiv", [(minx, slot), (maxx, slot)]
+
+    def _respace_divider(self, st, new_overlay_pts):
+        """Rewrite a committed divider's stored (mark-relative) points so it now
+        traces `new_overlay_pts` — it stays anchored to its own mark, only the
+        offsets change. Returns the new stored pts (for the undo record)."""
+        buf = self.view.get_buffer()
+        it = buf.get_iter_at_mark(st["mark"])
+        r = self.view.get_iter_location(it)
+        f = self.font_px / max(st["font_px"], 1)
+        rel = []
+        for ox, oy in new_overlay_pts:
+            bx, by = self._overlay_to_buffer_f(ox, oy)
+            rel.append(((bx - r.x) / f, (by - r.y) / f))
+        st["pts"] = rel
+        return rel
+
+    def _finish_grid_divider(self, pts_overlay):
+        """Commit a grid divider on the sheet: add it, then re-space every
+        divider of its orientation inside the rectangle evenly. One undo entry
+        for the whole gesture."""
+        vertical = self._snap_kind == "vdiv"
+        self._commit_stroke(pts_overlay)     # the new divider is now last
+        new_stroke = self.strokes[-1]
+        a, b = pts_overlay
+        mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        rect = self._rect_containing(mx, my)
+        if rect is None:
+            return
+        minx, miny, maxx, maxy = rect
+        sibs = self._dividers_in_rect(rect, vertical)  # includes the new one
+        entries = []
+        positions = even_divider_positions(
+            minx if vertical else miny, maxx if vertical else maxy, len(sibs))
+        for s, pos in zip(sibs, positions):
+            old = list(s["pts"])
+            over = ([(pos, miny), (pos, maxy)] if vertical
+                    else [(minx, pos), (maxx, pos)])
+            new = self._respace_divider(s, over)
+            if s is not new_stroke:
+                entries.append((s, old, list(new)))
+        if entries and self._undo_ops and self._undo_ops[-1][0] == "add":
+            # fold the sibling re-spacing into the new divider's own ("add")
+            # op so ONE Ctrl+Z reverts the whole grid gesture (PDF-canvas
+            # parity — the "grid" op there is likewise one entry)
+            add_op = self._undo_ops.pop()
+            self._undo_ops.append(("group", [add_op, ("reshape", entries)]))
 
     def _commit_stroke(self, pts_overlay):
         if len(pts_overlay) < 2:
@@ -7623,7 +8095,7 @@ class TextPageView(Gtk.Overlay):
     def _erase_at(self, x, y):
         # Hit-test every SEGMENT, not just the stored vertices, reusing the PDF
         # canvas' geometry so the two erasers cannot drift apart. Vertices alone
-        # are not enough: _snap_to_straight collapses a stroke to its two
+        # are not enough: _snap_to_shape collapses a stroke to its two
         # endpoints, so a straight line has nothing to hit in the middle and was
         # erasable only near its ends — the same trap the lasso hit in row 102.
         hit = [st for st in self.strokes
@@ -7663,19 +8135,19 @@ class TextPageView(Gtk.Overlay):
         handle = (self._lasso_handle_at(x, y)
                   if self.has_lasso_selection() else None)
         if handle is not None:
-            # press on a corner handle scales the selection, anchored at the
-            # opposite corner
-            corners = PDFCanvas._bbox_corners(self._selection_bbox())
+            # a corner scales uniformly; a side handle stretches one axis (see
+            # PDFCanvas — same shared handle policy)
             self._lasso_scaling = True
-            self._lasso_scale_anchor = corners[(handle + 2) % 4]
+            self._lasso_scale_mode, self._lasso_scale_anchor = \
+                lasso_handle_anchor(handle, self._selection_bbox())
             self._lasso_scale_start = (x, y)
-            self._lasso_scale_factor = 1.0
+            self._lasso_scale_fx = self._lasso_scale_fy = 1.0
             self._lasso_orig = [(st, self._stroke_overlay_pts(st))
                                 for st in self._selected]
             self._lasso_img_orig = [(im, self._image_overlay_rect(im))
                                     for im in self._selected_images]
             self.ink.set_cursor(Gdk.Cursor.new_from_name(
-                "nwse-resize" if handle in (0, 2) else "nesw-resize"))
+                lasso_handle_cursor(handle)))
         elif self.has_lasso_selection() and self._point_in_selection(x, y):
             # press inside the current selection grabs it for a move
             self._lasso_moving = True
@@ -7812,17 +8284,15 @@ class TextPageView(Gtk.Overlay):
         return math.hypot(x - hx, y - hy) <= hit
 
     def _lasso_handle_at(self, x, y, hit=4.0):
-        """Index (0–3) of the corner resize handle under the overlay point, or
-        None — same pad/hit-box compromise as the PDF canvas (a grab just
-        inside the box still means move, even on tiny selections)."""
+        """Index (0–7) of the resize handle under the overlay point, or None —
+        4 corners + 4 side midpoints, same pad/hit-box compromise as the PDF
+        canvas (a grab just inside the box still means move)."""
         bbox = self._selection_bbox()
         if bbox is None:
             return None
         pad = 5.0
         x0, y0, x1, y1 = bbox
-        corners = ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
-                   (x1 + pad, y1 + pad), (x0 - pad, y1 + pad))
-        for i, (hx, hy) in enumerate(corners):
+        for i, (hx, hy) in enumerate(lasso_handle_points(x0, y0, x1, y1, pad)):
             if abs(x - hx) <= hit and abs(y - hy) <= hit:
                 return i
         return None
@@ -8246,6 +8716,10 @@ class TextPageView(Gtk.Overlay):
             for st, before, after in payload:
                 st["color"], st["width"], st["opacity"] = \
                     before if undo else after
+        elif kind == "reshape":
+            # grid re-spacing: swap each divider's stored points
+            for st, before, after in payload:
+                st["pts"] = list(before if undo else after)
 
     def undo_ink(self):
         if not self._undo_ops:
@@ -8290,9 +8764,9 @@ class TextPageView(Gtk.Overlay):
                 return (cx + dx * cos_a - dy * sin_a,
                         cy + dx * sin_a + dy * cos_a)
             return rotate
-        f = self._lasso_scale_factor
+        fx, fy = self._lasso_scale_fx, self._lasso_scale_fy
         ax, ay = self._lasso_scale_anchor
-        return lambda p: (ax + (p[0] - ax) * f, ay + (p[1] - ay) * f)
+        return lambda p: (ax + (p[0] - ax) * fx, ay + (p[1] - ay) * fy)
 
     def _lasso_drag_pts(self):
         """{id(stroke): transformed overlay pts} for the selection while a
@@ -8335,7 +8809,8 @@ class TextPageView(Gtk.Overlay):
         ctx.set_line_cap(cairo.LINE_CAP_ROUND)
         ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         drag = self._lasso_drag_pts()
-        wf = self._lasso_scale_factor if self._lasso_scaling else 1.0
+        wf = (math.sqrt(self._lasso_scale_fx * self._lasso_scale_fy)
+              if self._lasso_scaling else 1.0)
         # NOTE: images are NOT drawn here. They live under the text, painted by
         # the view's BELOW_TEXT layer (_snapshot_images) — this overlay sits on
         # top of the TextView, so anything drawn here would cover the words.
@@ -8363,6 +8838,9 @@ class TextPageView(Gtk.Overlay):
             for p in self.current_stroke[1:]:
                 ctx.line_to(*p)
             ctx.stroke()
+        if self._snap_label:
+            draw_snap_label(ctx, self._snap_at[0], self._snap_at[1],
+                            self._snap_label, self.accent())
         self._draw_lasso(ctx, drag, wf)
 
     def _draw_lasso(self, ctx, drag, wf):
@@ -8407,8 +8885,8 @@ class TextPageView(Gtk.Overlay):
                           (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad)
             ctx.stroke()
             ctx.set_dash([])
-            for hx, hy in ((x0 - pad, y0 - pad), (x1 + pad, y0 - pad),
-                           (x1 + pad, y1 + pad), (x0 - pad, y1 + pad)):
+            # 4 corners (uniform) + 4 side midpoints (one-axis stretch)
+            for hx, hy in lasso_handle_points(x0, y0, x1, y1, pad):
                 ctx.rectangle(hx - 4, hy - 4, 8, 8)
                 ctx.set_source_rgba(1, 1, 1, 0.95)
                 ctx.fill_preserve()
@@ -9349,6 +9827,23 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._smooth_scale.connect("value-changed", self._on_smoothing_changed)
         popover_box.append(self._smooth_scale)
 
+        shape_label = Gtk.Label(label="Shape snap", xalign=0)
+        shape_label.add_css_class("dim-label")
+        shape_label.set_margin_top(6)
+        popover_box.append(shape_label)
+
+        # holding still mid-stroke (the dwell that already snaps a line) can
+        # also clean a rough rectangle/ellipse and turn a line drawn inside a
+        # box into an even grid divider — or be limited to lines, or off
+        self._shape_snap_dd = Gtk.DropDown.new_from_strings(
+            ["Off", "Lines only", "Shapes & grids"])
+        self._shape_snap_dd.set_selected(
+            {"off": 0, "lines": 1, "shapes": 2}[self.canvas.shape_snap])
+        self._shape_snap_dd.set_tooltip_text(
+            "What holding still mid-stroke snaps to")
+        self._shape_snap_dd.connect("notify::selected", self._on_shape_snap_changed)
+        popover_box.append(self._shape_snap_dd)
+
         popover = Gtk.Popover()
         popover.set_child(popover_box)
 
@@ -9740,6 +10235,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             (s.canvas.hl_color, s.canvas.hl_width, s.canvas.hl_opacity) if hl
             else (s.canvas.pen_color, s.canvas.pen_width, 1.0))
         tp.get_smoothing = lambda s=s: s.canvas.smoothing
+        tp.get_shape_snap = lambda s=s: s.canvas.shape_snap
         tp.accent = lambda s=s: s.canvas.zoom_accent
         # Ctrl+scroll / Ctrl+= on the sheet zooms the whole paper (text, ink
         # and margins together), not the persistent notes-font setting
@@ -12059,6 +12555,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _on_smoothing_changed(self, scale):
         self.canvas.smoothing = scale.get_value() / 100.0
+
+    def _on_shape_snap_changed(self, dd, _param=None):
+        self.canvas.shape_snap = ("off", "lines", "shapes")[dd.get_selected()]
 
     def _on_color_changed(self, btn, _param=None):
         if self._syncing_pen:

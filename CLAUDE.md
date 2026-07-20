@@ -171,10 +171,21 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
 - **One table, not two**: `chord_tool` (chords), `zoom_factor_for_scroll`
   (scroll→zoom rate), `erase_radius` (what counts as touching ink),
   `clipboard_content_for`/`paste_objects` (the clipboard), `draw_image` (how a
-  pasted image looks) are shared by both canvases on purpose. Duplicating a
-  *decision* is how the PDF and text sides drift; duplicating *mechanics* is
-  fine — they have genuinely different substrates (a scale-transform canvas vs
-  a reflowing ScrolledWindow).
+  pasted image looks), `recognize_shape`/`rect_bbox_of`/`even_divider_positions`
+  /`draw_snap_label` (the extended-dwell shape snap, row 121) are shared by both
+  canvases on purpose. Duplicating a *decision* is how the PDF and text sides
+  drift; duplicating *mechanics* is fine — they have genuinely different
+  substrates (a scale-transform canvas vs a reflowing ScrolledWindow).
+- **The extended dwell (`_snap_to_shape`, row 121).** Holding still mid-stroke
+  no longer only makes a line: `recognize_shape()` also cleans a closed loop
+  into an axis-aligned **rectangle/ellipse**, and a straight line drawn inside a
+  rectangle becomes an evenly-spaced **grid divider** (re-spacing its siblings,
+  one undo entry — PDF's `("grid", …)` op / the sheet's grouped
+  `("reshape", …)`). Recognised shapes are ordinary **strokes** (polylines), no
+  new object kind — they lasso/erase/round-trip for free. The **line is always
+  the fallback**, so the `shape_snap` setting's "lines"/"off" can't regress the
+  classic snap. Rectangles are detected geometrically (`rect_bbox_of`), so grid
+  snapping survives a reload with no stored tag.
 - **Geometry you STORE must not go through the int-truncating coord helpers.**
   `window_to_buffer_coords`/`buffer_to_window_coords` only take ints, so a
   per-point conversion rounds every point on the way in *and* out. Invisible
@@ -228,6 +239,15 @@ names its PDF with an `![[name.pdf]]` embed line at the top.
     `Del`. Rotation is a knob on a stalk above the box; Shift snaps to
     `ROTATE_SNAP_DEG`. A tilt is stored as an ANGLE and applied at render — it
     is never baked into the pixels, so repeat rotations never degrade.
+  - **Resize is 8 handles (row 122)**: 4 corners scale uniformly, 4 side
+    midpoints stretch ONE axis (aspect changes). One shared policy —
+    `lasso_handle_points`/`lasso_handle_anchor`/`lasso_scale_factors`
+    /`lasso_handle_cursor` — drives both canvases and both the hit-test and the
+    painter. Scale is per-axis `(fx, fy)` about an anchor (opposite edge for a
+    side, opposite corner for a corner); the `("lasso_scale", …, fx, fy, ax,
+    ay)` op and stroke width (`sqrt(fx*fy)`) follow. A non-uniform stretch of a
+    *rotated image* stretches along page axes, not the image's (the rect can't
+    skew — same limit as rotation).
   - **One undo entry per gesture**, even when it moved ink and images together
     (the `("group", [ops])` op).
   - **The eraser ignores images** (lasso + `Del` removes them); **recolour
@@ -336,7 +356,17 @@ Do NOT trust `get_image_info(xrefs=True)` or `get_image_rects()` — they resolv
 placements by visual match and lie about xrefs; the content stream + Resources
 dict are ground truth.
 
-## Next session (2026-07-17 handoff)
+## Next session (2026-07-20 handoff)
+
+**Row 121 (shape & grid recognition) just landed — code-verified, needs an
+in-app pass.** The extended dwell now recognises rectangles/ellipses and snaps
+grid dividers (see "The extended dwell" under Conventions). Pure classifier,
+grid spacing and the PDF grid-divider commit/undo/redo are unit-tested
+(`TestShapeRecognition`, `TestGridDivider`); the full suite is green. Gestures
+still need the real app — hand the user the checklist. **One thing was
+deliberately deferred:** Ctrl+Z on a just-snapped shape *removes* it rather than
+reverting to the raw freehand (a two-step un-snap); the `shape_snap` setting +
+the 500 ms dwell are the escapes for now.
 
 **Row 118 (pasted images) is DONE and verified** — the OCG layer's tests were
 re-run after the refactor, the save/reopen/move round-trip was driven
@@ -345,7 +375,7 @@ pass: paste-size caps, any-tool editing of a selection, lasso click-select,
 Shift multi-select) landed on top of it and is verified too. Both are written
 up; the README gained a line for image paste and one for the grown lasso.
 
-**Next up: row 119 (crop)** — the last piece of the image feature. Its design
+**Still open: row 119 (crop)** — the last piece of the image feature. Its design
 is settled in row 118 and must not be re-litigated: a field on the model
 applied at render, never a destructive re-encode. It lands ONCE for both modes
 (the model and draw path are shared). Read row 118's traps first if you touch

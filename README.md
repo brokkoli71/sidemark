@@ -25,9 +25,9 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### Annotations
 
 - **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging
-- **Straight-line snap** — hold still mid-stroke to lock to a straight line; move while holding to aim, release to commit
+- **Shape snap** — hold still mid-stroke to clean up what you drew: a straight line, or a neat rectangle or ellipse from a rough loop. Draw a line inside a box and it becomes an evenly-spaced grid divider — handy for tables and matrices. Set it to lines-only or off in the pen settings
 - **Highlighter** (`Ctrl+H`) — wide translucent strokes with their own color and width, saved like any annotation. Long-press the tool for **mark text**, which lays clean highlight bands over the words you drag across — still ink, so erase and undo work unchanged
-- **Lasso ink** (lasso tool, or `Ctrl+Shift+Alt+drag`) — loop around strokes to select them (GoodNotes-style), or just click one; `Shift` adds more to the selection. Then drag to **move**, drag a corner handle to **resize**, the knob above to **rotate**, `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step
+- **Lasso ink** (lasso tool, or `Ctrl+Shift+Alt+drag`) — loop around strokes to select them (GoodNotes-style), or just click one; `Shift` adds more to the selection. Then drag to **move**, drag a corner handle to **resize** (a side handle **stretches** one axis), the knob above to **rotate**, `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step
 - **Paste images** (`Ctrl+V`) — drop a picture from the clipboard onto a PDF page or a text page and it behaves like ink: move, resize and rotate it with the lasso, forever — never a flattened stamp. Whatever tool you're holding, a fresh paste is ready to drag straight away. `Ctrl+C` copies a selection back out — Sidemark gets the real strokes and images, every other app gets a picture
 - **Undo / redo** (`Ctrl+Z` / `Ctrl+Y`) — works across both the canvas and notes; undo a stroke, an erase, or a burst of typing in the order you made them
 
@@ -39,7 +39,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
 - **Date / time snippets** — type `/date`, `/time`, or `/now` then Space to expand
 - **Choose where notes live** — each PDF gets a `<filename>-notes.md` sidecar, created only once you actually write something; pick **Notes file…** from the ☰ menu to point several PDFs at one shared Markdown file (remembered per PDF)
-- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — straight-line snap, smoothing, move/resize/duplicate included (`Alt+drag` draws without leaving the text tool; ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
+- **Text-first mode** — open a bare `.md` (or **New text page**, `Ctrl+Alt+N`) and the window becomes one endless A4 sheet of live Markdown you can **draw on** with the same pen, highlighter, eraser and lasso — shape snap, smoothing, move/resize/duplicate included (`Alt+drag` draws without leaving the text tool; ink rides along with the text you anchor it to). Drag the paper's side edge to set the sheet width — handy on a half-screen window — and it's remembered per document. The file stays **pure Markdown** — ink lives in a `<name>-ink.json` sidecar — and **Export as PDF** renders text and ink to A4 pages. Launching Sidemark without a file opens a persistent scratchpad page
 
 ### Navigation
 
@@ -126,7 +126,7 @@ pip install pymupdf
 | Input | Action |
 |-------|--------|
 | Left-drag | Draw stroke |
-| Hold still mid-stroke | Snaps the stroke to a straight line (GoodNotes-style) — keep holding and move to aim it, release to commit |
+| Hold still mid-stroke | Snaps to a clean line, rectangle or ellipse — or, for a line inside a box, an even grid divider (GoodNotes-style); keep holding and move to aim a line, release to commit |
 | Right-drag | Erase stroke (including from previous sessions) |
 | `Ctrl+H` | Toggle highlighter — wide translucent strokes, own color/width in pen settings |
 | `Ctrl+Shift+drag` | Draw one highlighter stroke without switching tool (reverts on release) |
