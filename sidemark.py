@@ -12570,6 +12570,141 @@ class _ShareServer:
             shutil.rmtree(self._tmp, ignore_errors=True)
 
 
+# ── the export's text font ────────────────────────────────────────────────────
+#
+# Base-14 `helv` is Latin-1, so every glyph the notes grammar produces — the 64
+# symbols in `_MD_SYMBOLS`, the six combining marks in `_MD_ACCENTS` — reached
+# the file as `?`. Exporting notes that said anything mathematical threw the
+# maths away at the one moment the notes leave the app, and `_draw_page_marks`
+# is shared with the phone-share render, so a callout's maths came out as `?`
+# on the phone's screen too.
+#
+# DejaVu Sans is the pick: it covers both tables in regular AND bold (headings
+# and section labels are bold), and it is packaged on every distribution that
+# packages fonts at all. `ttf-dejavu` is a dependency now. Missing it falls
+# back to base-14 and the `?` come back — a handout with holes in its maths
+# still beats an export that refuses to run.
+#
+# **Measure with the font you draw with.** Four places size something from the
+# text that goes in it: `_NotesWriter._wrap`, the callout and text-box height
+# probes, and the anchor label's centring. A measurement taken in a different
+# font is a box that clips its last line or a digit sitting off its circle, and
+# it fails quietly — so `_export_font()` hands out the name and the file
+# together and every call site takes both.
+_EXPORT_FONT_FAMILY = "DejaVu Sans"
+
+# Where the distributions put it — Arch, Debian/Ubuntu, Fedora, openSUSE.
+# fontconfig is asked only when none of these exist, and its answer is CHECKED:
+# `fc-match` always replies, with a substitute when the family is absent (here
+# it offers Liberation Sans, which has neither ℝ nor the combining marks), so
+# an unverified reply is how a "Unicode font" silently becomes Latin-1 again.
+# TeX Live is last on purpose: it ships the same font but keeps it out of
+# fontconfig, so it is the one copy `fc-match` below cannot find. Trying it
+# saves a texlive box from exporting `?` for want of a second copy.
+_EXPORT_FONT_PATHS = {
+    False: ("/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/texmf-dist/fonts/truetype/public/dejavu/DejaVuSans.ttf"),
+    True: ("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+           "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+           "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+           "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+           "/usr/share/texmf-dist/fonts/truetype/public/dejavu/DejaVuSans-Bold.ttf"),
+}
+_EXPORT_FONT_STYLE = {False: "Book", True: "Bold"}
+_export_font_files = {}          # bold -> path or None, resolved once
+
+
+def _export_font_file(bold=False):
+    """Path to the export's Unicode font, or None to fall back to base-14.
+
+    Resolved once per process and remembered, including the failure: this is
+    asked once per callout box and once per wrapped line, and a font installed
+    while the app is running is not worth a stat call on each of them."""
+    if bold in _export_font_files:
+        return _export_font_files[bold]
+    found = next((p for p in _EXPORT_FONT_PATHS[bold] if os.path.exists(p)), None)
+    if found is None and shutil.which("fc-match"):
+        try:
+            out = subprocess.run(
+                ["fc-match", "--format=%{family}\t%{file}",
+                 f"{_EXPORT_FONT_FAMILY}:style={_EXPORT_FONT_STYLE[bold]}"],
+                check=True, capture_output=True, text=True).stdout
+            family, _, path = out.partition("\t")
+            # the substitute check: fc-match answering with something else is
+            # the normal case on a box without DejaVu, not an error
+            if _EXPORT_FONT_FAMILY in family and os.path.exists(path):
+                found = path
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    if found is None:
+        logging.info("export: %s not found, notes maths will export as '?'",
+                     _EXPORT_FONT_FAMILY)
+    _export_font_files[bold] = found
+    return found
+
+
+def _export_font(bold=False):
+    """`(fontname, fontfile)` for `insert_text`/`insert_textbox` — pass BOTH.
+
+    The name is the PDF resource key, so it has to differ per weight or the
+    second weight registered on a page silently draws in the first one's
+    glyphs. With no font file the name is the base-14 fallback and `fontfile`
+    is None, which is exactly what the two calls already defaulted to."""
+    path = _export_font_file(bold)
+    if path is None:
+        return ("hebo" if bold else "helv"), None
+    return ("smbo" if bold else "smrg"), path
+
+
+_export_measure_fonts = {}       # bold -> fitz.Font, built once
+
+
+def _export_measure_font(bold=False):
+    """The `fitz.Font` that measures what `_export_font(bold)` draws.
+
+    Kept, because this is asked once per anchor circle and once per notes page,
+    and a `fitz.Font` re-parses the whole font file each time it is built. It
+    only measures, so one instance serves every export."""
+    font = _export_measure_fonts.get(bold)
+    if font is None:
+        path = _export_font_file(bold)
+        font = (fitz.Font(fontfile=path) if path
+                else fitz.Font("hebo" if bold else "helv"))
+        _export_measure_fonts[bold] = font
+    return font
+
+
+# Beyond this many distinct fonts in the finished export, subsetting costs more
+# wait than it saves bytes. Chosen against STALL_WARN_MS (250 ms, this app's own
+# "a hitch a hand notices"), from the export path itself on a real book:
+#
+#   src pages   fonts   subset_fonts()   saved
+#          10      17            23 ms   793 KB
+#          25      22            76 ms   821 KB
+#          50      28           244 ms   878 KB
+#         100      38           763 ms   925 KB
+#         200      47          3072 ms   917 KB
+#
+# The saving is FLAT — it is our own font being shrunk, and a book's fonts
+# arrived subset already — while the cost grows faster than the page count. So
+# there is a size past which this is pure wait, and that is the whole reason
+# for a limit rather than a preference.
+_SUBSET_FONT_LIMIT = 24
+
+
+def _output_font_count(doc):
+    """Distinct fonts in the document — the thing `subset_fonts()` walks, so
+    the one number that predicts what it will cost."""
+    seen = set()
+    for page in doc:
+        for font in page.get_fonts():
+            seen.add(font[0])                      # xref
+    return len(seen)
+
+
 def _draw_page_marks(out_page, notes_text, accent):
     """Draw a page's on-page marks into the given (copied) page: flatten ink to
     content first, then text boxes, callout boxes, and numbered anchor circles on
@@ -12677,6 +12812,26 @@ def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
     # entry it points at, so every one of them dangles in the export — settle
     # them into plain images, which every viewer renders (see _settle_ocg_refs)
     PDFCanvas._settle_ocg_refs(out_doc)
+    # The notes font is embedded in FULL otherwise — ~0.65 MB of DejaVu Sans
+    # for the forty glyphs an export actually uses — so subsetting is worth
+    # real money on a small export. It has to run after all the text is
+    # written, since it keeps only the glyphs the document references.
+    #
+    # But `subset_fonts()` walks EVERY font on EVERY page, and the source's
+    # fonts are the ones that cost: on a 428-page, 82-font book it added 27 s
+    # to an export and saved 0.5 MB of 7.7. It holds the GIL for all of it, so
+    # the window freezes even though the export runs on a worker thread —
+    # which is how this reached a user, as a watchdog stall report during an
+    # ordinary export. Re-subsetting a book's own fonts is also not ours to
+    # do: they arrived subset.
+    # ceiling: a big export keeps the full font. If its SIZE ever matters more
+    # than its wait, the fix is to subset the notes pages in a scratch
+    # document and insert_pdf them, so the cost follows our pages only.
+    if _output_font_count(out_doc) <= _SUBSET_FONT_LIMIT:
+        try:
+            out_doc.subset_fonts()
+        except Exception:                          # noqa: BLE001
+            logging.exception("export: subsetting fonts failed, saving in full")
     out_doc.save(out_path, garbage=4, deflate=True)
     out_doc.close()
     src_doc.close()
@@ -12707,10 +12862,48 @@ def _draw_export_anchor(page, px, py, number, color):
     page.draw_circle((px, py), radius, color=color, fill=color)
     label = str(number)
     fontsize = radius * 1.5
-    tw = fitz.Font("helv").text_length(label, fontsize)
+    fontname, fontfile = _export_font()
+    tw = _export_measure_font().text_length(label, fontsize)
     # Center the text baseline visually inside the circle
     page.insert_text((px - tw / 2, py + fontsize * 0.35),
-                     label, fontsize=fontsize, color=(1, 1, 1), fontname="helv")
+                     label, fontsize=fontsize, color=(1, 1, 1),
+                     fontname=fontname, fontfile=fontfile)
+
+
+def _fit_export_box(page_rect, text, box_w, pad, fontsize):
+    """The text — truncated if it cannot fit a page — and the box height it
+    needs, measured in the font it will be DRAWN in.
+
+    Measures on a scratch page using fitz's own wrapping rather than estimating:
+    `insert_textbox` silently renders NOTHING when the text does not fit the
+    rect it is handed, so a height guessed one line short is an empty box, not
+    a clipped one. Shared by the callout and the standalone text box, which is
+    what keeps the measuring font and the drawing font the same in both."""
+    fontname, fontfile = _export_font()
+    measure_doc = fitz.open()
+    measure_page = measure_doc.new_page(width=page_rect.width,
+                                        height=page_rect.height)
+    measure_rect = fitz.Rect(0, 0, box_w - 2 * pad, page_rect.height)
+    spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
+                                        fontname=fontname, fontfile=fontfile,
+                                        align=0)
+    while spare < 0 and len(text) > 8:   # taller than a page: truncate
+        text = text[:int(len(text) * 0.8)].rstrip() + "\u2026"
+        spare = measure_page.insert_textbox(measure_rect, text,
+                                            fontsize=fontsize,
+                                            fontname=fontname,
+                                            fontfile=fontfile, align=0)
+    measure_doc.close()
+    return text, (measure_rect.height - max(spare, 0)) + 2 * pad + 2
+
+
+def _draw_export_box_text(page, box, text, pad, fontsize):
+    """The body text inside an export box, in the export font."""
+    fontname, fontfile = _export_font()
+    text_rect = fitz.Rect(box.x0 + pad, box.y0 + pad, box.x1 - pad, box.y1 - pad)
+    page.insert_textbox(text_rect, text, fontsize=fontsize,
+                        color=(0.1, 0.1, 0.1), fontname=fontname,
+                        fontfile=fontfile, align=0)
 
 
 def _draw_export_callout(page, a, color):
@@ -12720,21 +12913,7 @@ def _draw_export_callout(page, a, color):
     pad = 5.0
     box_w = 170.0
     page_rect = page.rect
-    # Measure the exact height fitz's own wrapping needs on a scratch page —
-    # estimating it ourselves risks a too-small rect, and insert_textbox
-    # silently renders nothing when the text does not fit.
-    text = a["text"]
-    measure_doc = fitz.open()
-    measure_page = measure_doc.new_page(width=page_rect.width, height=page_rect.height)
-    measure_rect = fitz.Rect(0, 0, box_w - 2 * pad, page_rect.height)
-    spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
-                                        fontname="helv", align=0)
-    while spare < 0 and len(text) > 8:   # taller than a page: truncate
-        text = text[:int(len(text) * 0.8)].rstrip() + "…"
-        spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
-                                            fontname="helv", align=0)
-    measure_doc.close()
-    box_h = (measure_rect.height - max(spare, 0)) + 2 * pad + 2
+    text, box_h = _fit_export_box(page_rect, a["text"], box_w, pad, fontsize)
 
     cx, cy = a["callout"]
     cx = min(max(cx, 0), page_rect.width - box_w)
@@ -12757,9 +12936,7 @@ def _draw_export_callout(page, a, color):
         page.draw_line(attach, right, color=color, width=1.2)
 
     page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
-    text_rect = fitz.Rect(box.x0 + pad, box.y0 + pad, box.x1 - pad, box.y1 - pad)
-    page.insert_textbox(text_rect, text, fontsize=fontsize,
-                        color=(0.1, 0.1, 0.1), fontname="helv", align=0)
+    _draw_export_box_text(page, box, text, pad, fontsize)
 
 
 def _draw_export_textbox(page, t, color):
@@ -12769,26 +12946,13 @@ def _draw_export_textbox(page, t, color):
     pad = 5.0
     box_w = 170.0
     page_rect = page.rect
-    text = t["text"]
-    measure_doc = fitz.open()
-    measure_page = measure_doc.new_page(width=page_rect.width, height=page_rect.height)
-    measure_rect = fitz.Rect(0, 0, box_w - 2 * pad, page_rect.height)
-    spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
-                                        fontname="helv", align=0)
-    while spare < 0 and len(text) > 8:
-        text = text[:int(len(text) * 0.8)].rstrip() + "…"
-        spare = measure_page.insert_textbox(measure_rect, text, fontsize=fontsize,
-                                            fontname="helv", align=0)
-    measure_doc.close()
-    box_h = (measure_rect.height - max(spare, 0)) + 2 * pad + 2
+    text, box_h = _fit_export_box(page_rect, t["text"], box_w, pad, fontsize)
 
     bx = min(max(t["x"], 0), page_rect.width - box_w)
     by = min(max(t["y"], 0), page_rect.height - box_h)
     box = fitz.Rect(bx, by, bx + box_w, by + box_h)
     page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
-    text_rect = fitz.Rect(box.x0 + pad, box.y0 + pad, box.x1 - pad, box.y1 - pad)
-    page.insert_textbox(text_rect, text, fontsize=fontsize,
-                        color=(0.1, 0.1, 0.1), fontname="helv", align=0)
+    _draw_export_box_text(page, box, text, pad, fontsize)
 
 
 def _export_notes_blocks(notes_text):
@@ -12866,7 +13030,10 @@ class _NotesWriter:
         self.margin = 40
         self.size = 10
         self.line_h = self.size * 1.45
-        self.font = fitz.Font("helv")
+        # the measuring twin of _export_font(): _wrap sizes only body text,
+        # which _line draws in the same regular weight (a section heading is
+        # never wrapped — it goes straight to _line)
+        self.font = _export_measure_font()
         self.page = None
         self.y = 0.0
 
@@ -12874,8 +13041,10 @@ class _NotesWriter:
         self.page = self.doc.new_page(width=self.w, height=self.h)
         self.page.draw_line((self.margin, 30), (self.w - self.margin, 30),
                             color=(0.7, 0.7, 0.7))
+        fontname, fontfile = _export_font(bold=True)
         self.page.insert_text((self.margin, 24), self.title,
-                              fontsize=11, color=(0.3, 0.3, 0.3), fontname="hebo")
+                              fontsize=11, color=(0.3, 0.3, 0.3),
+                              fontname=fontname, fontfile=fontfile)
         self.y = 45.0
 
     def ensure_page(self):
@@ -12896,23 +13065,24 @@ class _NotesWriter:
                 out.append(word)
         return out or ['']
 
-    def _line(self, text, fontname, color, indent):
+    def _line(self, text, bold, color, indent):
         if self.page is None or self.y + self.line_h > self.h - self.margin:
             self._new_page()
+        fontname, fontfile = _export_font(bold)
         self.page.insert_text((self.margin + indent, self.y + self.size),
                               text, fontsize=self.size, color=color,
-                              fontname=fontname)
+                              fontname=fontname, fontfile=fontfile)
         self.y += self.line_h
 
     def section_heading(self, label):
         self.y += 6
-        self._line(label, "hebo", self.accent, 0)
+        self._line(label, True, self.accent, 0)
 
     def paragraph(self, text, indent=0):
         max_w = self.w - 2 * self.margin - indent
         for logical in text.split('\n'):
             for dl in self._wrap(logical, max_w):
-                self._line(dl, "helv", (0, 0, 0), indent)
+                self._line(dl, False, (0, 0, 0), indent)
 
     def gap(self):
         self.y += self.line_h * 0.4

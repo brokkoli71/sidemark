@@ -167,14 +167,15 @@ two that have shipped:
 - **Row 180 (Nextcloud) is blocked on ONE answer from them**: their own
   instance, or anyone's?
 
-**An APPROVED plan from 2026-08-14 is also unstarted**:
+**An APPROVED plan from 2026-08-14 is PHASE 0 IN**:
 `notes/text-objects-plan.md` (row 168) — type your own text on a page, stored
-like a drawing and written into the PDF as REAL selectable text. Its **phase 0
-is a standalone fix for a live bug** (the notes export writes `α ∑ ℝ →` as
-`?????`, because base-14 `helv` cannot encode them) and can land on its own. It
-opens with the design decisions already made; read it before designing anything
-in that area. Editing the PDF's OWN text was analysed and REJECTED there with
-the user's agreement — don't reopen it.
+like a drawing and written into the PDF as REAL selectable text. **Phase 0
+landed on its own** (row 191): the export embeds a Unicode font, so notes stop
+exporting their maths as `?`. Phases 1–5 are unstarted, and phase 1 should draw
+through the `_export_font()` helper phase 0 created rather than resolving a font
+of its own. The plan opens with the design decisions already made; read it
+before designing anything in that area. Editing the PDF's OWN text was analysed
+and REJECTED there with the user's agreement — don't reopen it.
 
 **Two refinements to row 162 shipped on the WEB first and are owed to the
 desktop** (2026-08-16, both verified in a browser, both small):

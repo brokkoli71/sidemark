@@ -152,6 +152,19 @@ if ! find /usr/share/icons/Adwaita -name "go-next-symbolic*" 2>/dev/null | grep 
     _need "adwaita-icon-theme" "adwaita-icon-theme" "adwaita-icon-theme"
 fi
 
+# DejaVu Sans is what the PDF export embeds so notes keep their maths: the
+# built-in PDF fonts are Latin-1, and without it every α, ∑, ℝ and → in an
+# exported handout becomes a question mark. Warned about rather than fatal —
+# the export still runs — but it is the kind of missing that only shows up
+# after you have handed the file to somebody.
+if ! ls /usr/share/fonts/TTF/DejaVuSans.ttf \
+        /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+        /usr/share/fonts/dejavu/DejaVuSans.ttf \
+        /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf >/dev/null 2>&1; then
+    warn "DejaVu Sans not found — maths in exported notes will export as '?'."
+    _need "ttf-dejavu" "fonts-dejavu-core" "dejavu-sans-fonts"
+fi
+
 # ── auto-install missing packages ─────────────────────────────────────────────
 _has_missing() {
     [[ ${#_MISS_ARCH[@]} -gt 0 || ${#_MISS_DEB[@]} -gt 0 || \

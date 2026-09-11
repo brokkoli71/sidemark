@@ -96,6 +96,31 @@
     Every path that replaces a notes buffer wholesale must go through
     `_set_buffer_text`.
 
+- **The PDF export writes text in an EMBEDDED font, never base-14** (row 191).
+  The built-in PDF fonts are Latin-1, so all 64 glyphs `_MD_SYMBOLS` produces
+  and all six `_MD_ACCENTS` marks used to reach the file as `?` — the maths
+  lost at the one moment the notes leave the app. `_export_font()` returns the
+  `(fontname, fontfile)` pair and **both arguments must be passed**; with no
+  font installed it returns the base-14 fallback, so the export degrades to `?`
+  rather than failing. `ttf-dejavu` is a dependency for this reason.
+  - **Measure with the font you draw with.** `insert_textbox` renders
+    *nothing* when the text does not fit its rect, so a height measured in a
+    different font is an EMPTY box, not a clipped one — it fails silently and
+    only in the file. `_fit_export_box()` is the one helper the callout and the
+    text box both size themselves with, `_export_measure_font()` is
+    `_NotesWriter`'s measuring twin, and a new drawing call needs its own
+    measurement to come from the same place.
+  - `_draw_page_marks` is shared with the phone-share render, so this is two
+    surfaces: the exported PDF and the PNG a phone sees live.
+  - **Subsetting is gated on the export's font count**, not run always
+    (`_SUBSET_FONT_LIMIT`). `subset_fonts()` walks every font on every page and
+    **holds the GIL throughout**, so a big export froze the window for ~27 s
+    even though the export already runs on a worker thread — moving work off
+    the main thread does not help here. The saving is flat (~800 KB, our own
+    font) while the cost follows the SOURCE's fonts, so past a modest size it
+    is pure wait. The limit is set against `STALL_WARN_MS`. It must still run
+    after all the text is written, since it keeps only referenced glyphs.
+
 - **HTML comments are hidden by default** (`MarkdownNotesView.show_comments`,
   the ☰ switch, persisted as `show_comments`). Not a special case for ours: a
   Markdown viewer renders no comment, and Sidemark's own per-page bookkeeping

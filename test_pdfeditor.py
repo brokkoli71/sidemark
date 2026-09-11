@@ -11,6 +11,7 @@ import re
 import base64
 import json
 import tempfile
+import shutil
 import time
 import types
 import threading
@@ -6331,6 +6332,151 @@ class TestExportSymbolizes(unittest.TestCase):
             self.assertNotIn(r'\mapsto', text)
             # the model itself is untouched (still source)
             self.assertEqual(m.get(0), r'the sum \sum and map \mapsto')
+
+
+class TestExportFont(unittest.TestCase):
+    """The export embeds a Unicode font, so the notes grammar's maths survives
+    into the file (row 168 phase 0).
+
+    Base-14 `helv` is Latin-1: every one of these glyphs used to reach the PDF
+    as `?`, which is the whole notes panel's maths lost at the moment the notes
+    leave the app. The cases below are generated FROM `_MD_SYMBOLS` /
+    `_MD_ACCENTS` rather than listing glyphs, so adding a command to either
+    table tests it here without anyone remembering to."""
+
+    def _export(self, note, **kw):
+        """Export a one-page PDF carrying `note`, returning (all text, bytes)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        src = os.path.join(d, "s.pdf")
+        out = os.path.join(d, "o.pdf")
+        make_pdf(src, n_pages=1)
+        m = NotesModel()
+        m.set(0, note)
+        _export_pdf_with_notes(src, out, m, include_empty=False,
+                               accent=(0.5, 0.7, 0.3), **kw)
+        doc = fitz.open(out)
+        try:
+            return "".join(p.get_text() for p in doc), os.path.getsize(out)
+        finally:
+            doc.close()
+
+    def test_every_symbol_survives_the_export(self):
+        """Each glyph `_MD_SYMBOLS` can produce comes back out of the file."""
+        from sidemark import _MD_SYMBOLS
+        cmds = sorted(_MD_SYMBOLS)
+        text, _ = self._export("\n".join(f"{c} x" for c in cmds))
+        missing = sorted({_MD_SYMBOLS[c] for c in cmds
+                          if _MD_SYMBOLS[c] not in text})
+        self.assertEqual(missing, [],
+                         f"{len(missing)} symbol(s) did not survive export — "
+                         f"the embedded font is missing them, or the export "
+                         f"fell back to base-14")
+
+    def test_accents_survive_the_export(self):
+        """The combining marks too — they are a second table and a second
+        Unicode block, so a font can cover one and not the other."""
+        from sidemark import _MD_ACCENTS
+        text, _ = self._export("\n".join(rf"\{n}{{x}}" for n in sorted(_MD_ACCENTS)))
+        missing = sorted(m for m in _MD_ACCENTS.values() if m not in text)
+        self.assertEqual(missing, [])
+
+    def test_maths_survives_in_a_callout_on_the_page(self):
+        """The on-page path, not the notes page — `_draw_export_callout` had
+        its own `helv`. This is also what the phone-share render bakes into its
+        PNG (`_draw_page_marks` is shared), so it is two surfaces, not one."""
+        note = ("<!-- anchor:100:200 --> <!-- callout:300:300 -->\n"
+                "energy \\alpha and \\sum")
+        text, _ = self._export(note)
+        self.assertIn("α", text)
+        self.assertIn("Σ", text)
+
+    def test_maths_survives_in_a_bold_section_heading(self):
+        """Grouped notes pages head each section in BOLD — a second font
+        resource, and a weight that has to be embedded separately."""
+        text, _ = self._export(r"\alpha \beta \gamma", group=True)
+        for glyph in "αβγ":
+            self.assertIn(glyph, text)
+
+    def test_the_embedded_font_is_subset(self):
+        """A bound, not a measurement: DejaVu Sans is ~750 KB a weight, so an
+        export that forgot to subset lands in the megabytes. Anything near a
+        one-page PDF's own size means the subsetting still happened."""
+        from sidemark import _MD_SYMBOLS
+        _, size = self._export("\n".join(sorted(_MD_SYMBOLS)))
+        self.assertLess(size, 400_000,
+                        "the export embedded a full font, not a subset")
+
+    def test_maths_survives_whether_or_not_the_export_is_subset(self):
+        """Subsetting is SKIPPED on a font-heavy export (it walks every font on
+        every page, and on a real book that cost 27 s of held GIL to save 0.5 MB
+        of 7.7 — a frozen window during an ordinary export). What must not
+        depend on that decision is the text: the same glyphs come back either
+        way, so the size gate can be retuned without anyone re-checking this."""
+        import sidemark
+        from sidemark import _MD_SYMBOLS
+        note = "\n".join(f"{c} x" for c in sorted(_MD_SYMBOLS))
+        saved = sidemark._SUBSET_FONT_LIMIT
+        seen = {}
+        try:
+            for label, limit in (("subset", 10 ** 6), ("not subset", 0)):
+                sidemark._SUBSET_FONT_LIMIT = limit
+                seen[label], _ = self._export(note)
+        finally:
+            sidemark._SUBSET_FONT_LIMIT = saved
+        for label, text in seen.items():
+            missing = sorted({g for g in _MD_SYMBOLS.values() if g not in text})
+            self.assertEqual(missing, [], f"lost {len(missing)} glyph(s) {label}")
+
+    def test_a_font_heavy_export_skips_subsetting(self):
+        """The gate reads the FINISHED document, so it has to count fonts that
+        arrived with the source pages, not only the one we add."""
+        import sidemark
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        src = os.path.join(d, "s.pdf")
+        make_pdf(src, n_pages=1)
+        doc = fitz.open(src)
+        # base-14 names are distinct font resources, which is all the counter
+        # claims to measure
+        for i, name in enumerate(("helv", "hebo", "cour", "tibo", "symb")):
+            doc[0].insert_text((40, 60 + i * 20), f"font {name}", fontname=name)
+        doc.save(os.path.join(d, "many.pdf"))
+        doc.close()
+        many = fitz.open(os.path.join(d, "many.pdf"))
+        try:
+            self.assertGreaterEqual(sidemark._output_font_count(many), 5)
+        finally:
+            many.close()
+        blank = fitz.open(src)
+        try:
+            self.assertEqual(sidemark._output_font_count(blank), 0)
+        finally:
+            blank.close()
+
+    def test_export_still_runs_without_the_font(self):
+        """The fallback is base-14 and `?` for the maths, never a failed
+        export: a handout with holes in its maths beats no handout. Forced by
+        emptying the resolver's cache with a miss in it."""
+        import sidemark
+        saved_files = dict(sidemark._export_font_files)
+        saved_fonts = dict(sidemark._export_measure_fonts)
+        # BOTH caches, or the export measures in DejaVu what it draws in
+        # base-14 — a state the app itself cannot reach, so a test that sets
+        # it up is testing nothing that can happen
+        sidemark._export_font_files.clear()
+        sidemark._export_measure_fonts.clear()
+        sidemark._export_font_files.update({False: None, True: None})
+        try:
+            self.assertEqual(sidemark._export_font(), ("helv", None))
+            self.assertEqual(sidemark._export_font(bold=True), ("hebo", None))
+            text, _ = self._export("plain ascii notes")
+            self.assertIn("plain ascii notes", text)
+        finally:
+            sidemark._export_font_files.clear()
+            sidemark._export_font_files.update(saved_files)
+            sidemark._export_measure_fonts.clear()
+            sidemark._export_measure_fonts.update(saved_fonts)
 
 
 class TestTextBox(unittest.TestCase):

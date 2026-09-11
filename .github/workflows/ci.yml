@@ -50,6 +50,7 @@ jobs:
             gir1.2-gtksource-5 \
             libgtk-4-1 libadwaita-1-0 \
             libgtksourceview-5-0 \
+            fonts-dejavu-core \
             weston
           # pytest is NOT optional here: conftest.py's autouse fixture is what
           # resets settings.json between tests, and running the suite through

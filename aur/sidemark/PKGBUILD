@@ -19,6 +19,9 @@ depends=(
     'python-cairo'
     'gtksourceview5'
     'adwaita-icon-theme'
+    # the PDF export embeds it so notes keep their maths — the
+    # built-in PDF fonts are Latin-1 and turn α ∑ ℝ → into '?'
+    'ttf-dejavu'
 )
 optdepends=(
     'librsvg: render PNG icon sizes at install time'
