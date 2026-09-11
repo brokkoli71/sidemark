@@ -30,12 +30,15 @@ def pytest_sessionstart(session):
     only thing that sets SIDEMARK_TEST_HARNESS.
 
     A rule in a document is a rule that gets missed; this one is enforced.
-    Set SIDEMARK_ALLOW_BARE_PYTEST=1 to override deliberately."""
+    Set SIDEMARK_ALLOW_BARE_PYTEST=1 to override deliberately — CI does, because
+    it runs a bare pytest against a headless Weston of its own. Having a display
+    is therefore NOT evidence of a real session, which is why the override is an
+    explicit opt-in and not a guess about the environment."""
     if os.environ.get("SIDEMARK_TEST_HARNESS") or \
             os.environ.get("SIDEMARK_ALLOW_BARE_PYTEST"):
         return
     if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
-        return          # no session to damage (CI runs its own way)
+        return          # no session to damage
     raise pytest.UsageError(
         "\n\nRefusing to run against your live desktop session.\n"
         "  Use  ./run_tests.sh            (isolated headless Weston)\n"

@@ -88,6 +88,12 @@ jobs:
           # so the suite must never write the settings.json of whoever runs it
           XDG_CONFIG_HOME: /tmp/sidemark-ci-config
           SIDEMARK_TEST: "1"
+          # conftest.py refuses a bare pytest when a display is present, so the
+          # suite can never run against somebody's real desktop. CI IS a bare
+          # pytest and it DOES have a display — the isolated headless Weston
+          # started above — which is the exact case the guard exists to allow,
+          # so it says so deliberately rather than hiding its compositor.
+          SIDEMARK_ALLOW_BARE_PYTEST: "1"
           # The runner has no GPU, so GSK's default renderer runs on llvmpipe
           # through EGL — and the log is full of "libEGL warning: failed to get
           # driver name", "ZINK: vkCreateInstance failed" and "failed to create
