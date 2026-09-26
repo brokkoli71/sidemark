@@ -1,0 +1,31 @@
+app-id: de.hspitz.sidemark
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+command: sidemark
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+modules:
+  - name: python-deps
+    buildsystem: simple
+    build-commands:
+      - pip3 install --prefix=/app --no-cache-dir -r requirements.txt
+    sources:
+      - type: file
+        path: flatpak/requirements.txt
+
+  - name: sidemark
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 sidemark.py /app/share/sidemark/sidemark.py
+      - install -Dm755 flatpak/sidemark-launcher /app/bin/sidemark
+      - install -Dm644 de.hspitz.sidemark.desktop /app/share/applications/de.hspitz.sidemark.desktop
+      - install -Dm644 icon.svg /app/share/icons/hicolor/scalable/apps/de.hspitz.sidemark.svg
+      - install -Dm644 flatpak/de.hspitz.sidemark.metainfo.xml /app/share/metainfo/de.hspitz.sidemark.metainfo.xml
+    sources:
+      - type: dir
+        path: .
