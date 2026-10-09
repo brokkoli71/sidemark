@@ -14371,6 +14371,45 @@ class TestReloadRestoresTheSession(unittest.TestCase):
 
             self._in_app(body)
 
+    def test_a_restored_text_page_stays_a_text_page(self):
+        """A text page records `notes: False` (it has no panel), and restoring
+        that flipped the notes toggle off — whose hide animation pushed the
+        divider to full width. The next position change, however much later,
+        then read as the left-edge pull and turned the page into a blank PDF
+        with the .md as its sidebar."""
+        with tempfile.TemporaryDirectory() as d:
+            md = os.path.join(d, "note.md")
+            with open(md, "w", encoding="utf-8") as f:
+                f.write("# hello\n\nsome text\n")
+
+            def settle(ms):
+                ctx = GLib.MainContext.default()
+                deadline = time.time() + ms / 1000
+                while time.time() < deadline:
+                    ctx.iteration(False)
+
+            def body(app):
+                first = PDFEditorWindow(app); first.present()
+                first.open_file_in_tab(md)
+                settle(400)
+                state = first.session_state()
+                first.destroy()
+                app.restore_session(state)
+                win = [w for w in app.get_windows()
+                       if isinstance(w, PDFEditorWindow)][-1]
+                s = win._active_session
+                # past the animation AND the watcher's programmatic window
+                settle(1000)
+                self.assertLess(s._paned.get_position(), win.MODE_PAGE_BACK)
+                # any later layout nudge must not read as a pull
+                win._on_pane_position(s)
+                settle(win.PANE_SETTLE_MS + 300)
+                self.assertTrue(s._text_mode, "the text page became a PDF")
+                self.assertIsNone(s._path)
+                self.assertEqual(s._notes_path, md)
+
+            self._in_app(body)
+
     def test_every_dirty_tab_is_asked_about_before_reloading(self):
         """A reload replaces the whole window, so a tab you never looked at
         would lose its edits without ever being mentioned."""

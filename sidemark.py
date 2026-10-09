@@ -25902,6 +25902,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._toast(f"Notes file: {os.path.basename(new_path)}")
 
     def _on_notes_toggled(self, btn):
+        # The sheet owns that side of the divider, as in _set_notes_shown. The
+        # off branch below animates the divider to full width, which on a text
+        # page leaves it far from the edge — and the next position change then
+        # reads as row 130's pull and turns the page into a blank PDF. A
+        # reload's restore flips this toggle off for every text tab.
+        if self._text_mode:
+            return
         w = self.get_width() or 1280
         if btn.get_active():
             self._notes_box.set_visible(True)
