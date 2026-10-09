@@ -120,7 +120,7 @@ _need() {
 
 # check_py TEST ARCH_PKGS DEB_PKGS RPM_PKGS [pip=PKG]
 check_py() {
-    /usr/bin/python3 -c "$1" 2>/dev/null || _need "$2" "$3" "$4" "${5:-}"
+    /usr/bin/python3 -c "$1" >/dev/null 2>&1 || _need "$2" "$3" "$4" "${5:-}"
 }
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -134,7 +134,7 @@ check_py "import gi; gi.require_version('Gtk','4.0'); from gi.repository import 
 check_py "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" \
     "libadwaita" "gir1.2-adw-1 libadwaita-1-0" "libadwaita"
 # PyMuPDF: Arch = pacman, others = pip
-if ! /usr/bin/python3 -c "import fitz" 2>/dev/null; then
+if ! /usr/bin/python3 -c "import fitz" >/dev/null 2>&1; then
     case "$_DISTRO" in
         arch) _need "python-pymupdf" "" "" ;;
         *)    _need "" "" "" "pymupdf" ;;
@@ -157,10 +157,21 @@ fi
 # exported handout becomes a question mark. Warned about rather than fatal —
 # the export still runs — but it is the kind of missing that only shows up
 # after you have handed the file to somebody.
-if ! ls /usr/share/fonts/TTF/DejaVuSans.ttf \
-        /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
-        /usr/share/fonts/dejavu/DejaVuSans.ttf \
-        /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf >/dev/null 2>&1; then
+# Each distro has exactly ONE of these paths, so the test is "any exists" — a
+# single `ls` of all of them fails whenever any one is missing, i.e. always.
+# The list is the app's own `_EXPORT_FONT_PATHS`; keep the two in step.
+_has_dejavu() {
+    local f
+    for f in /usr/share/fonts/TTF/DejaVuSans.ttf \
+             /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+             /usr/share/fonts/dejavu/DejaVuSans.ttf \
+             /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf \
+             /usr/share/texmf-dist/fonts/truetype/public/dejavu/DejaVuSans.ttf; do
+        [[ -e $f ]] && return 0
+    done
+    return 1
+}
+if ! _has_dejavu; then
     warn "DejaVu Sans not found — maths in exported notes will export as '?'."
     _need "ttf-dejavu" "fonts-dejavu-core" "dejavu-sans-fonts"
 fi
@@ -210,7 +221,7 @@ if _has_missing; then
             "gtk4" "gir1.2-gtk-4.0 libgtk-4-1" "gtk4"
         check_py "import gi; gi.require_version('Adw','1'); from gi.repository import Adw" \
             "libadwaita" "gir1.2-adw-1 libadwaita-1-0" "libadwaita"
-        if ! /usr/bin/python3 -c "import fitz" 2>/dev/null; then
+        if ! /usr/bin/python3 -c "import fitz" >/dev/null 2>&1; then
             case "$_DISTRO" in
                 arch) _need "python-pymupdf" "" "" ;;
                 *)    _need "" "" "" "pymupdf" ;;
