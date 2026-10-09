@@ -215,6 +215,7 @@ Renders automatically on lines where the cursor isn't; move the cursor to a line
 | `\forall` `\exists` `\partial` `\nabla` `\to` | ∀ ∃ ∂ ∇ → |
 | `\R` `\N` `\Q` `\Z` `\C` | number sets ℝ ℕ ℚ ℤ ℂ (also spelled `\realnum`, `\natnum`, `\ratnum`, `\intnum`, `\compnum`) |
 | `\hat{x}` `\bar{x}` `\tilde{x}` `\vec{x}` | accents x̂ x̄ x̃ x⃗ (also `\dot` / `\ddot`; braces optional: `\hat x`) |
+| `\bra{\phi}` `\ket{\psi}` | Dirac notation ⟨φ\| \|ψ⟩ |
 
 The space that *ends* a command or an unbraced script is a terminator, not a gap, so it is not drawn: `\alpha x` reads "αx" and `x^2 y` reads "x²y". Type two spaces where you want one — `\alpha  + \beta` → "α + β".
 

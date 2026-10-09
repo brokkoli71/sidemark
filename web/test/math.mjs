@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  MD_SYMBOLS, MD_ACCENTS, MAX_SCRIPT_DEPTH, SCRIPT_SCALE,
+  MD_SYMBOLS, MD_ACCENTS, MD_BRAKETS, MAX_SCRIPT_DEPTH, SCRIPT_SCALE,
   symbolize, splitMarkup, iterScripts, scriptBodyEnd, scriptContent,
   renderSpans, RENDERABLE_RE,
 } from "../src/mathrender.js";
@@ -27,6 +27,7 @@ function check(name, got, want) {
 
 check("symbol table", MD_SYMBOLS, V.symbols);
 check("accent table", MD_ACCENTS, V.accents);
+check("bra-ket table", MD_BRAKETS, V.brakets);
 check("MAX_SCRIPT_DEPTH", MAX_SCRIPT_DEPTH, V.max_depth);
 check("SCRIPT_SCALE", SCRIPT_SCALE, V.scale);
 
@@ -73,6 +74,23 @@ check("\\alpha with the caret still on it", reveals("\\alpha", 6), true);
 // an accent eats nothing, so its two ends agree and the rule above is a no-op
 check("\\hat{x} after ONE space", reveals("\\hat{x} ", 8), false);
 check("\\hat{x} with the caret still on it", reveals("\\hat{x}", 7), true);
+// the argument is often a command, and must not be claimed as a symbol first
+check("\\ket{\\psi} renders as ONE span",
+      renderSpans("\\ket{\\psi}").map((s) => s.text), ["|ψ⟩"]);
+check("\\bra\\phi A after ONE space", reveals("\\bra\\phi A ", 11), false);
+check("\\ket 11 with the caret still on it", reveals("\\ket 11", 7), true);
+check("\\ket 11 after ONE space", reveals("\\ket 11 ", 8), false);
+
+// what the editor draws is what the desktop renders, span by span
+for (const c of V.cases) {
+  const spans = renderSpans(c.raw);
+  if (!spans.length || splitMarkup(c.raw).some((s) => s.kind !== "text")) continue;
+  if (spans.some((s) => s.kind === "script")) continue;   // drawn, not text
+  let out = "", at = 0;
+  for (const s of spans) { out += c.raw.slice(at, s.from) + s.text; at = s.to; }
+  out += c.raw.slice(at);
+  check(`${JSON.stringify(c.raw)} spans compose to symbolize`, out, c.symbolize);
+}
 
 if (failures) {
   console.error(`\n✗ ${failures} of ${checks} maths checks failed.`);

@@ -604,6 +604,138 @@
    "renderable": true
   },
   {
+   "raw": "\\hatch",
+   "symbolize": "\\hatch",
+   "split": [
+    [
+     "\\hatch",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\ket{\\psi}",
+   "symbolize": "|ψ⟩",
+   "split": [
+    [
+     "\\ket{\\psi}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\bra{\\phi} A \\ket{\\psi}",
+   "symbolize": "⟨φ| A |ψ⟩",
+   "split": [
+    [
+     "\\bra{\\phi} A \\ket{\\psi}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\ket 0",
+   "symbolize": "|0⟩",
+   "split": [
+    [
+     "\\ket 0",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\ket 11",
+   "symbolize": "|11⟩",
+   "split": [
+    [
+     "\\ket 11",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\ket 11 x",
+   "symbolize": "|11⟩x",
+   "split": [
+    [
+     "\\ket 11 x",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\ket 0, x",
+   "symbolize": "|0⟩, x",
+   "split": [
+    [
+     "\\ket 0, x",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\ket 11  x",
+   "symbolize": "|11⟩ x",
+   "split": [
+    [
+     "\\ket 11  x",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\hat xy",
+   "symbolize": "x̂y",
+   "split": [
+    [
+     "\\hat xy",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\bra\\phi A",
+   "symbolize": "⟨φA|",
+   "split": [
+    [
+     "\\bra\\phi A",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
+   "raw": "\\braket{a|b}",
+   "symbolize": "\\braket{a|b}",
+   "split": [
+    [
+     "\\braket{a|b}",
+     "text"
+    ]
+   ],
+   "scripts": [],
+   "renderable": true
+  },
+  {
    "raw": "`\\alpha` and \\beta",
    "symbolize": "`\\alpha` and β",
    "split": [
@@ -842,6 +974,16 @@
   "vec": "⃗",
   "dot": "̇",
   "ddot": "̈"
+ },
+ "brakets": {
+  "bra": [
+   "⟨",
+   "|"
+  ],
+  "ket": [
+   "|",
+   "⟩"
+  ]
  },
  "max_depth": 3,
  "scale": 0.65

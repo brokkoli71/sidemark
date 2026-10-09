@@ -55,6 +55,11 @@ export const MD_ACCENTS = {
   dot: "̇", ddot: "̈",
 };
 
+// Dirac notation takes an argument exactly as an accent does — `\ket{\psi}`,
+// `\bra\phi`, `\ket 0` — so it rides the same regex; only what is put AROUND
+// the argument differs. U+27E8/9 are the mathematical angle brackets.
+export const MD_BRAKETS = { bra: ["⟨", "|"], ket: ["|", "⟩"] };
+
 // THE SPACE THAT ENDS A COMMAND IS A TERMINATOR, NOT A GAP: you have to write
 // `\alpha x` because `\alphax` is a different command, so rendering it puts a
 // hole in the middle of "αx". Exactly one such space is eaten with the command
@@ -71,8 +76,6 @@ const SYMBOL_RE = /\\([A-Za-z]+)( )?/g;
 // glyph belongs on screen.
 export const COMMAND_RE = /\\[A-Za-z]+/g;
 
-const ACCENT_RE = new RegExp(
-  "\\\\(" + Object.keys(MD_ACCENTS).join("|") + ")\\s*(?:\\{([^}]*)\\}|(\\S))", "g");
 
 const CODE_SPAN_RE = /`[^`\n]+?`/;
 const LINK_RE = /(?<!!)\[\[([^\[\]\n]+?)\]\]/;
@@ -98,6 +101,25 @@ const SCRIPT_BODY = "[A-Za-z0-9"
   + "]";
 const SCRIPT_RE = new RegExp(
   "(\\^|_)(?:\\{([^}]*)\\}|([+-]?" + SCRIPT_BODY + "+)( )?)", "g");
+
+// An argument-taking command — the accents and `\bra`/`\ket`. Its name must
+// END at a non-letter, as every command does: without the lookahead `\braket`
+// read as `\bra` applied to "k", and `\hatch` as ĉh.
+// AN UNBRACED ARGUMENT IS A SCRIPT BODY: the same class and the same eaten
+// space (group 4) as an unbraced `^`/`_`, so `\ket 11` is |11⟩ and `\ket 0, x`
+// is |0⟩, x. Matched on SYMBOLISED text, like a script: `\bra\phi A` is ⟨φA|,
+// as `x^\phi A` superscripts both.
+const ACCENT_NAMES = "\\\\(" + [...Object.keys(MD_ACCENTS), ...Object.keys(MD_BRAKETS)]
+  .join("|") + ")(?![A-Za-z])\\s*";
+const ACCENT_RE = new RegExp(
+  ACCENT_NAMES + "(?:\\{([^}]*)\\}|([+-]?" + SCRIPT_BODY + "+)( )?)", "g");
+// The same expression found in SOURCE, where an argument character may still
+// be a known `\command` — with the space that terminates it, since by the time
+// the desktop matches, that space is gone.
+const KNOWN_COMMAND = "\\\\(?:" + Object.keys(MD_SYMBOLS).map((k) => k.slice(1))
+  .sort((a, b) => b.length - a.length).join("|") + ")(?![A-Za-z]) ?";
+const ACCENT_SRC_RE = new RegExp(ACCENT_NAMES + "(?:\\{([^}]*)\\}|([+-]?(?:"
+  + SCRIPT_BODY + "|" + KNOWN_COMMAND + ")+)( )?)", "g");
 
 export const MAX_SCRIPT_DEPTH = 3;   // beyond this the glyphs are unreadable
 export const SCRIPT_SCALE = 0.65;    // each level shrinks by this much
@@ -135,8 +157,9 @@ function subSymbol(whole, name) {
 }
 
 function subAccent(whole, name, braced, bare) {
-  const mark = MD_ACCENTS[name];
   const base = braced !== undefined ? braced : (bare || "");
+  if (name in MD_BRAKETS) return MD_BRAKETS[name][0] + base + MD_BRAKETS[name][1];
+  const mark = MD_ACCENTS[name];
   if (!base) return mark;
   return base[0] + mark + base.slice(1);
 }
@@ -235,7 +258,7 @@ export function scriptScale(chain) {
  * `x^2b` superscripts "2b"), so typing it means you are DONE. Test the caret
  * against `to` and the terminator you just typed holds the expression open
  * underneath it, and a second space is needed to let go of something already
- * finished. Accents eat no space, so both ends agree there. */
+ * finished. An unbraced accent argument eats one too, by the same rule. */
 export function renderSpans(line) {
   const spans = [];
   const claimed = [];
@@ -259,6 +282,21 @@ export function renderSpans(line) {
     claimed.push([s.from, s.to]);
   }
 
+  // Accents before symbols: the argument is often a command itself
+  // (`\ket{\psi}`, `\hat\alpha`), and a symbol claimed first would leave the
+  // accent overlapping it and unrendered. The whole expression renders as one
+  // span, its argument symbolised, exactly as the desktop composes the two.
+  const accRe = new RegExp(ACCENT_SRC_RE.source, "g");
+  for (const m of line.matchAll(accRe)) {
+    const from = m.index, to = m.index + m[0].length;
+    if (overlaps(from, to)) continue;
+    // the caret end never includes the space that ended the argument — its
+    // own, or the one its last \command ate
+    spans.push({ from, to, caretTo: to - (m[2] === undefined && m[0].endsWith(" ") ? 1 : 0),
+                 kind: "accent", text: symbolize(m[0]) });
+    claimed.push([from, to]);
+  }
+
   const symRe = new RegExp(SYMBOL_RE.source, "g");
   for (const m of line.matchAll(symRe)) {
     const from = m.index, to = m.index + m[0].length;
@@ -268,17 +306,6 @@ export function renderSpans(line) {
     // the backslash and the letters, never the space m[2] may have eaten
     spans.push({ from, to, caretTo: from + 1 + m[1].length, kind: "symbol",
                  text: glyph });
-    claimed.push([from, to]);
-  }
-
-  const accRe = new RegExp(ACCENT_RE.source, "g");
-  for (const m of line.matchAll(accRe)) {
-    const from = m.index, to = m.index + m[0].length;
-    if (overlaps(from, to)) continue;
-    spans.push({
-      from, to, kind: "accent",
-      text: subAccent(m[0], m[1], m[2], m[3]),
-    });
     claimed.push([from, to]);
   }
 

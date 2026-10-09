@@ -5156,6 +5156,56 @@ class TestLatexFormatting(unittest.TestCase):
             v._apply_symbol_subs(r'let \hat{x} be the estimate'),
             'let x̂ be the estimate')
 
+    # ── Dirac notation (\bra, \ket) ────────────────────────────────────────
+
+    def test_bra_and_ket_take_an_argument_like_an_accent(self):
+        """Braced, bare, and a command as the argument — the forms an accent
+        takes, because they ride the same regex."""
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\ket{\psi}'), '|ψ⟩')
+        self.assertEqual(v._apply_symbol_subs(r'\bra{\phi}'), '⟨φ|')
+        self.assertEqual(v._apply_symbol_subs(r'\ket 0'), '|0⟩')
+        self.assertEqual(v._apply_symbol_subs(r'\bra{\phi} A \ket{\psi}'),
+                         '⟨φ| A |ψ⟩')
+
+    def test_an_unbraced_argument_ends_where_a_script_does(self):
+        """`\\ket 11` is |11⟩, not |1⟩1; punctuation ends it as it ends
+        `a_i, b_j`; the space that ended it is eaten, so two ask for one. And
+        the script's consequence holds too: `\\phi A` is "φA" by the time the
+        argument is found, so `\\bra\\phi A` wraps both, as `x^\\phi A`
+        superscripts both."""
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\ket 11'), '|11⟩')
+        self.assertEqual(v._apply_symbol_subs(r'\ket 11 x'), '|11⟩x')
+        self.assertEqual(v._apply_symbol_subs(r'\ket 11  x'), '|11⟩ x')
+        self.assertEqual(v._apply_symbol_subs(r'\ket 0, x'), '|0⟩, x')
+        self.assertEqual(v._apply_symbol_subs(r'\bra\phi A'), '⟨φA|')
+
+    def test_the_eaten_space_releases_the_caret(self):
+        """Typing the space that ends `\\ket 11` says you are done: the caret
+        after it is no longer inside the expression."""
+        from sidemark import MarkdownNotesView
+        src = r'\ket 11 x'
+        self.assertIsNotNone(MarkdownNotesView._caret_expression(src, 7))
+        self.assertIsNone(MarkdownNotesView._caret_expression(src, 8))
+
+    def test_an_argument_command_is_a_whole_word(self):
+        """`\braket` is not `\bra` applied to "k", nor `\hatch` a hatted c:
+        a command runs to the first non-letter, as everywhere else."""
+        v = self._view()
+        self.assertEqual(v._apply_symbol_subs(r'\braket{a|b}'), r'\braket{a|b}')
+        self.assertEqual(v._apply_symbol_subs(r'\hatch'), r'\hatch')
+
+    def test_a_ket_maps_back_to_its_source(self):
+        """A click on the rendered ket lands inside the command that made it,
+        and the text after it keeps its own columns."""
+        from sidemark import _symbolize_map
+        src = r'\ket{\psi} x'
+        rend, imap = _symbolize_map(src)
+        self.assertEqual(rend, '|ψ⟩ x')
+        self.assertTrue(all(imap[i] < src.index(' ') for i in range(3)))
+        self.assertEqual(src[imap[rend.index('x')]], 'x')
+
     # ── script regex ──────────────────────────────────────────────────────────
 
     def test_script_re_single_sup(self):
@@ -6380,6 +6430,14 @@ class TestExportFont(unittest.TestCase):
         text, _ = self._export("\n".join(rf"\{n}{{x}}" for n in sorted(_MD_ACCENTS)))
         missing = sorted(m for m in _MD_ACCENTS.values() if m not in text)
         self.assertEqual(missing, [])
+
+    def test_bra_and_ket_survive_the_export(self):
+        """The angle brackets are a third Unicode block (Misc. Mathematical
+        Symbols-A), so they need their own check."""
+        from sidemark import _MD_BRAKETS
+        text, _ = self._export("\n".join(rf"\{n}{{x}}" for n in sorted(_MD_BRAKETS)))
+        glyphs = {g for pair in _MD_BRAKETS.values() for g in pair}
+        self.assertEqual(sorted(g for g in glyphs if g not in text), [])
 
     def test_maths_survives_in_a_callout_on_the_page(self):
         """The on-page path, not the notes page — `_draw_export_callout` had

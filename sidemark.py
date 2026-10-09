@@ -10164,18 +10164,28 @@ def _sub_symbol(m):
 # LaTeX accents over a base symbol, rendered with Unicode combining marks:
 # \hat{x} → x̂, \bar{x} → x̄, \tilde{x} → x̃, \vec{x} → x⃗ (and \dot / \ddot).
 # The mark follows the base grapheme, so it sits on the first character of the
-# (usually single-character) argument.
+# argument.
 _MD_ACCENTS = {
     'hat': '̂', 'bar': '̄', 'tilde': '̃', 'vec': '⃗',
     'dot': '̇', 'ddot': '̈',
 }
-_MD_ACCENT_RE = re.compile(
-    r'\\(' + '|'.join(_MD_ACCENTS) + r')\s*(?:\{([^}]*)\}|(\S))')
+# Dirac notation takes an argument exactly as an accent does — `\ket{\psi}`,
+# `\bra\phi`, `\ket 0` — so it rides the same regex, and with it the caret
+# rule, the click map and the export; only what is put AROUND the argument
+# differs. U+27E8/9 are the mathematical angle brackets: the CJK-looking
+# U+2329/A are not in DejaVu, and the export would lose them.
+_MD_BRAKETS = {'bra': ('⟨', '|'), 'ket': ('|', '⟩')}
+# `_MD_ACCENT_RE` is built further down, beside `_MD_SCRIPT_RE`, because an
+# unbraced argument is a script body and shares its class.
 
 
 def _sub_accent(m):
+    body = m.group(2) if m.group(2) is not None else (m.group(3) or '')
+    if m.group(1) in _MD_BRAKETS:
+        left, right = _MD_BRAKETS[m.group(1)]
+        return left + body + right
     mark = _MD_ACCENTS[m.group(1)]
-    base = m.group(2) if m.group(2) is not None else (m.group(3) or '')
+    base = body
     if not base:
         return mark
     return base[0] + mark + base[1:]
@@ -10583,6 +10593,19 @@ _MD_SCRIPT_BODY = ('[A-Za-z0-9'
                    + ']')
 _MD_SCRIPT_RE = re.compile(
     r'(\^|_)(?:\{([^}]*)\}|([+-]?' + _MD_SCRIPT_BODY + r'+)( )?)')
+
+# An argument-taking command — the accents and `\bra`/`\ket`. Its name must
+# END at a non-letter, as every command does: without the lookahead `\braket`
+# read as `\bra` applied to "k", and `\hatch` as ĉh.
+# AN UNBRACED ARGUMENT IS A SCRIPT BODY, by the user's call: the same class and
+# the same eaten space (group 4) as an unbraced `^`/`_`, so `\ket 11` is |11⟩,
+# `\ket 0, x` is |0⟩, x, and you only have to know one rule for where a thing
+# you did not brace ends. That includes the script's consequence: symbols are
+# substituted first, `\phi A` has become "φA", and so `\bra\phi A` is ⟨φA|,
+# exactly as `x^\phi A` superscripts both — brace it to stop early.
+_MD_ACCENT_RE = re.compile(
+    r'\\(' + '|'.join([*_MD_ACCENTS, *_MD_BRAKETS])
+    + r')(?![A-Za-z])\s*(?:\{([^}]*)\}|([+-]?' + _MD_SCRIPT_BODY + r'+)( )?)')
 
 # A script that starts exactly where the previous one's content ended is a
 # script OF that script — `a_i_j` is "j indexing i", not two indices of `a`
@@ -14927,8 +14950,12 @@ class MarkdownNotesView(GtkSource.View):
         next keystroke."""
         for rx in (_MD_ACCENT_RE, _MD_COMMAND_RE):
             for m in rx.finditer(src):
-                if m.start() <= col <= m.end():
-                    return m.start(), m.end()
+                # never the space an unbraced argument ate: typing it is
+                # what says you are done
+                end = m.end() - len(m.group(4) or '') if rx is _MD_ACCENT_RE \
+                    else m.end()
+                if m.start() <= col <= end:
+                    return m.start(), end
         return None
 
     def _on_insert_text(self, _buf, location, text, _len):

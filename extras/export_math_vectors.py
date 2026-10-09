@@ -61,6 +61,18 @@ CASES = [
     r"\vec{A}",
     r"\hat{\alpha}",       # accents run after substitution
     r"\dot x",
+    r"\hatch",            # a command runs to the first non-letter
+    # Dirac notation: an argument, like an accent, put between brackets
+    r"\ket{\psi}",
+    r"\bra{\phi} A \ket{\psi}",
+    r"\ket 0",
+    r"\ket 11",           # an unbraced argument is a script body…
+    r"\ket 11 x",         # …eating its terminating space…
+    r"\ket 0, x",         # …and stopping at punctuation
+    r"\ket 11  x",        # two spaces is how you ask for one
+    r"\hat xy",           # the mark sits on the first character
+    r"\bra\phi A",         # \phi's space is gone first, so both are inside
+    r"\braket{a|b}",      # not \bra applied to "k"
     # verbatim spans: nothing renders inside them
     r"`\alpha` and \beta",
     r"[[\alpha]] and \beta",
@@ -102,6 +114,7 @@ def main():
     json.dump({"cases": out,
                "symbols": S._MD_SYMBOLS,
                "accents": S._MD_ACCENTS,
+               "brakets": {k: list(v) for k, v in S._MD_BRAKETS.items()},
                "max_depth": S.MAX_SCRIPT_DEPTH,
                "scale": S.SCRIPT_SCALE},
               sys.stdout, indent=1, ensure_ascii=False)
