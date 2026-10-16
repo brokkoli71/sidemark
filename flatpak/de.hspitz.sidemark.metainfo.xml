@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>de.hspitz.sidemark</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Sidemark</name>
+  <summary>View and annotate PDF files with markdown notes</summary>
+  <launchable type="desktop-id">de.hspitz.sidemark.desktop</launchable>
+  <description>
+    <p>
+      Sidemark is a lightweight PDF annotator with a live Markdown notes panel.
+      Open PDF documents, annotate directly on pages, and keep page-linked notes.
+    </p>
+  </description>
+  <categories>
+    <category>Office</category>
+    <category>Viewer</category>
+  </categories>
+  <provides>
+    <binary>sidemark</binary>
+  </provides>
+  <releases>
+    <release version="0.2.1" date="2026-06-18" />
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>
