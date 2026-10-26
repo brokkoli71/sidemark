@@ -3707,6 +3707,10 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # {page_idx: [{"pts": [...], "color": (r,g,b,a), "width": float}]}
         self.all_strokes = {}
+        # What the document's ink annotations hold right now, per PAGE XREF —
+        # see _write_ink_annotations. Valid only for _ink_doc.
+        self._ink_doc = None
+        self._ink_on_page = {}
         # Pasted images, per page — an OBJECT like ink, never a flattened
         # stamp (row 118): PNG bytes + a rect in PDF units + a free rotation,
         # editable forever. The `-ink.json` sidecar beside the PDF is the
@@ -4145,6 +4149,7 @@ class PDFCanvas(Gtk.DrawingArea):
                         self.all_strokes.setdefault(i, []).append(st)
                         total_annots += 1
         logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
+        self._note_ink_in_document()
         self._load_page(0)
 
     def _load_page(self, idx, keep_view=False):
@@ -8182,14 +8187,70 @@ class PDFCanvas(Gtk.DrawingArea):
 
     # ── save ──────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _frozen_stroke(stroke):
+        """Everything _write_ink_annotations reads from a stroke, frozen.
+
+        A deep copy into tuples, not a reference: strokes are edited IN PLACE
+        all over the canvas (a lasso move reassigns s["pts"] on the same dict),
+        so anything identity-based would miss an edit and the file would keep
+        the old ink. Must stay in step with what the writer reads."""
+        prof = stroke.get("press")
+        return (tuple(tuple(p) for p in stroke["pts"]), tuple(stroke["color"]),
+                stroke["width"], stroke.get("opacity", 1.0),
+                tuple(prof) if prof else None)
+
+    def _note_ink_in_document(self):
+        """Record that the document's ink annotations hold all_strokes exactly.
+
+        True right after load (the strokes were READ from them) and right after
+        save reopens the file it just wrote. A page loaded from another app's
+        multi-polyline annotation is equivalent rather than identical, which is
+        fine: it is left as it was until its ink changes."""
+        self._ink_doc = self.document
+        self._ink_on_page = {
+            self.document.page_xref(i):
+                [self._frozen_stroke(s) for s in self.all_strokes.get(i, [])]
+            for i in range(self.n_pages)}
+
     def _write_ink_annotations(self):
-        """Sync in-memory strokes into the document as ink annotations."""
+        """Sync in-memory strokes into the document as ink annotations.
+
+        Only pages whose ink CHANGED are touched, and a page that only GAINED
+        strokes gets just the new ones appended. Rewriting everything costs
+        seconds on a long, heavily inked PDF — re-creating annotations, not
+        saving — on the main loop, once a minute from autosave (issue #195).
+        It also leaks: a deleted annotation's objects stay in the document
+        until a garbage-collecting save, so the full rewrite grew memory and
+        the snapshot by the whole document's ink every tick.
+
+        The record is keyed by page XREF, which follows a page through insert,
+        delete and reorder, and is dropped wholesale when the document object
+        is replaced. A mismatch can only cost a needless rewrite: the check is
+        a full content compare."""
+        if self._ink_doc is not self.document:
+            self._ink_doc = self.document
+            self._ink_on_page = {}
         total_written = 0
         for i in range(self.n_pages):
+            strokes = self.all_strokes.get(i, [])
+            sig = [self._frozen_stroke(s) for s in strokes]
+            xref = self.document.page_xref(i)
+            had = self._ink_on_page.get(xref)
+            if had == sig:
+                continue
             page = self.document[i]
-            for annot in list(page.annots(types=[fitz.PDF_ANNOT_INK])):
-                page.delete_annot(annot)
-            for stroke in self.all_strokes.get(i, []):
+            if had is not None and sig[:len(had)] == had:
+                # appended to: annotations keep stroke order, which is the
+                # drawing order a reload reads back, so adding after is exact
+                strokes = strokes[len(had):]
+            else:
+                for annot in list(page.annots(types=[fitz.PDF_ANNOT_INK])):
+                    page.delete_annot(annot)
+            # forgotten while half-written, so a failure mid-page means a full
+            # rewrite next time rather than a record claiming ink that is not there
+            self._ink_on_page.pop(xref, None)
+            for stroke in strokes:
                 pts = stroke["pts"]
                 if not pts:
                     continue
@@ -8216,6 +8277,7 @@ class PDFCanvas(Gtk.DrawingArea):
                                    + ",".join(f"{p:.2f}" for p in prof))
                 annot.update()
                 total_written += 1
+            self._ink_on_page[xref] = sig
         return total_written
 
     # ── the image render layer ───────────────────────────────────────────────
@@ -8347,6 +8409,7 @@ class PDFCanvas(Gtk.DrawingArea):
         os.replace(tmp, path)
         # Reopen so self.document reflects the saved state cleanly
         self.document = fitz.open(path)
+        self._note_ink_in_document()   # it holds exactly what we just wrote
         # self.page belonged to the document we just replaced, and _rerender_now
         # renders THAT object — so without this the page render keeps painting
         # the orphaned document, which still has the image layer baked in by
@@ -8501,6 +8564,9 @@ class PDFCanvas(Gtk.DrawingArea):
         if self.n_pages <= 1:
             return False
         idx = self.current_page_idx
+        # forget it BEFORE its object number is freed: a page created later
+        # under a reused number must not inherit this page's ink record
+        self._ink_on_page.pop(self.document.page_xref(idx), None)
         self.document.delete_page(idx)
         # Remove strokes/images/anchors for the deleted page; shift later pages
         # down by one

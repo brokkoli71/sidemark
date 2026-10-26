@@ -14996,6 +14996,117 @@ class TestNavKeepsZoom(unittest.TestCase):
             raise errors[0]
 
 
+class TestInkWriteOnlyWhatChanged(unittest.TestCase):
+    """_write_ink_annotations touches only pages whose ink changed (#195).
+
+    The way this breaks is a page the record wrongly calls unchanged: the file
+    keeps the OLD ink and a stroke is lost on the next reload. So every edit
+    test is a round trip — edit, snapshot, reload, compare against the canvas."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp(prefix="sidemark-test-inkwrite-")
+        self.path = os.path.join(self._dir, "doc.pdf")
+        make_pdf(self.path, n_pages=3)
+        self.c = PDFCanvas()
+        self.c.load(self.path)
+        for i in range(3):
+            self.c.all_strokes[i] = [self._stroke(i, k) for k in range(2)]
+        self.c.save_copy(self._snap())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    @staticmethod
+    def _stroke(i, k):
+        return {"pts": [(10 + k, 10 + i), (60 + k, 40 + i)],
+                "color": (0, 0, 1), "width": 2}
+
+    def _snap(self):
+        return os.path.join(self._dir, "snap.pdf")
+
+    @staticmethod
+    def _shape(all_strokes):
+        return {i: [([tuple(round(v, 2) for v in p) for p in s["pts"]],
+                     tuple(s["color"]), s["width"]) for s in v]
+                for i, v in all_strokes.items() if v}
+
+    def _assert_round_trips(self):
+        self.c.save_copy(self._snap())
+        back = PDFCanvas()
+        back.load(self._snap())
+        self.assertEqual(self._shape(back.all_strokes),
+                         self._shape(self.c.all_strokes))
+
+    def _annot_xrefs(self, i):
+        return [a[0] for a in self.c.document[i].annot_xrefs()]
+
+    def test_appended_stroke_is_written(self):
+        self.c.all_strokes[1].append(self._stroke(1, 5))
+        self._assert_round_trips()
+
+    def test_stroke_moved_in_place_is_written(self):
+        s = self.c.all_strokes[0][0]
+        s["pts"] = [(x + 7, y + 7) for x, y in s["pts"]]   # how a lasso move edits
+        self._assert_round_trips()
+
+    def test_mutable_point_edited_in_place_is_written(self):
+        # the record must be a deep copy, or editing a point list in place
+        # edits the record with it and the page reads as unchanged
+        s = self.c.all_strokes[0][0]
+        s["pts"] = [list(p) for p in s["pts"]]
+        self.c.save_copy(self._snap())
+        s["pts"][0][0] = 99
+        self._assert_round_trips()
+
+    def test_colour_list_edited_in_place_is_written(self):
+        s = self.c.all_strokes[2][1]
+        s["color"] = [0, 0, 1]
+        self.c.save_copy(self._snap())
+        s["color"][0] = 1
+        self._assert_round_trips()
+
+    def test_erased_strokes_are_removed(self):
+        del self.c.all_strokes[2][0]
+        self.c.all_strokes[1].clear()
+        self._assert_round_trips()
+
+    def test_page_insert_move_and_delete_keep_ink_on_its_page(self):
+        self.c.add_blank_page()                 # after page 0
+        self._assert_round_trips()
+        self.c.move_page(3, 0)
+        self._assert_round_trips()
+        self.c._load_page(2)
+        self.c.delete_current_page()
+        self._assert_round_trips()
+
+    def test_edits_after_a_save_are_written(self):
+        self.c.save(self.path)                  # reopens the document
+        self.c.all_strokes[0].append(self._stroke(0, 9))
+        self.c.all_strokes[2][0]["width"] = 5
+        self._assert_round_trips()
+
+    def test_unchanged_pages_are_not_rewritten(self):
+        before = {i: self._annot_xrefs(i) for i in range(3)}
+        size = self.c.document.xref_length()
+        self.c.save_copy(self._snap())
+        self.assertEqual(self.c.document.xref_length(), size,
+                         "a tick with no ink change created objects")
+        self.c.all_strokes[0].append(self._stroke(0, 5))
+        self.c.save_copy(self._snap())
+        self.assertEqual(self._annot_xrefs(1), before[1])
+        self.assertEqual(self._annot_xrefs(2), before[2])
+        # drawing appends: the page's existing annotations are kept, not rebuilt
+        self.assertEqual(self._annot_xrefs(0)[:len(before[0])], before[0])
+
+    def test_ink_just_loaded_is_not_rewritten(self):
+        c = PDFCanvas()
+        c.load(self._snap())
+        size = c.document.xref_length()
+        c._write_ink_annotations()
+        self.assertEqual(c.document.xref_length(), size)
+
+
 class TestAutosave(unittest.TestCase):
     def setUp(self):
         import sidemark as sm

@@ -77,9 +77,20 @@
   data-safety feature, so a caller nobody has audited must cost a needless
   write, never a lost recovery. The snapshot is still written when there is
   none, because recovery reads `doc.pdf` and notes must never be half a pair.
-  *Not done: per-page ink rewriting, which would cut the drawing case too —
-  it needs to know which pages' ink changed, and getting that wrong loses
-  strokes.*
+- **Writing ink touches only the pages whose ink changed (row 193).**
+  `_write_ink_annotations` compares each page's strokes against a record of
+  what its annotations hold, keyed by page xref: equal is skipped, a grown
+  page gets only the new strokes appended, anything else is rewritten. A full
+  rewrite was seconds on a long inked PDF AND a leak — deleted annotations
+  stay in the document until a garbage-collecting save, so every tick grew
+  memory and the snapshot by the whole document's ink. Two things hold it up:
+  the record is a **deep, frozen copy** (`_frozen_stroke`), because strokes
+  are edited in place and a shared list would change with them and hide the
+  edit; and it must read **exactly the fields the writer writes** — add a
+  field to the annotation and not to `_frozen_stroke`, and a change to only
+  that field never reaches the file. Anything that replaces `self.document`
+  must either re-seed (`_note_ink_in_document`, as load and save do) or leave
+  the record to be dropped by the identity check.
 
 - **PyMuPDF 1.27.2.3 calls a debug benchmark on every `Annot.update()`**
   (`update_timing_test`, counting to 30,000 in pure Python, result discarded):
