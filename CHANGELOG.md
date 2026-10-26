@@ -1,4 +1,143 @@
-## [0.6.0] - 2026-08-11 — Ink and Input
+## [0.7.0] - 2026-10-26 — Off the Desk
+
+### 🚀 Features
+
+- *(outline)* Rename and delete the document's own headings too
+- *(outline)* Edit a heading's page too, and add headings from the menu
+- *(web)* Browser prototype of the ink half
+- *(web)* PDFs, pages, the sidebar and merge import
+- *(web)* An input probe, so browser choice is measured not argued
+- *(web)* The notes panel, and the sidecar format it writes
+- *(web)* Live maths in the notes panel
+- *(web)* Saving — annotated PDF and the .md sidecar
+- *(web)* Lasso selection — select, move, resize, duplicate, delete
+- *(web)* Lasso rotation, and fix the header stacking its icons
+- *(web)* Port the shape recogniser (the extended dwell)
+- *(web)* The extended dwell — hold still mid-stroke to snap
+- *(web)* Grid dividers — a line inside a rectangle cuts even cells
+- *(web)* Circle to lasso — hold on the loop you just drew
+- *(web)* The divider is the way between the modes (row 130)
+- *(web)* Page management — reorder, delete, insert from the toolbar
+- *(web)* Find in document (Ctrl+F)
+- *(web)* The text cursor — select and copy text from a PDF
+- *(web)* Bookmarks, and the linked-notes checkbox
+- *(web)* Sidemark's own palette, a pen swatch and zoom buttons; Pages workflow
+- *(web)* Say when saving cannot write back to the original
+- *(web)* The Sidemark icon as the favicon
+- *(web)* Hidden pages, blank pages, notes in search, recolour, shortcuts
+- *(web)* PNG favicons
+- *(web)* Select several pages, export them, and a header that fits
+- *(web)* Recent documents
+- *(web)* Presenter mode
+- *(web)* Control points and welding (row 127)
+- *(web)* Copy ink — a picture for other apps, the objects for this one
+- *(web)* Anchors and callouts, and hide HTML comments in the notes
+- *(web)* A tour that waits until you have actually done it
+- *(web)* A press outside a selection dismisses it, and marks nothing
+- *(web)* The tour teaches Export, not a drag that cannot land
+- *(web)* Pasted images, as objects rather than stamps
+- *(web)* Publish the demo from master, and a README aimed at its visitors
+- *(notes)* The caret follows you between the page and the sheet
+- *(notes)* One rule for the space that ends a symbol or a script
+- *(notes)* Links point at NAMES, and say when they point at nothing
+- *(notes)* Hovering a link shows the page it leads to
+- *(notes)* The link you are standing in shows its page under it
+- *(notes)* ![[embeds]] show their page, wherever the caret is
+- *(images)* Import the PDF's own pictures as objects
+- *(logging)* A GTK abort and a frozen loop both leave a trace now
+- *(web)* The caret crosses the divider, and a document is two files
+- *(web)* The sidebar follows the caret while the notes are one sheet
+- *(web)* A run lights up whole, and the caret keeps its exact place
+- *(notes)* A search says the same thing on the page and in the notes, and a task box is one you can tick
+- *(ink)* A recognised ellipse is still resizable while the pen is down
+- *(text)* The sheet coasts after a touchpad flick
+- *(text)* The sheet scrolls exactly like every other surface
+- *(text)* The sheet claims every press, and the caret is a tool
+- *(share)* A public link via Tailscale Funnel, and sharing outlives its window
+- *(share)* The phone runs the real editor, and ink flows both ways live
+- *(share)* Point the phone from the desktop, and make the QR dialog instant
+- *(share)* A bookmarkable address, and the phone answers to modifiers
+- *(share)* The phone's tool is the desktop's, both ways
+- *(share)* The phone installs Sidemark, and remembers which computer
+- *(notes)* Dirac notation, \bra and \ket
+
+### 🐛 Bug Fixes
+
+- *(ci)* Ask for our own scroll controller by name, and stop closing the app
+- *(gtk)* Two real bugs the CI warnings were hiding
+- *(web)* Reopened ink is editable again, and reloading restores the document
+- *(web)* Three bugs found by auditing rather than by using
+- *(web)* The pen swatch, and render the page above display resolution
+- *(web)* Sharpness — 1:1 rendering on whole device pixels
+- *(web)* Presenter navigation — right-click, and a double-fire I had added
+- *(web)* Four dead menu entries, and a file picker that could never open
+- *(web)* Every page-menu entry was dead to a real click
+- *(web)* Dropping a PDF on the thumbnails, and three smaller things
+- *(web)* The page drag, the timer that would not go, and a bar with too much in it
+- *(web)* A page menu nobody could reach, and a hook to catch the next one
+- *(web)* A modifier the window never saw released left the pen dead
+- *(web)* Holds that tolerate a hand, and drags that actually carry something
+- *(web)* The tour's dwell step ends when the shape appears
+- *(web)* One space finishes a script, as it does on the desktop
+- *(text)* The thumb button reaches the sheet's press router
+- *(text)* The thumb's pan is not fought by the TextView below
+- *(notes)* The hand, the hover and the picker were dead off the caret line
+- *(notes)* The hover preview is a tooltip, and the sheet keeps its scroll
+- *(ink)* A hold is not a freeze — both dwells reachable by a real hand
+- *(pages)* A page inserted inside a run joins it, and the strip selects by region
+- *(notes)* The whole task box is clickable, and it stands alone at the left margin
+- *(notes)* A task box does not open under the caret, and the press decides which box a click ticks
+- *(ink,text)* An ellipse stretches per axis, and the coast is much shorter
+- *(notes,scroll)* A hover cannot abort the app, and a flick coasts at the sidebar's rate
+- *(share)* Public link by default, a funnel stop that works, and a green suite
+- *(share)* The phone's ink arrives again, and Tailscale says why in words
+- *(web)* A page that is not ready yet, and one that arrives sooner
+- *(share)* A teardown says who asked without looking like a crash
+- *(export)* Notes keep their maths, and subsetting stops freezing the window
+- *(install)* DejaVu is found when it is there, and the fitz notice stays quiet
+- *(notes)* A reload keeps a text page a text page
+- *(ink)* Autosave rewrites only the ink that changed
+
+### 💼 Other
+
+- *(web)* A single-file build, and a launcher to open it
+
+### 📚 Documentation
+
+- *(web)* Bring the README up to date
+- *(web)* Bring the README up to date
+- *(web)* Why a page cannot be dragged to a file manager
+- *(text)* Record the text-mode parity plan and its diagnosis
+- *(text)* The width-drag comment names the caret's tool, not the gesture it replaced
+- *(share)* Record the phone-view tool, the dialog speed fix and --version
+- CLAUDE.md becomes a starting point again, and stays one
+- The share thread's open ends, and the ML Kit gate closes
+
+### ⚡ Performance
+
+- *(web)* Render the page at 3x, and oversample thumbnails too
+- *(autosave)* Typing must not re-serialise the whole PDF
+
+### 🧪 Testing
+
+- *(web)* Drive the app in headless Chromium, and read the live model
+- *(text)* The adapter rule is stated, and parity is a matrix
+- Popovers stay off presented windows, so headless Weston survives
+
+### ⚙️ Miscellaneous Tasks
+
+- *(aur)* Bump pkgver to 0.6.0.r0.gd4f9685
+- *(aur)* Bump sidemark (fixed release) to 0.6.0
+- Name the crashing test, and take llvmpipe's GL stack out of the run
+- A block scalar, so the timeout flags reach pytest
+- Interrupt a stall with SIGALRM, so the run still reports
+- Ignore web/dist without clobbering the rest
+- The suite runs again, because CI says its Weston is its own
+
+### ◀️ Revert
+
+- *(notes)* Pull the link previews, and write down what they taught
+## [0.6.0] - 2026-08-11
 
 ### 🚀 Features
 
