@@ -2787,8 +2787,11 @@ class TestBookmarksInWindow(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as d:
                     pdf = os.path.join(d, "deck.pdf")
                     make_pdf(pdf, n_pages=pdf_pages)
+                    # NOT presented: adding a bookmark pops the name popover,
+                    # and a popup on a presented window crashes the headless
+                    # Weston (null output in constrain_to_output), taking
+                    # every later window test in the run down with it
                     win = PDFEditorWindow(a)
-                    win.present()
                     win._do_open_file(pdf)
                     body(win, pdf)
             except Exception as e:
@@ -15927,8 +15930,9 @@ class TestRecentFiles(unittest.TestCase):
 
         def on_activate(a):
             try:
+                # NOT presented: emitting "show" maps the menu popover, and a
+                # popup on a presented window crashes the headless Weston
                 win = PDFEditorWindow(a)
-                win.present()
                 win._do_open_file(pdf)
                 # the menu starts on its "main" page
                 win._menu_pop.emit("show")
@@ -15966,8 +15970,9 @@ class TestRecentFiles(unittest.TestCase):
 
         def on_activate(a):
             try:
+                # NOT presented: the shortcut pops the menu popover, and a
+                # popup on a presented window crashes the headless Weston
                 win = PDFEditorWindow(a)
-                win.present()
                 win._do_open_file(pdf)
                 win._show_recent_files()
                 if win._menu_stack.get_visible_child_name() != "recent":
