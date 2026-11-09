@@ -28,7 +28,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Annotations
 
-- **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging. Handwriting is pressure-sensitive on a stylus, and blank pages can be **ruled** (lines, squares or dots) from the ☰ menu so you write straighter
+- **Draw** with a configurable pen — strokes are saved as native PDF ink annotations and are individually erasable by right-click-dragging. Handwriting is pressure-sensitive on a stylus, and blank pages can be **ruled** (lines, squares or dots) in Settings so you write straighter
 - **Shape snap** — hold still mid-stroke to clean up what you drew: a straight line, or a neat rectangle or ellipse from a rough loop. Draw a line inside a box and it becomes an evenly-spaced grid divider — handy for tables and matrices. Set it to lines-only or off in the pen settings
 - **Highlighter** — wide translucent strokes with their own color and width, saved like any annotation. Long-press the tool for **mark text**, which lays clean highlight bands over the words you drag across — still ink, so erase and undo work unchanged
 - **Lasso ink** (middle-drag, or the lasso tool on any button) — loop around strokes to select them (GoodNotes-style), or just click one; `Shift` adds more to the selection. The loop stays as the selection's outline: drag anywhere inside it to **move**, or tap the chip at its top-left to swap it for a resize box — corner handle to **resize** (a side handle **stretches** one axis), the knob above to **rotate**. `Ctrl+D` to **duplicate**, `Delete` to remove, or pick a new colour/width to **recolour** — each a single undo step

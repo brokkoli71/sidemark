@@ -13733,6 +13733,68 @@ class TestButtonBindings(unittest.TestCase):
         finally:
             os.unlink(tmp)
 
+    def test_a_disabled_thumb_is_no_button_but_keeps_its_bindings(self):
+        """Settings → Thumb button off: every read skips the thumb's chords
+        (routing, stripes, tooltips, the popover list), every other chord reads
+        exactly as before, and switching it back on restores what was bound."""
+        b = Bindings()
+        b.bind("thumb", "pan")
+        b.bind("shift+thumb", "zoom")
+        on = {btn: b.tool_for(btn) for btn in sidemark.BUTTON_NAMES}
+        b.thumb_enabled = False
+        self.assertIsNone(b.tool_for(sidemark.BTN_THUMB))
+        self.assertIsNone(b.tool_for(sidemark.BTN_THUMB, shift=True))
+        self.assertIsNone(b.tool_for_chord("thumb"))
+        self.assertFalse([c for c, _t in b.items() if "thumb" in c])
+        for tool in ("pan", "zoom"):
+            self.assertNotIn("thumb", b.plain_buttons_for(tool))
+            self.assertFalse([c for c in b.chords_for(tool) if "thumb" in c])
+        for btn, tool in on.items():
+            if btn != sidemark.BTN_THUMB:
+                self.assertEqual(b.tool_for(btn), tool)
+        b.thumb_enabled = True
+        self.assertEqual(b.tool_for(sidemark.BTN_THUMB), "pan")
+        self.assertEqual(b.tool_for(sidemark.BTN_THUMB, shift=True), "zoom")
+
+    def test_the_thumb_switch_survives_a_restart(self):
+        self.assertTrue(Bindings.load().thumb_enabled)
+        sidemark._save_setting("thumb_button", False)
+        self.assertFalse(Bindings.load().thumb_enabled)
+
+    @staticmethod
+    def _thumb_press():
+        return types.SimpleNamespace(
+            get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
+            get_button=lambda: sidemark.BTN_THUMB,
+            get_modifier_state=lambda: Gdk.ModifierType(0))
+
+    def test_a_disabled_thumb_press_does_nothing_on_a_pdf_page(self):
+        canvas = PDFCanvas()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            tmp = f.name
+        try:
+            make_pdf(tmp)
+            canvas.load(tmp)
+            canvas._fit_page(800, 600)
+            canvas.bindings.bind("thumb", "pan")
+            canvas.bindings.thumb_enabled = False
+            canvas._mouse_x, canvas._mouse_y = 100, 100
+            canvas._on_thumb_event(None, self._thumb_press())
+            self.assertIsNone(canvas._thumb_gesture)
+            self.assertFalse(canvas._panning)
+        finally:
+            os.unlink(tmp)
+
+    def test_a_disabled_thumb_press_does_nothing_on_a_text_page(self):
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\n")
+        tp.bindings.bind("thumb", "pen", mode="text")
+        tp.bindings.thumb_enabled = False
+        tp._mouse_xy = (100.0, 100.0)
+        # not swallowed: a press nobody claimed travels on, as when unbound
+        self.assertFalse(tp._on_thumb_event(None, self._thumb_press()))
+        self.assertIsNone(tp._thumb_gesture)
+
 
 class TestBindingToolbar(unittest.TestCase):
     def _run_in_window(self, body):
@@ -13814,6 +13876,71 @@ class TestBindingToolbar(unittest.TestCase):
             win._bind_chord("left", "lasso")
             win._reset_bindings()
             self.assertEqual(win.bindings.tool_for_chord("left"), "pen")
+
+        self._run_in_window(body)
+
+    def test_a_disabled_thumb_cannot_be_bound_from_the_bar(self):
+        """Both of the bar's press paths (the click gesture and the legacy
+        button-10 controller) end in `_bind_chord`; with the thumb off a thumb
+        click there must leave the table alone."""
+        def body(win):
+            before = win.bindings.table_for(None).get("thumb")
+            win._on_thumb_toggled(False)
+            win._bind_chord("thumb", "eraser")
+            win._bind_chord("ctrl+thumb", "eraser")
+            self.assertEqual(win.bindings.table_for(None).get("thumb"), before)
+            self.assertNotIn("ctrl+thumb", win.bindings.table_for(None))
+            win._on_thumb_toggled(True)
+            win._bind_chord("thumb", "eraser")
+            self.assertEqual(win.bindings.tool_for_chord("thumb"), "eraser")
+
+        self._run_in_window(body)
+
+    def test_the_menu_is_as_wide_as_its_main_page(self):
+        """The ☰ menu is a stack of pages; a homogeneous stack takes the width
+        of its WIDEST page (the shortcuts list), not the one on screen."""
+        def body(win):
+            stack = win._menu_stack
+            stack.set_visible_child_name("main")
+            main = stack.get_child_by_name("main")
+            own = main.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            shown = stack.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            self.assertLessEqual(shown, own)
+
+        self._run_in_window(body)
+
+    def test_the_settings_dialog_rows_write_through(self):
+        """Ruling, comments and the thumb live in the Settings dialog. Each row
+        must reach the thing it names — a row wired to nothing still looks
+        perfectly fine. The dialog is built but not presented (headless)."""
+        def walk(w):
+            yield w
+            c = w.get_first_child()
+            while c is not None:
+                yield from walk(c)
+                c = c.get_next_sibling()
+
+        def body(win):
+            with mock.patch.object(Adw.PreferencesDialog, "present"):
+                dlg = win._show_settings()
+            # an Adw.Dialog's own widget tree is empty until it is presented;
+            # its child (and so the page) is reachable from get_child()
+            rows = {r.get_title(): r for r in walk(dlg.get_child())
+                    if isinstance(r, (Adw.SwitchRow, Adw.ComboRow))}
+            rows["Thumb button"].set_active(False)
+            self.assertFalse(win.bindings.thumb_enabled)
+            self.assertIs(sidemark._load_settings()["thumb_button"], False)
+            was = sidemark.MarkdownNotesView.show_comments
+            try:
+                rows["Show comments"].set_active(not was)
+                self.assertEqual(sidemark.MarkdownNotesView.show_comments,
+                                 not was)
+            finally:
+                sidemark.MarkdownNotesView.show_comments = was
+            last = len(sidemark.PAGE_BACKGROUNDS) - 1
+            rows["Ruling"].set_selected(last)
+            self.assertEqual(sidemark._load_settings()["page_background"],
+                             sidemark.PAGE_BACKGROUNDS[last])
 
         self._run_in_window(body)
 

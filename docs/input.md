@@ -88,6 +88,11 @@
   - **The thumb is a real button**: button 10 never reaches a `GestureDrag`, so
     its press is replayed through the same router with a `_SyntheticDrag`.
     That is what lets it hold any tool instead of a hardwired pan.
+    **Settings → Thumb button** can switch it off (`Bindings.thumb_enabled`,
+    row 194): every READ of the table skips thumb chords, so it routes,
+    paints and lists nothing, and `_bind_chord` refuses it — while the stored
+    table keeps them for when it is switched back on. Filter at the reads,
+    never at the press handlers, or one path forgets.
   - **A stylus's ends ARE mouse buttons (row 135).** `button_for_event()` maps
     the hardware to a button identity — tip→left, eraser barrel→right, other
     barrel+tip→middle, finger→`BTN_FINGER` — so the pen needs NO table of its

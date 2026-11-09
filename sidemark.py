@@ -3241,6 +3241,25 @@ class Bindings:
         self._tables = {m: dict(tables.get(m) or DEFAULT_TABLES[m])
                         for m in BINDING_MODES}
         self.mode = mode if mode in self._tables else "pdf"
+        # Settings → "Thumb button" (settings.json `thumb_button`). Off, the
+        # thumb is not a button at all: every READ below skips its chords, so
+        # it routes nothing, wears no stripe, lists no row and cannot be bound
+        # from the bar. Its table entries are kept, so switching it back on
+        # restores them. Off exists for a thumb the OS already remaps (to a
+        # touch, say), which otherwise reaches us as button 10 some of the time
+        # and binds a second, different chord.
+        self.thumb_enabled = True
+
+    def is_live(self, chord):
+        """Whether a chord names a button that currently exists."""
+        return self.thumb_enabled or chord.rsplit("+", 1)[-1] != "thumb"
+
+    def _readable(self, mode=None):
+        """The table as every READ sees it: the stored one minus dead chords.
+        Writes go to the stored table, so nothing is lost while a chord is
+        dead."""
+        return {c: t for c, t in self.table_for(mode).items()
+                if self.is_live(c)}
 
     @property
     def _table(self):
@@ -3254,7 +3273,7 @@ class Bindings:
 
     def tool_for(self, button, ctrl=False, shift=False, alt=False, mode="pdf"):
         """The tool this chord runs in this document mode, or None."""
-        tool = self.table_for(mode).get(chord_id(button, ctrl, shift, alt))
+        tool = self._readable(mode).get(chord_id(button, ctrl, shift, alt))
         if tool is None:
             return None
         tool = canonical_tool(tool)
@@ -3262,7 +3281,7 @@ class Bindings:
 
     def tool_for_chord(self, chord, mode=None):
         """The tool bound to a chord id, ignoring document mode."""
-        tool = self.table_for(mode).get(chord)
+        tool = self._readable(mode).get(chord)
         return canonical_tool(tool) if tool else None
 
     def chords_for(self, tool, mode=None):
@@ -3271,7 +3290,7 @@ class Bindings:
         from, so they can never disagree with what the mouse does. `mode` also
         picks the TABLE, so the bar describes the document in front of you."""
         tool = canonical_tool(tool)
-        table = self.table_for(mode)
+        table = self._readable(mode)
         found = [c for c, t in table.items() if canonical_tool(t) == tool]
         if mode is not None and not tool_in_mode(tool, mode):
             return []
@@ -3281,7 +3300,7 @@ class Bindings:
         """The UNMODIFIED buttons a tool owns — the ones that earn a badge.
         Modified chords deliberately get none, or every button in the bar
         wears a constellation; they live in the tooltip instead."""
-        table = self.table_for(mode)
+        table = self._readable(mode)
         tool = canonical_tool(tool)
         return sorted((c for c, t in table.items()
                        if canonical_tool(t) == tool and "+" not in c),
@@ -3289,7 +3308,7 @@ class Bindings:
 
     def items(self, mode=None):
         """(chord, tool) pairs, plain buttons first — the popover's list."""
-        table = self.table_for(mode)
+        table = self._readable(mode)
         return [(c, table[c])
                 for c in sorted(table, key=lambda c: (c.count("+"), c))]
 
@@ -3394,6 +3413,7 @@ class Bindings:
         if dirty:
             _save_setting("button_defaults_seeded", seen)
             bindings.save()
+        bindings.thumb_enabled = settings.get("thumb_button", True) is not False
         return bindings
 
     def save(self):
@@ -19120,6 +19140,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # THE button table (row 132), shared by every canvas and sheet in this
         # window and persisted in settings.json
         self.bindings = Bindings.load()
+        # a class-wide display preference (Settings → Show comments), read
+        # before any view renders
+        MarkdownNotesView.show_comments = bool(
+            _load_settings().get("show_comments", False))
         self._bindings_list = None   # built with the pen popover
         self._tool_btns = None       # built with the header
         self._tool_strips = {}       # tool -> the painted binding stripes
@@ -19384,6 +19408,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._menu_stack = Gtk.Stack()
         self._menu_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self._menu_stack.set_transition_duration(120)
+        # Size to the page SHOWN, not the widest page: a stack is homogeneous
+        # by default, and the shortcuts page would make the whole menu as wide
+        # as its longest row.
+        self._menu_stack.set_hhomogeneous(False)
+        self._menu_stack.set_vhomogeneous(False)
+        self._menu_stack.set_interpolate_size(True)
         menu_pop.set_child(self._menu_stack)
         # always reopen on the main page
         menu_pop.connect("show", lambda _p: self._menu_stack.set_visible_child_name("main"))
@@ -19429,57 +19459,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _menu_item("New text page",
                    lambda: (menu_pop.popdown(), self._on_new_text_page()),
                    "A blank Markdown page you can write and draw on (Ctrl+Alt+N)")
-
-        # What "New" makes. It sits here rather than in a settings dialog
-        # because it only ever means anything at the moment a page is created —
-        # the ruling is baked into that page and cannot be changed afterwards.
-        bg_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        bg_row.set_margin_start(8)
-        bg_row.set_margin_end(8)
-        bg_row.set_margin_top(2)
-        bg_row.set_margin_bottom(2)
-        bg_label = Gtk.Label(label="Ruling", xalign=0)
-        bg_label.add_css_class("dim-label")
-        bg_row.append(bg_label)
-        self._bg_dropdown = Gtk.DropDown.new_from_strings(
-            ["Plain", "Lines", "Squares", "Dots"])
-        saved = _load_settings().get("page_background", "plain")
-        self._bg_dropdown.set_selected(
-            PAGE_BACKGROUNDS.index(saved) if saved in PAGE_BACKGROUNDS else 0)
-        self._bg_dropdown.set_hexpand(True)
-        self._bg_dropdown.set_tooltip_text(
-            "Ruling drawn on blank pages — a new document, and every page you "
-            "add to one. It becomes part of the page, so it prints and "
-            "exports, and is fixed once that page is made.")
-        self._bg_dropdown.connect("notify::selected", self._on_page_bg_changed)
-        bg_row.append(self._bg_dropdown)
-        menu_box.append(bg_row)
-        # HTML comments are Sidemark's own bookkeeping as often as they are
-        # yours (`<!-- page:13-40 continued -->`), and on a sheet showing a whole
-        # sidecar they are most of what is on screen. Hidden by default; the
-        # switch lives in the menu because it is a preference, not a verb.
-        cm_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        cm_row.set_margin_start(8)
-        cm_row.set_margin_end(8)
-        cm_row.set_margin_top(2)
-        cm_row.set_margin_bottom(2)
-        cm_label = Gtk.Label(label="Show comments", xalign=0)
-        cm_label.add_css_class("dim-label")
-        cm_label.set_hexpand(True)
-        cm_row.append(cm_label)
-        self._comments_switch = Gtk.Switch()
-        self._comments_switch.set_valign(Gtk.Align.CENTER)
-        MarkdownNotesView.show_comments = bool(
-            _load_settings().get("show_comments", False))
-        self._comments_switch.set_active(MarkdownNotesView.show_comments)
-        self._comments_switch.set_tooltip_text(
-            "Show HTML comments (<!-- … -->) in the text — including the page "
-            "markers Sidemark keeps its bookmarks and linked notes in. They "
-            "stay in the file either way, and the line under the caret always "
-            "shows them.")
-        self._comments_switch.connect("notify::active", self._on_comments_toggled)
-        cm_row.append(self._comments_switch)
-        menu_box.append(cm_row)
         _menu_item("Save", lambda: (menu_pop.popdown(), self._on_save()),
                    "Save the document and its notes (Ctrl+S)")
         # Mode-neutral (both PDF and text-first pages) — this app's "both
@@ -19542,6 +19521,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                    "into another document's notes")
         _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"),
                    "Show the full list of keyboard shortcuts")
+        # Preferences live in a DIALOG, not in this popover: a popover is
+        # positioned against the screen edge, and a dropdown opened inside one
+        # is a second popover that a window in a screen corner cannot place.
+        # The menu keeps verbs; anything that is a standing preference goes
+        # in `_show_settings`.
+        _menu_item("Settings…",
+                   lambda: (menu_pop.popdown(), self._show_settings()),
+                   "Page ruling, comments, the thumb button")
 
         # sub-pages reached from the menu (recent files, keyboard shortcuts)
         self._recent_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -25255,7 +25242,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         """Move `chord` onto `tool` and say so. A chord maps to exactly one
         tool, so binding always takes it from somewhere — the toast names what
         it displaced and offers the way back, because a mis-click here quietly
-        changes what your mouse does."""
+        changes what your mouse does.
+
+        A dead chord (the thumb, switched off in Settings) binds nothing: both
+        of the bar's press paths end here, so this is the one place to say no."""
+        if not self.bindings.is_live(chord):
+            return
         tool = canonical_tool(tool)
         if self.bindings.tool_for_chord(chord) == tool:
             return
@@ -26078,11 +26070,68 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _on_smoothing_changed(self, scale):
         self._set_pen_setting("smoothing", scale.get_value() / 100.0)
 
-    def _on_page_bg_changed(self, dd, _param=None):
-        _save_setting("page_background", PAGE_BACKGROUNDS[dd.get_selected()])
+    def _show_settings(self):
+        """The Settings dialog — every standing preference that is not the
+        pen's (the pen keeps its own popover, beside the thing it changes).
 
-    def _on_comments_toggled(self, sw, _param=None):
-        on = sw.get_active()
+        An `Adw.PreferencesDialog`, not a popover: it is laid out inside the
+        window, so it opens whole wherever the window sits on the screen. Rows
+        read their state from settings each time it opens, so there is no
+        widget state to keep in step with the file."""
+        dlg = Adw.PreferencesDialog()
+        dlg.set_title("Settings")
+        page = Adw.PreferencesPage()
+        dlg.add(page)
+
+        pages = Adw.PreferencesGroup(title="Pages")
+        ruling = Adw.ComboRow(title="Ruling")
+        ruling.set_subtitle(
+            "Drawn on blank pages — a new document, and every page you add to "
+            "one. It becomes part of the page, so it prints and exports, and "
+            "is fixed once that page is made.")
+        ruling.set_model(Gtk.StringList.new(["Plain", "Lines", "Squares", "Dots"]))
+        saved = _load_settings().get("page_background", "plain")
+        ruling.set_selected(
+            PAGE_BACKGROUNDS.index(saved) if saved in PAGE_BACKGROUNDS else 0)
+        ruling.connect("notify::selected", lambda r, _p:
+                       self._on_page_bg_changed(r.get_selected()))
+        pages.add(ruling)
+        page.add(pages)
+
+        notes = Adw.PreferencesGroup(title="Notes")
+        comments = Adw.SwitchRow(title="Show comments")
+        comments.set_subtitle(
+            "HTML comments (<!-- … -->), including the page markers Sidemark "
+            "keeps its bookmarks and linked notes in. They stay in the file "
+            "either way, and the line under the caret always shows them.")
+        comments.set_active(MarkdownNotesView.show_comments)
+        comments.connect("notify::active", lambda r, _p:
+                         self._on_comments_toggled(r.get_active()))
+        notes.add(comments)
+        page.add(notes)
+
+        mouse = Adw.PreferencesGroup(title="Mouse")
+        thumb = Adw.SwitchRow(title="Thumb button")
+        thumb.set_subtitle("The side button some mice have. Off, Sidemark "
+                           "ignores it.")
+        thumb.set_active(self.bindings.thumb_enabled)
+        thumb.connect("notify::active", lambda r, _p:
+                      self._on_thumb_toggled(r.get_active()))
+        mouse.add(thumb)
+        page.add(mouse)
+
+        dlg.present(self)
+        return dlg
+
+    def _on_page_bg_changed(self, index):
+        _save_setting("page_background", PAGE_BACKGROUNDS[index])
+
+    def _on_thumb_toggled(self, on):
+        _save_setting("thumb_button", on)
+        self.bindings.thumb_enabled = on
+        self._refresh_tool_bindings()
+
+    def _on_comments_toggled(self, on):
         _save_setting("show_comments", on)
         MarkdownNotesView.show_comments = on
         # every view in every tab, not just the one in front: the setting is
