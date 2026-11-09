@@ -52,6 +52,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 - **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Ctrl+drag` to pan, `Shift+drag` to zoom to region, `Shift+click` to fit page
 - **Page flip** — `PageDown` / `PageUp` or the mouse **back/forward side buttons** (they work even while typing notes); scrolling past a page edge flips automatically
+- **Back to where you were** — `Alt+Left` / `Alt+Right` (or `Escape`) step back and forward through your pans, zooms, page flips and jumps, like a browser. In Settings the side buttons can do this instead of turning pages; holding `Ctrl` gives you the other one
 - **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser. Links light up while `Alt` is held, or whenever the text-cursor tool is in hand
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between table of contents and page thumbnails; drag thumbnails to reorder pages, drop documents onto the sidebar to import them as chapters at that spot, drag a chapter in the outline to move all of its pages at once, or drag pages **out to a file manager** to export them as a standalone PDF (annotations and notes included), like macOS Preview
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
@@ -156,7 +157,7 @@ pip install pymupdf
 | `PageUp` | Previous page (keeps current zoom) |
 | Mouse forward / back buttons | Next / previous page — works anywhere in the window, even while editing notes |
 | `Alt+click` | Follow the link under the cursor — a footnote, citation, or cross-reference jumps to its target (URLs open in your browser) |
-| `Alt+Left` | Jump back to where you were before following a link |
+| `Alt+Left` / `Alt+Right` | Back / forward through where you were — links, jumps, pans and zooms |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
 | `F5` | Toggle presenter view — mirror the page fullscreen on a second screen (`Esc` to close) |

@@ -15,6 +15,28 @@
 > it here. Present tense about how it behaves, not past tense about how it
 > got here.
 
+- **View history — back / forward through where you were (row 195).** ONE
+  `ViewHistory` per surface (`PDFCanvas.history`, `TextPageView.history`), so
+  one per tab; Alt+Left/Right, Escape and the mouse side buttons all walk it.
+  It records only what calls it, so the rule is at the CALL SITES:
+  - **A user movement calls `history.moving()` BEFORE it changes the view**
+    (scroll, pan, pinch, zoom, page flip, a scrollbar press). A run of calls
+    without a `VIEW_HISTORY_BURST_S` pause is one step — call it on every
+    update of a long gesture too, or a slow drag splits into several.
+  - **A discrete jump calls `history.jump()`** (links, `window._go_to_page`
+    — thumbnails, outline, bookmarks, undo landing on another page — search
+    hits, zoom-to-region, fit).
+  - **Anything the APP does calls neither**: open (including reopening at the
+    remembered page, which is why that path calls `canvas.go_to_page`
+    directly), resize re-fits, reload, the phone driving the page. A new
+    movement path that forgets its call is invisible to back; one that calls
+    it from an automatic path fills the history with places nobody went.
+  - Restores run through `set_state`, i.e. ordinary movement code;
+    `_restoring` is what keeps a back from recording itself.
+  - Side buttons: 8 is BACK and 9 forward in BOTH modes (previous/next page,
+    or history — Settings, Ctrl swaps); a text page has no pages, so there it
+    is always history.
+
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a
   background you write on is one you hand in, so it must print and export.

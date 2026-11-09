@@ -227,7 +227,7 @@ class TestLinkNavigation(unittest.TestCase):
         c.scale, c.offset_x, c.offset_y = 1.5, 12.0, -40.0
         c.follow_goto(2, to_y=700)
         self.assertEqual(c.current_page_idx, 2)
-        self.assertTrue(c.can_nav_back())
+        self.assertTrue(c.can_go_back())
         # destination point scrolled into view (not the page top); 700*1.5 is well
         # below a 600px viewport, so we scroll down (offset_y goes negative)
         self.assertLess(c.offset_y, 0)
@@ -236,43 +236,49 @@ class TestLinkNavigation(unittest.TestCase):
         c = self._canvas()
         c.scale, c.offset_x, c.offset_y = 1.5, 12.0, -40.0
         c.follow_goto(2, to_y=700)
-        self.assertTrue(c.nav_back())
+        self.assertTrue(c.go_back())
         self.assertEqual(c.current_page_idx, 0)
         self.assertAlmostEqual(c.offset_x, 12.0)
         self.assertAlmostEqual(c.offset_y, -40.0)
         self.assertAlmostEqual(c.scale, 1.5)
-        self.assertFalse(c.can_nav_back())
+        self.assertFalse(c.can_go_back())
 
     def test_same_page_footnote_scrolls_and_round_trips(self):
         c = self._canvas(n_pages=1)
         c.scale, c.offset_y = 1.0, 0.0
         c.follow_goto(0, to_y=760)   # footnote at the bottom of the same page
         self.assertEqual(c.current_page_idx, 0)
-        self.assertTrue(c.can_nav_back())
+        self.assertTrue(c.can_go_back())
         self.assertNotAlmostEqual(c.offset_y, 0.0)   # the view actually moved
-        c.nav_back()
+        c.go_back()
         self.assertAlmostEqual(c.offset_y, 0.0)
 
     def test_nav_back_on_empty_history_is_noop(self):
         c = self._canvas()
-        self.assertFalse(c.nav_back())
+        self.assertFalse(c.go_back())
 
     def test_load_clears_nav_history(self):
         c = self._canvas()
         c.follow_goto(1, to_y=300)
-        self.assertTrue(c.can_nav_back())
+        self.assertTrue(c.can_go_back())
         pdf2 = os.path.join(self._tmp.name, "other.pdf")
         make_pdf(pdf2, n_pages=2)
         c.load(pdf2)
-        self.assertFalse(c.can_nav_back())
+        self.assertFalse(c.can_go_back())
 
-    def test_history_callback_fires_on_push_and_pop(self):
+    def test_following_a_link_tells_the_window(self):
+        """The window's one-time "Alt+Left goes back" hint hangs off this —
+        and only off a LINK: a scroll records a step too, and must not claim
+        you jumped to one."""
         c = self._canvas()
         seen = []
         c.on_nav_history = lambda can_back: seen.append(can_back)
+        c._on_scroll(types.SimpleNamespace(
+            get_current_event_state=lambda: Gdk.ModifierType(0),
+            get_unit=lambda: Gdk.ScrollUnit.WHEEL), 0, 1)
+        self.assertEqual(seen, [])
         c.follow_goto(1, to_y=300)
-        c.nav_back()
-        self.assertEqual(seen, [True, False])
+        self.assertEqual(seen, [True])
 
     def test_alt_click_on_goto_link_follows_and_records(self):
         pdf = os.path.join(self._tmp.name, "linked.pdf")
@@ -283,8 +289,8 @@ class TestLinkNavigation(unittest.TestCase):
         # screen == PDF coords at scale 1 / no offset; click inside the link rect
         c._open_link_at(120, 110)
         self.assertEqual(c.current_page_idx, 1)
-        self.assertTrue(c.can_nav_back())
-        c.nav_back()
+        self.assertTrue(c.can_go_back())
+        c.go_back()
         self.assertEqual(c.current_page_idx, 0)
 
     def test_alt_click_on_named_link_follows(self):
@@ -300,7 +306,237 @@ class TestLinkNavigation(unittest.TestCase):
         }]
         c._open_link_at(120, 110)
         self.assertEqual(c.current_page_idx, 2)
-        self.assertTrue(c.can_nav_back())
+        self.assertTrue(c.can_go_back())
+
+
+# ── view history: back / forward through where you were (row 195) ──────────────
+
+class TestViewHistory(unittest.TestCase):
+    """The rules of a step, on a bare history with a fake clock and a fake
+    view — so they are tested apart from any one way of moving."""
+
+    def setUp(self):
+        self.now = 100.0
+        patcher = mock.patch.object(sidemark.ViewHistory, "clock",
+                                    staticmethod(lambda: self.now))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.view = 0
+        self.h = sidemark.ViewHistory(lambda: self.view, self._set)
+
+    def _set(self, v):
+        self.view = v
+        self.h.moving()          # a restore runs movement code; must not record
+
+    def _move(self, to, dt=0.0):
+        self.now += dt
+        self.h.moving()
+        self.view = to
+
+    def test_one_continuous_movement_is_one_step(self):
+        burst = sidemark.VIEW_HISTORY_BURST_S
+        for i in range(1, 6):        # far longer than one burst, never pausing
+            self._move(i, dt=burst * 0.5)
+        self.assertTrue(self.h.go_back())
+        self.assertEqual(self.view, 0)
+        self.assertFalse(self.h.can_back())
+
+    def test_a_pause_starts_a_new_step(self):
+        self._move(1)
+        self._move(2, dt=sidemark.VIEW_HISTORY_BURST_S * 2)
+        self.h.go_back()
+        self.assertEqual(self.view, 1)
+        self.h.go_back()
+        self.assertEqual(self.view, 0)
+
+    def test_a_jump_is_its_own_step(self):
+        self._move(1)
+        self.h.jump(); self.view = 50      # straight after, no pause
+        self._move(51)                     # and moving on from the target
+        self.h.go_back()
+        self.assertEqual(self.view, 50)
+        self.h.go_back()
+        self.assertEqual(self.view, 1)
+
+    def test_forward_redoes_and_a_new_move_drops_it(self):
+        self._move(1)
+        self.h.go_back()
+        self.assertTrue(self.h.go_forward())
+        self.assertEqual(self.view, 1)
+        self.h.go_back()
+        self._move(7, dt=sidemark.VIEW_HISTORY_BURST_S * 2)
+        self.assertFalse(self.h.can_forward())
+
+    def test_restoring_records_nothing(self):
+        self._move(1)
+        self.h.go_back()
+        self.assertEqual(self.h.back, [])
+        self.assertEqual(self.h.fwd, [1])
+
+    def test_a_step_that_never_moved_is_skipped(self):
+        self._move(1)
+        self.h.jump()                      # recorded 1, but nothing moved
+        self.h.go_back()
+        self.assertEqual(self.view, 0)
+
+
+class TestViewHistoryOnSurfaces(unittest.TestCase):
+    """Each way of moving records a step, and back puts the view back."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _canvas(self):
+        pdf = os.path.join(self._tmp.name, "doc.pdf")
+        make_pdf(pdf, n_pages=3)
+        c = PDFCanvas()
+        c.load(pdf)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        return c
+
+    @staticmethod
+    def _scroll(ctrl=False):
+        return types.SimpleNamespace(
+            get_current_event_state=lambda: (Gdk.ModifierType.CONTROL_MASK
+                                             if ctrl else Gdk.ModifierType(0)),
+            get_unit=lambda: Gdk.ScrollUnit.WHEEL)
+
+    def test_every_pdf_movement_can_be_gone_back_from(self):
+        def pan(c):
+            c.bindings.bind("left", "pan")
+            g = _FakeDrag(100, 100)
+            c._on_drag_begin(g, 100, 100)
+            c._on_drag_update(g, 40, 30)
+            c._on_drag_end(g, 40, 30)
+
+        def pinch(c):
+            g = mock.Mock()
+            g.get_bounding_box_center.return_value = (True, 100.0, 100.0)
+            c._on_pinch_begin(g, None)
+            c._on_pinch_scale(g, 2.0)
+            c._on_pinch_end(g, None)
+
+        moves = {
+            "scroll": lambda c: c._on_scroll(self._scroll(), 0, 1),
+            "ctrl+scroll zoom": lambda c: c._on_scroll(self._scroll(True), 0, -1),
+            "pan drag": pan,
+            "pinch": pinch,
+            "page flip": lambda c: c._flip_page(1),
+            "link": lambda c: c.follow_goto(2, to_y=300),
+            "zoom to region": lambda c: c._execute_zoom_to_rect((50, 50), (200, 200)),
+            "fit": lambda c: (setattr(c, "scale", 2.0), c.zoom_to_fit()),
+        }
+        for name, move in moves.items():
+            with self.subTest(move=name):
+                c = self._canvas()
+                if name == "fit":
+                    c.scale = 2.0
+                before = c._view_state()
+                move(c)
+                self.assertNotEqual(c._view_state(), before, "did not move")
+                self.assertTrue(c.go_back())
+                self.assertEqual(c._view_state(), before)
+
+    def test_going_back_across_pages_and_forward_again(self):
+        c = self._canvas()
+        c.follow_goto(2, to_y=300)
+        there = c._view_state()
+        c.go_back()
+        self.assertEqual(c.current_page_idx, 0)
+        self.assertTrue(c.go_forward())
+        self.assertEqual(c._view_state(), there)
+
+    def test_text_page_zoom_and_region_can_be_gone_back_from(self):
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\n" * 20)
+        before = tp._view_state()
+        tp.zoom_by_at(1.5, 10, 10)
+        self.assertNotEqual(tp._view_state(), before)
+        self.assertTrue(tp.go_back())
+        self.assertEqual(tp._view_state()[0], before[0])
+        tp.zoom_step(1)
+        tp.history._last = None            # as if a pause followed
+        tp.fit_width()
+        self.assertTrue(tp.can_go_back())
+
+
+class TestSideButtons(unittest.TestCase):
+    """Mouse back/forward (8/9): pages or history per Settings, Ctrl swaps,
+    and the BACK button points back in both modes."""
+
+    @staticmethod
+    def _press(btn, ctrl=False):
+        return types.SimpleNamespace(
+            get_event_type=lambda: Gdk.EventType.BUTTON_PRESS,
+            get_button=lambda: btn,
+            get_modifier_state=lambda: (Gdk.ModifierType.CONTROL_MASK if ctrl
+                                        else Gdk.ModifierType(0)))
+
+    def _run(self, body):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf, n_pages=4)
+            app = Adw.Application(application_id="test.sidemark.sidebuttons")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_pages_mode_back_is_previous_and_ctrl_is_history(self):
+        def body(win):
+            c = win.canvas
+            win._on_side_buttons("pages")
+            win._on_window_button(None, self._press(9))
+            self.assertEqual(c.current_page_idx, 1)        # forward → next
+            win._on_window_button(None, self._press(8))
+            self.assertEqual(c.current_page_idx, 0)        # back → previous
+            c.follow_goto(3, to_y=100)
+            c.history._last = None
+            win._on_window_button(None, self._press(8, ctrl=True))
+            self.assertEqual(c.current_page_idx, 0)        # history, not page 2
+            self.assertEqual(sidemark._load_settings()["side_buttons"], "pages")
+
+        self._run(body)
+
+    def test_history_mode_back_is_history_and_ctrl_is_pages(self):
+        def body(win):
+            c = win.canvas
+            win._on_side_buttons("history")
+            c.follow_goto(3, to_y=100)
+            win._on_window_button(None, self._press(8))
+            self.assertEqual(c.current_page_idx, 0)        # back where we were
+            win._on_window_button(None, self._press(9))
+            self.assertEqual(c.current_page_idx, 3)        # and forward again
+            win._on_window_button(None, self._press(8, ctrl=True))
+            self.assertEqual(c.current_page_idx, 2)        # Ctrl: previous page
+
+        self._run(body)
+
+    def test_alt_arrows_walk_the_same_history(self):
+        def body(win):
+            c = win.canvas
+            c.follow_goto(3, to_y=100)
+            alt = Gdk.ModifierType.ALT_MASK
+            self.assertTrue(win._on_global_key(None, Gdk.KEY_Left, 0, alt))
+            self.assertEqual(c.current_page_idx, 0)
+            win._on_global_key(None, Gdk.KEY_Right, 0, alt)
+            self.assertEqual(c.current_page_idx, 3)
+
+        self._run(body)
 
 
 # ── zoom to region ────────────────────────────────────────────────────────────
@@ -318,7 +554,7 @@ class TestZoomToRegion(unittest.TestCase):
         # Simulate 800×600 canvas
         # Select screen rect (100,100)–(300,250)
         c._execute_zoom_to_rect((100, 100), (300, 250))
-        self.assertEqual(len(c._zoom_stack), 1)
+        self.assertEqual(len(c.history.back), 1)
         # After zoom, the selection should be scaled up
         self.assertGreater(c.scale, 1.0)
 
@@ -326,20 +562,20 @@ class TestZoomToRegion(unittest.TestCase):
         c = self._canvas()
         original = (c.scale, c.offset_x, c.offset_y)
         c._execute_zoom_to_rect((100, 100), (300, 250))
-        c.zoom_back()
+        c.go_back()
         self.assertAlmostEqual(c.scale, original[0])
         self.assertAlmostEqual(c.offset_x, original[1])
         self.assertAlmostEqual(c.offset_y, original[2])
-        self.assertEqual(len(c._zoom_stack), 0)
+        self.assertEqual(len(c.history.back), 0)
 
     def test_zoom_back_on_empty_stack_does_not_raise(self):
         c = self._canvas()
-        c.zoom_back()  # should not raise
+        c.go_back()  # should not raise
 
     def test_tiny_rect_does_not_zoom_in(self):
         c = self._canvas()
         c._execute_zoom_to_rect((100, 100), (103, 102))  # < 8px → no zoom push
-        self.assertEqual(len(c._zoom_stack), 0)
+        self.assertEqual(len(c.history.back), 0)
         self.assertAlmostEqual(c.scale, 1.0)
 
     def test_zoom_rect_is_free_proportioned(self):
@@ -380,7 +616,7 @@ class TestZoomToRegion(unittest.TestCase):
         self.assertFalse(c._panning)
         c._on_drag_update(g, 200, 150)
         c._on_drag_end(g, 200, 150)
-        self.assertEqual(len(c._zoom_stack), 1)
+        self.assertEqual(len(c.history.back), 1)
         self.assertGreater(c.scale, 1.0)
 
     def test_plain_middle_drag_still_pans(self):
@@ -409,7 +645,7 @@ class TestZoomToRegion(unittest.TestCase):
         c._on_motion(None, 300, 250)
         self.assertEqual(c._zoom_end, (300, 250))
         c._on_thumb_event(None, self._thumb_event(Gdk.EventType.BUTTON_RELEASE))
-        self.assertEqual(len(c._zoom_stack), 1)
+        self.assertEqual(len(c.history.back), 1)
         self.assertGreater(c.scale, 1.0)
 
     def test_an_unbound_thumb_does_nothing(self):
@@ -428,9 +664,9 @@ class TestZoomToRegion(unittest.TestCase):
         c._execute_zoom_to_rect((50, 50), (200, 200))
         scale1 = c.scale
         c._execute_zoom_to_rect((60, 60), (180, 180))
-        c.zoom_back()
+        c.go_back()
         self.assertAlmostEqual(c.scale, scale1)
-        c.zoom_back()
+        c.go_back()
         self.assertAlmostEqual(c.scale, 1.0)
 
 
@@ -10632,7 +10868,7 @@ class TestPresenterMode(unittest.TestCase):
             self._run_in_window(body)
 
     def test_presenter_window_click_navigates(self):
-        # click / mouse-forward advance, right-click / mouse-back go back
+        # click / mouse-forward (9) advance, right-click / mouse-back (8) go back
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
             make_pdf(pdf, n_pages=4)
@@ -10650,11 +10886,11 @@ class TestPresenterMode(unittest.TestCase):
 
                 press(1)                  # left click → next
                 self.assertEqual(win.canvas.current_page_idx, 1)
-                press(8)                  # mouse forward → next
+                press(9)                  # mouse forward → next
                 self.assertEqual(win.canvas.current_page_idx, 2)
                 press(3)                  # right click → previous
                 self.assertEqual(win.canvas.current_page_idx, 1)
-                press(9)                  # mouse back → previous
+                press(8)                  # mouse back → previous
                 self.assertEqual(win.canvas.current_page_idx, 0)
                 self.assertEqual(pres.canvas.current_page_idx, 0)
 
@@ -10831,6 +11067,9 @@ class TestMouseSideButtonNav(unittest.TestCase):
         def get_button(self):
             return self.b
 
+        def get_modifier_state(self):
+            return Gdk.ModifierType(0)
+
     def test_side_buttons_flip_pages(self):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
@@ -10840,9 +11079,10 @@ class TestMouseSideButtonNav(unittest.TestCase):
                 win._do_open_file(pdf)
                 # focus the notes editor: navigation must still work
                 win._notes_view.grab_focus()
-                self.assertTrue(win._on_window_button(None, self._Ev(8)))
-                self.assertEqual(win.canvas.current_page_idx, 1)
+                # pages mode (the default): forward → next, back → previous
                 self.assertTrue(win._on_window_button(None, self._Ev(9)))
+                self.assertEqual(win.canvas.current_page_idx, 1)
+                self.assertTrue(win._on_window_button(None, self._Ev(8)))
                 self.assertEqual(win.canvas.current_page_idx, 0)
 
             self._run_in_window(body)
@@ -14082,6 +14322,9 @@ class TestBindingToolbar(unittest.TestCase):
                                  not was)
             finally:
                 sidemark.MarkdownNotesView.show_comments = was
+            rows["Side buttons"].set_selected(1)
+            self.assertEqual(win._side_buttons, "history")
+            self.assertEqual(sidemark._load_settings()["side_buttons"], "history")
             last = len(sidemark.PAGE_BACKGROUNDS) - 1
             rows["Ruling"].set_selected(last)
             self.assertEqual(sidemark._load_settings()["page_background"],
@@ -18098,7 +18341,7 @@ class TestTextFirstMode(unittest.TestCase):
             def body(win):
                 self._open_md(win, d, text="para\n\n" * 200)
                 tp = win._active_session._text_page
-                self.assertFalse(tp.can_zoom_back())     # nothing to go back to
+                self.assertFalse(tp.can_go_back())     # nothing to go back to
 
                 va = tp.scroll.get_vadjustment()
                 va.configure(0.0, 0.0, 10000.0, 1.0, 10.0, 100.0)
@@ -18107,23 +18350,25 @@ class TestTextFirstMode(unittest.TestCase):
 
                 tp._zoom_to_region((40.0, 40.0), (140.0, 140.0))
                 self.assertNotAlmostEqual(tp.zoom, z0)   # zoomed in
-                self.assertTrue(tp.can_zoom_back())
+                self.assertTrue(tp.can_go_back())
 
                 self.assertTrue(win._on_key(None, Gdk.KEY_Escape, 0,
                                             Gdk.ModifierType(0)))
                 self.assertAlmostEqual(tp.zoom, z0)      # exactly where we were
                 self.assertAlmostEqual(va.get_value(), v0, places=3)
-                self.assertFalse(tp.can_zoom_back())
+                self.assertFalse(tp.can_go_back())
 
                 # with nothing left, Escape is NOT claimed — the key stays free
                 self.assertFalse(win._on_key(None, Gdk.KEY_Escape, 0,
                                              Gdk.ModifierType(0)))
 
-                # fitting is a fresh start: it drops the history
+                # fitting is a step too: back returns to the zoom you left
                 tp._zoom_to_region((40.0, 40.0), (140.0, 140.0))
-                self.assertTrue(tp.can_zoom_back())
+                zoomed = tp.zoom
                 tp.fit_width()
-                self.assertFalse(tp.can_zoom_back())
+                self.assertTrue(tp.can_go_back())
+                tp.go_back()
+                self.assertAlmostEqual(tp.zoom, zoomed)
 
             self._run_in_window(body)
 

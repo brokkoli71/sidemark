@@ -3687,6 +3687,105 @@ def draw_snap_label(ctx, sx, sy, text, accent):
 IMAGE_OCG_NAME = "Sidemark images"
 
 
+# ── view history: back / forward through where you were (row 195) ────────────
+# One per surface (a PDF canvas, a text sheet), so one per tab. A STEP is one
+# continuous movement — a drag, a pinch, a burst of scrolling, zooming or page
+# flips — and ends when the view has been still for VIEW_HISTORY_BURST_S. A
+# step per scroll event would bury the place you meant under fifty of them.
+VIEW_HISTORY_BURST_S = 1.0
+VIEW_HISTORY_MAX = 100
+
+
+class ViewHistory:
+    """Browser-style back/forward over a surface's view.
+
+    The surface supplies `get_state()` (an opaque, comparable snapshot of what
+    you see) and `set_state(state)`; this holds the two stacks. Every USER
+    movement calls `moving()` BEFORE it changes the view, and every discrete
+    jump (a link, a thumbnail, a search hit) calls `jump()`. A view the app
+    moves on its own — a resize re-fit, opening a file, the phone driving the
+    page — calls neither, and so is not a place you were.
+
+    Going back or forward restores a state through `set_state`, which runs the
+    same code a user movement would; `_restoring` keeps that from recording
+    itself as a new step."""
+
+    clock = staticmethod(time.monotonic)   # tests replace it
+
+    def __init__(self, get_state, set_state):
+        self._get, self._set = get_state, set_state
+        self.back, self.fwd = [], []
+        self._last = None          # when the open step last moved, or None
+        self._restoring = False
+        self.on_change = None      # callback() when back/forward availability may change
+
+    def moving(self):
+        """A continuous movement is about to change the view. The first call of
+        a step records where it started; the rest just keep the step open."""
+        if self._restoring:
+            return
+        now = self.clock()
+        if self._last is None or now - self._last > VIEW_HISTORY_BURST_S:
+            self._record(self._get())
+        self._last = now
+
+    def jump(self):
+        """A discrete jump is about to happen: always its own step, and it
+        closes any open one so the next movement starts afresh from the
+        jump's target."""
+        if self._restoring:
+            return
+        self._record(self._get())
+        self._last = None
+
+    def _record(self, state):
+        if not self.back or self.back[-1] != state:
+            self.back.append(state)
+            del self.back[:-VIEW_HISTORY_MAX]
+        self.fwd.clear()           # a new path drops the old future, as a browser does
+        if self.on_change:
+            self.on_change()
+
+    def can_back(self):
+        return bool(self.back)
+
+    def can_forward(self):
+        return bool(self.fwd)
+
+    def go_back(self):
+        return self._step(self.back, self.fwd)
+
+    def go_forward(self):
+        return self._step(self.fwd, self.back)
+
+    def _step(self, src, dst):
+        here = self._get()
+        # a recorded step that never actually moved (a pinch that did not
+        # change the zoom) would make back look dead — skip past it
+        while src and src[-1] == here:
+            src.pop()
+        if not src:
+            if self.on_change:
+                self.on_change()
+            return False
+        dst.append(here)
+        state = src.pop()
+        self._restoring = True
+        try:
+            self._set(state)
+        finally:
+            self._restoring = False
+        self._last = None
+        if self.on_change:
+            self.on_change()
+        return True
+
+    def clear(self):
+        self.back.clear()
+        self.fwd.clear()
+        self._last = None
+
+
 class PDFCanvas(Gtk.DrawingArea):
     SCALE_MIN, SCALE_MAX = 0.1, 20.0   # zoom range of the PDF page canvas
     SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
@@ -3855,12 +3954,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_user_action = None     # callback() once per completed draw/erase gesture
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
         self.on_lasso_selection = None # callback(has_selection: bool) when the lasso set changes
-        self.on_nav_history = None     # callback(can_go_back: bool) when the link back-stack changes
+        self.on_nav_history = None     # callback(True) when a followed link records a step
 
-        # link navigation: following an internal (GOTO) link — e.g. a footnote or
-        # citation reference — pushes the reading location here so it can be
-        # restored with nav_back() (Alt+Left). Each entry: (page, ox, oy, scale).
-        self._nav_history = []
+        # back / forward through where you were (row 195): every pan, zoom,
+        # flip and jump is a step — see ViewHistory
+        self.history = ViewHistory(self._view_state, self._restore_view_state)
 
         # {page_idx: [mark dict from _parse_page_marks, ...]}
         self._anchors = {}
@@ -3892,8 +3990,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.search_rects = []          # fitz.Rect hits for current page
         self.search_current_rect = None # the active match rect
 
-        # zoom-to-region state
-        self._zoom_stack = []          # [(scale, offset_x, offset_y), ...]
+        # zoom-to-region state (stepping back out of one is `history`)
         self._zoom_selecting = False
         self._zoom_start = None        # screen (x, y)
         self._zoom_end = None          # screen (x, y), free-proportioned
@@ -4134,9 +4231,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._redo_stack = []
         self._erase_group = 0
         self._draw_group = 0
-        self._nav_history = []
-        if self.on_nav_history:
-            self.on_nav_history(False)
+        self.history.clear()      # where you were in ANOTHER file means nothing here
         total_annots = 0
         for i in range(self.n_pages):
             page = self.document[i]   # keep reference alive while reading annotations
@@ -5596,6 +5691,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 return True
             self._scroll_past = 0.0
             step = 1.0 if smooth else self.WHEEL_PAN_STEP
+            self.history.moving()
             self.offset_x -= dx * step
             self.offset_y -= dy * step
             self._clamp_scroll_offset()
@@ -5657,6 +5753,7 @@ class PDFCanvas(Gtk.DrawingArea):
         new_scale = max(self.SCALE_MIN, min(self.SCALE_MAX, old_scale * factor))
         if new_scale == old_scale:
             return
+        self.history.moving()
         pdf_x = (cx - self.offset_x) / old_scale
         pdf_y = (cy - self.offset_y) / old_scale
         self.scale = new_scale
@@ -5676,6 +5773,7 @@ class PDFCanvas(Gtk.DrawingArea):
         ok, cx, cy = gesture.get_bounding_box_center()
         if not ok:
             cx, cy = self._mouse_x, self._mouse_y
+        self.history.moving()
         self._pinch_start_scale = self.scale
         # document point under the pinch centroid — kept under the (moving)
         # centroid for the rest of the gesture, so fingers stay anchored to the
@@ -5704,6 +5802,7 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         new_scale = max(self.SCALE_MIN,
                         min(self.SCALE_MAX, self._pinch_start_scale * delta))
+        self.history.moving()      # keeps a long pinch one step
         pdf_x, pdf_y = self._pinch_anchor_pdf
         self.scale = new_scale
         self._is_fitted = False
@@ -5761,6 +5860,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._flip_page(target - self.current_page_idx)
 
     def _flip_page(self, delta):
+        self.history.moving()   # a run of flips is one step, like a scroll
         if self._is_fitted:
             self.go_to_page(self.current_page_idx + delta)   # refit on the new page
             return
@@ -6045,6 +6145,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._lasso_press(start_x, start_y)
             return
         if tool == "pan":
+            self.history.moving()
             self._panning = True
             self._is_fitted = False
             self._pan_start_offset = (self.offset_x, self.offset_y)
@@ -6527,6 +6628,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self.queue_draw()
             return
         if self._panning:
+            self.history.moving()      # keeps a long drag one step
             self.offset_x = self._pan_start_offset[0] + offset_x
             self.offset_y = self._pan_start_offset[1] + offset_y
             self.queue_draw()
@@ -7163,11 +7265,13 @@ class PDFCanvas(Gtk.DrawingArea):
     def follow_goto(self, page_no, to_y=None):
         """Jump to an internal link destination (footnote, citation, TOC entry),
         scrolling to the target point — not just the page top — and remembering
-        the current reading location so nav_back() can return to it."""
+        the current reading location so going back returns to it."""
         page_no = max(0, min(self.n_pages - 1, page_no))
         logger.debug(
             f"follow_goto: page {self.current_page_idx} -> {page_no} to_y={to_y}")
-        self._push_nav_history()
+        self.history.jump()
+        if self.on_nav_history:
+            self.on_nav_history(True)
         if page_no != self.current_page_idx:
             if self.on_page_will_change:
                 self.on_page_will_change()
@@ -7187,30 +7291,32 @@ class PDFCanvas(Gtk.DrawingArea):
         h = self.get_height() or 600
         self.offset_y = min(8.0, h * top_frac - py * self.scale)
 
-    def _push_nav_history(self):
-        self._nav_history.append(
-            (self.current_page_idx, self.offset_x, self.offset_y, self.scale))
-        if self.on_nav_history:
-            self.on_nav_history(True)
+    # ── view history (row 195) ───────────────────────────────────────────────
 
-    def can_nav_back(self):
-        return bool(self._nav_history)
+    def _view_state(self):
+        return (self.current_page_idx, self.offset_x, self.offset_y, self.scale)
 
-    def nav_back(self):
-        """Return to the reading location saved before the last followed link."""
-        if not self._nav_history:
-            return False
-        page, ox, oy, scale = self._nav_history.pop()
-        if page != self.current_page_idx:
+    def _restore_view_state(self, state):
+        page, ox, oy, scale = state
+        if page != self.current_page_idx and self.document:
             if self.on_page_will_change:
                 self.on_page_will_change()
             self._load_page(page, keep_view=True)
         self.offset_x, self.offset_y, self.scale = ox, oy, scale
         self._is_fitted = False
+        self._schedule_rerender()
         self.queue_draw()
-        if self.on_nav_history:
-            self.on_nav_history(bool(self._nav_history))
-        return True
+
+    def can_go_back(self):
+        """True when there is somewhere to go back to — so Escape only claims
+        the key when it would actually do something."""
+        return self.history.can_back()
+
+    def go_back(self):
+        return self.history.go_back()
+
+    def go_forward(self):
+        return self.history.go_forward()
 
     @staticmethod
     def _words_to_text(words):
@@ -7940,7 +8046,7 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         cw = self.get_width() or 800
         ch = self.get_height() or 600
-        self._zoom_stack.append((self.scale, self.offset_x, self.offset_y))
+        self.history.jump()
         new_scale = min(cw / pdf_w, ch / pdf_h) * 0.97
         self.scale = new_scale
         self._is_fitted = False
@@ -7948,21 +8054,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
         self._schedule_rerender()
 
-    def can_zoom_back(self):
-        """True when zoom_back() has a view to return to — so Escape only
-        claims the key when it would actually do something."""
-        return bool(self._zoom_stack)
-
-    def zoom_back(self):
-        if self._zoom_stack:
-            self.scale, self.offset_x, self.offset_y = self._zoom_stack.pop()
-            self._is_fitted = False
-            self._schedule_rerender()
-            self.queue_draw()
-
     def zoom_to_fit(self):
-        """Reset to fit-page view, clearing the entire zoom history."""
-        self._zoom_stack.clear()
+        """Reset to fit-page view — a step, so back returns to the zoom."""
+        self.history.jump()
         self._fit_page()
         self._schedule_rerender()
         self.queue_draw()
@@ -8101,6 +8195,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.clear_lasso_selection()
         self._redo_stack.append(popped)
         if page != self.current_page_idx:
+            self.history.jump()
             self.go_to_page(page)   # show the user what was undone
         if self.on_change:
             self.on_change()
@@ -8158,6 +8253,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.clear_lasso_selection()
         self._undo_stack.extend(reversed(ops))
         if page != self.current_page_idx:
+            self.history.jump()
             self.go_to_page(page)
         if self.on_change:
             self.on_change()
@@ -15561,7 +15657,6 @@ class TextPageView(Gtk.Overlay):
         self._lassoing = False
         self._lasso_additive = False   # Shift: add this loop's catch to the selection
         self._lasso_base = ([], [])    # the selection an additive loop started from
-        self._zoom_stack = []          # [(zoom, scroll_h, scroll_v), ...] for Escape
         self._lasso_path = []          # overlay coords of the loop in progress
         # The loop a selection was made with (row 125), stored the way a STROKE
         # is — mark + buffer offsets + font_px — so it reflows with the
@@ -15703,10 +15798,16 @@ class TextPageView(Gtk.Overlay):
         self._rerase_press = None    # a right-press that may still be a click
         self._rerase_started = False
 
-        # Escape steps back out of a zoom-to-region: each one pushes the view
-        # it came from, exactly like PDFCanvas._zoom_stack. The sheet's view is
-        # (zoom, scroll_h, scroll_v) where the canvas' is (scale, offsets).
-        self._zoom_stack = []
+        # back / forward through where you were (row 195), the PDF canvas'
+        # twin. The sheet's view is (zoom, scroll_h, scroll_v) where the
+        # canvas' is (page, offsets, scale).
+        self.history = ViewHistory(self._view_state, self._restore_view_state)
+        # a scrollbar drag is a movement too; its press is the step's start
+        for bar in (self.scroll.get_vscrollbar(), self.scroll.get_hscrollbar()):
+            press = Gtk.GestureClick()
+            press.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            press.connect("pressed", lambda *_a: self.history.moving())
+            bar.add_controller(press)
 
         # Two-finger pinch zooms the sheet, mirroring the PDF canvas. Capture
         # phase on the overlay so the gesture wins over text-view scrolling.
@@ -15875,6 +15976,7 @@ class TextPageView(Gtk.Overlay):
     def zoom_step(self, direction):
         """+1 zoom in, -1 out, 0 reset — wired to the sheet's Ctrl+scroll and
         Ctrl+= / Ctrl+- / Ctrl+0 (the notes-font gesture on the panel)."""
+        self.history.moving()
         if direction == 0:
             self.set_zoom(1.0)
         else:
@@ -15884,6 +15986,7 @@ class TextPageView(Gtk.Overlay):
         """One keyboard/wheel STEP, anchored at viewport (vx, vy). direction 0
         resets to 1.0 (Ctrl+0). Wheel steps come from the shared table so the
         sheet and the PDF page move at the same rate."""
+        self.history.moving()
         old = self.zoom
         if direction == 0:
             self.set_zoom(1.0)
@@ -15895,6 +15998,7 @@ class TextPageView(Gtk.Overlay):
         """Multiply the zoom by `factor`, anchored at viewport (vx, vy) — the
         continuous form, so a touchpad can zoom proportionally to the scroll
         distance instead of in fixed steps (PDF-canvas parity, _zoom_at)."""
+        self.history.moving()
         old = self.zoom
         self.set_zoom(self.zoom * factor)
         return self._reanchor_zoom(old, vx, vy)
@@ -15921,24 +16025,31 @@ class TextPageView(Gtk.Overlay):
     def fit_width(self):
         """Zoom so the paper spans the viewport — Shift+click parity with the
         PDF canvas' fit-page (available while a drawing tool is active; with
-        the text tool, Shift+click keeps its editing meaning). Fitting is a
-        fresh start, so it drops the zoom history (PDFCanvas.zoom_to_fit)."""
-        self._zoom_stack.clear()
+        the text tool, Shift+click keeps its editing meaning). A step, so back
+        returns to the zoom you left (PDFCanvas.zoom_to_fit)."""
+        self.history.jump()
         vw = self.scroll.get_width()
         if vw > 0:
             self.set_zoom((vw - 2 * self.PAGE_GAP) / self.page_width)
 
-    def can_zoom_back(self):
-        """True when zoom_back() has a view to return to (PDF-canvas twin)."""
-        return bool(self._zoom_stack)
+    def _view_state(self):
+        return (self.zoom, self.scroll.get_hadjustment().get_value(),
+                self.scroll.get_vadjustment().get_value())
 
-    def zoom_back(self):
-        """Step back to the view before the last zoom-to-region — the sheet's
-        twin of PDFCanvas.zoom_back. The sheet's view is (zoom, scroll), where
-        the canvas' is (scale, offset)."""
-        if not self._zoom_stack:
-            return
-        z, hv, vv = self._zoom_stack.pop()
+    def can_go_back(self):
+        return self.history.can_back()
+
+    def go_back(self):
+        return self.history.go_back()
+
+    def go_forward(self):
+        return self.history.go_forward()
+
+    def _restore_view_state(self, state):
+        """Put the sheet back at a recorded (zoom, scroll) — what going back
+        and forward run (the PDF canvas' twin)."""
+        z, hv, vv = state
+        self._glide.stop()
         self.set_zoom(z)
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
         ha.set_value(hv)
@@ -16022,10 +16133,9 @@ class TextPageView(Gtk.Overlay):
         if rw < ZOOM_RECT_MIN_PX or rh < ZOOM_RECT_MIN_PX or vw <= 0 or vh <= 0:
             return
         old = self.zoom
-        # remember where we came from so Escape can step back out (the canvas
-        # pushes the same way in _execute_zoom_to_rect)
-        ha0, va0 = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
-        self._zoom_stack.append((old, ha0.get_value(), va0.get_value()))
+        # a step, so back (or Escape) returns to where this zoom started — the
+        # canvas records the same way in _execute_zoom_to_rect
+        self.history.jump()
         # fit both axes (like the PDF canvas), leaving a hair of margin
         self.set_zoom(old * min(vw / rw, vh / rh) * 0.97)
         f = self.zoom / old
@@ -16092,6 +16202,7 @@ class TextPageView(Gtk.Overlay):
         a two-finger drag pans even when the scale barely changes: the sheet
         scales linearly with the zoom (same wrap), so base scroll + base
         centroid scale by f, and subtracting the live centroid adds the pan."""
+        self.history.moving()
         self.set_zoom(self._pinch_base_zoom * scale)
         f = self.zoom / self._pinch_base_zoom
         c0x, c0y = self._pinch_center
@@ -16270,6 +16381,7 @@ class TextPageView(Gtk.Overlay):
         self.set_cursor(Gdk.Cursor.new_from_name("grabbing"))
 
     def _pan_update(self, dx, dy):
+        self.history.moving()
         ha, va = self.scroll.get_hadjustment(), self.scroll.get_vadjustment()
         ha.set_value(self._pan_start[0] - dx)
         va.set_value(self._pan_start[1] - dy)
@@ -16392,6 +16504,7 @@ class TextPageView(Gtk.Overlay):
         # ±1 and needs the same step the PDF canvas pans by, so the two modes
         # scroll at one speed.
         step = SURFACE_SCROLL_FACTOR if smooth else PDFCanvas.WHEEL_PAN_STEP
+        self.history.moving()
         self._glide_scroll(dx * step, dy * step)
         return True
 
@@ -19103,6 +19216,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # THE button table (row 132), shared by every canvas and sheet in this
         # window and persisted in settings.json
         self.bindings = Bindings.load()
+        # Settings → Side buttons: "pages" or "history" (row 195)
+        self._side_buttons = ("history" if _load_settings().get("side_buttons")
+                              == "history" else "pages")
         # a class-wide display preference (Settings → Show comments), read
         # before any view renders
         MarkdownNotesView.show_comments = bool(
@@ -19491,7 +19607,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # in `_show_settings`.
         _menu_item("Settings…",
                    lambda: (menu_pop.popdown(), self._show_settings()),
-                   "Page ruling, comments, the thumb button")
+                   "Page ruling, comments, the mouse buttons")
 
         # sub-pages reached from the menu (recent files, keyboard shortcuts)
         self._recent_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -20290,7 +20406,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         s.canvas.reset_modifiers()
         self.connect("notify::is-active", _on_active_changed)
 
-        # Mouse side buttons (back/forward, 8/9) flip pages from anywhere in the
+        # Mouse side buttons (back/forward, 8/9) flip pages or step the view
+        # history (Settings → Side buttons) from anywhere in the
         # window — including while typing in the notes editor. Extra-button
         # press/release isn't reliably reported through the gesture APIs (see the
         # canvas thumb-button note), so a capture-phase legacy controller is used.
@@ -20306,9 +20423,30 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return False
         btn = event.get_button()
         if btn in (8, 9):
-            self._nav_page(1 if btn == 8 else -1)
+            # 8 is the browser's BACK button, 9 forward — the same direction in
+            # both modes, so Ctrl swapping the mode never swaps the direction.
+            # A text page has no pages, so there it is always the history.
+            back = btn == 8
+            ctrl = (bool(event.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK)
+                    or self._held_mods[0])
+            history = (self._side_buttons == "history") != ctrl or self._text_mode
+            if history:
+                surface = self._history_surface()
+                if back:
+                    surface.go_back()
+                else:
+                    surface.go_forward()
+            else:
+                self._nav_page(-1 if back else 1)
             return True
         return False
+
+    def _history_surface(self):
+        """Whose view history back/forward steps through: the sheet on a text
+        page, the PDF canvas otherwise."""
+        if self._text_mode and self._text_page is not None:
+            return self._text_page
+        return self.canvas
 
     def _build_document_widgets(self, s):
         """Build one document's canvas / notes editor / search bar / sidebar
@@ -21023,7 +21161,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Left-drag",     "Select text (in select-text mode)"),
             ("Ctrl+C",        "Copy selected text"),
             ("Alt+Click",     "Follow link under cursor (footnote, citation, URL)"),
-            ("Alt+Left",      "Back to where you were before following a link"),
+            ("Alt+Left",      "Back to where you were (links, jumps, pans, zooms)"),
+            ("Alt+Right",     "Forward again"),
+            ("Mouse back/forward", "Previous / next page, or back / forward — Settings; Ctrl swaps"),
             ("Ctrl+T",       "Toggle outline / page-thumbnail sidebar"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
@@ -21039,8 +21179,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Alt+Shift+Drag", "Zoom to region (works under the text caret too)"),
             ("Shift+Middle/Thumb-drag", "Zoom to region (works on text pages too)"),
             ("Shift+Click",   "Fit page"),
-            ("Escape",        "Step back out of the last zoom-to-region"),
-            ("Escape",        "Step back out of the last zoom-to-region"),
+            ("Escape",        "Back to where you were (e.g. out of a zoom-to-region)"),
             ("File",          None),
             ("Ctrl+O",        "Open file…"),
             ("Ctrl+Shift+O",  "Open recent…"),
@@ -22315,7 +22454,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             self._presenter.sync_page()
 
     def _go_to_page(self, idx):
+        """A user's jump to a page — a thumbnail, the outline, a bookmark, a
+        link, an undo landing elsewhere — and so a step in the view history.
+        Paths the app takes on its own call `canvas.go_to_page` directly."""
         self._commit_note()
+        if idx != self.canvas.current_page_idx:
+            self.canvas.history.jump()
         self.canvas.go_to_page(idx)
 
     # ── bookmarks (row 134) ──────────────────────────────────────────────────
@@ -22789,6 +22933,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if self._presenter is not None:
             # While presenting, each slide should show whole and centred — re-fit
             # the new page rather than carrying a zoomed-in reading position over.
+            c.history.moving()
             c.go_to_page(target)
         else:
             c._flip_page(target - c.current_page_idx)
@@ -23098,11 +23243,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not ctrl_held and keyval == Gdk.KEY_Page_Up:
             self._nav_page(-1)
             return True
-        if (state & Gdk.ModifierType.ALT_MASK) and keyval == Gdk.KEY_Left:
-            # return to the reading spot we left when following a link (footnote,
-            # citation, internal cross-reference)
-            if self.canvas.nav_back():
-                self._toast("Back to where you were")
+        if (state & Gdk.ModifierType.ALT_MASK) and keyval in (Gdk.KEY_Left,
+                                                                Gdk.KEY_Right):
+            # back / forward through where you were (row 195) — the same
+            # history the mouse side buttons step through
+            surface = self._history_surface()
+            if keyval == Gdk.KEY_Left:
+                surface.go_back()
+            else:
+                surface.go_forward()
             return True
         return False
 
@@ -26076,6 +26225,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         thumb.connect("notify::active", lambda r, _p:
                       self._on_thumb_toggled(r.get_active()))
         mouse.add(thumb)
+        side = Adw.ComboRow(title="Side buttons")
+        side.set_subtitle("Back and forward turn pages, or go back to where "
+                          "you were. Hold Ctrl for the other.")
+        side.set_model(Gtk.StringList.new(["Pages", "Where you were"]))
+        side.set_selected(1 if self._side_buttons == "history" else 0)
+        side.connect("notify::selected", lambda r, _p: self._on_side_buttons(
+            "history" if r.get_selected() == 1 else "pages"))
+        mouse.add(side)
         page.add(mouse)
 
         dlg.present(self)
@@ -26083,6 +26240,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _on_page_bg_changed(self, index):
         _save_setting("page_background", PAGE_BACKGROUNDS[index])
+
+    def _on_side_buttons(self, mode):
+        _save_setting("side_buttons", mode)
+        self._side_buttons = mode
 
     def _on_thumb_toggled(self, on):
         _save_setting("thumb_button", on)
@@ -26180,7 +26341,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         or in a link is applied AFTER open_file, so it still wins."""
         page = _recent_page(path)
         if 0 < page < self.canvas.n_pages:
-            self._go_to_page(page)
+            # opening a file is not a place you were: no history step
+            self._commit_note()
+            self.canvas.go_to_page(page)
 
     def _remember_recent(self, path):
         path = os.path.abspath(path)
@@ -28603,16 +28766,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     and state & Gdk.ModifierType.CONTROL_MASK):
                 surface.duplicate_selected()
                 return True
-        # Escape steps BACK one zoom-to-region, in whichever mode is showing:
-        # every zoom-to-region remembers the view it left, so you can dive into
-        # a figure and step back out through the views you came from instead of
-        # fitting the page and hunting for your place again. It comes AFTER the
+        # Escape goes BACK through where you were (row 195), in whichever mode
+        # is showing — so you can dive into a figure with zoom-to-region and
+        # step back out through the views you came from. It comes AFTER the
         # lasso branch above (dropping a selection is the more immediate
         # "cancel") and only claims Escape when there is somewhere to go back
         # to, so the key stays free for everything else.
         zoom_surface = tp if tp is not None else self.canvas
-        if keyval == Gdk.KEY_Escape and zoom_surface.can_zoom_back():
-            zoom_surface.zoom_back()
+        if keyval == Gdk.KEY_Escape and zoom_surface.can_go_back():
+            zoom_surface.go_back()
             return True
         # PageUp/PageDown and Ctrl+\ are handled in _on_global_key (capture phase)
         # so they work even when the notes editor has focus.
@@ -28948,8 +29110,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._search_current = idx % n
         match = self._search_matches[self._search_current]
         page_idx = match[1]
+        if self._text_mode and self._text_page is not None:
+            self._text_page.history.jump()        # the sheet is about to scroll
         if page_idx != self.canvas.current_page_idx and self.canvas.document:
             self._commit_note()
+            self.canvas.history.jump()
             self.canvas.go_to_page(page_idx)  # fires _on_page_changed → _update_search_canvas
         else:
             self._update_search_canvas()
@@ -29052,7 +29217,8 @@ class PresenterWindow(Adw.Window):
 
         # While this window has focus (e.g. a clicker driving the projected
         # screen), it can still page: click advances, the mouse back/forward
-        # side buttons flip like in the editor (8 next, 9 prev).
+        # side buttons flip like in the editor's Pages mode (8 back → prev,
+        # 9 forward → next).
         click = Gtk.GestureClick()
         click.set_button(0)   # 0 = listen to every button
         click.connect("pressed", self._on_click)
@@ -29112,9 +29278,9 @@ class PresenterWindow(Adw.Window):
 
     def _on_click(self, gesture, _n_press, _x, _y):
         button = gesture.get_current_button()
-        if button in (Gdk.BUTTON_PRIMARY, 8):   # click / mouse-forward → next
+        if button in (Gdk.BUTTON_PRIMARY, 9):   # click / mouse-forward → next
             self._nav(1)
-        elif button in (Gdk.BUTTON_SECONDARY, 9):   # right / mouse-back → prev
+        elif button in (Gdk.BUTTON_SECONDARY, 8):   # right / mouse-back → prev
             self._nav(-1)
 
 
