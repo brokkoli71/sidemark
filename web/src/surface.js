@@ -8,13 +8,13 @@ import {
   HOVER_TRAIL_MS,
 } from "./ink.js";
 import { drawInkStroke, strokeHit, rgbCss } from "./draw.js";
-import { BTN_FINGER, buttonForEvent, chordId } from "./bindings.js";
+import { BTN_FINGER, BTN_LEFT, buttonForEvent, chordId } from "./bindings.js";
 import { recognizeShape, snapGridDivider, respaceDividers, polylineIsClosed,
          ellipseResizeState, resizedEllipse, SNAP_LABELS } from "./shapes.js";
 import { pageWords, nearestWord, wordsBetween, wordsInRect,
          selectionText, selectionRects } from "./textlayer.js";
 import { copySelection, takeCopy, hasCopy, copyExtent } from "./clipboard.js";
-import { parseAnchors, addAnchor, moveAnchor, moveCallout, calloutBox,
+import { parsePageMarks, coveredBy, addAnchor, moveAnchor, moveCallout, calloutBox,
          drawAnchor, ANCHOR_R } from "./anchors.js";
 import { isImage, imageHit, imageQuad, imageFrame, drawImageObject,
          makeImage, pasteScale } from "./images.js";
@@ -617,10 +617,15 @@ export class Surface {
       // table.
     }
 
-    // An anchor or a callout is grabbable with ANY tool, like a selection — it
-    // is a thing ON the page, and having to change tools to nudge one is the
-    // sort of friction the binding table exists to avoid.
-    const grabbed = this._anchorAt(e.offsetX, e.offsetY);
+    // An anchor or a callout under a plain LEFT press (a pen tip is left) is
+    // grabbed whatever tool left holds, like a selection — it is a thing ON
+    // the page, and having to change tools to nudge one is the sort of
+    // friction the binding table exists to avoid. Left only, as on the
+    // desktop: a finger bound to pan must still pan across a callout.
+    const mods = this._chordState(e);
+    const grabbed = buttonForEvent(e) === BTN_LEFT
+      && !(mods.ctrl || mods.shift || mods.alt)
+      ? this._anchorAt(e.offsetX, e.offsetY) : null;
     if (grabbed) {
       this.active = {
         pointerId: e.pointerId, tool: "anchor-move", device: e.pointerType,
@@ -1106,7 +1111,7 @@ export class Surface {
    * time. */
   get anchors() {
     if (!this.doc) return [];
-    return parseAnchors(this.doc.notes.get(this.pageIndex));
+    return parsePageMarks(this.doc.notes.get(this.pageIndex));
   }
 
   _writeNotes(text) {
@@ -1120,16 +1125,16 @@ export class Surface {
   _anchorAt(sx, sy) {
     const ctx = this.ctx;
     for (const a of this.anchors) {
-      const [ax, ay] = this.toView(a.x, a.y);
-      if (Math.hypot(sx - ax, sy - ay) <= ANCHOR_R + 4) return { anchor: a, part: "dot" };
-      if (a.callout && a.text) {
-        const [cx, cy] = this.toView(a.callout[0], a.callout[1]);
-        const box = calloutBox(ctx, a.text, cx, cy);
-        if (box && sx >= box.x && sx <= box.x + box.w
-                && sy >= box.y && sy <= box.y + box.h) {
-          return { anchor: a, part: "callout" };
-        }
+      const screen = this.toView(a.x, a.y);
+      const box = a.callout
+        ? calloutBox(ctx, a.text, ...this.toView(a.callout[0], a.callout[1]))
+        : null;
+      // a dot under its own box is not drawn, so it is not there to grab
+      if (!coveredBy(box, screen)
+          && Math.hypot(sx - screen[0], sy - screen[1]) <= ANCHOR_R + 4) {
+        return { anchor: a, part: "dot" };
       }
+      if (coveredBy(box, [sx, sy])) return { anchor: a, part: "callout" };
     }
     return null;
   }
@@ -1148,7 +1153,7 @@ export class Surface {
     for (const a of this.anchors) {
       const screen = this.toView(a.x, a.y);
       let box = null;
-      if (a.callout && a.text) {
+      if (a.callout) {
         const [cx, cy] = this.toView(a.callout[0], a.callout[1]);
         box = calloutBox(ctx, a.text, cx, cy);
       }

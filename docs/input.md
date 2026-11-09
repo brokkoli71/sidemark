@@ -80,11 +80,15 @@
     `select_mode` are derived the same way — **never assign them alongside a
     tool change**, or `select_mode = False` hands the caret's button back to
     the pen.
-  - **Two exceptions, both AT the router, neither a fork of the table**: with
+  - **Three exceptions, all AT the router, none a fork of the table**: with
     the lasso on the plain button Shift ADDS to the selection (Shift+lasso is
-    still the lasso), and a live selection is grabbable with any tool (row 125)
+    still the lasso); a live selection is grabbable with any tool (row 125)
     — which on the sheet must be claimed on the capture gesture or a pasted
-    image is unmovable.
+    image is unmovable; and a plain LEFT press (a pen tip is left) on an
+    anchor or callout grabs it whatever left holds (`_page_mark_at`, row 15;
+    the web port's `_onDown` is the same rule). Left only, so a finger bound
+    to pan still pans across a callout. The `GestureClick` beside the drag
+    decides nothing: it fires for a finger too and cannot tell it from left.
   - **The thumb is a real button**: button 10 never reaches a `GestureDrag`, so
     its press is replayed through the same router with a `_SyntheticDrag`.
     That is what lets it hold any tool instead of a hardwired pan.

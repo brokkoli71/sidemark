@@ -6541,9 +6541,8 @@ class TestExportFont(unittest.TestCase):
 
 
 class TestTextBox(unittest.TestCase):
-    """Standalone text boxes (#56): a `<!-- textbox:X:Y -->` marker whose
-    paragraph is rendered in a box on the page, placed with Ctrl+Alt+right-click
-    and edited in the notes panel."""
+    """Legacy text boxes (#56): a `<!-- textbox:X:Y -->` marker in an older
+    file, read and moved as a callout sitting on its own anchor."""
 
     def test_parse_textboxes(self):
         from sidemark import _parse_textboxes
@@ -6557,7 +6556,22 @@ class TestTextBox(unittest.TestCase):
         from sidemark import _strip_markers
         self.assertEqual(_strip_markers("<!-- textbox:1:2 -->\nhi"), "hi")
 
-    def test_place_and_move_in_window(self):
+    def test_a_legacy_textbox_reads_as_a_callout_on_its_anchor(self):
+        """Text boxes are callouts now (row 56): an old marker comes back as a
+        mark whose box sits on its own anchor, AFTER every real anchor so the
+        anchors keep their numbers."""
+        from sidemark import _parse_page_marks
+        marks = _parse_page_marks(
+            "<!-- textbox:120:300 -->\nHello\n\n<!-- anchor:10:10 -->\nA")
+        self.assertEqual(len(marks), 2)
+        self.assertIsNone(marks[0].get("textbox"))
+        self.assertEqual(marks[0]["text"], "A")
+        box = marks[1]
+        self.assertEqual(box["textbox"], 0)
+        self.assertEqual(box["callout"], (box["x"], box["y"]))
+        self.assertEqual(box["text"], "Hello")
+
+    def test_moving_a_legacy_textbox_rewrites_its_own_marker(self):
         errors = []
         app = Adw.Application(application_id="test.sidemark.textbox")
         with tempfile.TemporaryDirectory() as d:
@@ -6568,14 +6582,16 @@ class TestTextBox(unittest.TestCase):
                 try:
                     win = PDFEditorWindow(a); win.present()
                     win.open_file_in_tab(pdf)
-                    win._on_textbox_placed(0, 100, 200)
-                    boxes = win.canvas._textboxes.get(0, [])
-                    out["n"] = len(boxes)
-                    out["pos"] = (boxes[0]["x"], boxes[0]["y"]) if boxes else None
-                    out["text"] = boxes[0]["text"] if boxes else None
-                    win._on_textbox_moved(0, 150, 260)
-                    moved = win.canvas._textboxes.get(0, [])
-                    out["moved"] = (moved[0]["x"], moved[0]["y"]) if moved else None
+                    buf = win._notes_view.get_buffer()
+                    buf.set_text("<!-- anchor:5:5 -->\nA\n\n"
+                                 "<!-- textbox:100:200 -->\nBox")
+                    marks = win.canvas._anchors[0]
+                    out["idx"] = [m.get("textbox") for m in marks].index(0)
+                    win._on_callout_moved(out["idx"], 150, 260)
+                    out["text"] = buf.get_text(buf.get_start_iter(),
+                                               buf.get_end_iter(), True)
+                    m = win.canvas._anchors[0][out["idx"]]
+                    out["mark"] = (m["x"], m["y"], m["callout"])
                 except Exception:
                     import traceback
                     errors.append(traceback.format_exc())
@@ -6586,10 +6602,10 @@ class TestTextBox(unittest.TestCase):
             app.run([])
             if errors:
                 raise AssertionError(errors[0])
-            self.assertEqual(out["n"], 1)
-            self.assertEqual(out["pos"], (100, 200))
-            self.assertEqual(out["text"], "Text")          # placeholder inserted
-            self.assertEqual(out["moved"], (150, 260))      # marker rewritten
+            self.assertIn("<!-- textbox:150:260 -->", out["text"])
+            self.assertNotIn("callout:", out["text"])     # still a text box
+            self.assertIn("<!-- anchor:5:5 -->", out["text"])
+            self.assertEqual(out["mark"], (150, 260, (150, 260)))
 
     def test_export_includes_textbox(self):
         from sidemark import _export_pdf_with_notes
@@ -11213,7 +11229,7 @@ class TestCallouts(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    # -- gesture: Ctrl+Alt+drag places a callout --------------------------------
+    # -- gesture: an anchor-tool drag places a callout ------------------------
 
     def _drag_gesture(self):
         g = mock.Mock()
@@ -11236,6 +11252,7 @@ class TestCallouts(unittest.TestCase):
 
     def test_short_drag_stays_anchor_only(self):
         canvas = PDFCanvas()
+        canvas.bindings.bind("ctrl+alt+left", "anchor")
         placed = []
         canvas.on_callout_placed = lambda x, y: placed.append((x, y))
         canvas._on_drag_begin(self._drag_gesture(), 100, 100)
@@ -11408,6 +11425,134 @@ class TestCallouts(unittest.TestCase):
         canvas._on_drag_update(self._plain_drag_gesture(), 2, 1)   # below threshold
         canvas._on_drag_end(self._plain_drag_gesture(), 2, 1)
         self.assertEqual(moved, [])
+
+    def test_left_grabs_a_callout_whatever_tool_it_holds(self):
+        """The hand cursor over a callout promises a drag, so a plain left
+        press grabs it with ANY tool on left — and the tool does not also run
+        (the anchor tool used to drop a second anchor on top)."""
+        for tool in sorted(t for t in sidemark.TOOL_MODES
+                           if sidemark.tool_in_mode(t, "pdf")):
+            with self.subTest(tool=tool):
+                canvas = self._canvas_with_callout()
+                canvas.bindings.bind("left", tool)
+                placed = []
+                canvas.on_anchor_placed = lambda *a: placed.append(a)
+                canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+                self.assertEqual(canvas._callout_moving, 0)
+                self.assertFalse(canvas._panning or canvas._erasing
+                                 or canvas._zoom_selecting
+                                 or canvas._callout_dragging)
+                self.assertEqual(placed, [])
+
+    def test_left_grabs_an_anchor_even_when_left_is_unbound(self):
+        canvas = self._canvas_with_anchor()
+        canvas.bindings.clear("left")
+        canvas._on_drag_begin(self._plain_drag_gesture(), 100, 100)
+        self.assertEqual(canvas._anchor_dragging, 0)
+
+    def test_a_finger_pans_across_a_callout(self):
+        canvas = self._canvas_with_callout()
+        canvas.bindings.bind("finger", "pan")
+        g = self._plain_drag_gesture()
+        g.get_current_event.return_value = _stylus_event("touch")
+        canvas._on_drag_begin(g, 100, 100)
+        self.assertIsNone(canvas._callout_moving)
+        self.assertTrue(canvas._panning)
+
+    def _drawn(self, notes):
+        canvas = PDFCanvas()
+        f = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        make_pdf(f.name)
+        canvas.load(f.name)
+        canvas._fit_page(800, 600)
+        canvas._anchors[0] = sidemark._parse_page_marks(notes)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+        canvas._draw(canvas, cairo.Context(surf), 800, 600)
+        return canvas
+
+    def test_an_anchor_under_its_own_box_is_not_there(self):
+        """A callout dragged onto its anchor IS a text box: no circle, and so
+        nothing separate to grab — a press there takes the box."""
+        canvas = self._drawn("<!-- anchor:100:100 --> <!-- callout:90:90 -->\nN")
+        self.assertIn(0, canvas._covered_anchors)
+        sx, sy = canvas._pdf_to_screen(100, 100)
+        self.assertIsNone(canvas._anchor_hit_test(sx, sy))
+        self.assertEqual(canvas._page_mark_at(sx, sy), ("callout", 0))
+
+    def test_an_anchor_outside_its_box_keeps_its_circle(self):
+        canvas = self._drawn("<!-- anchor:100:100 --> <!-- callout:300:300 -->\nN")
+        self.assertNotIn(0, canvas._covered_anchors)
+        sx, sy = canvas._pdf_to_screen(100, 100)
+        self.assertEqual(canvas._anchor_hit_test(sx, sy), 0)
+
+    def test_an_empty_callout_still_has_a_box_to_grab(self):
+        canvas = self._drawn("<!-- anchor:100:100 --> <!-- callout:300:300 -->")
+        self.assertEqual([b[0] for b in canvas._callout_boxes], [0])
+
+    def _in_window(self, body):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "doc.pdf")
+            make_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.calloutwin")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise errors[0]
+
+    def test_a_new_callout_starts_with_selected_text(self):
+        def body(win):
+            win._on_anchor_placed(0, 50, 60)
+            win._on_callout_placed(80, 90)
+            buf = win._notes_view.get_buffer()
+            bounds = buf.get_selection_bounds()
+            self.assertTrue(bounds)
+            self.assertEqual(buf.get_text(*bounds, True), "Text")
+            self.assertEqual(win.canvas._anchors[0][0]["text"], "Text")
+            self.assertEqual(win.canvas._anchors[0][0]["callout"], (80, 90))
+
+        self._in_window(body)
+
+    def test_a_callout_on_written_notes_gets_no_placeholder(self):
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            buf.set_text("my note")
+            buf.place_cursor(buf.get_start_iter())
+            win._on_anchor_placed(0, 50, 60)
+            win._on_callout_placed(80, 90)
+            self.assertEqual(win.canvas._anchors[0][0]["text"], "my note")
+
+        self._in_window(body)
+
+    def test_editing_the_notes_repaints_the_page(self):
+        """Deleting a callout's paragraph must repaint now — the marks live in
+        the notes, and the page used to keep the old box until something else
+        happened to redraw it."""
+        def body(win):
+            buf = win._notes_view.get_buffer()
+            buf.set_text("intro\n\n<!-- anchor:50:60 --> "
+                         "<!-- callout:80:90 -->\nBox")
+            buf.place_cursor(buf.get_start_iter())   # not in the anchor's para
+            with mock.patch.object(win.canvas, "queue_draw") as qd:
+                buf.set_text("intro\n")
+                self.assertTrue(qd.called)
+            self.assertEqual(win.canvas._anchors[0], [])
+
+        self._in_window(body)
 
     def test_window_callout_move_rewrites_marker(self):
         errors = []
@@ -14024,14 +14169,31 @@ class TestToolModes(unittest.TestCase):
         self.assertTrue(self.canvas._zoom_selecting)
         self.assertEqual(len(self.canvas.current_stroke), 0)
 
-    def test_anchor_tool_places_anchor_on_click(self):
+    def test_anchor_tool_places_anchor_on_press(self):
         placed = []
         self.canvas.on_anchor_placed = lambda p, x, y: placed.append((p, x, y))
         self.canvas.tool = "anchor"
-        click = mock.Mock()
-        click.get_current_event_state.return_value = Gdk.ModifierType(0)
-        self.canvas._on_click_pressed(click, 1, 120, 130)
+        self.canvas._on_drag_begin(self._plain_drag(), 100, 100)
         self.assertEqual(len(placed), 1)
+
+    def test_a_finger_does_not_drop_the_lefts_anchor(self):
+        """Left on the anchor, the finger on pan: a touch pans and drops
+        nothing. Both the click gesture and the drag router see a touch as a
+        primary press — only the router knows it was a finger."""
+        placed = []
+        self.canvas.on_anchor_placed = lambda p, x, y: placed.append((p, x, y))
+        self.canvas.tool = "anchor"
+        self.canvas.bindings.bind("finger", "pan")
+        touch = _stylus_event("touch")
+        click = mock.Mock()
+        click.get_current_event.return_value = touch
+        click.get_current_event_state.return_value = Gdk.ModifierType(0)
+        self.canvas._on_click_pressed(click, 1, 100, 100)
+        g = self._plain_drag()
+        g.get_current_event.return_value = touch
+        self.canvas._on_drag_begin(g, 100, 100)
+        self.assertTrue(self.canvas._panning)
+        self.assertEqual(placed, [])
 
     def test_anchor_tool_drag_places_callout(self):
         out = []

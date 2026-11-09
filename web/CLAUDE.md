@@ -82,6 +82,7 @@ npm test                                              # all the runners
 | `shapes.mjs` | 100 | 13 strokes through the recogniser |
 | `inkpdf.mjs` | — | annots, appearance, profile, regeneration, foreign ink |
 | `crossing.mjs` | 27 | where the caret and its selection land crossing the divider |
+| `anchors.mjs` | 12 | legacy text boxes read as callouts, the new callout's placeholder, covered dots |
 | `paging.mjs` | 885 | insert/delete/reorder re-key notes, runs, bookmarks, hidden, outline |
 | `pwa.mjs` | 124 | the precache list vs the directory, the manifest, the share-target handoff, what a scanned code may be |
 | `render.mjs` | 38 | fit against a container with no size, render scale, the preview pass, two renders racing, prefetch |

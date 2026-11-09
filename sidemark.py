@@ -3852,8 +3852,6 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_anchor_moved = None    # callback(anchor_index, pdf_x, pdf_y)
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
         self.on_callout_moved = None   # callback(anchor_index, pdf_x, pdf_y)
-        self.on_textbox_placed = None  # callback(page_idx, pdf_x, pdf_y) — standalone box
-        self.on_textbox_moved = None   # callback(textbox_index, pdf_x, pdf_y)
         self.on_user_action = None     # callback() once per completed draw/erase gesture
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
         self.on_lasso_selection = None # callback(has_selection: bool) when the lasso set changes
@@ -3864,7 +3862,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # restored with nav_back() (Alt+Left). Each entry: (page, ox, oy, scale).
         self._nav_history = []
 
-        # {page_idx: [anchor dict from _parse_anchors, ...]}
+        # {page_idx: [mark dict from _parse_page_marks, ...]}
         self._anchors = {}
         self._active_anchors = set()  # indices highlighted on current page
         # drag-to-reposition: index of the anchor being dragged, and whether the
@@ -3873,8 +3871,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._anchor_drag_moved = False
         self._hovering_anchor = False
 
-        # Ctrl+Alt+drag: anchor placed at press (GestureClick), callout box
-        # placed at release when the drag travelled far enough
+        # the anchor tool: anchor placed at press, callout box placed at
+        # release when the drag travelled far enough
         self._callout_dragging = False
         self._callout_start = None    # screen (x, y)
         self._callout_cur = None
@@ -3887,14 +3885,9 @@ class PDFCanvas(Gtk.DrawingArea):
         # screen-space rects of callout boxes from the last draw, for hit-testing:
         # [(anchor_index, bx, by, bw, bh), ...]
         self._callout_boxes = []
-
-        # standalone text boxes (#56): like a callout but with no anchor/arrow.
-        # {page_idx: [textbox dict from _parse_textboxes, ...]}
-        self._textboxes = {}
-        self._textbox_boxes = []       # [(index, bx, by, bw, bh), ...] last draw
-        self._textbox_moving = None
-        self._textbox_move_offset = (0.0, 0.0)
-        self._textbox_move_moved = False
+        # anchors sitting under their own callout box at the last draw: drawn
+        # as nothing, so not grabbable either
+        self._covered_anchors = set()
 
         self.search_rects = []          # fitz.Rect hits for current page
         self.search_current_rect = None # the active match rect
@@ -4802,19 +4795,18 @@ class PDFCanvas(Gtk.DrawingArea):
 
         self._draw_lasso(ctx)
 
-        # standalone text boxes (#56) — drawn before anchors so anchor circles
-        # stay on top if they overlap
-        self._textbox_boxes = []
-        for i, t in enumerate(self._textboxes.get(self.current_page_idx, [])):
-            self._draw_text_box(ctx, t, i)
-
-        # anchor markers
+        # anchor markers and their callouts (legacy text boxes included — see
+        # _parse_page_marks)
         anchors = self._anchors.get(self.current_page_idx, [])
         self._callout_boxes = []
+        self._covered_anchors = set()
         if anchors:
-            # callout boxes go under the circles so an anchor inside a box stays visible
+            # callout boxes go under the circles, so an anchor inside SOMEBODY
+            # ELSE's box stays visible; one inside its OWN box draws nothing
+            # (_draw_callout decides), which is what makes a callout dragged
+            # onto its anchor a plain text box
             for i, a in enumerate(anchors):
-                if a.get("callout") and a.get("text"):
+                if a.get("callout"):
                     self._draw_callout(ctx, a, i)
             ctx.save()
             ctx.translate(self.offset_x, self.offset_y)
@@ -4822,6 +4814,8 @@ class PDFCanvas(Gtk.DrawingArea):
             r, g, b = self.zoom_accent
             radius = 8.0 / self.scale
             for i, a in enumerate(anchors):
+                if i in self._covered_anchors:
+                    continue
                 ax, ay = a["x"], a["y"]
                 if i in self._active_anchors:
                     ctx.set_source_rgba(r, g, b, 0.3)
@@ -4839,7 +4833,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.show_text(label)
             ctx.restore()
 
-        # callout placement preview (Ctrl+Alt+drag in progress)
+        # callout placement preview (an anchor-tool drag in progress)
         if self._callout_dragging and self._callout_start and self._callout_cur:
             ar, ag, ab = self.zoom_accent
             ctx.set_source_rgba(ar, ag, ab, 0.8)
@@ -5481,7 +5475,9 @@ class PDFCanvas(Gtk.DrawingArea):
         ax, ay = self._pdf_to_screen(a["x"], a["y"])
         cx, cy = self._pdf_to_screen(*a["callout"])
         pad = max(3.0, 5.0 * self.scale)
-        layout = self._note_box_layout(ctx, a["text"])
+        # an empty paragraph still gets its (empty) box: a callout you placed
+        # and cannot see is one you cannot grab either
+        layout = self._note_box_layout(ctx, a["text"] or " ")
         tw, th = layout.get_pixel_size()
         bx, by = cx, cy
         bw, bh = tw + 2 * pad, th + 2 * pad
@@ -5494,6 +5490,9 @@ class PDFCanvas(Gtk.DrawingArea):
         ar, ag, ab = self.zoom_accent
         dxv, dyv = attach_x - ax, attach_y - ay
         dist = math.hypot(dxv, dyv)
+        if dist <= 1.0 and idx is not None:
+            # the anchor is under its own box: no arrow, and no circle
+            self._covered_anchors.add(idx)
         if dist > 1.0:
             ctx.set_source_rgba(ar, ag, ab, 0.85)
             ctx.set_line_width(max(1.0, 1.5 * self.scale))
@@ -5510,18 +5509,6 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.fill()
 
         self._paint_note_box(ctx, layout, bx, by, bw, bh, pad)
-
-    def _draw_text_box(self, ctx, t, idx=None):
-        """A standalone text box (#56) — like a callout but with no anchor or
-        arrow; just the box with its rendered note text at its PDF position."""
-        cx, cy = self._pdf_to_screen(t["x"], t["y"])
-        pad = max(3.0, 5.0 * self.scale)
-        layout = self._note_box_layout(ctx, t["text"] or " ")
-        tw, th = layout.get_pixel_size()
-        bw, bh = tw + 2 * pad, th + 2 * pad
-        if idx is not None:
-            self._textbox_boxes.append((idx, cx, cy, bw, bh))
-        self._paint_note_box(ctx, layout, cx, cy, bw, bh, pad)
 
     # ── input handlers ────────────────────────────────────────────────────────
 
@@ -5585,8 +5572,7 @@ class PDFCanvas(Gtk.DrawingArea):
         over = (self._hovered_link_rect is None and not borrowed_caret
                 and self.page is not None
                 and (self._anchor_hit_test(x, y) is not None
-                     or self._callout_hit_test(x, y) is not None
-                     or self._textbox_hit_test(x, y) is not None))
+                     or self._callout_hit_test(x, y) is not None))
         if over == self._hovering_anchor:
             return
         self._hovering_anchor = over
@@ -5798,6 +5784,8 @@ class PDFCanvas(Gtk.DrawingArea):
         """Return index of anchor circle under screen point, or None."""
         anchors = self._anchors.get(self.current_page_idx, [])
         for i, a in enumerate(anchors):
+            if i in self._covered_anchors:
+                continue        # not drawn, so not there to grab
             scx, scy = self._pdf_to_screen(a["x"], a["y"])
             if math.hypot(sx - scx, sy - scy) <= 10.0:
                 return i
@@ -5807,14 +5795,6 @@ class PDFCanvas(Gtk.DrawingArea):
         """Return the anchor index whose callout box is under the screen point,
         or None. Uses the rects recorded during the last draw; topmost wins."""
         for idx, bx, by, bw, bh in reversed(self._callout_boxes):
-            if bx <= sx <= bx + bw and by <= sy <= by + bh:
-                return idx
-        return None
-
-    def _textbox_hit_test(self, sx, sy):
-        """Return the index of the standalone text box under the screen point,
-        or None (topmost wins)."""
-        for idx, bx, by, bw, bh in reversed(self._textbox_boxes):
             if bx <= sx <= bx + bw and by <= sy <= by + bh:
                 return idx
         return None
@@ -5931,21 +5911,14 @@ class PDFCanvas(Gtk.DrawingArea):
     def _on_click_pressed(self, gesture, n_press, x, y):
         if self.on_canvas_press:
             self.on_canvas_press()
-        state = self._chord_state(gesture)
-        # Ctrl+Alt (but not when Shift is also held — that's the lasso gesture)
-        ctrl_alt = ((state & Gdk.ModifierType.CONTROL_MASK)
-                    and (state & Gdk.ModifierType.ALT_MASK)
-                    and not (state & Gdk.ModifierType.SHIFT_MASK))
-        any_mod = state & (Gdk.ModifierType.CONTROL_MASK
-                           | Gdk.ModifierType.ALT_MASK
-                           | Gdk.ModifierType.SHIFT_MASK)
-        # Ctrl+Alt, or the anchor tool with no modifier, drops an anchor here.
-        if ctrl_alt or (self.tool == "anchor" and not any_mod):
-            if self.page is None:
-                return
-            px, py = self._screen_to_pdf(x, y)
-            if self.on_anchor_placed:
-                self.on_anchor_placed(self.current_page_idx, round(px), round(py))
+        # Nothing else. What a press DOES is the press router's call: this
+        # gesture fires for a finger too, and cannot tell it from left.
+
+    def _drop_anchor(self, x, y):
+        if self.page is None or not self.on_anchor_placed:
+            return
+        px, py = self._screen_to_pdf(x, y)
+        self.on_anchor_placed(self.current_page_idx, round(px), round(py))
 
     def _on_drag_begin(self, gesture, start_x, start_y):
         """THE press router: resolve the button+modifiers through the binding
@@ -5995,14 +5968,6 @@ class PDFCanvas(Gtk.DrawingArea):
             # GestureDrag copy (if any) must not double-run it
             self._ignoring = True
             return
-        if btn == BTN_RIGHT and ctrl and alt and not shift:
-            # Ctrl+Alt+right-click drops a standalone text box here (#56). An
-            # ACTION rather than a tool, so it is deliberately not in the table.
-            self._ignoring = True
-            if self.page is not None and self.on_textbox_placed:
-                px, py = self._screen_to_pdf(start_x, start_y)
-                self.on_textbox_placed(self.current_page_idx, round(px), round(py))
-            return
 
         tool = self.bindings.tool_for(btn, ctrl, shift, alt, mode="pdf")
         # THE one exception, and it is not a fork of the table: with the LASSO
@@ -6013,9 +5978,16 @@ class PDFCanvas(Gtk.DrawingArea):
         additive = False
         if shift and not ctrl and not alt and plain == "lasso":
             tool, additive = "lasso", True
-        log_press("pdf", chord_id(btn, ctrl, shift, alt), tool,
-                  "" if tool else "unbound")
-        if tool is None:
+        # An anchor or callout under a plain LEFT press (a pen tip is left)
+        # is grabbed whatever left holds: it is a thing ON the page, like a
+        # selection, and the hand cursor over it promises exactly this. Left
+        # only — a finger bound to pan must still pan across a callout.
+        mark = (self._page_mark_at(start_x, start_y)
+                if btn == BTN_LEFT and not (ctrl or shift or alt) else None)
+        log_press("pdf", chord_id(btn, ctrl, shift, alt),
+                  f"grab {mark[0]}" if mark else tool,
+                  "" if tool or mark else "unbound")
+        if tool is None and mark is None:
             self._ignoring = True
             return
 
@@ -6026,9 +5998,41 @@ class PDFCanvas(Gtk.DrawingArea):
         self._text_selecting = False
         self._zoom_selecting = False
         self._selected_words = []
+        if mark is not None:
+            self._press_tool = None
+            self._grab_page_mark(mark, start_x, start_y)
+            return
         self._press_tool = tool
         self._begin_tool(tool, start_x, start_y, chorded=(tool != plain),
                          additive=additive)
+
+    def _page_mark_at(self, x, y):
+        """`("anchor", i)` or `("callout", i)` under a screen point, or None.
+        An anchor circle beats a box: it is the smaller target."""
+        if self.page is None:
+            return None
+        hit = self._anchor_hit_test(x, y)
+        if hit is not None:
+            return ("anchor", hit)
+        hit = self._callout_hit_test(x, y)
+        return ("callout", hit) if hit is not None else None
+
+    def _grab_page_mark(self, mark, x, y):
+        """Start dragging an anchor or a callout box. A release that never
+        moved is a click: on an anchor that jumps the notes to it."""
+        self._dismiss_selection_unless_lasso()
+        kind, idx = mark
+        if kind == "anchor":
+            self._anchor_dragging = idx
+            self._anchor_drag_moved = False
+        else:
+            # keep the grab point fixed within the box so it doesn't jump
+            self._callout_moving = idx
+            self._callout_move_moved = False
+            cpx, cpy = self._anchors[self.current_page_idx][idx]["callout"]
+            px, py = self._screen_to_pdf(x, y)
+            self._callout_move_offset = (cpx - px, cpy - py)
+        self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
 
     def _begin_tool(self, tool, start_x, start_y, chorded, additive=False):
         """Start `tool` at this point. Called only by the press router, so the
@@ -6086,8 +6090,9 @@ class PDFCanvas(Gtk.DrawingArea):
                 self._phone_end = (start_x, start_y)
             return
         if tool == "anchor":
-            # the anchor itself is dropped at press by _on_click_pressed;
-            # dragging on places a callout box at the release point
+            # the anchor drops at the press; dragging on places a callout box
+            # at the release point
+            self._drop_anchor(start_x, start_y)
             self._callout_dragging = True
             self._callout_start = (start_x, start_y)
             self._callout_cur = None
@@ -6120,35 +6125,6 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # ── the plain press of a drawing / selecting tool ────────────────────
         self._dismiss_selection_unless_lasso()
-        hit = self._anchor_hit_test(start_x, start_y)
-        if hit is not None:
-            # begin dragging the anchor; a release with no real movement is
-            # treated as a click that jumps the notes cursor (see drag-end)
-            self._anchor_dragging = hit
-            self._anchor_drag_moved = False
-            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
-            return
-        chit = self._callout_hit_test(start_x, start_y)
-        if chit is not None:
-            # begin dragging a callout box; keep the grab point fixed within
-            # the box so it doesn't jump to the cursor
-            self._callout_moving = chit
-            self._callout_move_moved = False
-            cpx, cpy = self._anchors[self.current_page_idx][chit]["callout"]
-            px, py = self._screen_to_pdf(start_x, start_y)
-            self._callout_move_offset = (cpx - px, cpy - py)
-            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
-            return
-        thit = self._textbox_hit_test(start_x, start_y)
-        if thit is not None:
-            # begin dragging a standalone text box (same feel as callouts)
-            self._textbox_moving = thit
-            self._textbox_move_moved = False
-            t = self._textboxes[self.current_page_idx][thit]
-            px, py = self._screen_to_pdf(start_x, start_y)
-            self._textbox_move_offset = (t["x"] - px, t["y"] - py)
-            self.set_cursor(Gdk.Cursor.new_from_name("grabbing", None))
-            return
         if self.select_mode:
             # plain drag selects text instead of drawing
             self._text_selecting = True
@@ -6459,18 +6435,11 @@ class PDFCanvas(Gtk.DrawingArea):
             if 0 <= self._callout_moving < len(anchors):
                 px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
                 ox, oy = self._callout_move_offset
-                anchors[self._callout_moving]["callout"] = (round(px + ox), round(py + oy))
-                self.queue_draw()
-            return
-        if self._textbox_moving is not None:
-            if math.hypot(offset_x, offset_y) >= 4:
-                self._textbox_move_moved = True
-            boxes = self._textboxes.get(self.current_page_idx, [])
-            if 0 <= self._textbox_moving < len(boxes):
-                px, py = self._screen_to_pdf(sx + offset_x, sy + offset_y)
-                ox, oy = self._textbox_move_offset
-                boxes[self._textbox_moving]["x"] = round(px + ox)
-                boxes[self._textbox_moving]["y"] = round(py + oy)
+                a = anchors[self._callout_moving]
+                a["callout"] = (round(px + ox), round(py + oy))
+                if a.get("textbox") is not None:
+                    # a legacy text box is ONE position: its anchor rides along
+                    a["x"], a["y"] = a["callout"]
                 self.queue_draw()
             return
         if self._callout_dragging:
@@ -6700,17 +6669,6 @@ class PDFCanvas(Gtk.DrawingArea):
                 cx, cy = anchors[idx]["callout"]
                 if self.on_callout_moved:
                     self.on_callout_moved(idx, cx, cy)
-            self.queue_draw()
-            return
-        if self._textbox_moving is not None:
-            idx = self._textbox_moving
-            self._textbox_moving = None
-            self.set_cursor(None)
-            self._hovering_anchor = False
-            boxes = self._textboxes.get(self.current_page_idx, [])
-            if self._textbox_move_moved and 0 <= idx < len(boxes):
-                if self.on_textbox_moved:
-                    self.on_textbox_moved(idx, boxes[idx]["x"], boxes[idx]["y"])
             self.queue_draw()
             return
         if self._ignoring:
@@ -10036,10 +9994,28 @@ def _parse_anchors(text):
     return result
 
 
+def _parse_page_marks(text):
+    """Every mark a page's notes put ON the page: the anchors, then any legacy
+    text boxes — in that order, so an anchor's index (and its number) is its
+    place among the `anchor:` markers alone.
+
+    A text box is not a kind of its own any more. `<!-- textbox:X:Y -->` (from
+    files written before row 56 was folded into callouts) reads as an anchor
+    whose callout box sits exactly on it — which is what a callout dragged
+    onto its anchor looks like — so one drawing, hit-test, drag and export
+    path serves both. `textbox` carries the marker's index, because moving
+    one rewrites THAT marker (an older Sidemark still reads the file)."""
+    marks = _parse_anchors(text)
+    for i, t in enumerate(_parse_textboxes(text)):
+        marks.append({**t, "callout": (t["x"], t["y"]), "textbox": i})
+    return marks
+
+
 def _parse_textboxes(text):
-    """Parse standalone text-box markers (`<!-- textbox:X:Y -->`, no anchor).
-    Returns one dict per box: {x, y, text, line, para_end} — the text is the
-    box's paragraph (up to the next blank line), markers stripped."""
+    """Parse legacy text-box markers (`<!-- textbox:X:Y -->`, no anchor) —
+    read through `_parse_page_marks`, never drawn on their own. Returns one
+    dict per box: {x, y, text, line, para_end} — the text is the box's
+    paragraph (up to the next blank line), markers stripped."""
     lines = text.split('\n')
     n_lines = len(lines)
     result = []
@@ -12816,19 +12792,20 @@ def _output_font_count(doc):
 
 def _draw_page_marks(out_page, notes_text, accent):
     """Draw a page's on-page marks into the given (copied) page: flatten ink to
-    content first, then text boxes, callout boxes, and numbered anchor circles on
-    top — same stacking as the canvas. Shared by the PDF export and the live
-    phone-share page render so both look identical."""
+    content first, then callout boxes (legacy text boxes among them), and
+    numbered anchor circles on top — same stacking as the canvas, and the same
+    rule that an anchor under its own box draws no circle. Shared by the PDF
+    export and the live phone-share page render so both look identical."""
     _flatten_ink(out_page)
-    anchors = _parse_anchors(notes_text)
-    for t in _parse_textboxes(notes_text):
-        if t["text"]:
-            _draw_export_textbox(out_page, t, accent)
-    for a in anchors:
+    marks = _parse_page_marks(notes_text)
+    covered = set()
+    for i, a in enumerate(marks):
         if a["callout"] and a["text"]:
-            _draw_export_callout(out_page, a, accent)
-    for i, a in enumerate(anchors):
-        _draw_export_anchor(out_page, a["x"], a["y"], i + 1, accent)
+            if _draw_export_callout(out_page, a, accent):
+                covered.add(i)
+    for i, a in enumerate(marks):
+        if i not in covered and a.get("textbox") is None:
+            _draw_export_anchor(out_page, a["x"], a["y"], i + 1, accent)
 
 
 def _export_pdf_with_notes(src_path, out_path, notes_model, include_empty,
@@ -13017,7 +12994,8 @@ def _draw_export_box_text(page, box, text, pad, fontsize):
 
 def _draw_export_callout(page, a, color):
     """Callout box with the anchor's paragraph text plus an arrow from the
-    anchor — same layout as the canvas rendering."""
+    anchor — same layout as the canvas rendering. Returns True when the anchor
+    is under the box (no arrow, and the caller draws no circle)."""
     fontsize = 8.5
     pad = 5.0
     box_w = 170.0
@@ -13046,22 +13024,7 @@ def _draw_export_callout(page, a, color):
 
     page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
     _draw_export_box_text(page, box, text, pad, fontsize)
-
-
-def _draw_export_textbox(page, t, color):
-    """A standalone text box (#56) in the export — a callout box without the
-    anchor/arrow, positioned at its own (x, y)."""
-    fontsize = 8.5
-    pad = 5.0
-    box_w = 170.0
-    page_rect = page.rect
-    text, box_h = _fit_export_box(page_rect, t["text"], box_w, pad, fontsize)
-
-    bx = min(max(t["x"], 0), page_rect.width - box_w)
-    by = min(max(t["y"], 0), page_rect.height - box_h)
-    box = fitz.Rect(bx, by, bx + box_w, by + box_h)
-    page.draw_rect(box, color=color, fill=(1, 1, 1), width=0.8, fill_opacity=0.95)
-    _draw_export_box_text(page, box, text, pad, fontsize)
+    return dist <= 1.0
 
 
 def _export_notes_blocks(notes_text):
@@ -19816,7 +19779,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
         self._mode_anchor = Gtk.Button()
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
-        self._mode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
+        self._mode_anchor.set_tooltip_text("Anchor / callout")
         self._mode_phoneview = Gtk.Button()
         self._mode_phoneview.set_child(_glyph(_draw_mode_phoneview, 20))
         self._mode_phoneview.set_tooltip_text(
@@ -19881,7 +19844,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
         self._pmode_anchor = Gtk.Button()
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
-        self._pmode_anchor.set_tooltip_text("Anchor / callout (Ctrl+Alt+click/drag)")
+        self._pmode_anchor.set_tooltip_text("Anchor / callout")
         self._pmode_phoneview = Gtk.Button()
         self._pmode_phoneview.set_child(_glyph(_draw_mode_phoneview, 20))
         self._pmode_phoneview.set_tooltip_text(
@@ -20382,8 +20345,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.on_anchor_moved = lambda *a: s.win._on_anchor_moved(*a)
         s.canvas.on_callout_placed = lambda *a: s.win._on_callout_placed(*a)
         s.canvas.on_callout_moved = lambda *a: s.win._on_callout_moved(*a)
-        s.canvas.on_textbox_placed = lambda *a: s.win._on_textbox_placed(*a)
-        s.canvas.on_textbox_moved = lambda *a: s.win._on_textbox_moved(*a)
         s.canvas.on_user_action = lambda *a: s.win._on_canvas_action(*a)
         s.canvas.on_canvas_press = lambda *a: s.win._clear_thumb_selection(*a)
         s.canvas.on_nav_history = lambda *a: s.win._on_nav_history(*a)
@@ -21063,9 +21024,6 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             ("Ctrl+C",        "Copy selected text"),
             ("Alt+Click",     "Follow link under cursor (footnote, citation, URL)"),
             ("Alt+Left",      "Back to where you were before following a link"),
-            ("Ctrl+Alt+Click","Place anchor marker in notes"),
-            ("Ctrl+Alt+Drag","Place anchor + callout box at drag end"),
-            ("Ctrl+Alt+Right-click","Place a standalone text box on the page"),
             ("Ctrl+T",       "Toggle outline / page-thumbnail sidebar"),
             ("Navigate",      None),
             ("PageDown",      "Next page"),
@@ -23248,12 +23206,16 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         page_idx = self.canvas.current_page_idx
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
-        parsed = _parse_anchors(text)
+        parsed = _parse_page_marks(text)
+        changed = parsed != self.canvas._anchors.get(page_idx)
         self.canvas._anchors[page_idx] = parsed
-        self.canvas._textboxes[page_idx] = _parse_textboxes(text)
         self._anchor_line_nos = [a["line"] for a in parsed]
         self._anchor_para_ends = [a["para_end"] for a in parsed]
         self._on_notes_cursor_moved(buf, None)
+        if changed:
+            # the notes ARE the marks: an edit that adds, removes or rewords
+            # one must repaint the page now, not at its next unrelated redraw
+            self.canvas.queue_draw()
 
     def _on_notes_cursor_moved(self, buf, _param):
         cursor_line = buf.get_iter_at_mark(buf.get_insert()).get_line()
@@ -23278,16 +23240,38 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mark_dirty()
 
     def _on_callout_placed(self, px, py):
+        """An anchor-tool drag ended: add the callout marker beside the anchor
+        dropped at its press. A callout whose paragraph is empty gets a
+        selected "Text" placeholder and the notes panel, so you type straight
+        into the box you just drew."""
         if self._last_anchor_mark is None:
             return
         buf = self._notes_view.get_buffer()
         it = buf.get_iter_at_mark(self._last_anchor_mark)
         buf.insert(it, f" <!-- callout:{px}:{py} -->")
+        line = buf.get_iter_at_mark(self._last_anchor_mark).get_line()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        mine = [a for a in _parse_anchors(text) if a["line"] == line]
+        if mine and not mine[-1]["text"]:
+            end = buf.get_iter_at_mark(self._last_anchor_mark)
+            if not end.ends_line():
+                end.forward_to_line_end()
+            buf.insert(end, "\nText")
+            ls = end.copy()               # revalidated: just past "Text"
+            ls.backward_chars(len("Text"))
+            buf.select_range(ls, end)
+            if not self._notes_toggle.get_active():
+                self._notes_toggle.set_active(True)   # reveal the panel to edit
+            self._notes_view.grab_focus()
         self._mark_dirty()
 
     def _on_callout_moved(self, idx, cx, cy):
-        """Rewrite the callout marker belonging to the idx-th anchor with its new
+        """Rewrite the callout marker belonging to the idx-th mark with its new
         position. The buffer's changed handler refreshes the canvas anchors."""
+        marks = self.canvas._anchors.get(self.canvas.current_page_idx, [])
+        if 0 <= idx < len(marks) and marks[idx].get("textbox") is not None:
+            self._on_textbox_moved(marks[idx]["textbox"], cx, cy)
+            return
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
         anchors = list(_ANCHOR_RE.finditer(text))
@@ -23321,36 +23305,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         buf.insert(start, f"<!-- anchor:{px}:{py} -->")
         self._mark_dirty()
 
-    def _on_textbox_placed(self, page_idx, px, py):
-        """Ctrl+Alt+right-click dropped a standalone text box. Insert its marker
-        and a placeholder paragraph in the notes and select the placeholder so
-        the user can type straight over it."""
-        buf = self._notes_view.get_buffer()
-        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
-        if text == "" or text.endswith("\n\n"):
-            prefix = ""
-        elif text.endswith("\n"):
-            prefix = "\n"
-        else:
-            prefix = "\n\n"
-        placeholder = "Text"
-        buf.insert(buf.get_end_iter(),
-                   f"{prefix}<!-- textbox:{px}:{py} -->\n{placeholder}\n")
-        # select the placeholder line so typing replaces it
-        end = buf.get_end_iter()
-        ok, ls = buf.get_iter_at_line(end.get_line() - 1)
-        if ok:
-            le = ls.copy()
-            if not le.ends_line():
-                le.forward_to_line_end()
-            buf.select_range(ls, le)
-        if not self._notes_toggle.get_active():
-            self._notes_toggle.set_active(True)   # reveal the panel to edit
-        self._notes_view.grab_focus()
-        self._mark_dirty()
-
     def _on_textbox_moved(self, idx, x, y):
-        """Rewrite the idx-th text-box marker with its new position."""
+        """Rewrite the idx-th legacy text-box marker with its new position —
+        the marker it was read from, so the file stays one an older Sidemark
+        reads (see _parse_page_marks)."""
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
         matches = list(_TEXTBOX_RE.finditer(text))

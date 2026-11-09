@@ -20,7 +20,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Just PDF and Markdown** — strokes save as native PDF ink annotations; notes save as a standard `.md` sidecar that's Obsidian-compatible and readable anywhere
 - **Markdown notes built for lectures** — a full Markdown editor sits beside the page, scoped to whichever page you're on, with fast inline math for the things that actually come up in a lecture: indices, exponents, and Greek letters (`x^2`, `\alpha`, `\sum` …)
 - **Open PowerPoints directly — and present on them** — a `.pptx` converts to PDF automatically with each slide's **speaker notes imported into the notes sidebar**; presenter view (`F5`) mirrors the slide to a second screen and shows your ink live while you teach
-- **Anchor notes to the page** — `Ctrl+Alt+click` drops a numbered marker that links an exact spot on the PDF to the matching paragraph in your notes; callouts render the note right on the page with an arrow
+- **Anchor notes to the page** — the **Anchor** tool drops a numbered marker that links an exact spot on the PDF to the matching paragraph in your notes; callouts render the note right on the page with an arrow
 - **Rearrange pages by drag-and-drop** — reorder, import, and export pages from the thumbnail sidebar by dragging (drag pages out to a file manager to export, drop a PDF in to insert), inspired by Apple's Preview
 - **GoodNotes-style lasso** — loop around existing ink to select it, then drag to move, recolour, or delete it as a single undo step
 
@@ -38,9 +38,8 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 ### Notes
 
 - **Live Markdown** with syntax highlighting, inline math (`x^2`, `\alpha`, `\sum` …) and formatting shortcuts (`Ctrl+B`, `Ctrl+I`, `Ctrl+E`). Task boxes (`- [ ]`) render as a checkbox you click to tick, and `Enter` carries a bullet, numbered or task list on to the next item. Symbols render for display only — the `.md` always keeps the source `\commands`, so notes round-trip cleanly through other editors. `Ctrl+±` / `Ctrl+scroll` zooms the notes font (remembered between sessions)
-- **Anchor markers** (`Ctrl+Alt+click`) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
-- **Callout boxes** (`Ctrl+Alt+drag`) — an anchor plus its note paragraph rendered in a box on the PDF, arrow included; drag the anchor or the box to reposition. Renders the same inline math and Markdown as the notes; included in exports
-- **Standalone text boxes** (`Ctrl+Alt+right-click`) — drop typed text straight on the page, no anchor; edit it in the notes panel, drag it to reposition; included in exports
+- **Anchor markers** (Anchor tool, click) — numbered circles placed on the PDF that link to the corresponding paragraph in your notes
+- **Callout boxes** (Anchor tool, drag) — an anchor plus its note paragraph rendered in a box on the PDF, arrow included; drag the anchor or the box to reposition, and drag the box over its own anchor for a plain text box. Renders the same inline math and Markdown as the notes; included in exports
 - **Notes that run over several pages** — tick **Continue from page N** in the notes header and this page shares the previous page's notes, so a thought started on slide 12 keeps going on 13 and 14 without copying anything. One tick carries on through the blank pages that follow, stopping where notes already exist; unticking splits the run from that page onwards
 - **Hide pages** — right-click a page in the thumbnail strip (or several, Ctrl+click) and hide it: hidden pages are skipped as you page through the document and while presenting, and are left out of an export — so one deck can produce a shorter handout. They stay in the file, dimmed in the strip, and unhide the same way
 - **Bookmarks** — mark a page with the bookmark button (or `Ctrl+B`): a name field opens with a suggestion ready to overtype, and `Enter` makes the bookmark (`Esc` cancels it); hold the button for a list of every mark to jump to. Your bookmarks appear in the outline with a ★ (tick "Bookmarks" there to hide them), so a deck with no outline of its own still gets one. Sidemark also reopens each document on the page you last read
@@ -193,11 +192,10 @@ pip install pymupdf
 | `Alt+↑` / `Alt+↓` | Move the current line (or selected lines) up / down |
 | `/date` `/time` `/now` | Type the snippet then Space/Enter — expands to today's date, the time, or both |
 | `Ctrl+\` | Toggle notes panel |
-| `Ctrl+Alt+click` | Place a numbered anchor on the PDF, linked to the note paragraph at the current cursor position |
+| Anchor tool: click | Place a numbered anchor on the PDF, linked to the note paragraph at the current cursor position |
 | Drag an anchor | Move a placed anchor to a new spot (a click without dragging still jumps to its note) |
 | Drag a callout box | Move a placed callout box to a new spot — the arrow re-aims from its anchor automatically |
-| `Ctrl+Alt+drag` | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
-| `Ctrl+Alt+right-click` | Drop a **standalone text box** on the page (no anchor) — type into the placeholder in the notes panel; drag the box to reposition |
+| Anchor tool: drag | Place an anchor **and** a callout box at the drag end — the anchor's note paragraph is rendered on the PDF with an arrow pointing from the anchor |
 
 ### Inline math (notes)
 
