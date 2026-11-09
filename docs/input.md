@@ -89,6 +89,14 @@
     the web port's `_onDown` is the same rule). Left only, so a finger bound
     to pan still pans across a callout. The `GestureClick` beside the drag
     decides nothing: it fires for a finger too and cannot tell it from left.
+  - **PDF text selection is ONE model, `PageText` (row 196)**: the page's
+    characters in MuPDF reading order. Hit-testing (`caret_at` — the LINE
+    first, then the character), the painted bands, the copied text and the
+    highlighter's "mark text" strokes all read the same segments, so what is
+    painted is what is copied and what is marked. Never derive a second
+    geometry (word boxes) for one of them. Multi-click counting is
+    `count_click`, shared with the text sheet. Shift+click extends only when
+    a Shift chord routes to the text cursor — by default Shift+left is zoom.
   - **The thumb is a real button**: button 10 never reaches a `GestureDrag`, so
     its press is replayed through the same router with a `_SyntheticDrag`.
     That is what lets it hold any tool instead of a hardwired pan.

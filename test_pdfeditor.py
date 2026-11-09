@@ -14561,67 +14561,214 @@ class TestToolModes(unittest.TestCase):
         self.assertEqual(ct(True, True, True, "text"), "lasso")
 
 
-class TestReadingOrderSelection(unittest.TestCase):
-    """#53: reading-order text selection picks the contiguous run between the
-    words nearest the press and release points, ordered by (block,line,word)."""
+def _text_line(block, x, y, text, cw=5.0, h=10.0):
+    """A synthetic PageText line: `text` in `cw`-wide cells from (x, y)."""
+    chars = [(x + k * cw, y, x + (k + 1) * cw, y + h, c)
+             for k, c in enumerate(text)]
+    return (block, (x, y, x + len(text) * cw, y + h), chars)
+
+
+class TestPageText(unittest.TestCase):
+    """Browser-style PDF selection (row 196), on a synthetic page: two
+    columns, the left one a two-line paragraph and a second paragraph."""
 
     def setUp(self):
-        self.canvas = PDFCanvas()
-        # synthetic two-line page; tuples are (x0,y0,x1,y1, word, block,line,word)
-        self.words = [
-            (10, 10,  50, 20, "Hello",  0, 0, 0),
-            (55, 10,  80, 20, "big",    0, 0, 1),
-            (85, 10, 130, 20, "world",  0, 0, 2),
-            (10, 30,  60, 40, "second", 0, 1, 0),
-            (65, 30,  95, 40, "text",   0, 1, 1),
-            (100, 30, 130, 40, "line",  0, 1, 2),
-        ]
-        self.canvas._page_words = list(self.words)
-        self.canvas._ordered_words = list(self.words)
+        self.pt = sidemark.PageText([
+            _text_line(0, 10, 10, "Hello big world"),       # line 0
+            _text_line(0, 10, 25, "second line here"),      # line 1
+            _text_line(1, 10, 50, "New para"),               # line 2
+            _text_line(2, 200, 10, "Right column"),          # line 3
+        ])
 
-    def test_default_style_is_reading(self):
-        self.assertEqual(PDFCanvas().select_style, "reading")
+    def _at(self, ch_index_in_line, line, frac=0.3):
+        """A point inside character k of a line (left part of its cell)."""
+        x0, y0, x1, y1, *_ = self.pt.chars[self.pt.lines[line][5] + ch_index_in_line]
+        return (x0 + (x1 - x0) * frac, (y0 + y1) / 2)
 
-    def test_nearest_word_index(self):
-        # a point inside "text" (the 5th word, index 4)
-        self.assertEqual(self.canvas._nearest_word_index(70, 35), 4)
-        # a point off the page, closest to "Hello"
-        self.assertEqual(self.canvas._nearest_word_index(-100, -100), 0)
+    def _str(self, lo, hi):
+        return "".join(self.pt.chars[i][4] for i in range(lo, hi))
 
-    def test_range_within_a_line(self):
-        # from inside "big" (idx1) to inside "world" (idx2)
-        sel = self.canvas._words_in_reading_range(60, 15, 110, 15)
-        self.assertEqual([w[4] for w in sel], ["big", "world"])
+    def test_a_selection_starts_and_ends_mid_word(self):
+        a, _ = self.pt.caret_at(*self._at(7, 0))      # inside "big", before "i"
+        b, _ = self.pt.caret_at(*self._at(12, 0))     # inside "world"
+        self.assertEqual(self._str(a, b), "ig wo")
 
-    def test_range_spans_lines_in_reading_order(self):
-        # from "big" (idx1) down to "second" (idx3) → contiguous run, not a rect
-        sel = self.canvas._words_in_reading_range(60, 15, 30, 35)
-        self.assertEqual([w[4] for w in sel], ["big", "world", "second"])
+    def test_past_the_end_of_a_line_is_the_end_of_that_line(self):
+        x1, y = self.pt.lines[0][2], self._at(0, 0)[1]
+        caret, li = self.pt.caret_at(x1 + 20, y)      # right of it, nearer than column 2
+        self.assertEqual(li, 0)
+        self.assertEqual(caret, self.pt.lines[0][6])
 
-    def test_range_is_order_independent(self):
-        a = self.canvas._words_in_reading_range(60, 15, 30, 35)
-        b = self.canvas._words_in_reading_range(30, 35, 60, 15)
-        self.assertEqual(a, b)
+    def test_the_margin_beside_a_line_means_that_line(self):
+        _x, y = self._at(0, 1)
+        self.assertEqual(self.pt.line_at(-40, y), 1)
 
-    def test_drag_update_branches_on_style(self):
-        c = self.canvas
-        calls = []
-        c._words_in_rect = lambda *a: (calls.append("rect"), [])[1]
-        c._words_in_reading_range = lambda *a: (calls.append("reading"), [])[1]
+    def test_between_lines_picks_the_nearer_one(self):
+        y0_line1 = self.pt.lines[1][1]
+        self.assertEqual(self.pt.line_at(30, y0_line1 - 1), 1)
+        self.assertEqual(self.pt.line_at(30, self.pt.lines[0][3] + 1), 0)
+
+    def test_the_gutter_picks_the_nearer_column(self):
+        _x, y = self._at(0, 0)
+        right_x0 = self.pt.lines[3][0]
+        self.assertEqual(self.pt.line_at(right_x0 - 5, y), 3)
+
+    def test_a_double_click_takes_the_word_and_a_drag_grows_by_words(self):
+        caret, li = self.pt.caret_at(*self._at(7, 0))
+        word = self.pt.unit_bounds(caret, 2, li)
+        self.assertEqual(self._str(*word), "big")
+        to, li2 = self.pt.caret_at(*self._at(12, 0))  # mid "world"
+        self.assertEqual(self._str(*self.pt.extend(word, to, 2, li2)), "big world")
+        back, li3 = self.pt.caret_at(*self._at(2, 0))  # mid "Hello"
+        self.assertEqual(self._str(*self.pt.extend(word, back, 2, li3)), "Hello big")
+
+    def test_a_double_click_past_a_line_end_takes_that_lines_last_word(self):
+        caret, li = self.pt.caret_at(self.pt.lines[0][2] + 50, self._at(0, 0)[1])
+        self.assertEqual(self._str(*self.pt.unit_bounds(caret, 2, li)), "world")
+
+    def test_a_triple_click_takes_the_paragraph(self):
+        caret, li = self.pt.caret_at(*self._at(3, 1))
+        lo, hi = self.pt.unit_bounds(caret, 3, li)
+        self.assertEqual(self.pt.text(self.pt.segments(lo, hi)),
+                         "Hello big world second line here")
+
+    def test_a_line_paints_as_one_even_band(self):
+        segs = self.pt.segments(*self.pt.block_bounds(0))
+        self.assertEqual(len(segs), 2)
+        for seg in segs:
+            _x0, y0, _x1, y1 = self.pt.band(seg)
+            line = self.pt.lines[seg[0]]
+            self.assertEqual((y0, y1), (line[1], line[3]))
+
+    def test_copy_joins_lines_and_separates_paragraphs(self):
+        lo = self.pt.lines[1][5]
+        hi = self.pt.lines[2][6]
+        self.assertEqual(self.pt.text(self.pt.segments(0, hi)),
+                         "Hello big world second line here\n\nNew para")
+        self.assertEqual(self.pt.text(self.pt.segments(lo, hi), keep_lines=True),
+                         "second line here\nNew para")
+
+    def test_copy_rejoins_a_word_hyphenated_at_a_line_end(self):
+        pt = sidemark.PageText([_text_line(0, 0, 0, "text with an algo-"),
+                                _text_line(0, 0, 12, "rithm and an Anti-"),
+                                _text_line(0, 0, 24, "Pattern")])
+        self.assertEqual(pt.text(pt.segments(0, len(pt.chars))),
+                         "text with an algorithm and an Anti- Pattern")
+
+    def test_copy_keeps_a_line_that_ended_short(self):
+        pt = sidemark.PageText([_text_line(0, 0, 0, "first item of a list"),
+                                _text_line(0, 0, 12, "two"),
+                                _text_line(0, 0, 24, "a much longer line that really wraps"),
+                                _text_line(0, 0, 36, "on")])
+        self.assertEqual(pt.text(pt.segments(0, len(pt.chars))),
+                         "first item of a list\ntwo\n"
+                         "a much longer line that really wraps on")
+
+    def test_lines_on_one_row_join_however_short(self):
+        """A numbered heading is often two lines to the PDF: "7.2" and its
+        title, side by side."""
+        pt = sidemark.PageText([_text_line(0, 0, 0, "7.2"),
+                                _text_line(0, 30, 0, "A heading title here"),
+                                _text_line(0, 0, 12, "7.3"),
+                                _text_line(0, 30, 12, "Next one")])
+        self.assertEqual(pt.text(pt.segments(0, len(pt.chars))),
+                         "7.2 A heading title here 7.3 Next one")
+
+    def test_the_rect_style_takes_what_the_marquee_touches(self):
+        segs = self.pt.rect_segments(10, 10, 32, 40)   # first ~4 cells, 2 lines
+        self.assertEqual([self._str(a, b) for _l, a, b in segs], ["Hello", "secon"])
+
+    def test_reads_a_real_page_with_ligatures_expanded(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.pdf")
+            doc = fitz.open()
+            page = doc.new_page()
+            page.insert_text((72, 100), "first office line")
+            page.insert_text((72, 300), "far below")
+            doc.save(path)
+            doc.close()
+            doc = fitz.open(path)
+            pt = sidemark.PageText.from_page(doc[0])
+            text = pt.text(pt.segments(0, len(pt.chars)))
+            doc.close()
+        self.assertIn("first office line", text)
+        self.assertIn("far below", text)
+
+
+class TestPdfTextSelection(unittest.TestCase):
+    """The canvas end: a press starts a caret, a drag selects, clicks count."""
+
+    def setUp(self):
+        self.canvas = c = PDFCanvas()
+        f = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        make_pdf(f.name)
+        c.load(f.name)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c._page_text_cache = sidemark.PageText([
+            _text_line(0, 10, 10, "Hello big world"),
+            _text_line(0, 10, 25, "second line here")])
+        c.bindings.bind("left", "text")
+
+    def _drag(self, t=1000):
         g = mock.Mock()
-        g.get_start_point.return_value = (True, 100, 100)
-        c._text_selecting = True
-        c.select_style = "reading"
-        c._on_drag_update(g, 20, 20)
-        c.select_style = "rect"
-        c._on_drag_update(g, 20, 20)
-        self.assertEqual(calls, ["reading", "rect"])
+        g.get_current_button.return_value = 1
+        ev = types.SimpleNamespace(get_time=lambda: t,
+                                   get_event_sequence=lambda: None,
+                                   get_device_tool=lambda: None)
+        g.get_current_event.return_value = ev
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        return g
+
+    def _selected(self):
+        return self.canvas._page_text().text(self.canvas._text_segments)
+
+    def test_a_drag_selects_from_mid_word_to_mid_word(self):
+        c = self.canvas
+        g = self._drag()
+        g.get_start_point.return_value = (True, 46.5, 15)    # inside "big"
+        c._on_drag_begin(g, 46.5, 15)
+        c._on_drag_update(g, 30, 15)                          # to (76.5, 30): mid "he"
+        c._on_drag_end(g, 30, 15)
+        self.assertEqual(self._selected(), "ig world second line h")
+
+    def test_a_plain_click_leaves_no_selection(self):
+        c = self.canvas
+        g = self._drag()
+        g.get_start_point.return_value = (True, 46.5, 15)
+        c._on_drag_begin(g, 46.5, 15)
+        c._on_drag_update(g, 1, 0)
+        c._on_drag_end(g, 1, 0)
+        self.assertFalse(c.has_text_selection())
+
+    def test_double_and_triple_click(self):
+        c = self.canvas
+        for n, want in ((1, ""), (2, "big"), (3, "Hello big world second line here")):
+            g = self._drag(t=1000 + n)                        # within the click gap
+            g.get_start_point.return_value = (True, 47.5, 15)
+            c._on_drag_begin(g, 47.5, 15)
+            c._on_drag_end(g, 0, 0)
+            with self.subTest(clicks=n):
+                self.assertEqual(self._selected(), want)
+
+    def test_copy_puts_the_selection_on_the_clipboard_text(self):
+        c = self.canvas
+        got = []
+        c.on_text_copied = got.append
+        g = self._drag()
+        g.get_start_point.return_value = (True, 10, 15)
+        c._on_drag_begin(g, 10, 15)
+        c._on_drag_update(g, 100, 0)                          # past the line end
+        c._on_drag_end(g, 100, 0)
+        c.copy_text_selection()
+        self.assertEqual(got, ["Hello big world"])
 
 
 class TestTextHighlight(unittest.TestCase):
-    """#54 cheap tier: the highlighter's 'text' style selects words (reading
-    order) and lays one wide highlight ink stroke per text line over them,
-    reusing the whole ink pipeline (save / eraser / undo)."""
+    """The highlighter's 'text' style marks the same selection the text cursor
+    makes and lays one wide highlight ink stroke per line over it, reusing the
+    whole ink pipeline (save / eraser / undo)."""
 
     def setUp(self):
         self.canvas = PDFCanvas()
@@ -14630,17 +14777,9 @@ class TestTextHighlight(unittest.TestCase):
         make_pdf(self._tmp)
         self.canvas.load(self._tmp)
         self.canvas._fit_page(800, 600)
-        # two lines, three words each: (x0,y0,x1,y1, word, block,line,word)
-        self.words = [
-            (10, 10,  50, 20, "Hello",  0, 0, 0),
-            (55, 10,  80, 20, "big",    0, 0, 1),
-            (85, 10, 130, 20, "world",  0, 0, 2),
-            (10, 30,  60, 40, "second", 0, 1, 0),
-            (65, 30,  95, 40, "text",   0, 1, 1),
-            (100, 30, 130, 40, "line",  0, 1, 2),
-        ]
-        self.canvas._page_words = list(self.words)
-        self.canvas._ordered_words = list(self.words)
+        self.pt = sidemark.PageText([_text_line(0, 10, 10, "Hello big world"),
+                                     _text_line(0, 10, 30, "second text line")])
+        self.canvas._page_text_cache = self.pt
 
     def tearDown(self):
         os.unlink(self._tmp)
@@ -14673,30 +14812,22 @@ class TestTextHighlight(unittest.TestCase):
         self.assertFalse(c._text_highlighting)
         self.assertEqual(len(c.current_stroke), 1)
 
-    def test_commit_lays_one_stroke_per_line(self):
+    def test_commit_lays_one_stroke_per_line_over_what_was_painted(self):
         c = self.canvas
-        c._selected_words = list(self.words)   # spans two lines
+        c._text_segments = self.pt.segments(6, 26)    # "big world" .. "second te"
+        bands = [self.pt.band(s) for s in c._text_segments]
         c._commit_text_highlight()
         self.assertEqual(len(c.strokes), 2)
-        for s in c.strokes:
+        for s, (x0, y0, x1, y1) in zip(c.strokes, bands):
             self.assertEqual(s["color"], c.hl_color)
             self.assertEqual(s["opacity"], c.hl_opacity)
-            self.assertEqual(len(s["pts"]), 2)
-            self.assertGreater(s["width"], 0)
-
-    def test_stroke_spans_the_line_word_boxes(self):
-        c = self.canvas
-        line0 = [w for w in self.words if w[6] == 0]
-        c._selected_words = list(line0)
-        c._commit_text_highlight()
-        (x0, ymid), (x1, _) = c.strokes[-1]["pts"]
-        self.assertAlmostEqual(x0, min(w[0] for w in line0))
-        self.assertAlmostEqual(x1, max(w[2] for w in line0))
-        self.assertAlmostEqual(c.strokes[-1]["width"], 10.0)  # word height
+            (sx0, _), (sx1, _) = s["pts"]
+            self.assertEqual((sx0, sx1), (x0, x1))
+            self.assertEqual(s["width"], y1 - y0)
 
     def test_single_undo_removes_whole_highlight(self):
         c = self.canvas
-        c._selected_words = list(self.words)
+        c._text_segments = self.pt.segments(0, len(self.pt.chars))
         c._commit_text_highlight()
         self.assertEqual(len(c.strokes), 2)
         c.undo_last()
@@ -14706,7 +14837,7 @@ class TestTextHighlight(unittest.TestCase):
 
     def test_empty_selection_commits_nothing(self):
         c = self.canvas
-        c._selected_words = []
+        c._text_segments = []
         c._commit_text_highlight()
         self.assertEqual(len(c.strokes), 0)
         self.assertEqual(len(c._undo_stack), 0)

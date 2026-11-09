@@ -3687,6 +3687,264 @@ def draw_snap_label(ctx, sx, sy, text, accent):
 IMAGE_OCG_NAME = "Sidemark images"
 
 
+# ── PDF text selection, browser style (row 196) ──────────────────────────────
+
+def count_click(last, event, x, y):
+    """`(count, new_last)` for a press: 1, 2 or 3, counted the way
+    GtkGestureClick counts, from `last` = (time, x, y, count) of the previous
+    press. Shared by the text sheet and the PDF canvas, whose routers claim
+    every press and so have no click gesture to ask.
+
+    It reads the user's OWN thresholds out of GtkSettings rather than
+    hardcoding a pair, so a double-click takes as long as a double-click
+    anywhere else on their desktop. GTK4 offers no help from the event
+    itself: it dropped GTK3's DOUBLE/TRIPLE_BUTTON_PRESS event types."""
+    now = event.get_time() if event is not None else 0
+    st = Gtk.Settings.get_default()
+    gap = st.get_property("gtk-double-click-time") if st else 400
+    near = st.get_property("gtk-double-click-distance") if st else 5
+    last_t, last_x, last_y, count = last
+    if now - last_t <= gap and math.hypot(x - last_x, y - last_y) <= near:
+        count = count % 3 + 1       # GTK cycles rather than climbing
+    else:
+        count = 1
+    return count, (now, x, y, count)
+
+
+def _char_class(c):
+    """What a double-click groups: a run of word characters, of spaces, or of
+    anything else."""
+    if c.isspace():
+        return 0
+    if c.isalnum() or c in "_'’":
+        return 1
+    return 2
+
+
+class PageText:
+    """A PDF page's text as CHARACTERS in reading order — what lets selection
+    feel like a browser's: it starts and ends mid-word, finds the LINE under
+    the pointer before the character, paints one band per line and copies
+    paragraphs as paragraphs.
+
+    `chars` is [(x0, y0, x1, y1, c, line)], `lines` is
+    [(x0, y0, x1, y1, block, start, end)] with the line's characters at
+    `chars[start:end]`. A CARET is an index into `chars` (0..len): the gap
+    before that character. A selection is a caret range [lo, hi), and what is
+    painted and copied is its SEGMENTS: (line, a, b) character ranges.
+
+    Reading order is MuPDF's own block order — right for nearly every PDF a
+    word processor or LaTeX writes, columns included, since MuPDF segments
+    columns into blocks.
+    ceiling: horizontal text only; a rotated line's characters are still
+    selectable but the caret is placed by x. Handle `line["dir"]` if a
+    rotated table ever matters."""
+
+    # vertical distance counts double when picking a line: lines stack
+    # tightly, margins are wide, and a pointer beside a line means THAT line
+    LINE_PICK_DY_WEIGHT = 2.0
+    # a line ending this far (as a fraction of its paragraph's width) short of
+    # the paragraph's right edge did not WRAP — it ended: a list item, an
+    # address line, a paragraph's last line. Copy keeps that break.
+    SHORT_LINE_FRAC = 0.15
+
+    def __init__(self, lines):
+        """`lines`: [(block, (x0, y0, x1, y1), [(x0, y0, x1, y1, c), ...])]."""
+        self.chars, self.lines = [], []
+        for block, (x0, y0, x1, y1), chars in lines:
+            if not chars:
+                continue
+            start = len(self.chars)
+            li = len(self.lines)
+            self.chars.extend((*ch[:4], ch[4], li) for ch in chars)
+            self.lines.append((x0, y0, x1, y1, block, start, len(self.chars)))
+        self._block_x = {}             # block -> (left, right) of its lines
+        for x0, _y0, x1, _y1, block, *_ in self.lines:
+            lo, hi = self._block_x.get(block, (x0, x1))
+            self._block_x[block] = (min(lo, x0), max(hi, x1))
+
+    @classmethod
+    def from_page(cls, page):
+        """Read a fitz page. Ligatures are EXPANDED (no TEXT_PRESERVE_LIGATURES)
+        so "ﬁ" copies as "fi" and each letter has its own box to stop on."""
+        flags = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP
+        lines = []
+        for block_no, block in enumerate(
+                page.get_text("rawdict", flags=flags)["blocks"]):
+            if block.get("type", 0) != 0:
+                continue
+            for line in block["lines"]:
+                chars = [(*ch["bbox"], ch["c"]) for span in line["spans"]
+                         for ch in span["chars"]]
+                lines.append((block_no, tuple(line["bbox"]), chars))
+        return cls(lines)
+
+    # ── hit-testing ──────────────────────────────────────────────────────────
+
+    def line_at(self, px, py):
+        """The line a pointer means: the one it is over, else the nearest —
+        where a vertical miss costs double, so the margin beside a line picks
+        that line and the gutter between columns picks the nearer column."""
+        best, best_d = None, float("inf")
+        for li, (x0, y0, x1, y1, *_rest) in enumerate(self.lines):
+            dx = max(x0 - px, 0.0, px - x1)
+            dy = max(y0 - py, 0.0, py - y1)
+            d = dx + self.LINE_PICK_DY_WEIGHT * dy
+            if d < best_d:
+                best, best_d = li, d
+        return best
+
+    def caret_at(self, px, py):
+        """`(caret, line)` a pointer puts down: on its line, before the first
+        character whose middle is right of it — so past the end of a line is
+        the END of that line, as in a browser. The line comes along because a
+        caret at a line's end has the same index as the next line's start,
+        and a double-click there means THIS line's last word."""
+        li = self.line_at(px, py)
+        if li is None:
+            return 0, None
+        start, end = self.lines[li][5], self.lines[li][6]
+        for i in range(start, end):
+            x0, _y0, x1 = self.chars[i][:3]
+            if (x0 + x1) / 2 > px:
+                return i, li
+        return end, li
+
+    # ── units a click grows to ───────────────────────────────────────────────
+
+    def _line_of_caret(self, i, li=None):
+        """The line a caret belongs to and the character to classify there —
+        the character before it when the caret ends line `li`."""
+        if li is not None and i >= self.lines[li][6]:
+            return li, self.lines[li][6] - 1
+        i = max(0, min(i, len(self.chars) - 1))
+        return self.chars[i][5], i
+
+    def word_bounds(self, i, li=None):
+        """(lo, hi) of the run of same-class characters at caret `i`, within
+        its line."""
+        if not self.chars:
+            return (0, 0)
+        li, i = self._line_of_caret(i, li)
+        start, end = self.lines[li][5], self.lines[li][6]
+        k = _char_class(self.chars[i][4])
+        lo = i
+        while lo > start and _char_class(self.chars[lo - 1][4]) == k:
+            lo -= 1
+        hi = i + 1
+        while hi < end and _char_class(self.chars[hi][4]) == k:
+            hi += 1
+        return (lo, hi)
+
+    def block_bounds(self, i, li=None):
+        """(lo, hi) of the paragraph (MuPDF block) at caret `i`."""
+        if not self.chars:
+            return (0, 0)
+        li, _i = self._line_of_caret(i, li)
+        block = self.lines[li][4]
+        same = [ln for ln in self.lines if ln[4] == block]
+        return (same[0][5], same[-1][6])
+
+    def unit_bounds(self, i, granularity, li=None):
+        """The unit a click of `granularity` (1 char, 2 word, 3 paragraph)
+        takes at caret `i` — a bare caret for a single click."""
+        if granularity == 2:
+            return self.word_bounds(i, li)
+        if granularity == 3:
+            return self.block_bounds(i, li)
+        return (i, i)
+
+    def extend(self, anchor, focus, granularity, li=None):
+        """The range from an anchor UNIT to a focus caret, grown at the focus
+        end to whole units — so a double-click drag selects word by word and a
+        triple-click drag paragraph by paragraph."""
+        alo, ahi = anchor
+        flo, fhi = self.unit_bounds(focus, granularity, li)
+        if focus >= alo:
+            return (alo, max(ahi, fhi))
+        return (flo, ahi)
+
+    # ── what a range paints and copies ───────────────────────────────────────
+
+    def segments(self, lo, hi):
+        """[(line, a, b)] — the characters of [lo, hi) split by line."""
+        out = []
+        for li, (*_box, _block, start, end) in enumerate(self.lines):
+            a, b = max(lo, start), min(hi, end)
+            if a < b:
+                out.append((li, a, b))
+        return out
+
+    def rect_segments(self, x0, y0, x1, y1):
+        """The rectangular style: on each line, the run of characters whose
+        boxes the rectangle touches."""
+        rx0, rx1 = min(x0, x1), max(x0, x1)
+        ry0, ry1 = min(y0, y1), max(y0, y1)
+        out = []
+        for li, (*_box, _block, start, end) in enumerate(self.lines):
+            hit = [i for i in range(start, end)
+                   if self.chars[i][0] < rx1 and self.chars[i][2] > rx0
+                   and self.chars[i][1] < ry1 and self.chars[i][3] > ry0]
+            if hit:
+                out.append((li, hit[0], hit[-1] + 1))
+        return out
+
+    def band(self, seg):
+        """The rectangle a segment paints: its characters' horizontal extent
+        at its LINE's full height, so a line's highlight is one even band."""
+        li, a, b = seg
+        _x0, y0, _x1, y1 = self.lines[li][:4]
+        return (self.chars[a][0], y0, self.chars[b - 1][2], y1)
+
+    def text(self, segments, keep_lines=False):
+        """The text of `segments` as a reader means it: lines of a paragraph
+        joined with a space, a word hyphenated across a line end rejoined,
+        a line that ended short kept as a line, paragraphs separated by a
+        blank line. `keep_lines` (the rectangular style, usually a table
+        column) keeps one line per line instead.
+        ceiling: a table of contents is one paragraph of full-width lines to
+        the PDF, so its entries join; rectangular selection copies one per
+        line."""
+        out = []
+        prev_block = prev_line = None
+        for li, a, b in segments:
+            piece = "".join(self.chars[i][4] for i in range(a, b))
+            block = self.lines[li][4]
+            if not out:
+                out.append(piece.strip())
+            elif keep_lines:
+                out.append("\n" + piece.strip())
+            elif block != prev_block:
+                out[-1] = out[-1].rstrip()
+                out.append("\n\n" + piece.strip())
+            else:
+                last = out[-1].rstrip()
+                nxt = piece.strip()
+                left, right = self._block_x[block]
+                _px0, py0, px1, py1 = self.lines[prev_line][:4]
+                ymid = (self.lines[li][1] + self.lines[li][3]) / 2
+                same_row = py0 <= ymid <= py1    # "7.2" beside its title
+                ended_short = px1 < right - self.SHORT_LINE_FRAC * (right - left)
+                if same_row:
+                    out[-1] = last
+                    out.append(" " + nxt)
+                elif last.endswith("\u00ad"):          # a soft hyphen: always joins
+                    out[-1] = last[:-1]
+                    out.append(nxt)
+                elif ended_short:
+                    out[-1] = last
+                    out.append("\n" + nxt)
+                elif (last.endswith("-") and len(last) > 1 and last[-2].isalpha()
+                      and nxt[:1].islower()):
+                    out[-1] = last[:-1]                # "algo-" + "rithm"
+                    out.append(nxt)
+                else:
+                    out[-1] = last
+                    out.append(" " + nxt)
+            prev_block, prev_line = block, li
+        return "".join(out).strip()
+
+
 # ── view history: back / forward through where you were (row 195) ────────────
 # One per surface (a PDF canvas, a text sheet), so one per tab. A STEP is one
 # continuous movement — a drag, a pinch, a burst of scrolling, zooming or page
@@ -4104,9 +4362,16 @@ class PDFCanvas(Gtk.DrawingArea):
         # "text" style): same word-selection path, but commits highlight ink
         self._text_highlighting = False
         self._alt_start = (0.0, 0.0)
-        self._selected_words = []   # fitz word tuples currently highlighted
-        self._page_words = []       # cached for current page
-        self._ordered_words = []    # _page_words sorted in reading order (block,line,word)
+        # text selection (row 196): the page's PageText, built by the first
+        # press that needs it, and the selection as painted segments
+        self._page_text_cache = None
+        self._text_segments = []     # [(line, a, b)] into _page_text()
+        self._sel_anchor = (0, 0)    # the unit the press took, as a caret range
+        self._sel_gran = 1           # 1 char, 2 word, 3 paragraph
+        self._sel_range = None       # the live (lo, hi); None for the rect style
+        self._sel_extending = False  # this press Shift-extended the selection
+        self._last_text_click = (0, 0.0, 0.0, 0)
+        self._press_event = None     # the event of the press being routed
         # "reading" = press-to-release contiguous run (like a normal PDF viewer);
         # "rect" = rectangular marquee. Long-press the select tool to switch.
         self.select_style = "reading"
@@ -4277,11 +4542,9 @@ class PDFCanvas(Gtk.DrawingArea):
             self._needs_fit = False   # caller keeps zoom and positions the view
         else:
             self._needs_fit = True    # re-fit on first draw with real canvas dimensions
-        self._page_words = self.page.get_text("words")   # cache for text selection
-        # reading order: MuPDF segments columns into separate blocks, so
-        # (block, line, word) gives column-first order for free
-        self._ordered_words = sorted(self._page_words, key=lambda w: (w[5], w[6], w[7]))
-        self._selected_words = []
+        self._page_text_cache = None    # read lazily: most pages are never selected on
+        self._text_segments = []
+        self._sel_range = None
         self.queue_draw()
         if self.on_page_changed:
             self.on_page_changed(idx, self.n_pages)
@@ -4953,15 +5216,17 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.fill()
             ctx.restore()
 
-        # word-selection highlights
-        if self._selected_words:
+        # text selection: one even band per line
+        if self._text_segments:
             ctx.save()
             ctx.translate(self.offset_x, self.offset_y)
             ctx.scale(self.scale, self.scale)
             ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
-            for w in self._selected_words:
-                ctx.rectangle(w[0], w[1], w[2] - w[0], w[3] - w[1])
-                ctx.fill()
+            pt = self._page_text()
+            for seg in self._text_segments:
+                x0, y0, x1, y1 = pt.band(seg)
+                ctx.rectangle(x0, y0, x1 - x0, y1 - y0)
+            ctx.fill()
             ctx.restore()
 
         # hovered link highlight (Alt held)
@@ -6097,7 +6362,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._panning = False
         self._text_selecting = False
         self._zoom_selecting = False
-        self._selected_words = []
+        self._text_segments = []
+        self._press_event = gesture.get_current_event()
         if mark is not None:
             self._press_tool = None
             self._grab_page_mark(mark, start_x, start_y)
@@ -6210,9 +6476,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._lasso_press(start_x, start_y, additive=additive)
             return
         if tool == "text" and chorded:
-            self._text_selecting = True
-            self._alt_start = (start_x, start_y)
-            self.grab_focus()
+            self._begin_text_select(start_x, start_y)
             return
         if tool == "highlighter" and chorded:
             # a one-off highlighter stroke that ignores the sticky style
@@ -6228,18 +6492,12 @@ class PDFCanvas(Gtk.DrawingArea):
         self._dismiss_selection_unless_lasso()
         if self.select_mode:
             # plain drag selects text instead of drawing
-            self._text_selecting = True
-            self._alt_start = (start_x, start_y)
-            self.grab_focus()
+            self._begin_text_select(start_x, start_y)
             return
         if self.highlighter and self.highlight_style == "text":
-            # highlighter "text" style: drag selects words (reading order)
-            # and commits highlight ink over them on release
-            self._text_selecting = True
-            self._text_highlighting = True
-            self._alt_start = (start_x, start_y)
-            self._selected_words = []
-            self.grab_focus()
+            # highlighter "text" style: drag selects text (reading order)
+            # and commits highlight ink over it on release
+            self._begin_text_select(start_x, start_y, highlight=True)
             return
         self._cancel_straight_timer()
         self._straight_mode = False
@@ -6634,15 +6892,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self.queue_draw()
             return
         if self._text_selecting:
-            px0, py0 = self._screen_to_pdf(sx, sy)
-            px1, py1 = self._screen_to_pdf(sx + offset_x, sy + offset_y)
-            if self.select_style == "rect" and not self._text_highlighting:
-                self._selected_words = self._words_in_rect(px0, py0, px1, py1)
-            else:
-                # text-highlight always follows reading order, regardless of the
-                # select tool's rectangular/reading-order preference
-                self._selected_words = self._words_in_reading_range(px0, py0, px1, py1)
-            self.queue_draw()
+            self._update_text_select(sx + offset_x, sy + offset_y)
             return
         if self._phone_selecting:
             self._phone_end = (sx + offset_x, sy + offset_y)
@@ -6870,7 +7120,13 @@ class PDFCanvas(Gtk.DrawingArea):
             if self._text_highlighting:
                 self._text_highlighting = False
                 self._commit_text_highlight()
-            elif abs(offset_x) < 8 and abs(offset_y) < 8:
+            elif (abs(offset_x) < 8 and abs(offset_y) < 8
+                  and self._sel_gran == 1 and not self._sel_extending):
+                # a plain click: no selection (as in a browser), and the
+                # caret's click follows a link under it
+                self._text_segments = []
+                self._sel_range = None
+                self.queue_draw()
                 sx, sy = self._alt_start
                 self._open_link_at(sx, sy)
             else:
@@ -7093,71 +7349,80 @@ class PDFCanvas(Gtk.DrawingArea):
                    for s in sibs if s is not new_stroke]
         self._undo_stack.append(("grid", page, new_stroke, entries))
 
-    def _words_in_rect(self, px0, py0, px1, py1):
-        """Return fitz word tuples whose bounding boxes overlap the given PDF rect."""
-        rx0, rx1 = min(px0, px1), max(px0, px1)
-        ry0, ry1 = min(py0, py1), max(py0, py1)
-        return [w for w in self._page_words
-                if w[0] < rx1 and w[2] > rx0 and w[1] < ry1 and w[3] > ry0]
+    def _page_text(self):
+        """This page's PageText, read on first use."""
+        if self._page_text_cache is None:
+            self._page_text_cache = (PageText.from_page(self.page)
+                                     if self.page is not None else PageText([]))
+        return self._page_text_cache
 
-    @staticmethod
-    def _word_point_dist2(w, px, py):
-        """Squared distance from point to a word's bounding box (0 if inside)."""
-        dx = max(w[0] - px, 0.0, px - w[2])
-        dy = max(w[1] - py, 0.0, py - w[3])
-        return dx * dx + dy * dy
+    def has_text_selection(self):
+        return bool(self._text_segments)
 
-    def _nearest_word_index(self, px, py):
-        """Index into self._ordered_words of the word nearest the given point."""
-        best_i, best_d = 0, float("inf")
-        for i, w in enumerate(self._ordered_words):
-            d = self._word_point_dist2(w, px, py)
-            if d < best_d:
-                best_d, best_i = d, i
-        return best_i
+    def _begin_text_select(self, x, y, highlight=False):
+        """A press of the text cursor (or the text-marking highlighter), the
+        way a browser takes one: a caret where you pressed, the WORD for a
+        double-click and the PARAGRAPH for a triple-click — a drag from either
+        then grows by that unit — and Shift extends the selection you had."""
+        self._text_selecting = True
+        self._text_highlighting = highlight
+        self._alt_start = (x, y)
+        self.grab_focus()
+        pt = self._page_text()
+        caret, li = pt.caret_at(*self._screen_to_pdf(x, y))
+        count, self._last_text_click = count_click(
+            self._last_text_click, self._press_event, x, y)
+        self._sel_extending = (count == 1 and not highlight and self._shift_held
+                               and self._sel_range is not None)
+        if self._sel_extending:
+            rng = pt.extend(self._sel_anchor, caret, self._sel_gran, li)
+        else:
+            self._sel_gran = count
+            self._sel_anchor = pt.unit_bounds(caret, count, li)
+            rng = self._sel_anchor
+        self._set_text_range(rng)
 
-    def _words_in_reading_range(self, px0, py0, px1, py1):
-        """Contiguous reading-order run between the words nearest press & release."""
-        if not self._ordered_words:
-            return []
-        i = self._nearest_word_index(px0, py0)
-        j = self._nearest_word_index(px1, py1)
-        lo, hi = min(i, j), max(i, j)
-        return self._ordered_words[lo:hi + 1]
+    def _set_text_range(self, rng):
+        self._sel_range = rng
+        self._text_segments = self._page_text().segments(*rng)
+        self.queue_draw()
+
+    def _update_text_select(self, x, y):
+        """The pointer moved during a text press: the focus follows it. The
+        rectangular style (the select tool's alternative) takes the characters
+        under a marquee instead; marking text with the highlighter always
+        reads in order."""
+        pt = self._page_text()
+        if (self.select_style == "rect" and not self._text_highlighting
+                and self._sel_gran == 1 and not self._sel_extending):
+            p0 = self._screen_to_pdf(*self._alt_start)
+            p1 = self._screen_to_pdf(x, y)
+            self._sel_range = None
+            self._text_segments = pt.rect_segments(*p0, *p1)
+            self.queue_draw()
+            return
+        caret, li = pt.caret_at(*self._screen_to_pdf(x, y))
+        self._set_text_range(pt.extend(self._sel_anchor, caret, self._sel_gran, li))
 
     def _commit_text_highlight(self):
-        """Turn the selected words into highlighter ink: one wide stroke per text
-        line covering its word boxes. Stored as ink, so save / eraser / undo all
+        """Turn the selected text into highlighter ink: one wide stroke per text
+        line covering its selected characters. Stored as ink, so save / eraser / undo all
         work unchanged; the per-line strokes share a draw group so a single undo
         removes the whole highlight."""
-        words = self._selected_words
-        self._selected_words = []
-        if not words:
+        segments = self._text_segments
+        self._text_segments = []
+        self._sel_range = None
+        if not segments:
             self.queue_draw()
             return
         color = self.hl_color
         opacity = self.hl_opacity
-        ordered = sorted(words, key=lambda w: (w[5], w[6], w[7]))
         self._draw_group += 1
         group = self._draw_group
         committed = False
-        line_key = None
-        line = []
-        runs = []
-        for w in ordered:
-            key = (w[5], w[6])
-            if key != line_key and line:
-                runs.append(line)
-                line = []
-            line_key = key
-            line.append(w)
-        if line:
-            runs.append(line)
-        for run in runs:
-            x0 = min(w[0] for w in run)
-            x1 = max(w[2] for w in run)
-            y0 = min(w[1] for w in run)
-            y1 = max(w[3] for w in run)
+        pt = self._page_text()
+        for seg in segments:
+            x0, y0, x1, y1 = pt.band(seg)      # exactly what the selection painted
             ymid = 0.5 * (y0 + y1)
             stroke = {
                 "pts": [(x0, ymid), (x1, ymid)],
@@ -7180,8 +7445,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()   # highlight stays; copy on Ctrl+C
 
     def copy_text_selection(self):
-        text = self._words_to_text(self._selected_words)
-        self._selected_words = []
+        text = self._page_text().text(self._text_segments,
+                                      keep_lines=self._sel_range is None)
+        self._text_segments = []
+        self._sel_range = None
         self.queue_draw()
         if text:
             content = Gdk.ContentProvider.new_for_bytes(
@@ -7317,29 +7584,6 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def go_forward(self):
         return self.history.go_forward()
-
-    @staticmethod
-    def _words_to_text(words):
-        """Join fitz word tuples in reading order, preserving line/paragraph breaks."""
-        if not words:
-            return ""
-        # fitz words: (x0,y0,x1,y1, word, block_no, line_no, word_no)
-        ordered = sorted(words, key=lambda w: (w[5], w[6], w[7]))
-        parts = []
-        prev_block = prev_line = None
-        for w in ordered:
-            block, line = w[5], w[6]
-            if prev_block is not None:
-                if block != prev_block:
-                    parts.append("\n\n")
-                elif line != prev_line:
-                    parts.append("\n")
-                else:
-                    parts.append(" ")
-            parts.append(w[4])
-            prev_block, prev_line = block, line
-        return "".join(parts)
-
 
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
@@ -17067,29 +17311,8 @@ class TextPageView(Gtk.Overlay):
         return res if res else (x, y)
 
     def _click_count(self, event, x, y):
-        """1, 2 or 3 for a press, counted the way GtkGestureClick counts.
-
-        Counted by hand because the sheet has no click gesture to ask: the
-        router claims every press, and a second gesture on this widget would
-        be cancelled by that claim before it ever reported anything. GTK4 also
-        offers no help from the event itself — it dropped the
-        DOUBLE/TRIPLE_BUTTON_PRESS event types GTK3 had, and GtkGestureClick
-        does exactly this sum internally.
-
-        It reads the user's OWN thresholds out of GtkSettings rather than
-        hardcoding a pair, so a double-click here takes as long as a
-        double-click anywhere else on their desktop.
-        """
-        now = event.get_time() if event is not None else 0
-        st = Gtk.Settings.get_default()
-        gap = st.get_property("gtk-double-click-time") if st else 400
-        near = st.get_property("gtk-double-click-distance") if st else 5
-        last_t, last_x, last_y, count = self._last_click
-        if now - last_t <= gap and math.hypot(x - last_x, y - last_y) <= near:
-            count = count % 3 + 1       # GTK cycles rather than climbing
-        else:
-            count = 1
-        self._last_click = (now, x, y, count)
+        """1, 2 or 3 for a press (count_click, shared with the PDF canvas)."""
+        count, self._last_click = count_click(self._last_click, event, x, y)
         return count
 
     def _caret_drag_to(self, x, y):
@@ -28723,7 +28946,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             if keyval == Gdk.KEY_c:
                 # a WORD selection copies as text; a lasso selection wins Ctrl+C
                 # ahead of this, in the window's capture handler above
-                if self.canvas._selected_words and not self._notes_view.has_focus():
+                if self.canvas.has_text_selection() and not self._notes_view.has_focus():
                     self.canvas.copy_text_selection()
                     return True
             if keyval == Gdk.KEY_z:
