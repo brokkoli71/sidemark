@@ -33,9 +33,11 @@
     it from an automatic path fills the history with places nobody went.
   - Restores run through `set_state`, i.e. ordinary movement code;
     `_restoring` is what keeps a back from recording itself.
-  - Side buttons: 8 is BACK and 9 forward in BOTH modes (previous/next page,
-    or history — Settings, Ctrl swaps); a text page has no pages, so there it
-    is always history.
+  - Side buttons: one is BACK and the other forward in BOTH modes
+    (previous/next page, or history — Settings, Ctrl swaps); a text page has
+    no pages, so there it is always history. Which of 8/9 is back is
+    `side_button_step` alone (Settings → "Swap back and forward", default on:
+    8 = forward, as through 0.7.0) — the window and the projector both ask it.
 
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a

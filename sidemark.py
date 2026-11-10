@@ -236,6 +236,22 @@ def _save_setting(key, value):
     os.replace(tmp, path)
 
 
+def side_button_step(btn):
+    """The mouse side buttons as a direction: -1 back, +1 forward, 0 for any
+    other button. The ONE place that decides which of 8/9 is back, shared by
+    the editor window and the projector. Button 8 is the standard BACK button,
+    but mice disagree about which physical button sends it, so Settings →
+    Mouse → "Swap back and forward" (settings.json `swap_side_buttons`) flips
+    the pair. It defaults ON because Sidemark up to 0.7.0 treated 8 as
+    forward, and hands set to that must not find their buttons reversed."""
+    if btn not in (8, 9):
+        return 0
+    back = btn == 8
+    if _load_settings().get("swap_side_buttons", True) is not False:
+        back = not back
+    return -1 if back else 1
+
+
 def _fmt_clock(secs):
     """Seconds → m:ss (or h:mm:ss past an hour), for the presentation timer."""
     h, rem = divmod(int(secs), 3600)
@@ -20645,11 +20661,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if event is None or event.get_event_type() != Gdk.EventType.BUTTON_PRESS:
             return False
         btn = event.get_button()
-        if btn in (8, 9):
-            # 8 is the browser's BACK button, 9 forward — the same direction in
-            # both modes, so Ctrl swapping the mode never swaps the direction.
-            # A text page has no pages, so there it is always the history.
-            back = btn == 8
+        step = side_button_step(btn)
+        if step:
+            # one button is back, the other forward (side_button_step), the
+            # same direction in both modes, so Ctrl swapping the mode never
+            # swaps the direction. A text page has no pages, so there it is
+            # always the history.
+            back = step < 0
             ctrl = (bool(event.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK)
                     or self._held_mods[0])
             history = (self._side_buttons == "history") != ctrl or self._text_mode
@@ -26456,6 +26474,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         side.connect("notify::selected", lambda r, _p: self._on_side_buttons(
             "history" if r.get_selected() == 1 else "pages"))
         mouse.add(side)
+        swap = Adw.SwitchRow(title="Swap back and forward")
+        swap.set_subtitle("For a mouse whose side buttons go the wrong way.")
+        swap.set_active(_load_settings().get("swap_side_buttons", True)
+                        is not False)
+        swap.connect("notify::active", lambda r, _p:
+                     _save_setting("swap_side_buttons", r.get_active()))
+        mouse.add(swap)
         page.add(mouse)
 
         dlg.present(self)
@@ -29440,8 +29465,8 @@ class PresenterWindow(Adw.Window):
 
         # While this window has focus (e.g. a clicker driving the projected
         # screen), it can still page: click advances, the mouse back/forward
-        # side buttons flip like in the editor's Pages mode (8 back → prev,
-        # 9 forward → next).
+        # side buttons flip like in the editor's Pages mode (back → prev,
+        # forward → next, as side_button_step decides).
         click = Gtk.GestureClick()
         click.set_button(0)   # 0 = listen to every button
         click.connect("pressed", self._on_click)
@@ -29501,9 +29526,10 @@ class PresenterWindow(Adw.Window):
 
     def _on_click(self, gesture, _n_press, _x, _y):
         button = gesture.get_current_button()
-        if button in (Gdk.BUTTON_PRIMARY, 9):   # click / mouse-forward → next
+        step = side_button_step(button)
+        if button == Gdk.BUTTON_PRIMARY or step > 0:     # click / forward → next
             self._nav(1)
-        elif button in (Gdk.BUTTON_SECONDARY, 8):   # right / mouse-back → prev
+        elif button == Gdk.BUTTON_SECONDARY or step < 0:  # right / back → prev
             self._nav(-1)
 
 

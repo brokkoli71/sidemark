@@ -463,7 +463,11 @@ class TestViewHistoryOnSurfaces(unittest.TestCase):
 
 class TestSideButtons(unittest.TestCase):
     """Mouse back/forward (8/9): pages or history per Settings, Ctrl swaps,
-    and the BACK button points back in both modes."""
+    and the BACK button points back in both modes. These run with the swap
+    switch OFF (8 = back); TestSideButtonSwap covers the switch."""
+
+    def setUp(self):
+        sidemark._save_setting("swap_side_buttons", False)
 
     @staticmethod
     def _press(btn, ctrl=False):
@@ -537,6 +541,33 @@ class TestSideButtons(unittest.TestCase):
             self.assertEqual(c.current_page_idx, 3)
 
         self._run(body)
+
+
+class TestSideButtonSwap(unittest.TestCase):
+    """Settings → "Swap back and forward" flips which of 8/9 is back, in the
+    one helper every side-button path asks (the window, the projector)."""
+
+    def test_swap_flips_the_pair_and_nothing_else(self):
+        for swapped in (False, True):
+            sidemark._save_setting("swap_side_buttons", swapped)
+            back, fwd = (9, 8) if swapped else (8, 9)
+            self.assertEqual(sidemark.side_button_step(back), -1)
+            self.assertEqual(sidemark.side_button_step(fwd), 1)
+            for other in (1, 2, 3, 10):
+                self.assertEqual(sidemark.side_button_step(other), 0)
+
+    def test_window_follows_the_switch(self):
+        sidemark._save_setting("swap_side_buttons", True)
+
+        def body(win):
+            c = win.canvas
+            win._on_side_buttons("pages")
+            win._on_window_button(None, TestSideButtons._press(8))
+            self.assertEqual(c.current_page_idx, 1)   # 8 is forward now
+            win._on_window_button(None, TestSideButtons._press(9))
+            self.assertEqual(c.current_page_idx, 0)
+
+        TestSideButtons._run(self, body)
 
 
 # ── zoom to region ────────────────────────────────────────────────────────────
@@ -10869,6 +10900,7 @@ class TestPresenterMode(unittest.TestCase):
 
     def test_presenter_window_click_navigates(self):
         # click / mouse-forward (9) advance, right-click / mouse-back (8) go back
+        sidemark._save_setting("swap_side_buttons", False)   # 8 = back
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
             make_pdf(pdf, n_pages=4)
@@ -11074,6 +11106,8 @@ class TestMouseSideButtonNav(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
             make_pdf(pdf, n_pages=4)
+
+            sidemark._save_setting("swap_side_buttons", False)   # 8 = back
 
             def body(win):
                 win._do_open_file(pdf)
@@ -14322,6 +14356,8 @@ class TestBindingToolbar(unittest.TestCase):
                                  not was)
             finally:
                 sidemark.MarkdownNotesView.show_comments = was
+            rows["Swap back and forward"].set_active(False)
+            self.assertIs(sidemark._load_settings()["swap_side_buttons"], False)
             rows["Side buttons"].set_selected(1)
             self.assertEqual(win._side_buttons, "history")
             self.assertEqual(sidemark._load_settings()["side_buttons"], "history")
