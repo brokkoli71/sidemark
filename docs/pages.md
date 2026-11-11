@@ -134,6 +134,16 @@
   max_h=page height)`; `_targets_on_page` stores cite regions that way too):
   a 70-author entry's DOI sits past any height cap. What the card SHOWS of
   it is at most `CITE_PREVIEW_MAX_H`, fading out when cut (`cut`).
+- **Add to Zotero (row 209)** — offered on a paper's card when the document is
+  in Zotero, the paper was identified by a lookup and is not in the library.
+  Through Zotero's CONNECTOR server (`ZOTERO_CONNECTOR`, 127.0.0.1:23119,
+  what its browser extension uses): `saveItems` with one item whose `id` is
+  the connector key, then — for arXiv, the one place a free PDF is known —
+  the PDF downloaded and uploaded to `saveAttachment` with an `X-Metadata`
+  header (`sessionID`, `parentItemID` = that `id`, `title`, `url`). Checked
+  against Zotero's own server_connector.js: `saveItems` answers 201 only
+  after the item is saved, so the attachment always finds its parent. Never
+  exercised against the real library in tests (`post`/`get` are injected).
 - **Card and icon size follow the PAGE** (row 207): `_page_f()` (the page
   zoom, clamped 0.55–2.5) scales the cards' text, row heights and widths
   and the ↩ / Z icons. The rendered target strip keeps its own readable

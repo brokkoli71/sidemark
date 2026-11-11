@@ -1699,6 +1699,85 @@ class TestZotero(unittest.TestCase):
         finally:
             con.close()
 
+    PAPER = {"title": "Quantum supremacy using a programmable processor",
+             "authors": ["Frank Arute", "Kunal Arya", "John M. Martinis"],
+             "year": "2019", "venue": "Nature", "abstract": "The promise..."}
+
+    def test_adding_an_arxiv_paper_sends_the_item_then_its_pdf(self):
+        posts = []
+
+        def post(endpoint, body, headers):
+            posts.append((endpoint, body, headers))
+            return 201, ""
+        ok, msg = sidemark.add_to_zotero(
+            self.PAPER, "https://arxiv.org/abs/1910.11333v2", post=post,
+            get=lambda url: b"%PDF-1.5 fake")
+        self.assertTrue(ok)
+        self.assertIn("PDF", msg)
+        (ep1, body, _h), (ep2, pdf, h2) = posts
+        self.assertEqual((ep1, ep2), ("saveItems", "saveAttachment"))
+        sent = json.loads(body)
+        item = sent["items"][0]
+        self.assertEqual(item["itemType"], "preprint")
+        self.assertEqual(item["archiveID"], "arXiv:1910.11333")
+        self.assertEqual(item["title"], self.PAPER["title"])
+        self.assertEqual(item["creators"][2], {"firstName": "John M.",
+                         "lastName": "Martinis", "creatorType": "author"})
+        meta = json.loads(h2["X-Metadata"])
+        self.assertEqual(meta["parentItemID"], item["id"])   # attached to it
+        self.assertEqual(meta["sessionID"], sent["sessionID"])
+        self.assertEqual(h2["Content-Type"], "application/pdf")
+        self.assertEqual(pdf, b"%PDF-1.5 fake")
+
+    def test_adding_a_doi_paper_sends_the_item_without_a_pdf(self):
+        posts = []
+        ok, msg = sidemark.add_to_zotero(
+            self.PAPER, "https://doi.org/10.1038/s41586-019-1666-5",
+            post=lambda e, b, h: posts.append(e) or (201, ""),
+            get=lambda url: self.fail("no free PDF is known for a DOI"))
+        self.assertTrue(ok)
+        self.assertEqual(posts, ["saveItems"])
+
+    def test_zotero_not_running_is_said_so(self):
+        ok, msg = sidemark.add_to_zotero(
+            self.PAPER, "https://doi.org/10.1/x",
+            post=lambda e, b, h: (0, "Connection refused"))
+        self.assertFalse(ok)
+        self.assertIn("isn't running", msg)
+
+    def test_the_card_offers_add_to_zotero_and_reports_back(self):
+        c = self._canvas(self.pdf)
+        c._link_preview = {"type": "ref", "anchor": fitz.Rect(0, 0, 10, 10),
+                           "ref": {"uri": "https://doi.org/10.1234/new",
+                                   "state": "done", "info": dict(self.PAPER)}}
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
+        actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
+        self.assertIn(("zotero-add",), actions)
+        with mock.patch.object(sidemark, "add_to_zotero",
+                               return_value=(True, "Added to Zotero")) as add:
+            c._card_action(("zotero-add",))
+            deadline = time.time() + 3
+            while (c._link_preview.get("zadd") == "saving"
+                   and time.time() < deadline):
+                GLib.MainContext.default().iteration(False)
+                time.sleep(0.005)
+        add.assert_called_once()
+        self.assertEqual(c._link_preview["zadd"], "Added to Zotero")
+        actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
+        self.assertNotIn(("zotero-add",), actions)       # done, not again
+        self.assertEqual(c._zotero_checked, 0.0)         # re-read soon
+
+    def test_no_add_button_outside_zotero(self):
+        elsewhere = os.path.join(self._tmp.name, "paper2.pdf")
+        shutil.copy(self.pdf, elsewhere)
+        c = self._canvas(elsewhere)
+        c._link_preview = {"type": "ref", "anchor": fitz.Rect(0, 0, 10, 10),
+                           "ref": {"uri": "https://doi.org/10.1234/new",
+                                   "state": "done", "info": dict(self.PAPER)}}
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
+        actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
+        self.assertNotIn(("zotero-add",), actions)
+
     def test_outside_zotero_nothing_is_matched(self):
         elsewhere = os.path.join(self._tmp.name, "paper.pdf")
         shutil.copy(self.pdf, elsewhere)

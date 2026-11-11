@@ -4942,6 +4942,102 @@ def zotero_library_for(pdf_path):
     return _ZOTERO_LIBRARIES[d]
 
 
+# ── Add to Zotero (row 209) ──────────────────────────────────────────────────
+# Through Zotero's own CONNECTOR server — the local endpoint its browser
+# extension saves through (127.0.0.1:23119, there whenever Zotero runs). The
+# item lands in the collection selected in Zotero, exactly as a save from the
+# browser does. Its PDF is uploaded to the item (`saveAttachment`; Zotero
+# advertises supportsAttachmentUpload) when we know where a free copy is —
+# arXiv's — rather than asking Zotero to fetch it.
+ZOTERO_CONNECTOR = "http://127.0.0.1:23119/connector/"
+ZOTERO_PDF_MAX_BYTES = 80_000_000
+
+
+def _connector_post(endpoint, body, headers):
+    """(status, text) of a POST to the local Zotero connector, or (0, why)."""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        ZOTERO_CONNECTOR + endpoint, data=body, method="POST",
+        headers={"X-Zotero-Connector-API-Version": "3", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read(100_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(10_000).decode("utf-8", "replace")
+    except Exception as e:
+        return 0, str(e)
+
+
+def _http_get_bytes(url):
+    """The bytes at `url` (a PDF), or None. Bounded in time and size."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": REF_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read(ZOTERO_PDF_MAX_BYTES + 1)
+        return data if len(data) <= ZOTERO_PDF_MAX_BYTES else None
+    except Exception as e:
+        logger.info(f"add to zotero: no PDF from {url} — {e}")
+        return None
+
+
+def zotero_item_from_reference(info, uri):
+    """(the connector item, a PDF url or None) for a looked-up paper."""
+    kind = classify_reference_url(uri) or ("web", uri)
+    creators = []
+    for name in info.get("authors") or []:
+        parts = name.split()
+        if not parts:
+            continue
+        creators.append({"firstName": " ".join(parts[:-1]),
+                         "lastName": parts[-1], "creatorType": "author"})
+    item = {"id": "sidemark-1", "title": info.get("title") or "",
+            "creators": creators, "date": info.get("year") or "",
+            "abstractNote": info.get("abstract") or "",
+            "url": uri, "tags": [], "notes": [], "attachments": []}
+    pdf = None
+    if kind[0] == "arxiv":
+        item.update({"itemType": "preprint", "repository": "arXiv",
+                     "archiveID": f"arXiv:{kind[1]}",
+                     "url": f"https://arxiv.org/abs/{kind[1]}"})
+        pdf = f"https://arxiv.org/pdf/{kind[1]}"
+    else:
+        item.update({"itemType": "journalArticle",
+                     "publicationTitle": info.get("venue") or ""})
+        if kind[0] == "doi":
+            item["DOI"] = kind[1]
+    return item, pdf
+
+
+def add_to_zotero(info, uri, post=_connector_post, get=_http_get_bytes):
+    """Save the paper to Zotero. Returns (ok, what to tell the user)."""
+    import uuid
+    item, pdf_url = zotero_item_from_reference(info, uri)
+    session = "sidemark-" + uuid.uuid4().hex
+    status, text = post("saveItems", json.dumps(
+        {"sessionID": session, "uri": uri, "items": [item]}).encode(),
+        {"Content-Type": "application/json"})
+    if status == 0:
+        return False, "Zotero isn't running"
+    if status not in (200, 201):
+        logger.warning(f"add to zotero: saveItems {status}: {text[:300]}")
+        return False, "Zotero refused it"
+    if not pdf_url:
+        return True, "Added to Zotero"
+    data = get(pdf_url)
+    if data is None:
+        return True, "Added to Zotero (without the PDF)"
+    meta = {"sessionID": session, "parentItemID": item["id"],
+            "title": "Full Text PDF", "url": pdf_url}
+    status, text = post("saveAttachment", data, {
+        "Content-Type": "application/pdf", "X-Metadata": json.dumps(meta)})
+    if status not in (200, 201):
+        logger.warning(f"add to zotero: saveAttachment {status}: {text[:300]}")
+        return True, "Added to Zotero (without the PDF)"
+    return True, "Added to Zotero with its PDF"
+
+
 def link_inside(rect, region):
     """Is a link IN a region — its middle inside, not merely touching it? A
     bibliography entry's strip is padded, and the NEXT entry's link reaching
@@ -8921,6 +9017,47 @@ class PDFCanvas(Gtk.DrawingArea):
             found.append(({"arxiv": 0, "doi": 1}.get(c[0], 2), l["uri"]))
         return min(found)[1] if found else None
 
+    def _add_to_zotero(self):
+        """Save the card's paper to Zotero (row 209) on a worker thread; the
+        card says how it went, and the library is re-read soon after so the
+        entry's "i" becomes a Z."""
+        p = self._link_preview
+        ref = (p or {}).get("ref") or {}
+        info, uri = ref.get("info"), ref.get("uri")
+        if not info or not uri or p.get("zadd"):
+            return
+        p["zadd"] = "saving"
+        self.queue_draw()
+
+        def work():
+            try:
+                ok, msg = add_to_zotero(info, uri)
+            except Exception:
+                logger.warning("add to zotero failed", exc_info=True)
+                ok, msg = False, "Couldn't add it to Zotero"
+            GLib.idle_add(done, ok, msg)
+
+        def done(ok, msg):
+            q = self._link_preview
+            if q is not None and (q.get("ref") or {}).get("uri") == uri:
+                q["zadd"] = msg if ok else msg + " — try again later"
+                if not ok:
+                    GLib.timeout_add(4000, lambda: self._reset_zadd(uri))
+            if ok:
+                self._zotero_checked = 0.0   # look again at the next draw
+                GLib.timeout_add(1500, lambda: self.queue_draw() and False)
+            self.queue_draw()
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _reset_zadd(self, uri):
+        q = self._link_preview
+        if q is not None and (q.get("ref") or {}).get("uri") == uri:
+            q["zadd"] = None
+            self.queue_draw()
+        return False
+
     def _set_zotero_reference(self, item):
         """The paper is in your Zotero library: show it from there — offline,
         title first like any lookup — with Open PDF / Show in Zotero."""
@@ -9247,6 +9384,8 @@ class PDFCanvas(Gtk.DrawingArea):
             self._hide_link_preview()
             if self.on_open_document is not None:
                 self.on_open_document(action[1])
+        elif what == "zotero-add":
+            self._add_to_zotero()
         elif what == "row":
             self._follow_backlink(action[1])
         elif what == "follow":
@@ -9452,6 +9591,14 @@ class PDFCanvas(Gtk.DrawingArea):
             if opened:
                 out.append(("abstract", self._card_text(
                     ctx, info["abstract"], inner, lines=16), None))
+        if (zot is None and ref.get("uri") and self._zotero() is not None):
+            # reading from Zotero, and this paper is not in it (row 209)
+            state = p.get("zadd")
+            label = {None: "+ Add to Zotero",
+                     "saving": "Adding to Zotero…"}.get(state, state)
+            out.append(("toggle" if state is None else "note",
+                        self._card_text(ctx, label, inner, bold=state is None),
+                        ("zotero-add",) if state is None else None))
         if zot is not None:
             # in your library: the paper itself is one click away
             if zot.get("pdf"):
