@@ -263,6 +263,15 @@
   in settings.json, applied to every canvas: they are the app's, like the
   pen).
 
+- **Touchpad coast (rows 175, 206)**: ONE `KineticGlide` drives both the
+  sheet and the PDF canvas, from `::decelerate` (needs the scroll
+  controller's `KINETIC` flag; GTK reports px/SECOND — `GLIDE_VEL_PER_MS`).
+  Each surface scales the velocity by its own drag gain (the sheet's
+  `SURFACE_SCROLL_FACTOR`, the canvas' `TOUCHPAD_PAN_GAIN`) so a flick goes on
+  at the speed the fingers moved it. No coast after a Ctrl+scroll zoom; on a
+  PDF page a coast stops at the page's edges and never flips — only a push
+  of your own turns the page. A press, a new scroll or a page load stops it.
+
 - **The extended dwell (`_snap_to_shape`, rows 121 + 127).** Holding still
   mid-stroke no longer only makes a line: `recognize_shape()` cleans a closed
   loop into an axis-aligned **rectangle**, an **ellipse** (a near-circle snaps

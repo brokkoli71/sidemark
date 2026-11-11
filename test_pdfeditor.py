@@ -1536,6 +1536,23 @@ class TestZotero(unittest.TestCase):
         c._show_link_preview()
         self.assertEqual(c._link_preview["zotero"]["key"], "CHARL002")
 
+    def test_a_library_entry_wears_a_red_z_that_opens_its_pdf(self):
+        c = self._canvas(self.pdf)
+        opened = []
+        c.on_open_document = opened.append
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c._prepare_targets()
+        c._draw_backlink_icons(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)))
+        z = {item["key"]: box for box, item in c._zotero_icons}
+        self.assertIn("BRAVO001", z)                  # entry [2] is in Zotero
+        self.assertEqual(len(z), 2)                   # [2] by title, [3] by arXiv
+        bx, by, bw, bh = z["BRAVO001"]
+        self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].endswith("Writer 2019.pdf"))
+
     def test_outside_zotero_nothing_is_matched(self):
         elsewhere = os.path.join(self._tmp.name, "paper.pdf")
         shutil.copy(self.pdf, elsewhere)
@@ -1543,6 +1560,93 @@ class TestZotero(unittest.TestCase):
         card = self._hover(c, "cite.b")
         self.assertNotIn("zotero", card)
         self.assertIsNone(card["ref"])            # lookups are off, too
+
+
+class TestReferenceLinkChoice(unittest.TestCase):
+    """Which link in a bibliography entry names its paper (row 200)."""
+
+    def test_a_neighbours_link_reaching_in_is_not_the_entrys(self):
+        entry = fitz.Rect(300, 660, 545, 721)        # padded strip of [60]
+        mine = fitz.Rect(320, 690, 500, 700)
+        next_entrys = fitz.Rect(320, 719, 500, 729)  # [61]'s, 2 pt inside
+        self.assertTrue(sidemark.link_inside(mine, entry))
+        self.assertFalse(sidemark.link_inside(next_entrys, entry))
+
+    def test_a_link_straight_to_a_pdf_is_never_looked_up(self):
+        L = sidemark.reference_lookupable
+        self.assertFalse(L("https://dai.lids.mit.edu/x/Laura_MEng_Final.pdf"))
+        self.assertTrue(L("https://arxiv.org/pdf/2101.00001.pdf"))  # arXiv id
+        self.assertTrue(L("https://doi.org/10.1234/x"))
+        self.assertTrue(L("https://example.org/paper"))
+        self.assertFalse(L("mailto:a@b.c"))
+
+
+class TestCardsGrowWithThePage(unittest.TestCase):
+    """Row 207: the ↩ icons and the cards' own text are sized with the page's
+    zoom, like the text beside them, not fixed on screen."""
+
+    def test_icons_and_card_text_scale_with_the_zoom(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "p.pdf")
+            make_bib_pdf(pdf)
+            c = PDFCanvas()
+            c.load(pdf)
+            c.go_to_page(1)
+            ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1600, 1600))
+            sizes = {}
+            for scale in (1.0, 2.0):
+                c.scale, c.offset_x, c.offset_y = scale, 0.0, 0.0
+                c._prepare_targets()
+                c._draw_backlink_icons(ctx)
+                icon_h = c._backlink_icons[0][0][3]
+                title = c._card_text(ctx, "A title", 400, size=14)
+                sizes[scale] = (icon_h, title.get_pixel_size()[1])
+            for i in range(2):
+                self.assertGreater(sizes[2.0][i], 1.5 * sizes[1.0][i])
+
+
+class TestTouchpadCoast(unittest.TestCase):
+    """Row 206: a quick two-finger flick keeps the PDF page moving, like a
+    browser; a zoom does not fling, and a coast stops at the page's edge."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        pdf = os.path.join(self._tmp.name, "a.pdf")
+        make_pdf(pdf, n_pages=3)
+        self.c = PDFCanvas()
+        self.c.load(pdf)
+        self.c._fit_page(800, 600)
+        self.c.scale *= 3                    # taller and wider than the view
+        self.c.offset_x, self.c.offset_y = -300.0, -400.0
+        self.c._is_fitted = False
+
+    def test_a_flick_coasts(self):
+        c = self.c
+        with mock.patch.object(c._glide, "start") as start:
+            c._on_decelerate(None, 0.0, 3000.0)       # GTK: px per SECOND
+        (vx, vy), _ = start.call_args
+        self.assertEqual(vx, 0.0)
+        self.assertGreater(vy, 0.0)
+
+    def test_no_coast_after_a_zoom(self):
+        c = self.c
+        c._zoomed_by_scroll = True
+        with mock.patch.object(c._glide, "start") as start:
+            c._on_decelerate(None, 0.0, 3000.0)
+        start.assert_not_called()
+
+    def test_a_coast_moves_the_page_and_stops_at_its_edge(self):
+        c = self.c
+        y0 = c.offset_y
+        self.assertTrue(c._glide_pan(0, 50))
+        self.assertLess(c.offset_y, y0)
+        for _ in range(2000):                     # run it into the bottom
+            if not c._glide_pan(0, 50):
+                break
+        bottom = (c.get_height() or 600) - c.page_height * c.scale
+        self.assertAlmostEqual(c.offset_y, bottom)
+        self.assertEqual(c.current_page_idx, 0)   # a coast never flips
 
 
 class TestCapture(unittest.TestCase):

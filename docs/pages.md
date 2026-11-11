@@ -113,7 +113,17 @@
   entry, then volume + first page + year + first author for title-less
   physics entries. A match fills the card's paper section locally (no
   lookup, no switch) and adds Open the PDF (`on_open_document` → a tab in
-  the document's window) and Show in Zotero (`zotero://select/…`).
+  the document's window) and Show in Zotero (`zotero://select/…`). A cited
+  entry in the library also wears a red "Z" left of its ↩ icon (matched once
+  per page in `_prepare_targets`, `_zotero_targets`); clicking it opens the
+  PDF. **A link belongs to an entry only if its MIDDLE is inside the entry's
+  strip** (`link_inside`): strips are padded, and the next entry's link
+  reaching a point in made [60] look up [61]. A link straight to a `.pdf`
+  is never looked up (`reference_lookupable`).
+- **Card and icon size follow the PAGE** (row 207): `_page_f()` (the page
+  zoom, clamped 0.55–2.5) scales the cards' text, row heights and widths
+  and the ↩ / Z icons. The rendered target strip keeps its own readable
+  scale (`_preview_scale`).
 
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a

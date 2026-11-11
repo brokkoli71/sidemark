@@ -4421,6 +4421,15 @@ def classify_reference_url(uri):
     return None
 
 
+def reference_lookupable(uri):
+    """Would `fetch_reference` try this link at all? Not a direct .pdf: a
+    whole PDF on a hover is too much, and its card would only say it found
+    nothing."""
+    kind = classify_reference_url(uri)
+    return kind is not None and not (
+        kind[0] == "web" and kind[1].lower().split("?")[0].endswith(".pdf"))
+
+
 def _clean(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -4892,6 +4901,15 @@ def zotero_library_for(pdf_path):
     if d not in _ZOTERO_LIBRARIES:
         _ZOTERO_LIBRARIES[d] = ZoteroLibrary(d)
     return _ZOTERO_LIBRARIES[d]
+
+
+def link_inside(rect, region):
+    """Is a link IN a region — its middle inside, not merely touching it? A
+    bibliography entry's strip is padded, and the NEXT entry's link reaching
+    a point into it is not this entry's link (row 200: [60] was looked up as
+    [61])."""
+    return region.contains(fitz.Point((rect.x0 + rect.x1) / 2,
+                                      (rect.y0 + rect.y1) / 2))
 
 
 def _rounded_rect_path(ctx, x, y, w, h, r):
@@ -5389,6 +5407,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._card_hide_id = None      # the grace before a hover card goes
         self._targets_idle_id = None   # finding this page's targets, once
         self._backlink_icons = []      # [(screen box, key, region)] as drawn
+        self._zotero_icons = []        # [(screen box, Zotero item)] as drawn
+        self._zotero_targets = {}      # page -> {target key: Zotero item}
         self._ctx_actions = None       # the context menu's actions (row 201)
         self._zoom_trail = []          # [(view before, after)] per region zoom
         # the Zotero library this document is in (row 205), looked up once
@@ -5422,11 +5442,18 @@ class PDFCanvas(Gtk.DrawingArea):
         # notches, which axis-locks to horizontal *or* vertical. Smooth deltas
         # let a two-finger drag pan diagonally; we tell touchpad (SURFACE) from
         # mouse-wheel (WHEEL) input per-event via get_unit().
+        # KINETIC: a quick two-finger flick coasts on (row 206), the sheet's
+        # KineticGlide — GTK only emits ::decelerate with the flag set, and
+        # only after a continuous (touchpad) scroll, so a wheel keeps its step.
         scroll = Gtk.EventControllerScroll.new(
             Gtk.EventControllerScrollFlags.BOTH_AXES
+            | Gtk.EventControllerScrollFlags.KINETIC
         )
         scroll.connect("scroll", self._on_scroll)
+        scroll.connect("decelerate", self._on_decelerate)
         self.add_controller(scroll)
+        self._glide = KineticGlide(self, self._glide_pan)
+        self._zoomed_by_scroll = False   # the last scroll was Ctrl+scroll
 
         drag = Gtk.GestureDrag.new()
         drag.set_button(0)
@@ -5539,6 +5566,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._load_page(0)
 
     def _load_page(self, idx, keep_view=False):
+        self._glide.stop()             # a coast belongs to the page it began on
         self.clear_lasso_selection()   # selection is per-page and transient
         self._hide_link_preview()      # it belonged to a link on the old page
         self.current_page_idx = idx
@@ -6983,6 +7011,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self.set_cursor(self._default_cursor())
 
     def _on_scroll(self, ctrl, dx, dy):
+        self._glide.stop()               # fingers back on the pad: no coast
         state = ctrl.get_current_event_state()
         # Touchpad two-finger scroll arrives as smooth SURFACE-unit deltas (~1px
         # each, both axes at once); a mouse wheel as ±1 WHEEL notches. Pan speed
@@ -6997,6 +7026,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 return True
             self._scroll_past = 0.0
             step = self.TOUCHPAD_PAN_GAIN if smooth else self.WHEEL_PAN_STEP
+            self._zoomed_by_scroll = False
             self.history.moving()
             self.offset_x -= dx * step
             self.offset_y -= dy * step
@@ -7004,8 +7034,54 @@ class PDFCanvas(Gtk.DrawingArea):
             self._is_fitted = False
             self.queue_draw()
             return True
+        self._zoomed_by_scroll = True
         self._zoom_at(zoom_factor_for_scroll(smooth, dy),
                       self._mouse_x, self._mouse_y)
+        return True
+
+    def _on_decelerate(self, ctrl, vel_x, vel_y):
+        """The fingers left the touchpad mid-flick: coast on, like a browser
+        (row 206). Not after a Ctrl+scroll zoom — zooming is not scrolling —
+        and not in thumb-pan mode. GTK reports px/SECOND (GLIDE_VEL_PER_MS),
+        in the units of the deltas, so the velocity carries the pan's gain:
+        the page keeps going at the speed the fingers were moving it."""
+        if self._zoomed_by_scroll or self._thumb_gesture is not None:
+            return
+        k = GLIDE_VEL_PER_MS * self.TOUCHPAD_PAN_GAIN
+        self._glide.start(vel_x * k, vel_y * k)
+
+    def _glide_pan(self, dx, dy):
+        """One frame of the coast; False once the page edge stops it (a
+        coast never flips the page — that takes a push of your own)."""
+        if self.page is None:
+            return False
+        was = (self.offset_x, self.offset_y)
+        cw, ch = self.get_width() or 800, self.get_height() or 600
+
+        def stop_at_edges(v, before, view, size):
+            # the page's edges hold a coast: a page that fits does not move on
+            # that axis, one that is larger stops with its edge at the window's
+            # — and one already panned past that (a drag may) only comes back
+            if size <= view:
+                return before
+            lo, hi = view - size, 0.0
+            if lo <= v <= hi:
+                return v
+            if before < lo:              # already past it: only inward
+                return v if v > before else before
+            if before > hi:
+                return v if v < before else before
+            return min(max(v, lo), hi)
+
+        self.history.moving()
+        self.offset_x = stop_at_edges(self.offset_x - dx, was[0], cw,
+                                      self.page_width * self.scale)
+        self.offset_y = stop_at_edges(self.offset_y - dy, was[1], ch,
+                                      self.page_height * self.scale)
+        if abs(self.offset_x - was[0]) < 1e-6 and abs(self.offset_y - was[1]) < 1e-6:
+            return False
+        self._is_fitted = False
+        self.queue_draw()
         return True
 
     def _clamp_scroll_offset(self):
@@ -7381,6 +7457,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._post_pinch = False
         self._dismissed_selection = False
         self._text_highlighting = False
+        self._glide.stop()               # a press catches a coasting page
         if self._card_press(start_x, start_y):
             # the card or a backlink icon (rows 197-200) took the press; one
             # elsewhere closed the card and goes on to the page below
@@ -8649,7 +8726,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if self._zotero_match("", [link.get("uri")]) is not None:
             return True
         return (reference_preview_enabled()
-                and classify_reference_url(link.get("uri")) is not None)
+                and reference_lookupable(link.get("uri")))
 
     def _zotero(self):
         """The Zotero library THIS document lives in, or None (row 205)."""
@@ -8713,7 +8790,7 @@ class PDFCanvas(Gtk.DrawingArea):
             uri = link.get("uri")
             zot = self._zotero_match("", [uri])
             if zot is None and not (reference_preview_enabled()
-                                    and classify_reference_url(uri)):
+                                    and reference_lookupable(uri)):
                 return False
             self._link_preview = {"type": "ref", "anchor": link["from"],
                                   "ref": None, "x0": self._hover_x - 24}
@@ -8756,7 +8833,7 @@ class PDFCanvas(Gtk.DrawingArea):
             if self._zotero() is not None:
                 uris = [l.get("uri") for l in page.get_links()
                         if l.get("kind") == fitz.LINK_URI
-                        and l["from"].intersects(clip)]
+                        and link_inside(l["from"], clip)]
                 zot = self._zotero_match(page.get_textbox(clip), uris)
             if zot is not None:
                 self._set_zotero_reference(zot)   # local: no lookup needed
@@ -8774,11 +8851,12 @@ class PDFCanvas(Gtk.DrawingArea):
         paper: a DOI or arXiv link before any other address."""
         found = []
         for l in self.document[page_no].get_links():
-            if l.get("kind") != fitz.LINK_URI or not l["from"].intersects(clip):
+            if l.get("kind") != fitz.LINK_URI or not link_inside(l["from"], clip):
+                continue
+            if not reference_lookupable(l.get("uri")):
                 continue
             c = classify_reference_url(l.get("uri"))
-            if c:
-                found.append(({"arxiv": 0, "doi": 1}.get(c[0], 2), l["uri"]))
+            found.append(({"arxiv": 0, "doi": 1}.get(c[0], 2), l["uri"]))
         return min(found)[1] if found else None
 
     def _set_zotero_reference(self, item):
@@ -8863,6 +8941,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._backlinks = (sources, targets)
         self._backlinks_key = key
         self._targets_cache, self._words_cache = {}, {}
+        self._zotero_targets = {}
         return self._backlinks
 
     def _backlinks_to(self, link):
@@ -8930,11 +9009,29 @@ class PDFCanvas(Gtk.DrawingArea):
         first time costs tens of ms, which a draw must not."""
         self._targets_idle_id = None
         if self.document is not None and self.page is not None:
+            pno = self.current_page_idx
             try:
-                self._targets_on_page(self.current_page_idx)
+                targets = self._targets_on_page(pno)
             except Exception:
                 logger.error("backlink targets:\n" + traceback.format_exc())
-                self._targets_cache[self.current_page_idx] = []
+                self._targets_cache[pno] = targets = []
+            # which cited entries on this page are in your Zotero library
+            # (row 205) — once per page, beside the targets themselves
+            hits = {}
+            if self._zotero() is not None:
+                page = self.document[pno]
+                kinds = self._backlinks[1]
+                links = [l for l in page.get_links()
+                         if l.get("kind") == fitz.LINK_URI]
+                for region, key in targets:
+                    if kinds.get(key, (None, None, None))[2] != "cite":
+                        continue
+                    uris = [l.get("uri") for l in links
+                            if link_inside(l["from"], region)]
+                    item = self._zotero_match(page.get_textbox(region), uris)
+                    if item is not None:
+                        hits[key] = item
+            self._zotero_targets[pno] = hits
             self.queue_draw()
         return False
 
@@ -9005,6 +9102,14 @@ class PDFCanvas(Gtk.DrawingArea):
                     self._card_action(action)
                     break
             return True
+        for (bx, by, bw, bh), item in self._zotero_icons:
+            if bx - 2 <= x <= bx + bw + 2 and by - 2 <= y <= by + bh + 2:
+                # the Z: straight to the paper — its PDF, else its entry
+                if item.get("pdf"):
+                    self._card_action(("open-file", item["pdf"]))
+                else:
+                    self._card_action(("open", item["select_uri"]))
+                return True
         icon = self._backlink_icon_at(x, y)
         if icon is not None:
             self._open_backlinks(*icon)
@@ -9159,11 +9264,18 @@ class PDFCanvas(Gtk.DrawingArea):
         y = min(max(m, y), max(m, height - m - h))
         return max(m, x), y
 
+    def _page_f(self):
+        """Card text and icons are sized with the PAGE (row 207): at the page's
+        zoom, like the text they sit beside — within reason, so a card stays
+        legible zoomed far out and does not swallow the window zoomed in."""
+        return min(max(self.scale, 0.55), 2.5)
+
     def _card_text(self, ctx, text, width_px, size=None, bold=False,
                    italic=False, lines=1):
         lay = PangoCairo.create_layout(ctx)
         d = Pango.FontDescription("Sans")
-        d.set_absolute_size((size or self.CARD_TEXT_PX) * Pango.SCALE)
+        d.set_absolute_size((size or self.CARD_TEXT_PX) * self._page_f()
+                            * Pango.SCALE)
         if bold:
             d.set_weight(Pango.Weight.BOLD)
         if italic:
@@ -9232,9 +9344,12 @@ class PDFCanvas(Gtk.DrawingArea):
                     ("open-file", zot["pdf"])))
             out.append(("toggle", self._card_text(
                 ctx, "Show in Zotero", inner), ("open", zot["select_uri"])))
-        out.append(("source", self._card_text(
-            ctx, f"from {info.get('source', 'the web')}", inner,
-            size=self.CARD_TEXT_PX - 2), None))
+        out.append(("zsource" if zot is not None else "source",
+                    self._card_text(
+                        ctx, ("Z  In your Zotero library" if zot is not None
+                              else f"from {info.get('source', 'the web')}"),
+                        inner, size=self.CARD_TEXT_PX - 2, bold=zot is not None),
+                    None))
         return out
 
     def _draw_link_preview(self, ctx, width, height):
@@ -9247,13 +9362,15 @@ class PDFCanvas(Gtk.DrawingArea):
             if self._link_preview_id is None:
                 self._link_preview_id = GLib.idle_add(self._show_link_preview)
         pad, m = self.LINK_PREVIEW_PAD, self.LINK_PREVIEW_MARGIN
+        f = self._page_f()
+        row_h = self.CARD_ROW_H * f
         maxw = width - 2 * m
         if p["type"] == "backlinks":
-            w = min(self.CARD_LIST_W, maxw)
+            w = min(self.CARD_LIST_W * f, maxw)
         else:
             w = (p["w"] + 2 * pad) if p.get("surface") is not None else 0
             if p.get("ref") is not None:
-                w = max(w, self.CARD_REF_W)
+                w = max(w, self.CARD_REF_W * f)
             w = min(w, maxw)
         inner = w - 2 * pad
         # lay out first: the card's height is the sum of its parts
@@ -9261,7 +9378,7 @@ class PDFCanvas(Gtk.DrawingArea):
         h = pad
         for kind, lay, action in self._ref_section(ctx, inner):
             lh = lay.get_pixel_size()[1]
-            gap = 6 if kind in ("toggle", "source") else 3
+            gap = 6 if kind in ("toggle", "source", "zsource") else 3
             parts.append((h, lh, ("text", kind, lay), action))
             h += lh + gap
         if p["type"] == "link":
@@ -9279,13 +9396,12 @@ class PDFCanvas(Gtk.DrawingArea):
                 h += lay.get_pixel_size()[1]
         elif p["type"] == "backlinks":
             for row in p["rows"]:
-                parts.append((h, self.CARD_ROW_H, ("row", row), ("row", row)))
-                h += self.CARD_ROW_H
+                parts.append((h, row_h, ("row", row), ("row", row)))
+                h += row_h
             if p.get("more"):
                 lay = self._card_text(ctx, f"+{p['more']} more", inner)
-                parts.append((h + 3, self.CARD_ROW_H, ("text", "note", lay),
-                              None))
-                h += self.CARD_ROW_H
+                parts.append((h + 3, row_h, ("text", "note", lay), None))
+                h += row_h
         h += pad
         x, y = self._card_position(width, height, w, h)
         ix, iy = snap_to_device(x + pad, y + pad, self._origin_px,
@@ -9306,7 +9422,8 @@ class PDFCanvas(Gtk.DrawingArea):
         colours = {"title": (0.08, 0.08, 0.1), "meta": (0.35, 0.35, 0.38),
                    "tldr": (0.2, 0.2, 0.22), "abstract": (0.15, 0.15, 0.17),
                    "toggle": (ar, ag, ab), "note": (0.45, 0.45, 0.48),
-                   "source": (0.55, 0.55, 0.58), "footer": (0.35, 0.35, 0.38)}
+                   "source": (0.55, 0.55, 0.58), "footer": (0.35, 0.35, 0.38),
+                   "zsource": self.ZOTERO_RED}
         hits = []
         for oy, ph, what, action in parts:
             top = y + oy
@@ -9331,15 +9448,15 @@ class PDFCanvas(Gtk.DrawingArea):
                 PangoCairo.show_layout(ctx, what[2])
             elif what[0] == "row":
                 row = what[1]
-                label = self._card_text(ctx, f"p. {row['page'] + 1}", 48,
+                label = self._card_text(ctx, f"p. {row['page'] + 1}", 48 * f,
                                         bold=True)
                 ctx.set_source_rgb(ar, ag, ab)
-                ctx.move_to(ix, top + 3)
+                ctx.move_to(ix, top + 3 * f)
                 PangoCairo.show_layout(ctx, label)
                 snippet = self._card_text(ctx, row["text"] or "(link)",
-                                          inner - 52)
+                                          inner - 52 * f)
                 ctx.set_source_rgb(0.2, 0.2, 0.22)
-                ctx.move_to(ix + 52, top + 3)
+                ctx.move_to(ix + 52 * f, top + 3 * f)
                 PangoCairo.show_layout(ctx, snippet)
         p["hits"] = hits
         ctx.restore()
@@ -9362,18 +9479,28 @@ class PDFCanvas(Gtk.DrawingArea):
         sources = self._backlinks[0]
         ar, ag, ab = self.zoom_accent
         open_key = (self._link_preview or {}).get("key")
+        f = self._page_f()
+        zot = self._zotero_targets.get(pno, {})
+        self._zotero_icons = []
         for region, key in self._targets_cache[pno]:
             n = len(sources.get(key, ()))
             if not n:
                 continue
-            lay = self._card_text(ctx, f"↩ {n}", 60, size=10.5)
+            lay = self._card_text(ctx, f"↩ {n}", 60 * f, size=10.5)
             tw, th = lay.get_pixel_size()
-            bw, bh = tw + 8, th + 2
+            bw, bh = tw + 8 * f, th + 2 * f
             sx, sy = self._pdf_to_screen(region.x0, region.y0)
-            bx = max(2.0, sx - bw - 3)
-            by = sy + 1
+            bx = max(2.0, sx - bw - 3 * f)
+            by = sy + 1 * f
             box = (bx, by, bw, bh)
             self._backlink_icons.append((box, key, region))
+            item = zot.get(key)
+            if item is not None:
+                # in your Zotero library: a small red Z just left of the ↩
+                zs = bh
+                zbox = (max(2.0, bx - zs - 2 * f), by, zs, zs)
+                self._zotero_icons.append((zbox, item))
+                self._draw_zotero_badge(ctx, zbox)
             hot = (bx <= self._hover_x <= bx + bw
                    and by <= self._hover_y <= by + bh) or key == open_key
             a = 1.0 if hot else 0.55
@@ -9384,9 +9511,28 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.set_source_rgba(ar, ag, ab, a)
             ctx.set_line_width(1.0)
             ctx.stroke()
-            ctx.move_to(bx + 4, by + 1)
+            ctx.move_to(bx + 4 * f, by + 1 * f)
             PangoCairo.show_layout(ctx, lay)
             ctx.restore()
+
+    ZOTERO_RED = (0.80, 0.16, 0.16)   # Zotero's own red
+
+    def _draw_zotero_badge(self, ctx, box):
+        """The little red "Z": this paper is in your Zotero library."""
+        x, y, w, h = box
+        ctx.save()
+        _rounded_rect_path(ctx, x, y, w, h, h * 0.22)
+        ctx.set_source_rgb(*self.ZOTERO_RED)
+        ctx.fill()
+        lay = self._card_text(ctx, "Z", w * 2, size=None, bold=True)
+        d = lay.get_font_description()
+        d.set_absolute_size(h * 0.72 * Pango.SCALE)
+        lay.set_font_description(d)
+        tw, th = lay.get_pixel_size()
+        ctx.set_source_rgb(1, 1, 1)
+        ctx.move_to(x + (w - tw) / 2, y + (h - th) / 2)
+        PangoCairo.show_layout(ctx, lay)
+        ctx.restore()
 
     def _draw_flash(self, ctx):
         """The citation a backlink row jumped to, outlined for a moment."""
