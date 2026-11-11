@@ -4071,6 +4071,8 @@ class PageText:
 
 LINK_PREVIEW_DELAY_MS = 350     # rest on a link this long before the preview
 LINK_PREVIEW_MAX_H = 170.0      # PDF points: the tallest text strip a preview shows
+CITE_PREVIEW_MAX_H = 80.0       # … of a citation: ~6 lines. A 70-author entry
+                                # is names; the paper section says what it is
 TABLE_GAP = 8.0                 # PDF points: rows and rules of one table are closer
 
 # what a hyperref destination NAME says it is — `cite.Kourtis2018`,
@@ -4171,13 +4173,15 @@ def snap_to_device(x, y, origin, scale):
             round((oy + y) * scale) / scale - oy)
 
 
-def link_preview_clip(page, to, kind=None, layout=None):
+def link_preview_clip(page, to, kind=None, layout=None, max_h=None):
     """The strip of `page` an internal link points AT, in page coordinates:
     for a citation its bibliography entry, for a figure or table the whole
     float with its caption, for an equation the display, otherwise the
     paragraph or heading at the point. `kind` is `link_target_kind` of the
     destination's name (None for a link that does not say); `layout` is
-    `page_layout(page)` when the caller has it already.
+    `page_layout(page)` when the caller has it already. `max_h` overrides the
+    height cap — the WHOLE entry is what its links and its Zotero match are
+    looked for in, however much of it is shown.
 
     `to` is the destination point (page space, y down) or None. Everything is
     measured on pdflatex output (row 197 has the cases):
@@ -4264,7 +4268,7 @@ def link_preview_clip(page, to, kind=None, layout=None):
     # a raised anchor sits about a line above its text; further than that
     # and the gap is content (a figure), not air
     top = (ty if first_d > 14 else first[1]) - 3
-    bottom = min(end + 3, top + LINK_PREVIEW_MAX_H)
+    bottom = min(end + 3, top + (max_h or LINK_PREVIEW_MAX_H))
     # the padding stops at the neighbours: a tight bibliography's lines touch,
     # and a sliver of the next entry reads as part of this one
     above = [r[3] for r in rows[:i] if r[3] <= first[1] + 1]
@@ -8811,9 +8815,22 @@ class PDFCanvas(Gtk.DrawingArea):
         kind = self._link_kind(link)
         try:
             page = self.document[page_no]
-            clip = link_preview_clip(page, to, kind, self._page_layout(page_no))
+            layout = self._page_layout(page_no)
+            clip = link_preview_clip(page, to, kind, layout)
             if clip.is_empty:
                 return False
+            entry, cut = clip, False
+            if kind == "cite":
+                # the whole entry is searched for the paper (its link may be
+                # at the end of 70 names); the top of it is what is shown
+                entry = link_preview_clip(page, to, kind, layout,
+                                          max_h=page.rect.height)
+                if entry.height > CITE_PREVIEW_MAX_H + 1:
+                    clip = fitz.Rect(entry.x0, entry.y0, entry.x1,
+                                     entry.y0 + CITE_PREVIEW_MAX_H)
+                    cut = True
+                else:
+                    clip = entry
             device = self._device_px or float(self.get_scale_factor())
             surf = self._page_to_surface(page, self._preview_scale(clip),
                                          clip=clip, device=device)
@@ -8834,16 +8851,16 @@ class PDFCanvas(Gtk.DrawingArea):
                               "w": surf.get_width() / device,
                               "h": surf.get_height() / device,
                               "page": page_no, "clip": clip, "device": device,
-                              "footer": footer, "ref": None,
+                              "footer": footer, "ref": None, "cut": cut,
                               "to": to, "x0": self._hover_x - 24}
         if kind == "cite":
-            uri = self._entry_reference_uri(page_no, clip)
+            uri = self._entry_reference_uri(page_no, entry)
             zot = None
             if self._zotero() is not None:
                 uris = [l.get("uri") for l in page.get_links()
                         if l.get("kind") == fitz.LINK_URI
-                        and link_inside(l["from"], clip)]
-                zot = self._zotero_match(page.get_textbox(clip), uris)
+                        and link_inside(l["from"], entry)]
+                zot = self._zotero_match(page.get_textbox(entry), uris)
             if zot is not None:
                 self._set_zotero_reference(zot)   # local: no lookup needed
             elif uri and reference_preview_enabled():
@@ -8974,8 +8991,12 @@ class PDFCanvas(Gtk.DrawingArea):
             if layout is None:
                 layout = self._page_layout(page_no)
             try:
-                clip = link_preview_clip(self.document[page_no], to, kind,
-                                         layout)
+                # a citation's region is its WHOLE entry — the Zotero match
+                # reads it, and a long author list hides the DOI at its end
+                clip = link_preview_clip(
+                    self.document[page_no], to, kind, layout,
+                    max_h=self.document[page_no].rect.height
+                    if kind == "cite" else None)
             except Exception:
                 continue
             if not clip.is_empty:
@@ -9501,6 +9522,16 @@ class PDFCanvas(Gtk.DrawingArea):
                                         self._device_px or 1.0)
                 ctx.set_source_surface(p["surface"], sx, sy)
                 ctx.paint()
+                if p.get("cut"):
+                    # a shortened entry fades out rather than stopping mid-line
+                    fade = min(18.0, p["h"] / 3)
+                    g = cairo.LinearGradient(0, sy + p["h"] - fade,
+                                             0, sy + p["h"])
+                    g.add_color_stop_rgba(0, 1, 1, 1, 0)
+                    g.add_color_stop_rgba(1, 1, 1, 1, 1)
+                    ctx.rectangle(sx, sy + p["h"] - fade, p["w"], fade)
+                    ctx.set_source(g)
+                    ctx.fill()
             elif what[0] == "text":
                 ctx.set_source_rgb(*colours.get(what[1], (0.2, 0.2, 0.22)))
                 ctx.move_to(ix, top)

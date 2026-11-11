@@ -126,7 +126,11 @@
   point would be converted a second time. **A link belongs to an entry only if its MIDDLE is inside the entry's
   strip** (`link_inside`): strips are padded, and the next entry's link
   reaching a point in made [60] look up [61]. A link straight to a `.pdf`
-  is never looked up (`reference_lookupable`).
+  is never looked up (`reference_lookupable`). **A citation's link and its
+  Zotero match are looked for in the WHOLE entry** (`link_preview_clip(…,
+  max_h=page height)`; `_targets_on_page` stores cite regions that way too):
+  a 70-author entry's DOI sits past any height cap. What the card SHOWS of
+  it is at most `CITE_PREVIEW_MAX_H`, fading out when cut (`cut`).
 - **Card and icon size follow the PAGE** (row 207): `_page_f()` (the page
   zoom, clamped 0.55–2.5) scales the cards' text, row heights and widths
   and the ↩ / Z icons. The rendered target strip keeps its own readable

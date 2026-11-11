@@ -851,6 +851,59 @@ class TestLinkPreview(unittest.TestCase):
         self._pump(lambda: c._link_preview is None)
         self.assertIsNone(c._link_preview)
 
+    def test_a_long_entry_is_shortened_but_its_paper_still_found(self):
+        """A 70-author entry: the DOI link is at its END, far past what the
+        card shows. The whole entry is searched; the top of it is drawn."""
+        pdf = os.path.join(self._tmp.name, "long.pdf")
+        surf = cairo.PDFSurface(pdf, 595, 842)
+        ctx = cairo.Context(surf)
+        ctx.select_font_face("Sans")
+        ctx.set_font_size(10)
+        ctx.tag_begin(cairo.TAG_LINK, "dest='cite.Arute2019'")
+        ctx.move_to(100, 110)
+        ctx.show_text("[45]")
+        ctx.tag_end(cairo.TAG_LINK)
+        ctx.show_page()
+        ctx.tag_begin(cairo.TAG_DEST, "name='cite.Arute2019' x=60 y=90")
+        ctx.tag_end(cairo.TAG_DEST)
+        ctx.move_to(70, 100)
+        ctx.show_text("[45] F. Arute, K. Arya, R. Babbush, D. Bacon,")
+        for i in range(20):
+            ctx.move_to(90, 112 + 12 * i)
+            ctx.show_text(f"Author{i} A., Author{i} B., Author{i} C.,")
+        ctx.move_to(90, 112 + 12 * 20)
+        ctx.show_text("and J. M. Martinis, ")
+        ctx.tag_begin(cairo.TAG_LINK,
+                      "uri='https://doi.org/10.1038/s41586-019-1666-5'")
+        ctx.show_text("Nature 574, 505 (2019)")
+        ctx.tag_end(cairo.TAG_LINK)
+        ctx.show_page()
+        surf.finish()
+        c = PDFCanvas()
+        c.load(pdf)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        calls = []
+        lookups = sidemark.ReferenceLookups(
+            fetch=lambda u: calls.append(u) or {"title": "Quantum supremacy"})
+        sidemark._save_setting("reference_preview", True)
+        with mock.patch.object(sidemark, "REFERENCES", lookups), \
+                mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = 105, 106
+            c._update_link_hover()
+            c._show_link_preview()
+            card = c._link_preview
+            self.assertTrue(card["cut"])
+            self.assertLessEqual(card["clip"].height,
+                                 sidemark.CITE_PREVIEW_MAX_H + 1)
+            self.assertEqual(card["ref"]["uri"],
+                             "https://doi.org/10.1038/s41586-019-1666-5")
+            c._draw_link_preview(cairo.Context(
+                cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)), 600, 800)
+        # …and the entry's badges sit at the WHOLE entry
+        c.go_to_page(1)
+        region = c._targets_on_page(1)[0][0]
+        self.assertGreater(region.y1, 112 + 12 * 20)
+
     def test_a_web_link_has_no_page_to_preview(self):
         link = {"kind": fitz.LINK_URI, "uri": "https://example.org",
                 "from": fitz.Rect(10, 10, 50, 20)}
