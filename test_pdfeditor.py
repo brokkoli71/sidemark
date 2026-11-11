@@ -656,6 +656,24 @@ class TestLinkPreview(unittest.TestCase):
         c.go_back()
         self.assertEqual(c.current_page_idx, 1)
 
+    def test_clicking_the_preview_goes_where_the_link_goes(self):
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.c"]
+            c._update_link_hover()
+            c._show_link_preview()
+        c._draw_link_preview(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)), 600, 800)
+        (bx, by, bw, bh), action = next(h for h in c._link_preview["hits"]
+                                        if h[1][0] == "follow")
+        self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
+        self.assertEqual(c.current_page_idx, 1)
+        self.assertIsNone(c._link_preview)
+        _sx, sy = c._pdf_to_screen(70, 364)          # entry [3] in view
+        self.assertTrue(0 < sy < (c.get_height() or 600), sy)
+        c.go_back()
+        self.assertEqual(c.current_page_idx, 0)
+
     def test_a_press_elsewhere_closes_the_list_and_reaches_the_page(self):
         c = self.c
         self._click_icon(("n", "cite.b"))

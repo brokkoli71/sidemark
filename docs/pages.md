@@ -81,6 +81,7 @@
   the history step), or a page change. **Every press on a card or a backlink
   icon is the card's** — `_card_press` runs in `_on_drag_begin` before the
   tool router; a press elsewhere closes the card and goes on to the page.
+  Clicking a link card's rendered target follows the link (`follow`).
 - **Backlinks (row 199)** — who links HERE. `_backlink_index` maps a link
   KEY (`_link_key`: the destination name when there is one — every `\cite`
   of a key shares it — else page + height) to every source link, built once

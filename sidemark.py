@@ -8499,7 +8499,7 @@ class PDFCanvas(Gtk.DrawingArea):
                               "h": surf.get_height() / device,
                               "page": page_no, "clip": clip, "device": device,
                               "footer": footer, "ref": None,
-                              "x0": self._hover_x - 24}
+                              "to": to, "x0": self._hover_x - 24}
         if kind == "cite" and reference_preview_enabled():
             uri = self._entry_reference_uri(page_no, clip)
             if uri:
@@ -8758,6 +8758,12 @@ class PDFCanvas(Gtk.DrawingArea):
                 logger.debug("card: launch failed", exc_info=True)
         elif what == "row":
             self._follow_backlink(action[1])
+        elif what == "follow":
+            # the preview clicked: go where the link goes (a history step,
+            # Alt+Left returns — exactly as clicking the link itself)
+            _w, page_no, to = action
+            self._hide_link_preview()
+            self.follow_goto(page_no, to[1] if to else None)
 
     def debug_snapshot(self):
         """What a capture (F12) records about this canvas: the view, the
@@ -8977,7 +8983,9 @@ class PDFCanvas(Gtk.DrawingArea):
         if p["type"] == "link":
             if parts:
                 h += 4
-            parts.append((h, p["h"], ("image",), None))
+            # the rendered target IS the place: clicking it goes there
+            parts.append((h, p["h"], ("image",),
+                          ("follow", p["page"], p.get("to"))))
             h += p["h"]
             if p.get("footer"):
                 lay = self._card_text(ctx, p["footer"], inner)
