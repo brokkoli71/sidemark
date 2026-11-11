@@ -118,7 +118,11 @@
   the document's window) and Show in Zotero (`zotero://select/…`). A cited
   entry in the library also wears a red "Z" left of its ↩ icon (matched once
   per page in `_prepare_targets`, `_zotero_targets`); clicking it opens the
-  PDF. **A link belongs to an entry only if its MIDDLE is inside the entry's
+  PDF. Every OTHER cited entry wears an "i" there instead (never both):
+  `_open_info_card` builds the card a hovered citation shows
+  (`_build_link_card`, with every citing page in its footer), pinned. It
+  fakes the link as a GOTO already in page space plus a `_key` — as NAMED its
+  point would be converted a second time. **A link belongs to an entry only if its MIDDLE is inside the entry's
   strip** (`link_inside`): strips are padded, and the next entry's link
   reaching a point in made [60] look up [61]. A link straight to a `.pdf`
   is never looked up (`reference_lookupable`).

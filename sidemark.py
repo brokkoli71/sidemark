@@ -5408,6 +5408,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._targets_idle_id = None   # finding this page's targets, once
         self._backlink_icons = []      # [(screen box, key, region)] as drawn
         self._zotero_icons = []        # [(screen box, Zotero item)] as drawn
+        self._info_icons = []          # [(screen box, key, region)]: the "i"s
         self._zotero_targets = {}      # page -> {target key: Zotero item}
         self._ctx_actions = None       # the context menu's actions (row 201)
         self._zoom_trail = []          # [(view before, after)] per region zoom
@@ -8785,6 +8786,13 @@ class PDFCanvas(Gtk.DrawingArea):
         link = self._hovered_link
         if link is None or self.document is None:
             return False
+        self._build_link_card(link)
+        return False
+
+    def _build_link_card(self, link, here=True):
+        """Make the card for `link` the open one — what hovering it shows.
+        `here` leaves the link itself out of "Also cited on p. …"; a card
+        opened from an entry's "i" (no link was hovered) lists every place."""
         page_no, to = self._link_destination(link)
         if page_no < 0:
             uri = link.get("uri")
@@ -8799,7 +8807,7 @@ class PDFCanvas(Gtk.DrawingArea):
             else:
                 self._start_reference(uri)
             self.queue_draw()
-            return False
+            return True
         kind = self._link_kind(link)
         try:
             page = self.document[page_no]
@@ -8812,7 +8820,8 @@ class PDFCanvas(Gtk.DrawingArea):
         except Exception:
             logger.error("link preview failed:\n" + traceback.format_exc())
             return False
-        here = (self.current_page_idx, round(link["from"].y0))
+        here = ((self.current_page_idx, round(link["from"].y0)) if here
+                else None)
         others = sorted({src for src, r in self._backlinks_to(link)
                          if (src, round(r.y0)) != here})
         footer = None
@@ -8844,7 +8853,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._last_link_preview = {"link": dict(link), "page": page_no,
                                    "to": to, "clip": clip}
         self.queue_draw()
-        return False
+        return True
 
     def _entry_reference_uri(self, page_no, clip):
         """The followable link INSIDE a bibliography entry that names the
@@ -8904,6 +8913,8 @@ class PDFCanvas(Gtk.DrawingArea):
         """What a link points at, as something two links can share: the
         destination NAME when there is one (every \\cite of one key carries
         it), else the page and height."""
+        if "_key" in link:
+            return link["_key"]          # a card opened from a target's "i"
         name = link.get("nameddest") or link.get("name")
         if name and link.get("kind") == fitz.LINK_NAMED:
             return ("n", name)
@@ -9057,6 +9068,31 @@ class PDFCanvas(Gtk.DrawingArea):
                               "more": len(srcs) - len(rows)}
         self.queue_draw()
 
+    def _open_info_card(self, key, region):
+        """An entry's "i" was clicked: the card hovering one of its citations
+        shows — the rendered entry, the paper when it can be named, "Also
+        cited on p. …" with every page — PINNED under the badge. The same
+        badge again closes it."""
+        p = self._link_preview
+        if p is not None and p.get("info_key") == key:
+            self._hide_link_preview()
+            return
+        dest_page, to, _kind = self._backlink_index()[1][key]
+        if to is None:
+            return
+        self._hide_link_preview()
+        # the destination as a link would carry it — already in page space,
+        # so as a GOTO (a NAMED one would be converted a second time) — with
+        # its key, which a GOTO without a name could not say
+        link = {"kind": fitz.LINK_GOTO, "page": dest_page,
+                "to": fitz.Point(*to), "from": fitz.Rect(region),
+                "nameddest": key[1] if key[0] == "n" else None, "_key": key}
+        if self._build_link_card(link, here=False):
+            q = self._link_preview
+            q["pinned"] = True
+            q["info_key"] = key
+            self.queue_draw()
+
     def _follow_backlink(self, row):
         """Go to the place that cites this — a step in the history, so
         Alt+Left comes back — and flash the citation so the eye finds it."""
@@ -9110,6 +9146,10 @@ class PDFCanvas(Gtk.DrawingArea):
                 else:
                     self._card_action(("open", item["select_uri"]))
                 return True
+        for (bx, by, bw, bh), key, region in self._info_icons:
+            if bx - 2 <= x <= bx + bw + 2 and by - 2 <= y <= by + bh + 2:
+                self._open_info_card(key, region)
+                return True
         icon = self._backlink_icon_at(x, y)
         if icon is not None:
             self._open_backlinks(*icon)
@@ -9122,7 +9162,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # it still follows it, exactly as without the card.
         self._hide_link_preview()
         anchor = p.get("anchor")
-        if p.get("type") != "backlinks" and anchor is not None:
+        if not p.get("pinned") and anchor is not None:
             px, py = self._screen_to_pdf(x, y)
             if anchor.x0 <= px <= anchor.x1 and anchor.y0 <= py <= anchor.y1:
                 return False
@@ -9259,9 +9299,11 @@ class PDFCanvas(Gtk.DrawingArea):
         r = p["anchor"]
         lx, top = self._pdf_to_screen(r.x0, r.y0)
         _rx, bottom = self._pdf_to_screen(r.x1, r.y1)
-        if p["type"] == "backlinks":
-            icon = next((b for b, k, _r in self._backlink_icons
-                         if k == p["key"]), None)
+        if p["type"] == "backlinks" or p.get("info_key") is not None:
+            icons = (self._backlink_icons if p["type"] == "backlinks"
+                     else self._info_icons)
+            want = p.get("key", p.get("info_key"))
+            icon = next((b for b, k, _r in icons if k == want), None)
             if icon is not None:
                 x0, top, bottom = icon[0], icon[1], icon[1] + icon[3]
             else:
@@ -9492,7 +9534,9 @@ class PDFCanvas(Gtk.DrawingArea):
         open_key = (self._link_preview or {}).get("key")
         f = self._page_f()
         zot = self._zotero_targets.get(pno, {})
+        kinds = self._backlinks[1]
         self._zotero_icons = []
+        self._info_icons = []
         for region, key in self._targets_cache[pno]:
             n = len(sources.get(key, ()))
             if not n:
@@ -9505,15 +9549,24 @@ class PDFCanvas(Gtk.DrawingArea):
             by = sy + 1 * f
             box = (bx, by, bw, bh)
             self._backlink_icons.append((box, key, region))
+            if kinds.get(key, (None, None, None))[2] != "cite":
+                continue
+            # a cited entry: a small badge just left of the ↩ — the red Z when
+            # the paper is in your Zotero library (opens its PDF), else an "i"
+            # (shows the card hovering one of its citations would)
             item = zot.get(key)
+            zs = bh
+            zbox = (max(2.0, bx - zs - 2 * f), by, zs, zs)
+            zhot = (zbox[0] <= self._hover_x <= zbox[0] + zbox[2]
+                    and zbox[1] <= self._hover_y <= zbox[1] + zbox[3]) \
+                or (self._link_preview or {}).get("info_key") == key
+            a = 1.0 if zhot else 0.55
             if item is not None:
-                # in your Zotero library: a small red Z just left of the ↩
-                zs = bh
-                zbox = (max(2.0, bx - zs - 2 * f), by, zs, zs)
                 self._zotero_icons.append((zbox, item))
-                zhot = (zbox[0] <= self._hover_x <= zbox[0] + zbox[2]
-                        and zbox[1] <= self._hover_y <= zbox[1] + zbox[3])
-                self._draw_zotero_badge(ctx, zbox, 1.0 if zhot else 0.55)
+                self._draw_letter_badge(ctx, zbox, "Z", self.ZOTERO_RED, a)
+            else:
+                self._info_icons.append((zbox, key, region))
+                self._draw_letter_badge(ctx, zbox, "i", (ar, ag, ab), a)
             hot = (bx <= self._hover_x <= bx + bw
                    and by <= self._hover_y <= by + bh) or key == open_key
             a = 1.0 if hot else 0.55
@@ -9530,22 +9583,23 @@ class PDFCanvas(Gtk.DrawingArea):
 
     ZOTERO_RED = (0.80, 0.16, 0.16)   # Zotero's own red
 
-    def _draw_zotero_badge(self, ctx, box, alpha=1.0):
-        """The little red "Z": this paper is in your Zotero library. Drawn
-        like the ↩ icon beside it — the same 1 px border, faint until the
-        pointer is on it — but outlined, never filled."""
+    def _draw_letter_badge(self, ctx, box, letter, rgb, alpha=1.0):
+        """A one-letter badge beside a cited entry — the red "Z" (in your
+        Zotero library) or the "i" (the paper's card). Drawn like the ↩ icon
+        beside it: the same 1 px border, faint until the pointer is on it,
+        outlined, never filled."""
         x, y, w, h = box
         ctx.save()
         _rounded_rect_path(ctx, x, y, w, h, h * 0.22)
-        ctx.set_source_rgba(*self.ZOTERO_RED, alpha)
+        ctx.set_source_rgba(*rgb, alpha)
         ctx.set_line_width(1.0)
         ctx.stroke()
-        lay = self._card_text(ctx, "Z", w * 2, size=None, bold=True)
+        lay = self._card_text(ctx, letter, w * 2, size=None, bold=True)
         d = lay.get_font_description()
         d.set_absolute_size(h * 0.72 * Pango.SCALE)
         lay.set_font_description(d)
         tw, th = lay.get_pixel_size()
-        ctx.set_source_rgba(*self.ZOTERO_RED, alpha)  # outlined: border and Z
+        ctx.set_source_rgba(*rgb, alpha)            # outlined: border and letter
         ctx.move_to(x + (w - tw) / 2, y + (h - th) / 2)
         PangoCairo.show_layout(ctx, lay)
         ctx.restore()

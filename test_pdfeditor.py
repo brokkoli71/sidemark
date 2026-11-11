@@ -613,6 +613,26 @@ class TestLinkPreview(unittest.TestCase):
         self.assertTrue(region.y0 - 2 <= box[1] <= region.y1)
         self.assertIn(("n", "cite.a"), icons)
 
+    def test_an_entrys_i_opens_the_card_its_citations_show(self):
+        """Not in Zotero (here: no Zotero at all): every cited entry has an
+        "i", and clicking it pins the card hovering a citation would show."""
+        self._bib_page_icons()
+        c = self.c
+        infos = {key: box for box, key, _r in c._info_icons}
+        self.assertEqual(set(infos), {("n", "cite.a"), ("n", "cite.b"),
+                                      ("n", "cite.c")})
+        bx, by, bw, bh = infos[("n", "cite.b")]
+        self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
+        card = c._link_preview
+        self.assertEqual(card["type"], "link")
+        self.assertTrue(card["pinned"])
+        self.assertIn("bravoword", c.document[1].get_textbox(card["clip"]))
+        self.assertEqual(card["footer"], "Also cited on p. 1, 2")  # every page
+        c._on_motion_leave(None)                     # pinned: it stays
+        self.assertIs(c._link_preview, card)
+        self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
+        self.assertIsNone(c._link_preview)           # the same "i" closes it
+
     def test_no_icons_on_the_projector_or_while_presenting(self):
         c = self.c
         c._interactive = False
@@ -1571,6 +1591,8 @@ class TestZotero(unittest.TestCase):
         z = {item["key"]: box for box, item in c._zotero_icons}
         self.assertIn("BRAVO001", z)                  # entry [2] is in Zotero
         self.assertEqual(len(z), 2)                   # [2] by title, [3] by arXiv
+        # the one that is not wears the "i" instead — never both
+        self.assertEqual([k for _b, k, _r in c._info_icons], [("n", "cite.a")])
         bx, by, bw, bh = z["BRAVO001"]
         self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
         self.assertEqual(len(opened), 1)
