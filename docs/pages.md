@@ -120,7 +120,19 @@
   left out, at most `CARD_NOTES`) — read-only: Zotero offers no local way to
   edit a note (writing its database while it runs would be overwritten or
   corrupt it; only the zotero.org web API edits), so "Show in Zotero" is the
-  way to change one. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
+  way to change one. "Show in Zotero" opens the paper IN A COLLECTION
+  (`ZoteroLibrary.select_uri`): the one selected in Zotero now (asked of
+  its connector, `zotero_selected_collection`, off the main loop) if the
+  paper is in it, else one it shares with the paper being read
+  (`item_for_pdf`), else its first; an unfiled paper can only be shown in
+  the library.
+- **A paper card is as few lines as say it (row 211)**: title (click: the
+  paper), who/where/when, TL;DR, Zotero notes, ONE action row (`actions`
+  segments laid out by `_layout_actions`: the Z badge, Abstract, PDF / Web,
+  Show in / Add to Zotero), the abstract once opened. Once the paper is
+  known the rendered entry gives way to one line, "[81] · also cited on
+  p. …", which goes to the entry; it stays the card while the paper is
+  unknown and for figures, tables and equations. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
   entry, then volume + first page + year + first author for title-less
   physics entries. A match fills the card's paper section locally (no
   lookup, no switch) and adds Open the PDF (`on_open_document` → a tab in

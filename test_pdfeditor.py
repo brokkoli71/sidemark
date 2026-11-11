@@ -1488,6 +1488,17 @@ class TestReferenceLookup(unittest.TestCase):
                     "https://x.org/miss"), (False, None))
 
 
+def card_actions(c, ctx):
+    """Every action a paper card offers — its lines' and its action row's."""
+    out = []
+    for kind, payload, action in c._ref_section(ctx, 380):
+        if kind == "actions":
+            out += [act for _l, act, _s in payload if act]
+        elif action:
+            out.append(action)
+    return out
+
+
 def make_zotero_library(root, items):
     """A Zotero data directory at `root` with the tables Sidemark reads.
     `items`: dicts of {key, type, fields, creators [(first, last)], pdf}
@@ -1642,11 +1653,10 @@ class TestZotero(unittest.TestCase):
         ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
         parts = c._ref_section(ctx, 380)
         self.assertEqual(parts[0][0], "title")
-        actions = [a for _k, _l, a in parts if a]
+        actions = card_actions(c, ctx)
         pdf = next(a for a in actions if a[0] == "open-file")
         self.assertTrue(pdf[1].endswith("Writer 2019.pdf"))
-        self.assertIn(("open", "zotero://select/library/items/BRAVO001"),
-                      actions)
+        self.assertIn("zshow", [a[0] for a in actions])
         c._card_action(pdf)
         self.assertEqual(opened, [pdf[1]])
 
@@ -1771,7 +1781,7 @@ class TestZotero(unittest.TestCase):
                            "ref": {"uri": "https://doi.org/10.1234/new",
                                    "state": "done", "info": dict(self.PAPER)}}
         ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
-        actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
+        actions = card_actions(c, ctx)
         self.assertIn(("zotero-add",), actions)
         with mock.patch.object(sidemark, "add_to_zotero",
                                return_value=(True, "Added to Zotero")) as add:
@@ -1783,7 +1793,7 @@ class TestZotero(unittest.TestCase):
                 time.sleep(0.005)
         add.assert_called_once()
         self.assertEqual(c._link_preview["zadd"], "Added to Zotero")
-        actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
+        actions = card_actions(c, ctx)
         self.assertNotIn(("zotero-add",), actions)       # done, not again
         self.assertEqual(c._zotero_checked, 0.0)         # re-read soon
 
@@ -1795,7 +1805,7 @@ class TestZotero(unittest.TestCase):
                            "ref": {"uri": "https://doi.org/10.1234/new",
                                    "state": "done", "info": dict(self.PAPER)}}
         ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
-        actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
+        actions = card_actions(c, ctx)
         self.assertNotIn(("zotero-add",), actions)
 
     def test_a_papers_zotero_notes_show_on_its_card(self):
@@ -1812,6 +1822,46 @@ class TestZotero(unittest.TestCase):
         shown = [l.get_text() for k, l, _a in c._ref_section(ctx, 380)
                  if k == "znote"]
         self.assertTrue(any("referenz für mapping" in t for t in shown))
+
+    def test_the_card_is_one_row_of_actions_and_one_line_for_the_entry(self):
+        """Row 211: title, who/where/when, notes, ONE action row (the Z, the
+        abstract, the PDF, Zotero), and — the paper known — one clickable
+        line for the entry instead of its rendering."""
+        c = self._canvas(self.pdf)
+        card = self._hover(c, "cite.b")
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 900, 900))
+        parts = c._ref_section(ctx, 380)
+        kinds = [k for k, _p, _a in parts]
+        self.assertEqual(kinds.count("actions"), 1)
+        row = next(p for k, p, _a in parts if k == "actions")
+        self.assertEqual([st for _l, _a, st in row][0], "zbadge")
+        labels = [l for l, _a, _s in row]
+        self.assertIn("PDF", labels)
+        self.assertIn("Show in Zotero", labels)
+        self.assertNotIn("zsource", kinds)          # the Z says it
+        c._draw_link_preview(ctx, 900, 900)
+        follow = [a for _b, a in card["hits"] if a[0] == "follow"]
+        self.assertEqual(len(follow), 1)            # the "[2] · …" line
+        self.assertEqual(card["label"], "[2]")
+
+    def test_show_in_zotero_opens_it_in_a_collection(self):
+        item = {"key": "K1", "lib_part": "library",
+                "select_uri": "zotero://select/library/items/K1",
+                "collections": [(2, "OTHERCOL"), (3, "MACOLLEC")]}
+        u = sidemark.ZoteroLibrary.select_uri
+        self.assertEqual(u(item, selected=3),
+                         "zotero://select/library/collections/MACOLLEC/items/K1")
+        reading = {"collections": [(3, "MACOLLEC")]}
+        self.assertEqual(u(item, selected=None, reading=reading),
+                         "zotero://select/library/collections/MACOLLEC/items/K1")
+        self.assertEqual(u(item), "zotero://select/library/collections/"
+                                  "OTHERCOL/items/K1")
+        self.assertEqual(u(dict(item, collections=[])), item["select_uri"])
+        post = lambda e, b, h: (200, json.dumps(
+            {"id": 3, "name": "MA", "libraryName": "My Library"}))
+        self.assertEqual(sidemark.zotero_selected_collection(post), 3)
+        self.assertIsNone(sidemark.zotero_selected_collection(
+            lambda e, b, h: (0, "refused")))
 
     def test_note_html_becomes_text(self):
         t = sidemark.zotero_note_text(

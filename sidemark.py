@@ -4830,7 +4830,7 @@ class ZoteroLibrary:
                         else "library")
             base[item_id] = {"key": key, "fields": {}, "creators": [],
                              "select_uri": f"zotero://select/{lib_part}/items/{key}",
-                             "pdf": None}
+                             "lib_part": lib_part, "pdf": None}
         for item_id, name, value in q(
                 "SELECT d.itemID, f.fieldName, v.value FROM itemData d "
                 "JOIN fields f ON f.fieldID = d.fieldID "
@@ -4858,12 +4858,27 @@ class ZoteroLibrary:
                 text = zotero_note_text(note)
                 if text:
                     it.setdefault("notes", []).append(text)
+        # which collections each paper is in — "Show in Zotero" opens it in
+        # one, not in the whole library (row 211)
+        try:
+            for item_id, coll_id, coll_key in q(
+                    "SELECT ci.itemID, c.collectionID, c.key "
+                    "FROM collectionItems ci JOIN collections c "
+                    "ON c.collectionID = ci.collectionID"):
+                if item_id in base:
+                    base[item_id].setdefault("collections", []).append(
+                        (coll_id, coll_key))
+        except Exception:
+            pass                 # no collections table: the library will do
+        self._by_attachment = {}
         for parent, key, path, mode in q(
                 "SELECT ia.parentItemID, i.key, ia.path, ia.linkMode "
                 "FROM itemAttachments ia JOIN items i ON i.itemID = ia.itemID "
                 "WHERE ia.contentType = 'application/pdf' "
                 "AND ia.parentItemID IS NOT NULL"):
             it = base.get(parent)
+            if it is not None:
+                self._by_attachment[key] = it["key"]
             if it is None or it["pdf"] or not path:
                 continue
             if path.startswith("storage:"):
@@ -4889,6 +4904,8 @@ class ZoteroLibrary:
             m = re.search(r"(1[89]|20)\d\d", f.get("date") or "")
             out.append({
                 "key": it["key"], "select_uri": it["select_uri"],
+                "lib_part": it["lib_part"],
+                "collections": it.get("collections", []),
                 "pdf": it["pdf"], "notes": it.get("notes", []),
                 "title": _clean(f.get("title")) or None,
                 "creators": [_clean(f"{a} {b}") for a, b in it["creators"]],
@@ -4944,6 +4961,31 @@ class ZoteroLibrary:
                 return it
         return None
 
+    def item_for_pdf(self, pdf_path):
+        """The library item whose attachment `pdf_path` is (the paper you are
+        reading), or None."""
+        self.items()
+        akey = os.path.basename(os.path.dirname(os.path.abspath(pdf_path)))
+        key = getattr(self, "_by_attachment", {}).get(akey)
+        return next((it for it in self._items or [] if it["key"] == key), None)
+
+    @staticmethod
+    def select_uri(item, selected=None, reading=None):
+        """Where "Show in Zotero" opens `item`: in a COLLECTION it is in —
+        the one selected in Zotero right now (`selected`, a collectionID)
+        if it is there, else one it shares with the paper you are reading,
+        else its first — and only failing all that, the whole library."""
+        colls = item.get("collections") or []
+        if not colls:
+            return item["select_uri"]
+        ids = [cid for cid, _k in colls]
+        mine = {cid for cid, _k in (reading or {}).get("collections") or []}
+        pick = (selected if selected in ids else
+                next((cid for cid in ids if cid in mine), ids[0]))
+        ckey = dict(colls)[pick]
+        return (f"zotero://select/{item['lib_part']}/collections/{ckey}"
+                f"/items/{item['key']}")
+
     @staticmethod
     def as_reference(it):
         """A matched item in `fetch_reference`'s shape, so the card shows it
@@ -4952,6 +4994,21 @@ class ZoteroLibrary:
                 "authors": it["creators"], "year": it["year"],
                 "venue": it["venue"], "abstract": it["abstract"],
                 "source": "your Zotero library"}
+
+
+def zotero_selected_collection(post=None):
+    """The collectionID selected in Zotero now (its connector says), or
+    None — Zotero not running, or a library rather than a collection."""
+    status, text = (post or _connector_post)(
+        "getSelectedCollection", b"{}", {"Content-Type": "application/json"})
+    if status != 200:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data.get("id") if data.get("name") != data.get("libraryName") \
+        else None
 
 
 _ZOTERO_LIBRARIES = {}
@@ -9010,6 +9067,7 @@ class PDFCanvas(Gtk.DrawingArea):
                               "h": surf.get_height() / device,
                               "page": page_no, "clip": clip, "device": device,
                               "footer": footer, "ref": None, "cut": cut,
+                              "label": self._entry_label(page, entry, kind),
                               "to": to, "x0": self._hover_x - 24}
         if kind == "cite":
             uri = self._entry_reference_uri(page_no, entry)
@@ -9030,6 +9088,15 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()
         return True
 
+    @staticmethod
+    def _entry_label(page, entry, kind):
+        """What to call the target in one line: a citation's own label
+        ("[81]", "12."), else nothing."""
+        if kind != "cite":
+            return None
+        m = _CITE_LABEL.match(page.get_textbox(entry) or "")
+        return m.group(1).strip() if m else None
+
     def _entry_reference_uri(self, page_no, clip):
         """The followable link INSIDE a bibliography entry that names the
         paper: a DOI or arXiv link before any other address."""
@@ -9042,6 +9109,26 @@ class PDFCanvas(Gtk.DrawingArea):
             c = classify_reference_url(l.get("uri"))
             found.append(({"arxiv": 0, "doi": 1}.get(c[0], 2), l["uri"]))
         return min(found)[1] if found else None
+
+    def _show_in_zotero(self, item):
+        """Open the paper in Zotero IN A COLLECTION (row 211) — the one
+        selected there now if the paper is in it (Zotero's connector says
+        which; a local call, off the main loop), else one it shares with the
+        paper you are reading — not in the whole library."""
+        lib = self._zotero()
+        doc = getattr(self.document, "name", None)
+
+        def work():
+            try:
+                sel = zotero_selected_collection()
+                reading = lib.item_for_pdf(doc) if lib and doc else None
+                uri = ZoteroLibrary.select_uri(item, sel, reading)
+            except Exception:
+                logger.warning("show in zotero", exc_info=True)
+                uri = item["select_uri"]
+            GLib.idle_add(lambda: self._card_action(("open", uri)) and False)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _add_to_zotero(self):
         """Save the card's paper to Zotero (row 209) on a worker thread; the
@@ -9412,6 +9499,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 self.on_open_document(action[1])
         elif what == "zotero-add":
             self._add_to_zotero()
+        elif what == "zshow":
+            self._show_in_zotero(action[1])
         elif what == "row":
             self._follow_backlink(action[1])
         elif what == "follow":
@@ -9579,9 +9668,13 @@ class PDFCanvas(Gtk.DrawingArea):
         return " · ".join(bits)
 
     def _ref_section(self, ctx, inner):
-        """[(kind, layout, action or None)] of the paper section: TITLE first
-        (it is what you want to know), then who/where/when, the one-sentence
-        TL;DR when there is one, and the abstract behind a toggle."""
+        """[(kind, payload, action)] of the paper section, as few lines as
+        say it (row 211): the TITLE (click: the paper itself), who / where /
+        when, the TL;DR, your Zotero notes, then ONE row of actions — the Z
+        when it is in your library, the abstract toggle, the paper's PDF or
+        web page, Show in Zotero or Add to Zotero — and the abstract, once
+        opened. `payload` is a Pango layout, or for "actions" a list of
+        (label, action, style) segments."""
         p = self._link_preview
         ref = p.get("ref")
         if ref is None:
@@ -9594,12 +9687,12 @@ class PDFCanvas(Gtk.DrawingArea):
             return [("note", self._card_text(
                 ctx, "No details found for this paper", inner), None)]
         zot = p.get("zotero")
+        uri = ref.get("uri")
+        open_paper = (("open-file", zot["pdf"]) if zot and zot.get("pdf")
+                      else ("open", uri) if uri else None)
         out = [("title", self._card_text(ctx, info["title"], inner,
                                          size=self.CARD_TITLE_PX, bold=True,
-                                         lines=3),
-                ("open", ref["uri"]) if ref.get("uri")
-                else (("open-file", zot["pdf"]) if zot and zot.get("pdf")
-                      else None))]
+                                         lines=3), open_paper)]
         meta = self._authors_line(info)
         if info.get("citations"):
             meta += f" · cited by {info['citations']}"
@@ -9610,42 +9703,45 @@ class PDFCanvas(Gtk.DrawingArea):
             out.append(("tldr", self._card_text(ctx, "TL;DR " + info["tldr"],
                                                 inner, italic=True, lines=4),
                         None))
-        if info.get("abstract"):
-            opened = p.get("abstract_open")
-            out.append(("toggle", self._card_text(
-                ctx, ("▾ Abstract" if opened else "▸ Abstract"), inner,
-                bold=True), ("abstract",)))
-            if opened:
-                out.append(("abstract", self._card_text(
-                    ctx, info["abstract"], inner, lines=16), None))
-        if (zot is None and ref.get("uri") and self._zotero() is not None):
-            # reading from Zotero, and this paper is not in it (row 209)
-            state = p.get("zadd")
-            label = {None: "+ Add to Zotero",
-                     "saving": "Adding to Zotero…"}.get(state, state)
-            out.append(("toggle" if state is None else "note",
-                        self._card_text(ctx, label, inner, bold=state is None),
-                        ("zotero-add",) if state is None else None))
         if zot is not None:
             # your notes on it in Zotero (row 210), read-only: edited there
             for note in zot.get("notes", [])[:self.CARD_NOTES]:
                 out.append(("znote", self._card_text(
                     ctx, "✎ " + note, inner, lines=6), None))
+        segs = []
         if zot is not None:
-            # in your library: the paper itself is one click away
+            segs.append(("Z", None, "zbadge"))       # in your library
+        if info.get("abstract"):
+            opened = p.get("abstract_open")
+            segs.append(("Abstract ▾" if opened else "Abstract ▸",
+                         ("abstract",), "link"))
+        if zot is not None:
             if zot.get("pdf"):
-                out.append(("toggle", self._card_text(
-                    ctx, "Open the PDF from Zotero", inner, bold=True),
-                    ("open-file", zot["pdf"])))
-            out.append(("toggle", self._card_text(
-                ctx, "Show in Zotero", inner), ("open", zot["select_uri"])))
-        out.append(("zsource" if zot is not None else "source",
-                    self._card_text(
-                        ctx, ("Z  In your Zotero library" if zot is not None
-                              else f"from {info.get('source', 'the web')}"),
-                        inner, size=self.CARD_TEXT_PX - 2, bold=zot is not None),
-                    None))
+                segs.append(("PDF", ("open-file", zot["pdf"]), "link"))
+            segs.append(("Show in Zotero", ("zshow", zot), "link"))
+        else:
+            if uri:
+                kind = (classify_reference_url(uri) or ("web",))[0]
+                segs.append(({"arxiv": "arXiv", "doi": "DOI"}.get(kind, "Web")
+                             + " ↗", ("open", uri), "link"))
+            if uri and self._zotero() is not None:
+                # reading from Zotero, and this paper is not in it (row 209)
+                state = p.get("zadd")
+                if state is None:
+                    segs.append(("+ Add to Zotero", ("zotero-add",), "link"))
+                else:
+                    segs.append(("Adding to Zotero…" if state == "saving"
+                                 else state, None, "note"))
+        if segs:
+            out.append(("actions", segs, None))
+        if info.get("abstract") and p.get("abstract_open"):
+            out.append(("abstract", self._card_text(
+                ctx, info["abstract"], inner, lines=16), None))
         return out
+
+    def _paper_known(self, p):
+        ref = p.get("ref") or {}
+        return ref.get("state") == "done" and bool(ref.get("info"))
 
     def _draw_link_preview(self, ctx, width, height):
         p = self._link_preview
@@ -9660,34 +9756,54 @@ class PDFCanvas(Gtk.DrawingArea):
         f = self._page_f()
         row_h = self.CARD_ROW_H * f
         maxw = width - 2 * m
+        # Once the paper is KNOWN the rendered entry says nothing its card
+        # does not: it gives way to one line naming the entry, which goes
+        # there (row 211). Unknown — still looking, nothing found, lookups
+        # off, or a figure / table / equation — the rendering is the card.
+        show_image = (p["type"] == "link" and p.get("surface") is not None
+                      and not self._paper_known(p))
         if p["type"] == "backlinks":
             w = min(self.CARD_LIST_W * f, maxw)
         else:
-            w = (p["w"] + 2 * pad) if p.get("surface") is not None else 0
+            w = (p["w"] + 2 * pad) if show_image else 0
             if p.get("ref") is not None:
                 w = max(w, self.CARD_REF_W * f)
             w = min(w, maxw)
         inner = w - 2 * pad
         # lay out first: the card's height is the sum of its parts
-        parts = []                 # (y offset, height, draw(x, y), action)
+        parts = []                 # (y offset, height, what, action)
         h = pad
-        for kind, lay, action in self._ref_section(ctx, inner):
-            lh = lay.get_pixel_size()[1]
-            gap = 6 if kind in ("toggle", "source", "zsource") else 3
-            parts.append((h, lh, ("text", kind, lay), action))
-            h += lh + gap
+        for kind, payload, action in self._ref_section(ctx, inner):
+            if kind == "actions":
+                laid, lh = self._layout_actions(ctx, payload, inner)
+                parts.append((h, lh, ("actions", laid), None))
+                h += lh + 6 * f
+                continue
+            lh = payload.get_pixel_size()[1]
+            parts.append((h, lh, ("text", kind, payload), action))
+            h += lh + (6 if kind in ("meta", "znote") else 3) * f
         if p["type"] == "link":
-            if parts:
-                h += 4
-            # the rendered target IS the place: clicking it goes there
-            parts.append((h, p["h"], ("image",),
-                          ("follow", p["page"], p.get("to"))))
-            h += p["h"]
-            if p.get("footer"):
-                lay = self._card_text(ctx, p["footer"], inner)
-                h += 6
+            follow = ("follow", p["page"], p.get("to"))
+            if show_image:
+                if parts:
+                    h += 4
+                # the rendered target IS the place: clicking it goes there
+                parts.append((h, p["h"], ("image",), follow))
+                h += p["h"]
+                if p.get("footer"):
+                    lay = self._card_text(ctx, p["footer"], inner)
+                    h += 6
+                    parts.append((h, lay.get_pixel_size()[1],
+                                  ("text", "footer", lay), None))
+                    h += lay.get_pixel_size()[1]
+            else:
+                bits = [p.get("label") or "The entry"]
+                if p.get("footer"):
+                    bits.append(p["footer"][0].lower() + p["footer"][1:])
+                lay = self._card_text(ctx, " · ".join(bits), inner,
+                                      size=self.CARD_TEXT_PX - 1)
                 parts.append((h, lay.get_pixel_size()[1],
-                              ("text", "footer", lay), None))
+                              ("text", "footer", lay), follow))
                 h += lay.get_pixel_size()[1]
         elif p["type"] == "backlinks":
             for row in p["rows"]:
@@ -9716,21 +9832,26 @@ class PDFCanvas(Gtk.DrawingArea):
         ctx.stroke()
         colours = {"title": (0.08, 0.08, 0.1), "meta": (0.35, 0.35, 0.38),
                    "tldr": (0.2, 0.2, 0.22), "abstract": (0.15, 0.15, 0.17),
-                   "toggle": (ar, ag, ab), "note": (0.45, 0.45, 0.48),
-                   "source": (0.55, 0.55, 0.58), "footer": (0.35, 0.35, 0.38),
-                   "zsource": self.ZOTERO_RED, "znote": (0.12, 0.12, 0.14)}
+                   "note": (0.45, 0.45, 0.48), "footer": (0.35, 0.35, 0.38),
+                   "znote": (0.12, 0.12, 0.14)}
         hits = []
+
+        def hot(box):
+            return (box[0] <= self._hover_x <= box[0] + box[2]
+                    and box[1] <= self._hover_y <= box[1] + box[3])
+
+        def light(box):
+            ctx.set_source_rgba(ar, ag, ab, 0.12)
+            ctx.rectangle(*box)
+            ctx.fill()
+
         for oy, ph, what, action in parts:
             top = y + oy
             box = (x + 2, top - 1, w - 4, ph + 2)
-            hot = (action is not None and box[0] <= self._hover_x <= box[0] + box[2]
-                   and box[1] <= self._hover_y <= box[1] + box[3])
             if action is not None:
                 hits.append((box, action))
-            if hot:
-                ctx.set_source_rgba(ar, ag, ab, 0.12)
-                ctx.rectangle(*box)
-                ctx.fill()
+                if hot(box):
+                    light(box)
             if what[0] == "image":
                 # its own pixel corner: an odd offset is half a pixel at 1.5x
                 sx, sy = snap_to_device(ix, top, self._origin_px,
@@ -9751,6 +9872,23 @@ class PDFCanvas(Gtk.DrawingArea):
                 ctx.set_source_rgb(*colours.get(what[1], (0.2, 0.2, 0.22)))
                 ctx.move_to(ix, top)
                 PangoCairo.show_layout(ctx, what[2])
+            elif what[0] == "actions":
+                for dx, dy, lay, act, style in what[1]:
+                    tw, th = lay.get_pixel_size()
+                    sbox = (ix + dx - 2, top + dy - 1, tw + 4, th + 2)
+                    if style == "zbadge":
+                        self._draw_letter_badge(
+                            ctx, (ix + dx, top + dy, th, th), "Z",
+                            self.ZOTERO_RED, 1.0)
+                        continue
+                    if act is not None:
+                        hits.append((sbox, act))
+                        if hot(sbox):
+                            light(sbox)
+                    ctx.set_source_rgb(*((ar, ag, ab) if style == "link" else
+                                         (0.45, 0.45, 0.48)))
+                    ctx.move_to(ix + dx, top + dy)
+                    PangoCairo.show_layout(ctx, lay)
             elif what[0] == "row":
                 row = what[1]
                 label = self._card_text(ctx, f"p. {row['page'] + 1}", 48 * f,
@@ -9765,6 +9903,31 @@ class PDFCanvas(Gtk.DrawingArea):
                 PangoCairo.show_layout(ctx, snippet)
         p["hits"] = hits
         ctx.restore()
+
+    def _layout_actions(self, ctx, segs, inner):
+        """The action row's segments placed left to right, " · " between
+        them, wrapping when the card is narrow: ([(dx, dy, layout, action,
+        style)], height). The Z badge is a square one line high."""
+        f = self._page_f()
+        laid, x, y, line_h = [], 0.0, 0.0, 0.0
+        sep = self._card_text(ctx, " · ", inner)
+        sw = sep.get_pixel_size()[0]
+        for n, (label, action, style) in enumerate(segs):
+            lay = self._card_text(ctx, label, inner, bold=style == "link")
+            tw, th = lay.get_pixel_size()
+            if style == "zbadge":
+                tw = th
+            gap = 0 if n == 0 else (6 * f if segs[n - 1][2] == "zbadge"
+                                    else sw)
+            if n and x + gap + tw > inner:
+                x, y, gap = 0.0, y + line_h + 2 * f, 0
+            if gap and segs[n - 1][2] != "zbadge":
+                laid.append((x, y, sep, None, "sep"))
+            x += gap
+            laid.append((x, y, lay, action, style))
+            x += tw
+            line_h = max(line_h, th)
+        return laid, y + line_h
 
     def _draw_backlink_icons(self, ctx):
         """A small "↩ n" beside every target on this page that something
