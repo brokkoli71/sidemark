@@ -33,11 +33,75 @@
     it from an automatic path fills the history with places nobody went.
   - Restores run through `set_state`, i.e. ordinary movement code;
     `_restoring` is what keeps a back from recording itself.
-  - Side buttons: one is BACK and the other forward in BOTH modes
-    (previous/next page, or history — Settings, Ctrl swaps); a text page has
-    no pages, so there it is always history. Which of 8/9 is back is
-    `side_button_step` alone (Settings → "Swap back and forward", default on:
-    8 = forward, as through 0.7.0) — the window and the projector both ask it.
+  - Side buttons: walking the history is always browser-style (8 back, 9
+    forward); page turning has its own swap (Settings → "Swap for page
+    turning", default on: 8 = next, as through 0.7.0). Settings picks pages or
+    history, Ctrl gives the other; a text page has no pages, so there it is
+    always history. `side_button_step(btn, pages)` alone decides the direction
+    — the window and the projector both ask it.
+
+- **Link preview on hover (row 197)** — resting on an internal link, where a
+  click would follow it (`link_hover_active`), draws what it points at on the
+  canvas after `LINK_PREVIEW_DELAY_MS`. Drawn by `_draw`, NOT a popover (rule
+  2, and it follows zoom and pan for free); cleared by leaving the link, a
+  press, following it and a page load.
+  - `_link_destination` is THE resolution of a link, shared by following and
+    previewing. **PyMuPDF reports a NAMED destination — every LaTeX `\cite`
+    and `\ref` — y-UP, a GOTO y-down**; it converts the named one through the
+    target page's `transformation_matrix`. Read raw, a citation lands at the
+    mirror height of its entry.
+  - `link_preview_clip(page, to, kind)` — `kind` is `link_target_kind` of
+    the hyperref destination NAME (`cite.*`, `figure.*`/`table.*`,
+    `equation.*`/`AMS.*`): the name says what the target is, which no layout
+    rule can. It works on LINES grouped into ROWS, never blocks (PyMuPDF
+    splits a hanging first line into its own block, revtex's justified lines
+    into pieces), and on a two-column page only in the column the point is in
+    (`_page_gutter`, found from body-width lines only). A citation stops at
+    the next label row; an equation where text resumes at the column edge; a
+    float is found by its caption (`_float_clip`: from a hypcap anchor down
+    to the caption's end, or from a caption anchor up through graphics and
+    the text inside them); a rule touching the strip walks a table
+    (`_walk_table`). Padding stops at the neighbouring row.
+  - **Sharp at fractional scaling:** the card is rendered at `_device_px`,
+    the WINDOW SURFACE's scale (`_device_scale`: 1.5 at 150 %). Neither the
+    cairo context `_draw` gets (GTK records it and rasterises later; its
+    device scale reads 1.0) nor `get_scale_factor()` (rounds up to 2) says
+    it. The card is painted at a device-pixel corner of the screen
+    (`snap_to_device`, from `_surface_origin`). Either one off and the text
+    is resampled soft. Rendering cost is the page's vector content, not its
+    resolution (an entry ~2 ms, a dense six-panel figure ~60–100 ms at any
+    density), so there is no low-res-first pass.
+- **The hover card (rows 197/199/200)** — ONE card at a time,
+  `PDFCanvas._link_preview`, typed "link" (an internal target, rendered),
+  "ref" (a web link to an article) or "backlinks" (pinned). A hover card stays
+  while the pointer is on its link OR on the card; `CARD_HIDE_GRACE_MS`
+  covers the gap between them, and `_update_link_hover` leaves everything
+  alone while the pointer is on the card (a link under it is covered). A
+  pinned card stays until a press elsewhere, Escape (window `_on_key`, before
+  the history step), or a page change. **Every press on a card or a backlink
+  icon is the card's** — `_card_press` runs in `_on_drag_begin` before the
+  tool router; a press elsewhere closes the card and goes on to the page.
+- **Backlinks (row 199)** — who links HERE. `_backlink_index` maps a link
+  KEY (`_link_key`: the destination name when there is one — every `\cite`
+  of a key shares it — else page + height) to every source link, built once
+  per document on first use (~25 ms for a 22-page paper) and rebuilt when the
+  page count changes. A link preview's footer says "Also cited on p. …";
+  every target on the page with sources wears a faint "↩ n" icon at its left
+  (`_draw_backlink_icons`; regions from `_targets_on_page`, found on an IDLE
+  the first time — tens of ms a draw must not spend). Clicking it pins the
+  list; a row jumps via `follow_goto` (a history step) and flashes the
+  citation. No icons on the projector canvas (`interactive=False`) or while
+  presenting.
+- **Reference lookup (row 200)** — Settings → *Look up cited papers*
+  (`reference_preview`, OFF by default: it sends the link to outside
+  services). Only a link IN the document is looked up — the URI inside the
+  cited entry (`_entry_reference_uri`, arXiv/DOI first) or the hovered web
+  link — never a title search. `fetch_reference` (arXiv API / Crossref /
+  Semantic Scholar to fill gaps / a page's `citation_*` meta tags; never a
+  `.pdf`) runs on a worker thread through `REFERENCES`, which caches answers
+  on disk (`REF_CACHE_DIR`) and misses for `REF_MISS_TTL_S`. Parsers are pure
+  and take an injectable `get`, so tests never touch the network. The User-
+  Agent names the app only.
 
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a

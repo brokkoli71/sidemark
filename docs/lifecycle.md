@@ -17,8 +17,8 @@
 
 - **Ctrl+R reloads the CODE, so everything else has to be written down (row
   157).** It spawns a standalone process, so `session_state()` records every
-  tab that has a file, the page each is on, which was active, and the window's
-  view state; `--restore` hands the child a temp JSON file, which is **consumed**
+  tab that has a file, the page each is on, its zoom and spot (`view`), which
+  was active, and the window's view state; `--restore` hands the child a temp JSON file, which is **consumed**
   — read once and deleted whatever happens — so a stale session cannot come
   back twice. Neither an unreadable state nor a file deleted since is fatal: a
   poor reload beats a crash on startup. The divider position must be applied
@@ -31,6 +31,15 @@
   window, so a tab you never looked at would lose its edits unmentioned, and a
   single "save all?" cannot offer "discard this one, keep that one".
   Cancelling any of them abandons the reload.
+  A PDF tab's `view` is `PDFCanvas.view_anchor()`: the zoom and the page point
+  at the canvas CENTRE (the new canvas is not its final size yet), or None when
+  fitted. It is applied at the first draw (`_pending_view`), AFTER the fit that
+  a fresh page gets there — set any earlier and the fit erases it. A text tab's
+  is the sheet's `_view_state()`, applied by `_restore_sheet_view`: the tab
+  is found by its FILE when the attempt runs (retried until its sheet
+  exists), from a short default-priority TIMER — a LOW-priority idle starves
+  while anything else keeps the loop busy, and the restore silently never
+  ran. Restoring moves through `canvas.go_to_page`, never the history.
 - Single-instance app (`Gio.Application`, `HANDLES_COMMAND_LINE`): a second
   launch forwards its argv to the primary, which opens the file as a tab in the
   last-used window (`_open_target`/`open_file_in_tab`). For manual testing
@@ -105,6 +114,14 @@
   most — a GTK critical, a stalled loop, a slow render pass — all belong to a
   session that then exits perfectly cleanly, so an error-only rule deleted the
   log of exactly the run worth reading.
+  - **F12 is a capture for a bug report (row 198)**: `capture_diagnostics`
+    writes JSON to `CAPTURE_DIR` (`~/.cache/sidemark/captures/`, pruned to
+    `CAPTURE_KEEP`), keeps the session log (`_keep_log`), and copies one line
+    naming both. A KEY, not a button, because it is pressed with the pointer
+    still on the problem; `PDFCanvas.debug_snapshot` records the view and the
+    link preview with every line of its target page, so a capture can replay
+    `link_preview_clip` without the PDF. A new feature whose bugs are hard to
+    describe in words should add its state to the snapshot.
   - **A FREEZE is a blocked main loop, and only a thread outside it can see one
     (row 169).** The symptom users report is typing that stops appearing and
     then lands all at once: nothing is lost, the events were QUEUED while the

@@ -229,8 +229,9 @@
   `erase_radius` (what counts as touching ink),
   `clipboard_content_for`/`paste_objects` (the clipboard), `draw_image` (how a
   pasted image looks), `recognize_shape`/`rect_bbox_of`/`even_divider_positions`
-  /`draw_snap_label` (the extended-dwell shape snap, row 121) are shared by both
-  canvases on purpose. Duplicating a *decision* is how the PDF and text sides
+  /`draw_snap_label` (the extended-dwell shape snap, row 121), `CONTEXT_MENU`
+  (what the menu tool offers, row 201) and `zoom_trail_click` (what a zoom
+  click goes back to, row 202) are shared by both canvases on purpose. Duplicating a *decision* is how the PDF and text sides
   drift; duplicating *mechanics* is fine — they have genuinely different
   substrates (a scale-transform canvas vs a reflowing ScrolledWindow).
   **Before fixing a bug here, grep every caller of the function you are about
@@ -238,6 +239,29 @@
   callers route through. One guard in the shared helper is a *smaller* diff than
   a guard per caller, and patching only the path the report named leaves every
   sibling caller broken — which is exactly how the eraser drifted (row 116).
+
+- **The menu tool (row 201)** is a tool like any other — bound, not built
+  in — and what it offers is decided by what is SELECTED (`CONTEXT_MENU`:
+  each entry names a predicate and a verb both surfaces implement; a false
+  predicate HIDES the entry). On a PDF page it is the canvas' own
+  `Gtk.PopoverMenu`, which `PDFCanvas.do_size_allocate` presents (a bare
+  DrawingArea does not place a popover child itself). On a text page it is
+  GTK's own text menu with the same entries in its extra menu. Its press runs
+  FIRST in `_begin_tool`, ahead of the selection grab, and is the one press
+  that does not clear the PDF text selection — the menu is about it. Never
+  open it in a presented test window (CLAUDE.md rule 2):
+  `context_menu_entries()` arms and returns what would show.
+- **Zoom-to-region click (row 202)**: each region zoom pushes (before, after)
+  onto its surface's `_zoom_trail`; a click with the zoom tool pops back while
+  the view is still `_near_zoom` the trail's last "after"
+  (`ZOOM_TRAIL_DRIFT` / `ZOOM_TRAIL_SCALE`), else drops the trail and fits.
+  The sheet records the INTENDED view (its adjustments clamp until the async
+  relayout), so do not read it back right after `_zoom_to_region`.
+- **What survives a restart (row 203)**: the bindings table — every path
+  that binds SAVES, the toolbar's plain click included (`_set_tool_mode`) —
+  and the select / highlighter variants (`select_style`, `highlight_style`
+  in settings.json, applied to every canvas: they are the app's, like the
+  pen).
 
 - **The extended dwell (`_snap_to_shape`, rows 121 + 127).** Holding still
   mid-stroke no longer only makes a line: `recognize_shape()` cleans a closed

@@ -309,6 +309,493 @@ class TestLinkNavigation(unittest.TestCase):
         self.assertTrue(c.can_go_back())
 
 
+# ── link preview: what an internal link points at (row 197) ───────────────────
+
+def make_bib_pdf(path):
+    """A two-page "paper" built the way LaTeX/hyperref builds one: page 0
+    cites through NAMED destinations (cairo writes them like hyperref does,
+    y counted up from the page bottom), page 1 holds a bibliography whose
+    entries hang (label left, continuation indented) and run together with
+    no gap between [1] and [2], and a figure whose anchor is its caption.
+    Returns {dest name: link rect centre on page 0}."""
+    s = cairo.PDFSurface(path, 595, 842)
+    c = cairo.Context(s)
+    c.select_font_face("Sans")
+    c.set_font_size(10)
+    centres = {}
+    for i, name in enumerate(("cite.a", "cite.b", "cite.c", "figure.1")):
+        x, y = 100 + 40 * i, 110
+        c.tag_begin(cairo.TAG_LINK, f"dest='{name}'")
+        c.move_to(x, y)
+        c.show_text(f"[{i + 1}]")
+        c.tag_end(cairo.TAG_LINK)
+        centres[name] = (x + 5, y - 4)
+    c.show_page()
+
+    def dest(name, x, y):
+        c.tag_begin(cairo.TAG_DEST, f"name='{name}' x={x} y={y}")
+        c.tag_end(cairo.TAG_DEST)
+
+    def line(x, y, text):
+        c.move_to(x, y)
+        c.show_text(text)
+
+    dest("cite.a", 60, 282)                      # raised a line, like hyperref
+    line(70, 300, "[1] Alpha Author. A first title that")
+    line(90, 312, "wraps onto alphaword lines.")
+    dest("cite.b", 60, 306)                      # no space between items
+    line(70, 324, "[2] Bravo Writer. Second title that")
+    line(90, 336, "also wraps bravoword.")
+    dest("cite.c", 60, 350)
+    c.move_to(70, 368)
+    c.show_text("[3] Charlie Third. Charlieword. ")
+    c.tag_begin(cairo.TAG_LINK, "uri='https://arxiv.org/abs/2101.00001v2'")
+    c.show_text("arXiv:2101.00001")
+    c.tag_end(cairo.TAG_LINK)
+    c.rectangle(300, 500, 150, 100)              # the figure's graphic
+    c.stroke()
+    dest("figure.1", 300, 606)                   # hyperref: at the caption
+    line(300, 615, "Figure 1: a box standing in for a plot.")
+    # a second citation of [2], from another page: its backlinks are two
+    c.move_to(70, 760)
+    c.show_text("as also noted in ")
+    c.tag_begin(cairo.TAG_LINK, "dest='cite.b'")
+    c.show_text("[2]")
+    c.tag_end(cairo.TAG_LINK)
+    c.show_text(" for the general case.")
+    c.show_page()
+    s.finish()
+    return centres
+
+
+class TestLinkPreview(unittest.TestCase):
+    """Hovering an internal link previews what it points at (row 197): the
+    bibliography entry a citation names — that entry and not its
+    neighbours — or the figure a reference names."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.pdf = os.path.join(self._tmp.name, "paper.pdf")
+        self.centres = make_bib_pdf(self.pdf)
+        self.c = PDFCanvas()
+        self.c.load(self.pdf)
+        self.c.scale, self.c.offset_x, self.c.offset_y = 1.0, 0.0, 0.0
+
+    def _link(self, name):
+        return next(l for l in self.c.document[0].get_links()
+                    if l.get("nameddest") == name)
+
+    def _preview_text(self, name):
+        page_no, to = self.c._link_destination(self._link(name))
+        page = self.c.document[page_no]
+        return page.get_textbox(sidemark.link_preview_clip(page, to))
+
+    def test_a_citation_previews_its_own_entry_only(self):
+        own = {"cite.a": "alphaword", "cite.b": "bravoword",
+               "cite.c": "Charlieword"}
+        for name, word in own.items():
+            text = self._preview_text(name)
+            self.assertIn(word, text, name)
+            for other in set(own.values()) - {word}:
+                self.assertNotIn(other, text, name)
+
+    def test_a_figure_reference_previews_the_figure_too(self):
+        page_no, to = self.c._link_destination(self._link("figure.1"))
+        clip = sidemark.link_preview_clip(self.c.document[page_no], to)
+        self.assertIn("Figure 1", self.c.document[page_no].get_textbox(clip))
+        self.assertTrue(clip.contains(fitz.Rect(300, 500, 450, 600)))
+
+    def test_a_table_reference_previews_the_whole_table(self):
+        """booktabs leaves a gap around every rule that reads as a paragraph
+        break; the rows below it are still the table, the body text after
+        the bottom rule is not."""
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((200, 300), "Table 1: results captioned above.")
+        for y in (306, 323, 362):                       # top/mid/bottom rules
+            page.draw_line((220, y), (380, y))
+        for i, y in enumerate((317, 334, 346, 358)):    # header + three rows
+            page.insert_text((230, y), f"row{i} 1.0 2.0")
+        page.insert_text((100, 386), "Body text resumes after the float.")
+        clip = sidemark.link_preview_clip(page, (200, 288))
+        text = page.get_textbox(clip)
+        self.assertIn("Table 1", text)
+        self.assertIn("row3", text)
+        self.assertNotIn("Body text", text)
+
+    @staticmethod
+    def _two_column_page():
+        """A revtex-like two-column page (row 197's captures): body text in
+        both columns, so rows of the OTHER column sit level with every line."""
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        filler = "lorem ipsum dolor sit amet consectetur adipiscing"
+        for y in range(60, 800, 12):
+            page.insert_text((310, y), filler, fontsize=9)      # right column
+        return doc, page
+
+    def test_two_columns_a_citation_stays_in_its_column_and_entry(self):
+        doc, page = self._two_column_page()
+        for y in range(60, 400, 12):
+            page.insert_text((57, y), filler := "body text " * 5, fontsize=9)
+        page.insert_text((57, 430), "[53] B. Strasser, arXiv:1709.08949 (2017).",
+                         fontsize=9)
+        page.insert_text((57, 442), "[54] S. Fortunato, Phys. Rep. 486 (2010).",
+                         fontsize=9)
+        page.insert_text((57, 454), "[55] M. Girvan and M. E. J. Newman, Proc.",
+                         fontsize=9)
+        page.insert_text((70, 466), "Natl. Acad. Sci. 99, 7821 (2002).",
+                         fontsize=9)
+        # hyperref's raised anchor for [54] lands in [53]'s line
+        clip = sidemark.link_preview_clip(page, (57, 434), "cite")
+        self.assertIn("Fortunato", page.get_textbox(clip))
+        # what SHOWS: a neighbour's line is cut at most at its edge (line
+        # boxes overlap a fraction of a point), never through its middle
+        for word in ("Girvan", "Strasser", "lorem"):
+            for r in page.search_for(word):
+                mid = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+                self.assertFalse(clip.contains(mid), word)
+
+    def test_an_equation_ends_where_the_body_text_resumes(self):
+        doc, page = self._two_column_page()
+        for y in range(60, 300, 12):
+            page.insert_text((57, y), "body text " * 5, fontsize=9)
+        page.insert_text((110, 320), "cost = size(Tk) - a(size(Ti))", fontsize=9)
+        page.insert_text((270, 320), "(9)", fontsize=9)
+        page.insert_text((57, 340), "with a a tunable constant. If we take",
+                         fontsize=9)
+        clip = sidemark.link_preview_clip(page, (63, 310), "equation")
+        text = page.get_textbox(clip)
+        self.assertIn("cost", text)
+        self.assertIn("(9)", text)
+        self.assertNotIn("tunable", text)
+        self.assertNotIn("lorem", text)
+
+    def test_a_figure_anchored_at_its_top_shows_figure_and_caption(self):
+        """hypcap: the anchor is the float's top, the plot carries text of its
+        own (tick labels) — the preview runs to the end of the caption."""
+        doc, page = self._two_column_page()
+        page.draw_rect(fitz.Rect(80, 60, 280, 200))
+        for y in (80, 120, 160):
+            page.insert_text((64, y), "60", fontsize=7)  # tick labels
+        page.insert_text((57, 225), "Figure 3: (a) Segment of a tensor network",
+                         fontsize=9)
+        page.insert_text((57, 237), "with six tensors, one of which is COPY.",
+                         fontsize=9)
+        for y in range(270, 500, 12):
+            page.insert_text((57, y), "body text " * 5, fontsize=9)
+        clip = sidemark.link_preview_clip(page, (57, 52), "float")
+        text = page.get_textbox(clip)
+        self.assertTrue(clip.contains(fitz.Rect(80, 60, 280, 200)))
+        self.assertIn("COPY", text)                       # the whole caption
+        self.assertNotIn("body text", text)
+        self.assertNotIn("lorem", text)
+
+    def test_destination_names_say_what_they_point_at(self):
+        k = sidemark.link_target_kind
+        self.assertEqual(k("cite.Kourtis2018"), "cite")
+        self.assertEqual(k("figure.caption.12"), "float")
+        self.assertEqual(k("table.3"), "float")
+        self.assertEqual(k("equation.3.9"), "equation")
+        self.assertIsNone(k("section.2"))
+        self.assertIsNone(k(None))
+
+    def test_following_a_named_link_brings_its_entry_into_view(self):
+        """PyMuPDF reports a NAMED destination y-up; read y-down, a citation
+        lands at the mirror height of its entry, far off screen."""
+        x, y = self.centres["cite.c"]
+        self.c._open_link_at(x, y)
+        self.assertEqual(self.c.current_page_idx, 1)
+        _sx, sy = self.c._pdf_to_screen(70, 364)     # the [3] line
+        self.assertTrue(0 < sy < (self.c.get_height() or 600), sy)
+
+    def test_hovering_shows_the_preview_and_leaving_hides_it(self):
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            self.assertIsNotNone(c._link_preview_id)    # waiting to show
+            c._show_link_preview()
+            p = c._link_preview
+            self.assertIsNotNone(p)
+            self.assertEqual(p["page"], 1)
+            self.assertIn("bravoword",
+                          c.document[1].get_textbox(p["clip"]))
+            # it draws, and it stays on the canvas wherever the link is
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 300, 200)
+            c._draw_link_preview(cairo.Context(surf), 300, 200)
+            x, y, w, h = p["box"]                       # where it was drawn
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            c._hover_x, c._hover_y = 500, 700           # off the link
+            c._update_link_hover()
+            self.assertIsNotNone(c._card_hide_id)       # a grace, then gone
+            c._card_hide_check()
+            self.assertIsNone(c._link_preview)
+            self.assertIsNone(c._link_preview_id)
+
+    def test_a_capture_replays_the_preview_it_saw(self):
+        """F12's canvas snapshot: plain JSON, naming the link, its target and
+        the strip chosen — and every line of the target page, so the choice
+        can be re-run from the capture alone. It survives the preview hiding:
+        the key is pressed a moment after the thing looked wrong."""
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            c._show_link_preview()
+            c._hover_x, c._hover_y = 500, 700
+            c._update_link_hover()                 # moved off: preview gone
+            snap = json.loads(json.dumps(c.debug_snapshot()))
+        self.assertEqual(snap["preview_source"], "last shown")
+        self.assertEqual(snap["destination"]["page"], 1)
+        self.assertIn("bravoword", snap["clip_text"])
+        lines = [tuple(l["bbox"]) for l in snap["lines"]]
+        with mock.patch.object(fitz.Page, "get_text", return_value={
+                "blocks": [{"type": 0, "lines": [
+                    {"bbox": b, "spans": [{"text": "x"}]} for b in lines]}]}):
+            replay = sidemark.link_preview_clip(
+                c.document[1], snap["destination"]["to"])
+        self.assertEqual([round(v, 1) for v in replay],
+                         [round(v, 1) for v in snap["clip"]])
+
+    def test_the_preview_maps_pixel_for_pixel_at_a_fractional_scale(self):
+        """At 1.5x the card is rendered at 1.5 device px per logical one
+        (not the integer scale factor GTK reports) and lands on a device
+        pixel corner of the SCREEN — off by a fraction, the text is
+        resampled soft."""
+        c = self.c
+        c._device_px = 1.5
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            c._show_link_preview()
+        self.assertEqual(c._link_preview["surface"].get_device_scale(),
+                         (1.5, 1.5))
+        origin = (13.0, 47.0)                  # the canvas inside its window
+        for x, y in ((10.2, 20.45), (101.37, 7.9)):
+            sx, sy = sidemark.snap_to_device(x, y, origin, 1.5)
+            for v, o in ((sx, origin[0]), (sy, origin[1])):
+                self.assertAlmostEqual((v + o) * 1.5, round((v + o) * 1.5),
+                                       places=6)
+            self.assertLessEqual(abs(sx - x), 0.5 / 1.5 + 1e-9)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 300, 200)
+        c._draw_link_preview(cairo.Context(surf), 300, 200)
+
+    # ── backlinks (row 199) ──────────────────────────────────────────────
+
+    def test_a_citation_preview_names_the_other_places_citing_it(self):
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            c._show_link_preview()
+            self.assertEqual(c._link_preview["footer"], "Also cited on p. 2")
+            c._hover_x, c._hover_y = self.centres["cite.a"]   # cited once
+            c._update_link_hover()
+            c._show_link_preview()
+            self.assertIsNone(c._link_preview["footer"])
+
+    def _bib_page_icons(self):
+        c = self.c
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c._prepare_targets()                       # what the idle does
+        c._draw_backlink_icons(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)))
+        return {key: (box, region) for box, key, region in c._backlink_icons}
+
+    def test_a_cited_entry_wears_an_icon_beside_it(self):
+        icons = self._bib_page_icons()
+        box, region = icons[("n", "cite.b")]
+        self.assertLessEqual(box[0] + box[2], region.x0 + 1)  # left of it
+        self.assertTrue(region.y0 - 2 <= box[1] <= region.y1)
+        self.assertIn(("n", "cite.a"), icons)
+
+    def test_no_icons_on_the_projector_or_while_presenting(self):
+        c = self.c
+        c._interactive = False
+        self.assertEqual(self._bib_page_icons(), {})
+        c._interactive = True
+        c.stack_preview = True
+        self.assertEqual(self._bib_page_icons(), {})
+
+    def _click_icon(self, key):
+        box, _region = self._bib_page_icons()[key]
+        took = self.c._card_press(box[0] + 2, box[1] + 2)
+        self.assertTrue(took)
+        return self.c._link_preview
+
+    def test_clicking_the_icon_lists_who_cites_it_and_it_stays(self):
+        c = self.c
+        card = self._click_icon(("n", "cite.b"))
+        self.assertTrue(card["pinned"])
+        self.assertNotIn("title", card)            # just the list
+        self.assertEqual([r["page"] for r in card["rows"]], [0, 1])
+        self.assertIn("[2]", card["rows"][0]["text"])
+        self.assertIn("general case", card["rows"][1]["text"])
+        c._on_motion_leave(None)                   # pinned: the pointer may go
+        c._hover_x, c._hover_y = 590, 790
+        c._update_link_hover()
+        self.assertIs(c._link_preview, card)
+        self._click_icon(("n", "cite.b"))          # the same icon closes it
+        self.assertIsNone(c._link_preview)
+
+    def test_a_row_goes_there_and_back_comes_home(self):
+        c = self.c
+        self._click_icon(("n", "cite.b"))
+        c._draw_link_preview(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)), 600, 800)
+        (bx, by, bw, bh), action = c._link_preview["hits"][0]
+        self.assertEqual(action[0], "row")
+        self.assertTrue(c._card_press(bx + 5, by + 5))
+        self.assertEqual(c.current_page_idx, 0)
+        self.assertIsNone(c._link_preview)
+        self.assertEqual(c._flash[0], 0)           # the citation flashes
+        c.go_back()
+        self.assertEqual(c.current_page_idx, 1)
+
+    def test_a_press_elsewhere_closes_the_list_and_reaches_the_page(self):
+        c = self.c
+        self._click_icon(("n", "cite.b"))
+        c._draw_link_preview(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)), 600, 800)
+        self.assertFalse(c._card_press(590, 790))
+        self.assertIsNone(c._link_preview)
+
+    def test_the_hover_card_stays_while_the_pointer_is_on_it(self):
+        """Moving from the link onto the card must not lose it — that is
+        where the abstract opens and the title is clicked."""
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            c._show_link_preview()
+            c._draw_link_preview(cairo.Context(
+                cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)), 600, 800)
+            card = c._link_preview
+            bx, by, bw, bh = card["box"]
+            c._hover_x, c._hover_y = bx + bw / 2, by - 3   # the gap between
+            c._update_link_hover()
+            self.assertIs(c._link_preview, card)           # grace, not gone
+            c._hover_x, c._hover_y = bx + bw / 2, by + bh / 2   # onto it
+            c._update_link_hover()
+            self.assertIsNone(c._card_hide_id)
+            c._card_hide_check()
+            self.assertIs(c._link_preview, card)
+            c._hover_x, c._hover_y = 590, 790              # away from both
+            c._update_link_hover()
+            c._card_hide_check()
+            self.assertIsNone(c._link_preview)
+
+    # ── the paper behind a reference (row 200) ───────────────────────────
+
+    def _with_lookups(self, info):
+        calls = []
+
+        def fetch(uri):
+            calls.append(uri)
+            return info
+        lookups = sidemark.ReferenceLookups(fetch=fetch)
+        d = tempfile.mkdtemp(dir=self._tmp.name)
+        for patcher in (mock.patch.object(sidemark, "REFERENCES", lookups),
+                        mock.patch.object(sidemark, "REF_CACHE_DIR", d)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        sidemark._save_setting("reference_preview", True)
+        return calls
+
+    @staticmethod
+    def _pump(cond, secs=3):
+        deadline = time.time() + secs
+        while not cond() and time.time() < deadline:
+            GLib.MainContext.default().iteration(False)
+            time.sleep(0.005)
+
+    PAPER = {"title": "Hyper-optimized tensor network contraction",
+             "authors": ["J. Gray", "S. Kourtis"], "year": "2021",
+             "venue": "Quantum", "abstract": "Tensor networks represent...",
+             "tldr": "Contraction paths found by hypergraph partitioning.",
+             "source": "arXiv"}
+
+    def test_a_citation_shows_the_paper_title_first(self):
+        c = self.c
+        calls = self._with_lookups(dict(self.PAPER))
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.c"]
+            c._update_link_hover()
+            c._show_link_preview()
+        ref = c._link_preview["ref"]
+        self.assertEqual(ref["uri"], "https://arxiv.org/abs/2101.00001v2")
+        self._pump(lambda: c._link_preview["ref"]["state"] != "loading")
+        self.assertEqual(calls, ["https://arxiv.org/abs/2101.00001v2"])
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
+        parts = c._ref_section(ctx, 380)
+        self.assertEqual(parts[0][0], "title")
+        self.assertIn("Hyper-optimized", parts[0][1].get_text())
+        kinds = [k for k, _l, _a in parts]
+        self.assertNotIn("abstract", kinds)          # behind its toggle
+        c._card_action(("abstract",))
+        self.assertIn("abstract", [k for k, _l, _a in c._ref_section(ctx, 380)])
+
+    def test_no_lookup_unless_switched_on(self):
+        c = self.c
+        calls = self._with_lookups(dict(self.PAPER))
+        sidemark._save_setting("reference_preview", False)
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.c"]
+            c._update_link_hover()
+            c._show_link_preview()
+        self.assertIsNone(c._link_preview["ref"])
+        uri_link = next(l for l in c.document[1].get_links()
+                        if l["kind"] == fitz.LINK_URI)
+        self.assertFalse(c._previewable(uri_link))
+        self.assertEqual(calls, [])
+
+    def test_a_link_to_an_article_gets_a_card_of_its_own(self):
+        c = self.c
+        self._with_lookups(dict(self.PAPER))
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        uri_link = next(l for l in c.document[1].get_links()
+                        if l["kind"] == fitz.LINK_URI)
+        r = uri_link["from"]
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+            c._update_link_hover()
+            self.assertIsNotNone(c._link_preview_id)
+            c._show_link_preview()
+        self.assertEqual(c._link_preview["type"], "ref")
+        self._pump(lambda: c._link_preview["ref"]["state"] != "loading")
+        self.assertEqual(c._link_preview["ref"]["info"]["year"], "2021")
+
+    def test_an_unknown_web_page_shows_no_empty_card(self):
+        c = self.c
+        self._with_lookups(None)
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c._hovered_link = {"kind": fitz.LINK_URI, "uri": "https://example.org/x",
+                           "from": fitz.Rect(10, 10, 50, 20)}
+        c._show_link_preview()
+        self._pump(lambda: c._link_preview is None)
+        self.assertIsNone(c._link_preview)
+
+    def test_a_web_link_has_no_page_to_preview(self):
+        link = {"kind": fitz.LINK_URI, "uri": "https://example.org",
+                "from": fitz.Rect(10, 10, 50, 20)}
+        self.assertEqual(self.c._link_destination(link), (-1, None))
+
+    def test_following_the_link_closes_the_preview(self):
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.a"]
+            c._update_link_hover()
+            c._show_link_preview()
+            c._open_link_at(*self.centres["cite.a"])
+            self.assertIsNone(c._link_preview)
+
+
 # ── view history: back / forward through where you were (row 195) ──────────────
 
 class TestViewHistory(unittest.TestCase):
@@ -461,13 +948,229 @@ class TestViewHistoryOnSurfaces(unittest.TestCase):
         self.assertTrue(tp.can_go_back())
 
 
+class TestZoomClickStepsBackOut(unittest.TestCase):
+    """Row 202: after zoom-to-region, a plain click with the zoom tool takes
+    back the latest zoom — nested ones one click at a time — until you have
+    zoomed out or moved a lot; then the click is the whole page."""
+
+    def setUp(self):
+        self.c = PDFCanvas()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        pdf = os.path.join(self._tmp.name, "a.pdf")
+        make_pdf(pdf, n_pages=2)
+        self.c.load(pdf)
+        self.c._fit_page(800, 600)
+
+    def _zoom(self, x0, y0, x1, y1):
+        self.c._execute_zoom_to_rect((x0, y0), (x1, y1))
+
+    def test_clicks_unwind_nested_zooms_then_fit(self):
+        c = self.c
+        fitted = c._view_state()
+        self._zoom(100, 100, 400, 300)
+        first = c._view_state()
+        self._zoom(200, 200, 300, 260)
+        c.zoom_click()
+        self.assertEqual(c._view_state(), first)
+        c.zoom_click()
+        self.assertEqual(c._view_state(), fitted)
+        c.zoom_click()                          # nothing left: whole page
+        self.assertTrue(c._is_fitted)
+
+    def test_a_small_nudge_still_steps_back(self):
+        c = self.c
+        before = c._view_state()
+        self._zoom(100, 100, 400, 300)
+        c.offset_x += 0.1 * 800 * sidemark.ZOOM_TRAIL_DRIFT
+        c.zoom_click()
+        self.assertEqual(c._view_state(), before)
+
+    def test_after_moving_a_lot_the_click_is_the_whole_page(self):
+        c = self.c
+        self._zoom(100, 100, 400, 300)
+        c.offset_y -= 2 * 600 * sidemark.ZOOM_TRAIL_DRIFT
+        c.zoom_click()
+        self.assertTrue(c._is_fitted)
+        self.assertEqual(c._zoom_trail, [])     # the stale trail is gone
+
+    def test_zooming_out_by_hand_breaks_the_trail(self):
+        c = self.c
+        self._zoom(100, 100, 400, 300)
+        c.scale /= 2 * sidemark.ZOOM_TRAIL_SCALE
+        c.zoom_click()
+        self.assertTrue(c._is_fitted)
+
+    def test_stepping_out_is_a_step_back_can_return_to(self):
+        c = self.c
+        self._zoom(100, 100, 400, 300)
+        zoomed = c._view_state()
+        c.zoom_click()
+        c.go_back()
+        self.assertEqual(c._view_state(), zoomed)
+
+    def test_the_text_sheet_follows_the_same_rule(self):
+        tp = sidemark.TextPageView()
+        tp.view.get_buffer().set_text("alpha\n" * 20)
+        before = tp._view_state()
+        tp._zoom_trail.append((before, tp._view_state()))
+        tp.set_zoom(tp.zoom * 2)
+        tp._zoom_trail[-1] = (before, tp._view_state())
+        tp.zoom_click()
+        self.assertEqual(tp._view_state()[0], before[0])
+        tp.set_zoom(tp.zoom * 3)
+        with mock.patch.object(tp, "fit_width") as fit:
+            tp.zoom_click()                     # trail empty: the whole width
+        fit.assert_called_once()
+
+    def test_the_rule_itself(self):
+        near = lambda a, b: abs(a - b) < 5
+        trail = [(0, 100), (100, 200)]
+        self.assertEqual(sidemark.zoom_trail_click(trail, 202, near), 100)
+        self.assertEqual(sidemark.zoom_trail_click(trail, 100, near), 0)
+        trail = [(0, 100), (100, 200)]
+        self.assertIsNone(sidemark.zoom_trail_click(trail, 500, near))
+        self.assertEqual(trail, [])
+
+
+class TestContextMenuTool(unittest.TestCase):
+    """Row 201: the right-click menu is a TOOL, and what is selected decides
+    what it offers — the same table on the PDF page and the text page."""
+
+    def setUp(self):
+        self.c = PDFCanvas()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        pdf = os.path.join(self._tmp.name, "a.pdf")
+        make_pdf(pdf)
+        self.c.load(pdf)
+        self.c._fit_page(800, 600)
+        self.pt = sidemark.PageText([_text_line(0, 10, 10, "Hello big world"),
+                                     _text_line(0, 10, 30, "second text line")])
+        self.c._page_text_cache = self.pt
+
+    def test_it_is_a_tool_of_both_modes(self):
+        self.assertTrue(sidemark.tool_in_mode("menu", "pdf"))
+        self.assertTrue(sidemark.tool_in_mode("menu", "text"))
+        self.assertIn("menu", sidemark.TOOL_BAR_ORDER)
+
+    def test_a_text_selection_offers_highlight_and_copy(self):
+        c = self.c
+        self.assertNotIn("Highlight", c.context_menu_entries())
+        c._text_segments = self.pt.segments(6, 26)
+        entries = c.context_menu_entries()
+        self.assertIn("Highlight", entries)
+        self.assertIn("Copy", entries)
+        self.assertNotIn("Delete drawing", entries)
+        c._ctx_actions.activate_action("highlight", None)
+        self.assertEqual(len(c.strokes), 2)        # one per line, as ink
+
+    def test_a_drawing_selection_offers_its_verbs(self):
+        c = self.c
+        c.strokes.append({"pts": [(10, 10), (50, 50)], "color": (0, 0, 0),
+                          "width": 2.0, "opacity": 1.0})
+        c._set_selected([c.strokes[0]], [])
+        entries = c.context_menu_entries()
+        for label in ("Copy drawing", "Duplicate drawing", "Delete drawing"):
+            self.assertIn(label, entries)
+        c._ctx_actions.activate_action("delete-ink", None)
+        self.assertEqual(c.strokes, [])
+
+    def test_the_menu_press_keeps_the_selection_it_is_about(self):
+        c = self.c
+        c.bindings.bind("right", "menu")
+        self.addCleanup(c.bindings.bind, "right", "eraser")
+        c._text_segments = self.pt.segments(6, 26)
+        g = mock.Mock()
+        g.get_current_button.return_value = 3
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        with mock.patch.object(c, "open_context_menu") as opened:
+            c._on_drag_begin(g, 120, 40)
+        opened.assert_called_once_with(120, 40)
+        self.assertTrue(c._text_segments)          # still there to highlight
+        self.assertTrue(c._ignoring)               # the drag does nothing
+
+    def test_the_text_page_adds_the_same_entries_to_its_menu(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.ctxmenu")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    md = os.path.join(d, "note.md")
+                    with open(md, "w", encoding="utf-8") as f:
+                        f.write("first line of text\nsecond line here\n")
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(md)
+                    tp = win._active_session._text_page
+                    deadline = time.time() + 2
+                    while time.time() < deadline:
+                        GLib.MainContext.default().iteration(False)
+                    buf = tp.view.get_buffer()
+                    self.assertNotIn("Highlight", tp.context_menu_entries())
+                    self.assertIsNotNone(tp.view.get_extra_menu())
+                    buf.select_range(buf.get_iter_at_offset(6),
+                                     buf.get_iter_at_offset(26))
+                    self.assertIn("Highlight", tp.context_menu_entries())
+                    n = len(tp.strokes)
+                    tp._ctx_actions.activate_action("highlight", None)
+                    self.assertEqual(len(tp.strokes) - n, 2)   # two lines
+                    self.assertTrue(all(st["opacity"] < 1 for st in tp.strokes[n:]))
+                    tp.undo_ink()
+                    self.assertEqual(len(tp.strokes), n)       # one undo
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+
+class TestToolsSurviveAReload(unittest.TestCase):
+    """Row 203: the tool picked with a plain click, and the select /
+    highlighter variants, are saved — Ctrl+R (a new process) keeps them."""
+
+    def test_a_plain_click_pick_is_saved_and_variants_too(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.toolkeep")
+
+        def on_activate(a):
+            try:
+                win = PDFEditorWindow(a)
+                win.present()
+                win._set_tool_mode("lasso")
+                win._set_select_style("rect")
+                win._set_highlight_style("text")
+                fresh = sidemark.Bindings.load()       # what a new process reads
+                self.assertEqual(fresh.tool_for_chord("left"), "lasso")
+                win2 = PDFEditorWindow(a)
+                self.assertEqual(win2.canvas.select_style, "rect")
+                self.assertEqual(win2.canvas.highlight_style, "text")
+            except Exception:
+                import traceback
+                errors.append(traceback.format_exc())
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+
 class TestSideButtons(unittest.TestCase):
     """Mouse back/forward (8/9): pages or history per Settings, Ctrl swaps,
     and the BACK button points back in both modes. These run with the swap
     switch OFF (8 = back); TestSideButtonSwap covers the switch."""
 
     def setUp(self):
-        sidemark._save_setting("swap_side_buttons", False)
+        sidemark._save_setting("swap_page_buttons", False)
 
     @staticmethod
     def _press(btn, ctrl=False):
@@ -543,29 +1246,195 @@ class TestSideButtons(unittest.TestCase):
         self._run(body)
 
 
+class TestReferenceLookup(unittest.TestCase):
+    """What a cited paper IS (row 200), offline: the link is classified, each
+    service's answer parsed, and the second service only fills gaps."""
+
+    ARXIV = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+ <entry>
+  <title>Hyper-optimized tensor
+    network contraction</title>
+  <summary>  Tensor networks represent the state-of-the-art
+   in computational methods.</summary>
+  <published>2020-02-05T18:59:58Z</published>
+  <author><name>Johnnie Gray</name></author>
+  <author><name>Stefanos Kourtis</name></author>
+  <arxiv:journal_ref>Quantum 5, 410 (2021)</arxiv:journal_ref>
+ </entry>
+</feed>"""
+
+    def test_links_that_can_name_a_paper(self):
+        c = sidemark.classify_reference_url
+        self.assertEqual(c("https://arxiv.org/abs/2002.01935v3"),
+                         ("arxiv", "2002.01935"))
+        self.assertEqual(c("http://arxiv.org/pdf/hep-th/9901001.pdf"),
+                         ("arxiv", "hep-th/9901001"))
+        self.assertEqual(c("https://doi.org/10.22331/q-2021-03-15-410"),
+                         ("doi", "10.22331/q-2021-03-15-410"))
+        self.assertEqual(c("https://dl.acm.org/doi/10.1145/3676641.3716254"),
+                         ("doi", "10.1145/3676641.3716254"))
+        self.assertEqual(c("https://example.org/paper"),
+                         ("web", "https://example.org/paper"))
+        self.assertIsNone(c("mailto:someone@example.org"))
+        self.assertIsNone(c(None))
+
+    def test_arxiv(self):
+        info = sidemark.parse_arxiv_atom(self.ARXIV)
+        self.assertEqual(info["title"], "Hyper-optimized tensor network contraction")
+        self.assertEqual(info["authors"], ["Johnnie Gray", "Stefanos Kourtis"])
+        self.assertEqual(info["year"], "2020")
+        self.assertEqual(info["venue"], "Quantum 5, 410 (2021)")
+        self.assertTrue(info["abstract"].startswith("Tensor networks"))
+
+    def test_crossref(self):
+        info = sidemark.parse_crossref({"message": {
+            "title": ["A Title"], "container-title": ["Phys. Rep."],
+            "author": [{"given": "S.", "family": "Fortunato"}],
+            "issued": {"date-parts": [[2010, 2]]},
+            "abstract": "<jats:p>Graphs <jats:italic>are</jats:italic> nice.</jats:p>",
+            "is-referenced-by-count": 9000}})
+        self.assertEqual(info["authors"], ["S. Fortunato"])
+        self.assertEqual(info["year"], "2010")
+        self.assertEqual(info["abstract"], "Graphs are nice.")
+        self.assertEqual(info["citations"], 9000)
+
+    def test_publisher_page_meta_tags(self):
+        html = """<html><head><title>x</title>
+          <meta name="citation_title" content="Community detection in graphs">
+          <meta name="citation_author" content="Fortunato, Santo">
+          <meta name="citation_publication_date" content="2010/02/01">
+          <meta name="citation_journal_title" content="Physics Reports">
+          <meta name="description" content="The modern science of networks...">
+          </head><body></body></html>"""
+        info = sidemark.parse_citation_meta(html)
+        self.assertEqual(info["title"], "Community detection in graphs")
+        self.assertEqual(info["year"], "2010")
+        self.assertEqual(info["venue"], "Physics Reports")
+        self.assertTrue(info["abstract"].startswith("The modern science"))
+
+    def test_a_doi_borrows_the_abstract_and_tldr_crossref_lacks(self):
+        def get(url, accept=None):
+            if "crossref" in url:
+                return ("application/json", json.dumps({"message": {
+                    "title": ["T"], "author": [], "issued":
+                    {"date-parts": [[2019]]}}}))
+            if "semanticscholar" in url:
+                self.assertIn("DOI:10.1234/x", url)
+                return ("application/json", json.dumps({
+                    "title": "T", "abstract": "From S2.",
+                    "tldr": {"text": "Short."}, "year": 2019}))
+            self.fail(url)
+        info = sidemark.fetch_reference("https://doi.org/10.1234/x", get=get)
+        self.assertEqual(info["abstract"], "From S2.")
+        self.assertEqual(info["tldr"], "Short.")
+        self.assertEqual(info["source"], "Crossref")      # first answer names it
+
+    def test_a_link_to_a_pdf_file_is_not_fetched(self):
+        self.assertIsNone(sidemark.fetch_reference(
+            "https://example.org/paper.pdf",
+            get=lambda *a, **k: self.fail("fetched a PDF")))
+
+    def test_answers_are_kept_and_a_miss_is_retried_later(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sidemark, "REF_CACHE_DIR", d):
+            calls = []
+            look = sidemark.ReferenceLookups(
+                fetch=lambda u: calls.append(u) or {"title": u})
+            got = []
+            look.request("https://arxiv.org/abs/1", got.append)
+            deadline = time.time() + 3
+            while not got and time.time() < deadline:
+                GLib.MainContext.default().iteration(False)
+                time.sleep(0.005)
+            look.request("https://arxiv.org/abs/1", got.append)  # memory
+            fresh = sidemark.ReferenceLookups(fetch=lambda u: self.fail(u))
+            fresh.request("https://arxiv.org/abs/1", got.append)  # disk
+            self.assertEqual(len(calls), 1)
+            self.assertEqual([g["title"] for g in got], ["https://arxiv.org/abs/1"] * 3)
+            # a miss: kept for a while, asked again after the TTL
+            look2 = sidemark.ReferenceLookups(fetch=lambda u: None)
+            look2._done("https://x.org/miss", None)
+            self.assertEqual(sidemark.ReferenceLookups().cached(
+                "https://x.org/miss"), (True, None))
+            with mock.patch.object(sidemark.time, "time",
+                                   return_value=time.time()
+                                   + sidemark.REF_MISS_TTL_S + 5):
+                self.assertEqual(sidemark.ReferenceLookups().cached(
+                    "https://x.org/miss"), (False, None))
+
+
+class TestCapture(unittest.TestCase):
+    """F12 writes a capture for a bug report: a JSON file, the session log
+    kept beside it, and one line naming both on the clipboard."""
+
+    def test_capture_writes_keeps_the_log_and_copies_a_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "paper.pdf")
+            make_bib_pdf(pdf)
+            caps = os.path.join(d, "captures")
+
+            def body(win):
+                win._do_open_file(pdf)
+                with mock.patch.object(sidemark, "CAPTURE_DIR", caps), \
+                        mock.patch.object(sidemark, "_log_had_error", False):
+                    ev = types.SimpleNamespace()
+                    self.assertTrue(win._on_global_key(
+                        ev, Gdk.KEY_F12, 0, Gdk.ModifierType(0)))
+                    self.assertTrue(sidemark._log_had_error)
+                files = os.listdir(caps)
+                self.assertEqual(len(files), 1)
+                with open(os.path.join(caps, files[0]), encoding="utf-8") as f:
+                    snap = json.load(f)
+                self.assertEqual(snap["document"], pdf)
+                self.assertIn("canvas", snap)
+                got = []
+                cb = Gdk.Display.get_default().get_clipboard()
+                cb.read_text_async(None, lambda c, r: got.append(
+                    c.read_text_finish(r)))
+                for _ in range(200):
+                    if got:
+                        break
+                    GLib.MainContext.default().iteration(False)
+                    time.sleep(0.005)
+                self.assertTrue(got and files[0] in got[0], got)
+
+            TestSideButtons._run(self, body)
+
+
 class TestSideButtonSwap(unittest.TestCase):
-    """Settings → "Swap back and forward" flips which of 8/9 is back, in the
-    one helper every side-button path asks (the window, the projector)."""
+    """Settings → "Swap for page turning" flips which of 8/9 turns back a
+    page, in the one helper every side-button path asks (the window, the
+    projector). Walking the history stays browser-style (8 back) either way."""
 
-    def test_swap_flips_the_pair_and_nothing_else(self):
+    def test_swap_flips_pages_only(self):
         for swapped in (False, True):
-            sidemark._save_setting("swap_side_buttons", swapped)
+            sidemark._save_setting("swap_page_buttons", swapped)
             back, fwd = (9, 8) if swapped else (8, 9)
-            self.assertEqual(sidemark.side_button_step(back), -1)
-            self.assertEqual(sidemark.side_button_step(fwd), 1)
+            self.assertEqual(sidemark.side_button_step(back, pages=True), -1)
+            self.assertEqual(sidemark.side_button_step(fwd, pages=True), 1)
+            self.assertEqual(sidemark.side_button_step(8, pages=False), -1)
+            self.assertEqual(sidemark.side_button_step(9, pages=False), 1)
             for other in (1, 2, 3, 10):
-                self.assertEqual(sidemark.side_button_step(other), 0)
+                self.assertEqual(sidemark.side_button_step(other, True), 0)
 
-    def test_window_follows_the_switch(self):
-        sidemark._save_setting("swap_side_buttons", True)
+    def test_swapped_pages_with_browser_history(self):
+        sidemark._save_setting("swap_page_buttons", True)
 
         def body(win):
             c = win.canvas
             win._on_side_buttons("pages")
             win._on_window_button(None, TestSideButtons._press(8))
-            self.assertEqual(c.current_page_idx, 1)   # 8 is forward now
+            self.assertEqual(c.current_page_idx, 1)   # 8 turns forward
             win._on_window_button(None, TestSideButtons._press(9))
             self.assertEqual(c.current_page_idx, 0)
+            c.follow_goto(3, to_y=100)
+            c.history._last = None
+            win._on_window_button(None, TestSideButtons._press(8, ctrl=True))
+            self.assertEqual(c.current_page_idx, 0)   # Ctrl+8: history back
+            win._on_window_button(None, TestSideButtons._press(9, ctrl=True))
+            self.assertEqual(c.current_page_idx, 3)   # Ctrl+9: forward
 
         TestSideButtons._run(self, body)
 
@@ -4262,6 +5131,31 @@ class TestScrollFlip(unittest.TestCase):
         for _ in range(times):
             canvas._on_scroll(ctrl, 0, dy)
 
+    @staticmethod
+    def _touchpad(canvas, dy, times=1):
+        ctrl = mock.Mock()
+        ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
+        ctrl.get_unit.return_value = Gdk.ScrollUnit.SURFACE
+        for _ in range(times):
+            canvas._on_scroll(ctrl, 0, dy)
+
+    def test_a_touchpad_pans_faster_than_one_to_one(self):
+        """Row 204: two fingers move the page further than they moved."""
+        canvas = self._canvas_with_pdf()
+        canvas.scale *= 3                   # zoomed in: room to pan, no flip
+        canvas.offset_y = -500.0
+        before = canvas.offset_y
+        self._touchpad(canvas, 10)
+        self.assertLess(canvas.offset_y, before - 10)
+
+    def test_the_faster_pan_does_not_make_the_page_flip_sooner(self):
+        """The flip measures the RAW deltas: just under its threshold still
+        stays on the page, whatever the pan gain is."""
+        canvas = self._canvas_with_pdf()
+        n = int(canvas.TOUCHPAD_FLIP_THRESHOLD // 10) - 1
+        self._touchpad(canvas, 10, times=n)
+        self.assertEqual(canvas.current_page_idx, 0)
+
     def test_scrolling_past_bottom_flips_to_next_page(self):
         canvas = self._canvas_with_pdf()
         self._scroll(canvas, 1, times=3)
@@ -4351,15 +5245,18 @@ class TestTouchpadScroll(unittest.TestCase):
         ctrl.get_unit.return_value = Gdk.ScrollUnit.SURFACE
         return ctrl
 
-    def test_smooth_scroll_pans_both_axes_at_pixel_scale(self):
+    def test_smooth_scroll_pans_both_axes_in_proportion(self):
         canvas = self._canvas_with_pdf()
         canvas._is_fitted = False
         canvas.scale = 2.0
         canvas.offset_x, canvas.offset_y = -200.0, -200.0   # neither edge visible
         canvas._on_scroll(self._ctrl(), 12.0, 7.0)
-        # 1:1 with the surface delta, both axes at once (no axis lock)
-        self.assertAlmostEqual(canvas.offset_x, -212.0)
-        self.assertAlmostEqual(canvas.offset_y, -207.0)
+        # both axes at once (no axis lock), in the finger's direction, and at
+        # least as far as the finger went (row 204: the pan has a gain)
+        mx, my = -200.0 - canvas.offset_x, -200.0 - canvas.offset_y
+        self.assertGreaterEqual(mx, 12.0)
+        self.assertGreaterEqual(my, 7.0)
+        self.assertAlmostEqual(mx / my, 12.0 / 7.0)
 
     def test_small_smooth_scroll_does_not_flip(self):
         # a gentle two-finger drag past the edge (well under the px threshold)
@@ -10900,7 +11797,7 @@ class TestPresenterMode(unittest.TestCase):
 
     def test_presenter_window_click_navigates(self):
         # click / mouse-forward (9) advance, right-click / mouse-back (8) go back
-        sidemark._save_setting("swap_side_buttons", False)   # 8 = back
+        sidemark._save_setting("swap_page_buttons", False)   # 8 = back
         with tempfile.TemporaryDirectory() as d:
             pdf = os.path.join(d, "deck.pdf")
             make_pdf(pdf, n_pages=4)
@@ -11107,7 +12004,7 @@ class TestMouseSideButtonNav(unittest.TestCase):
             pdf = os.path.join(d, "deck.pdf")
             make_pdf(pdf, n_pages=4)
 
-            sidemark._save_setting("swap_side_buttons", False)   # 8 = back
+            sidemark._save_setting("swap_page_buttons", False)   # 8 = back
 
             def body(win):
                 win._do_open_file(pdf)
@@ -14356,8 +15253,10 @@ class TestBindingToolbar(unittest.TestCase):
                                  not was)
             finally:
                 sidemark.MarkdownNotesView.show_comments = was
-            rows["Swap back and forward"].set_active(False)
-            self.assertIs(sidemark._load_settings()["swap_side_buttons"], False)
+            rows["Look up cited papers"].set_active(True)
+            self.assertIs(sidemark._load_settings()["reference_preview"], True)
+            rows["Swap for page turning"].set_active(False)
+            self.assertIs(sidemark._load_settings()["swap_page_buttons"], False)
             rows["Side buttons"].set_selected(1)
             self.assertEqual(win._side_buttons, "history")
             self.assertEqual(sidemark._load_settings()["side_buttons"], "history")
@@ -15070,6 +15969,100 @@ class TestReloadRestoresTheSession(unittest.TestCase):
                 self.assertIs(win._active_session, win._sessions[0])
                 # …and the shared header followed the tab it landed on (row 156)
                 self.assertEqual(win._page_label.get_label(), "4 / 4")
+
+            self._in_app(body)
+
+    @staticmethod
+    def _settle(ms):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline:
+            ctx.iteration(False)
+
+    def test_a_zoomed_view_comes_back_zoomed_on_the_same_spot(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=3)
+
+            def body(app):
+                first = PDFEditorWindow(app); first.present()
+                first.open_file_in_tab(a)
+                first.canvas.go_to_page(1)
+                self._settle(300)
+                c = first.canvas
+                fitted = c.scale
+                c.scale = fitted * 2.7
+                c.offset_x, c.offset_y = -230.0, -410.0
+                c._is_fitted = False
+                w, h = c.get_width(), c.get_height()
+                centre = c._screen_to_pdf(w / 2, h / 2)
+                state = first.session_state()
+                first.destroy()
+                app.restore_session(state)
+                win = [w for w in app.get_windows()
+                       if isinstance(w, PDFEditorWindow)][-1]
+                self._settle(300)
+                n = win.canvas
+                self.assertEqual(n.current_page_idx, 1)
+                self.assertAlmostEqual(n.scale, c.scale, places=3)
+                got = n._screen_to_pdf(n.get_width() / 2, n.get_height() / 2)
+                self.assertAlmostEqual(got[0], centre[0], delta=1.0)
+                self.assertAlmostEqual(got[1], centre[1], delta=1.0)
+                # the app put it there, not you: nothing to go back to
+                self.assertFalse(n.can_go_back())
+
+            self._in_app(body)
+
+    def test_a_fitted_view_comes_back_fitted(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.pdf")
+            make_pdf(a, n_pages=2)
+
+            def body(app):
+                first = PDFEditorWindow(app); first.present()
+                first.open_file_in_tab(a)
+                self._settle(300)
+                state = first.session_state()
+                self.assertIsNone(state["tabs"][0]["view"])
+                first.destroy()
+                app.restore_session(state)
+                win = [w for w in app.get_windows()
+                       if isinstance(w, PDFEditorWindow)][-1]
+                self._settle(300)
+                self.assertTrue(win.canvas._is_fitted)
+
+            self._in_app(body)
+
+    def test_a_text_page_comes_back_at_its_zoom(self):
+        with tempfile.TemporaryDirectory() as d:
+            md = os.path.join(d, "note.md")
+            with open(md, "w", encoding="utf-8") as f:
+                f.write("# hello\n\n" + "a line of text\n\n" * 200)
+
+            def body(app):
+                first = PDFEditorWindow(app); first.present()
+                first.open_file_in_tab(md)
+                self._settle(400)
+                tp = first._active_session._text_page
+                tp.set_zoom(tp.zoom * 1.6)
+                zoom = tp.zoom
+                self._settle(200)
+                state = first.session_state()
+                first.destroy()
+                app.restore_session(state)
+                win = [w for w in app.get_windows()
+                       if isinstance(w, PDFEditorWindow)][-1]
+                # the restore runs from a low-priority idle after layout:
+                # wait for it, not for a fixed time a loaded machine outlasts
+                tp2 = win._active_session._text_page
+                deadline = time.time() + 5
+                while abs(tp2.zoom - zoom) > 1e-3 and time.time() < deadline:
+                    self._settle(50)
+                self.assertAlmostEqual(
+                    tp2.zoom, zoom, places=3,
+                    msg=f"state={state['tabs']} mode="
+                        f"{win._active_session.doc_mode} same_tp="
+                        f"{tp2 is win._active_session._text_page}")
 
             self._in_app(body)
 

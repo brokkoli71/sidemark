@@ -236,18 +236,19 @@ def _save_setting(key, value):
     os.replace(tmp, path)
 
 
-def side_button_step(btn):
+def side_button_step(btn, pages):
     """The mouse side buttons as a direction: -1 back, +1 forward, 0 for any
     other button. The ONE place that decides which of 8/9 is back, shared by
-    the editor window and the projector. Button 8 is the standard BACK button,
-    but mice disagree about which physical button sends it, so Settings →
-    Mouse → "Swap back and forward" (settings.json `swap_side_buttons`) flips
-    the pair. It defaults ON because Sidemark up to 0.7.0 treated 8 as
-    forward, and hands set to that must not find their buttons reversed."""
+    the editor window and the projector. `pages` says what the press does.
+    Walking the view history is always the browser's way: 8 back, 9 forward.
+    Turning pages follows Settings → Mouse → "Swap for page turning"
+    (settings.json `swap_page_buttons`), which defaults ON — 8 next, 9
+    previous — because every release through 0.7.0 turned pages that way and
+    hands set to it must not find their buttons reversed."""
     if btn not in (8, 9):
         return 0
     back = btn == 8
-    if _load_settings().get("swap_side_buttons", True) is not False:
+    if pages and _load_settings().get("swap_page_buttons", True) is not False:
         back = not back
     return -1 if back else 1
 
@@ -726,6 +727,32 @@ def _install_glib_log_bridge():
         logger.debug("GLib log bridge unavailable", exc_info=True)
 
 
+CAPTURE_DIR = os.path.join(os.path.dirname(LOG_DIR), "captures")
+CAPTURE_KEEP = 20
+
+
+def _keep_log():
+    """Keep this session's log at exit, as a warning would — for a capture
+    (F12), whose whole point is that the log beside it survives."""
+    global _log_had_error
+    _log_had_error = True
+
+
+def _jsonable(v):
+    """fitz geometry and other odds into plain JSON, for a capture."""
+    if isinstance(v, (fitz.Rect, fitz.Point, fitz.Matrix, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, float):
+        return round(v, 2)
+    if v is None or isinstance(v, (int, str, bool)):
+        return v
+    return repr(v)
+
+
 def _cleanup_log():
     logger.info("session ended cleanly")
     # before the handlers close: faulthandler holds the log's raw fd, and a
@@ -851,10 +878,11 @@ velocity. The sheet drives its own scrolling (a drawing tool takes it off the
 ScrolledWindow's event path), so it has to apply the same number itself or one
 surface answers a finger differently from the one beside it.
 
-The PDF canvas deliberately does NOT use it: a scroll there flips the page past
-an edge, and `TOUCHPAD_FLIP_THRESHOLD` is hand-tuned against raw 1-px deltas —
-scaling them would silently retune how hard you have to push to turn a slide.
-That is a different feature with its own judgement, not a parity gap."""
+The PDF canvas does NOT use it: a scroll there flips the page past an edge,
+and `TOUCHPAD_FLIP_THRESHOLD` is hand-tuned against raw 1-px deltas — scaling
+them would silently retune how hard you have to push to turn a slide. Its pan
+has a gain of its own (`PDFCanvas.TOUCHPAD_PAN_GAIN`, row 204), applied after
+the flip has read the raw delta."""
 
 GLIDE_VEL_PER_MS = 0.001
 """What one unit of `::decelerate`'s velocity is in px/ms — GTK reports px/SECOND.
@@ -2689,7 +2717,7 @@ def _merge_selection(base, strokes, images):
 # old id, still accepted everywhere a tool is named (settings, saved chords).
 
 TOOL_BAR_ORDER = ("pen", "highlighter", "eraser", "lasso", "text",
-                  "pan", "zoom", "anchor", "phoneview")
+                  "pan", "zoom", "menu", "anchor", "phoneview")
 TOOL_MODES = {
     "pen":         ("pdf", "text"),
     "highlighter": ("pdf", "text"),
@@ -2701,6 +2729,10 @@ TOOL_MODES = {
     # so the text bar reads the same as the PDF bar.
     "pan":         ("pdf", "text"),
     "zoom":        ("pdf", "text"),
+    # Row 201: the right-click menu as a tool you bind to a button — what is
+    # selected decides what it offers (CONTEXT_MENU). Both modes: on a text
+    # page it is GTK's own text menu with the same entries added.
+    "menu":        ("pdf", "text"),
     "anchor":      ("pdf",),        # the one genuinely PDF-only tool
     # Row 182: send the connected phone somewhere. PDF-only because the phone
     # only has a camera of its own when it is running the browser port, and a
@@ -2712,14 +2744,16 @@ TOOL_MODES = {
 TOOL_WIDGET = {"pen": "_mode_pen", "highlighter": "_mode_hl",
                "eraser": "_mode_eraser", "lasso": "_mode_lasso",
                "text": "_mode_text", "pan": "_mode_pan",
-               "zoom": "_mode_zoom", "anchor": "_mode_anchor",
+               "zoom": "_mode_zoom", "menu": "_mode_menu",
+               "anchor": "_mode_anchor",
                "phoneview": "_mode_phoneview"}
 TOOL_ALIASES = {"select": "text"}
 TOOL_INDEX = {t: i for i, t in enumerate(TOOL_BAR_ORDER)}
 TOOL_INDEX["select"] = TOOL_INDEX["text"]
 TOOL_LABELS = {"pen": "Pen", "highlighter": "Highlighter", "eraser": "Eraser",
                "lasso": "Lasso", "text": "Text cursor", "pan": "Pan",
-               "zoom": "Zoom to region", "anchor": "Anchor / callout",
+               "zoom": "Zoom to region", "menu": "Context menu",
+               "anchor": "Anchor / callout",
                "phoneview": "Phone view"}
 
 
@@ -2731,6 +2765,78 @@ def canonical_tool(tool):
 def tool_in_mode(tool, mode):
     """Is this tool available in this document mode?"""
     return mode in TOOL_MODES.get(canonical_tool(tool), ())
+
+
+# ── the context menu (row 201): ONE table for both surfaces ──────────────────
+# What the menu tool offers is decided by what is SELECTED, never by where you
+# clicked: (action, label, shown when the surface says…, do, modes). Both
+# surfaces implement the predicates and verbs under these names, so the PDF
+# page's menu and the text page's (GTK's text menu with these added) cannot
+# drift. An entry whose predicate is false is hidden, not greyed.
+# On a text page the text's own Cut/Copy/Paste are GTK's, already in its menu
+# — which is why "copy-text" is PDF-only and the ink entries name what they
+# act on.
+CONTEXT_MENU = (
+    ("highlight", "Highlight", "has_text_selection",
+     "highlight_text_selection", ("pdf", "text")),
+    ("copy-text", "Copy", "has_text_selection", "copy_text_selection",
+     ("pdf",)),
+    ("copy-ink", "Copy drawing", "has_lasso_selection", "copy_selection",
+     ("pdf", "text")),
+    ("duplicate", "Duplicate drawing", "has_lasso_selection",
+     "duplicate_selected", ("pdf", "text")),
+    ("delete-ink", "Delete drawing", "has_lasso_selection",
+     "delete_selected_strokes", ("pdf", "text")),
+    ("paste-ink", "Paste here", "wants_paste", "paste_clipboard_objects",
+     ("pdf", "text")),
+    ("back", "Back", "can_go_back", "go_back", ("pdf",)),
+    ("fit", "Fit page", None, "zoom_to_fit", ("pdf",)),
+)
+
+
+def context_menu_model(mode):
+    """The Gio.Menu for `mode`, every entry hidden while its action is
+    disabled — `refresh_context_actions` decides that right before it opens."""
+    menu = Gio.Menu()
+    section = Gio.Menu()
+    for action, label, _when, _do, modes in CONTEXT_MENU:
+        if mode not in modes:
+            continue
+        item = Gio.MenuItem.new(label, f"ctx.{action}")
+        item.set_attribute_value("hidden-when",
+                                 GLib.Variant.new_string("action-disabled"))
+        section.append_item(item)
+    menu.append_section(None, section)
+    return menu
+
+
+def install_context_actions(widget, surface, mode):
+    """The "ctx" action group the menu's entries name, on `widget`."""
+    group = Gio.SimpleActionGroup()
+    for action, _label, _when, do, modes in CONTEXT_MENU:
+        if mode not in modes:
+            continue
+        act = Gio.SimpleAction.new(action, None)
+        act.connect("activate", lambda _a, _p, do=do: getattr(surface, do)())
+        group.add_action(act)
+    widget.insert_action_group("ctx", group)
+    return group
+
+
+def refresh_context_actions(group, surface, mode):
+    """Enable exactly the entries that apply NOW; returns their labels."""
+    shown = []
+    for action, label, when, _do, modes in CONTEXT_MENU:
+        if mode not in modes:
+            continue
+        try:
+            on = when is None or bool(getattr(surface, when)())
+        except Exception:
+            on = False
+        group.lookup_action(action).set_enabled(on)
+        if on:
+            shown.append(label)
+    return shown
 
 
 # ── button bindings: THE table (row 132) ─────────────────────────────────────
@@ -3961,6 +4067,646 @@ class PageText:
         return "".join(out).strip()
 
 
+# ── link preview: what an internal link points at, on hover (row 197) ─────────
+
+LINK_PREVIEW_DELAY_MS = 350     # rest on a link this long before the preview
+LINK_PREVIEW_MAX_H = 170.0      # PDF points: the tallest text strip a preview shows
+TABLE_GAP = 8.0                 # PDF points: rows and rules of one table are closer
+
+# what a hyperref destination NAME says it is — `cite.Kourtis2018`,
+# `figure.caption.12`, `table.3`, `equation.3.9`, `AMS.12`. A non-LaTeX link
+# has no such name and gets the generic strip.
+_LINK_TARGET_KINDS = (("cite", "cite"), ("figure", "float"), ("table", "float"),
+                      ("equation", "equation"), ("AMS", "equation"))
+_CITE_LABEL = re.compile(r"\s*(\[[^\]]{1,24}\]|\d{1,4}\.\s)")
+_CAPTION = re.compile(r"\s*(Fig(ure|\.)?|FIG\.?|Table|TABLE|Tab\.|Abbildung|Abb\.|"
+                      r"Tabelle)\s*[\dIVXS]")
+
+
+def link_target_kind(name):
+    """"cite", "float", "equation" or None, from a destination's name."""
+    head = (name or "").split(".", 1)[0].rstrip("*")
+    for prefix, kind in _LINK_TARGET_KINDS:
+        if head == prefix:
+            return kind
+    return None
+
+
+def _page_gutter(lines, pr):
+    """The (x0, x1) of a two-column page's gutter, or None. Found from BODY
+    lines only (wider than a fifth of the page): a plot's tick labels and a
+    justified bibliography's fragments are narrow and would hide it. A strip
+    in the middle that almost no body line crosses — a full-width caption or
+    title may — with body lines on both sides."""
+    body = [ln for ln in lines if ln[2] - ln[0] > 0.2 * pr.width]
+    if len(body) < 6:
+        return None
+    lo, hi = int(pr.x0 + 0.3 * pr.width), int(pr.x0 + 0.7 * pr.width)
+    limit = max(1, int(0.05 * len(body)))
+    best, run = None, None
+    for x in range(lo, hi + 1):
+        free = sum(1 for ln in body if ln[0] <= x <= ln[2]) <= limit
+        if free:
+            run = (run[0], x) if run else (x, x)
+            if best is None or run[1] - run[0] > best[1] - best[0]:
+                best = run
+        else:
+            run = None
+    if best is None or best[1] - best[0] < 4:
+        return None
+    if not (any(ln[2] < best[0] for ln in body)
+            and any(ln[0] > best[1] for ln in body)):
+        return None
+    return best
+
+
+def _rows(lines):
+    """Lines grouped into visual rows (a justified line arrives in pieces),
+    top to bottom; each row (x0, y0, x1, y1, text left to right)."""
+    rows = []
+    for ln in sorted(lines, key=lambda ln: (ln[1], ln[0])):
+        for i, r in enumerate(rows):
+            if (min(ln[3], r[3]) - max(ln[1], r[1])
+                    > 0.5 * min(ln[3] - ln[1], r[3] - r[1])):
+                parts = sorted(r[5] + [ln], key=lambda p: p[0])
+                rows[i] = (min(r[0], ln[0]), min(r[1], ln[1]),
+                           max(r[2], ln[2]), max(r[3], ln[3]),
+                           " ".join(p[4] for p in parts), parts)
+                break
+        else:
+            rows.append((ln[0], ln[1], ln[2], ln[3], ln[4], [ln]))
+    rows.sort(key=lambda r: r[1])
+    return [r[:5] for r in rows]
+
+
+def page_layout(page):
+    """(text lines, graphics) of a page, the raw material of
+    `link_preview_clip`: lines as (x0, y0, x1, y1, text), graphics as the
+    bounds of every path/image drawn (the bounds log is cheap, unlike
+    get_drawings on a dense plot). A fill covering most of the page is a
+    background, not content, and is left out."""
+    pr = page.rect
+    lines = [(*ln["bbox"],
+              "".join(sp.get("text", "") for sp in ln.get("spans", ())))
+             for b in page.get_text("dict").get("blocks", ())
+             if b.get("type") == 0
+             for ln in b.get("lines", ())]
+    lines = [ln for ln in lines if ln[4].strip()]
+    try:
+        art = [fitz.Rect(r) for t, r in page.get_bboxlog()
+               if t.endswith(("path", "image", "imgmask"))]
+    except Exception:
+        art = []
+    art = [r for r in art if r.height < 0.8 * pr.height and not r.is_empty]
+    return lines, art
+
+
+def snap_to_device(x, y, origin, scale):
+    """(x, y) in a widget's logical coordinates, moved onto the nearest
+    device-pixel corner of the screen, given the widget's `origin` in its
+    window surface and the surface's `scale`. An image painted between
+    device pixels is resampled across two of them and its text goes soft."""
+    ox, oy = origin
+    return (round((ox + x) * scale) / scale - ox,
+            round((oy + y) * scale) / scale - oy)
+
+
+def link_preview_clip(page, to, kind=None, layout=None):
+    """The strip of `page` an internal link points AT, in page coordinates:
+    for a citation its bibliography entry, for a figure or table the whole
+    float with its caption, for an equation the display, otherwise the
+    paragraph or heading at the point. `kind` is `link_target_kind` of the
+    destination's name (None for a link that does not say); `layout` is
+    `page_layout(page)` when the caller has it already.
+
+    `to` is the destination point (page space, y down) or None. Everything is
+    measured on pdflatex output (row 197 has the cases):
+    - COLUMNS: on a two-column page (`_page_gutter`) only the column the point
+      is in counts — a row of the other column is never "the same line".
+    - LINES, grouped into ROWS, not blocks: PyMuPDF splits a hanging first
+      line into its own block, and revtex's justified lines into pieces.
+    - hyperref raises an anchor about a line above what it names, so the
+      target starts at the row the point is on or the first below it — or
+      the entry-starting row just below, when a raised anchor fell into the
+      previous bibliography entry's tail.
+    - The strip runs down while rows stay tight, and stops: for a citation
+      at the next row starting with a label (`[12]`, `12.`) or, when entries
+      hang, at the next row as far left as the first; for an equation where
+      body text resumes at the column's left edge.
+    - A float (`_float_clip`) is found by its caption.
+    - A horizontal rule touching the strip is a TABLE: rules and rows within
+      TABLE_GAP are walked both ways.
+    ceiling: an entry broken across a column or page shows its first part
+    only; following the link shows the rest."""
+    pr = page.rect
+    if to is None:
+        return fitz.Rect(pr.x0, pr.y0, pr.x1, pr.y0 + LINK_PREVIEW_MAX_H) & pr
+    tx, ty = float(to[0]), float(to[1])
+    lines, art = layout if layout is not None else page_layout(page)
+    gutter = _page_gutter(lines, pr)
+    if gutter is not None:
+        mid = (gutter[0] + gutter[1]) / 2
+        left = tx < mid
+        col = (pr.x0, gutter[0]) if left else (gutter[1], pr.x1)
+        incol = lambda x0: (x0 < mid) == left
+    else:
+        col = (pr.x0, pr.x1)
+        incol = lambda x0: True
+    if kind == "float":
+        clip = _float_clip(pr, tx, ty, lines, art, gutter, incol)
+        if clip is not None:
+            return clip
+    mine = [ln for ln in lines if incol(ln[0])]
+    rows = _rows(mine)
+    body = [r for r in rows if r[2] - r[0] > 0.5 * (col[1] - col[0])]
+    margin = min((r[0] for r in body), default=col[0])
+    first, first_d, best = None, None, None
+    for r in rows:
+        if r[3] < ty - 2:
+            continue
+        d = max(0.0, r[1] - ty)     # 0 when the point is on the row
+        # line boxes may overlap a little: on two at once, the nearer centre
+        key = (d, abs((r[1] + r[3]) / 2 - ty))
+        if best is None or key < best:
+            first, first_d, best = r, d, key
+    if first is None or first_d > LINK_PREVIEW_MAX_H:
+        top = max(pr.y0, ty - 4)
+        return fitz.Rect(col[0], top, col[1], top + LINK_PREVIEW_MAX_H / 2) & pr
+    i = rows.index(first)
+    if first_d == 0 and i + 1 < len(rows):
+        # the point is ON a row: in a bibliography with no space between
+        # items the anchor raised above entry [2] lands in [1]'s last line.
+        # A row just below that starts an entry is the one the link means.
+        nxt = rows[i + 1]
+        if nxt[1] <= ty + 14 and (nxt[0] < first[0] - 3 or (
+                kind == "cite" and _CITE_LABEL.match(nxt[4])
+                and not _CITE_LABEL.match(first[4]))):
+            first, first_d, i = nxt, max(0.0, nxt[1] - ty), i + 1
+    x0, x1, end = first[0], first[2], first[3]
+    below = rows[i + 1:]
+    hanging = bool(below) and below[0][0] > first[0] + 3
+    prev, after = first, None
+    for r in below:
+        if r[1] - prev[3] > 0.6 * (prev[3] - prev[1]):
+            after = r
+            break              # the space between entries / paragraphs
+        if kind == "cite" and _CITE_LABEL.match(r[4]):
+            after = r
+            break              # the next entry's label
+        if hanging and r[0] <= first[0] + 1:
+            after = r
+            break              # the next entry starts here
+        if kind == "equation" and r[0] <= margin + 3:
+            after = r
+            break              # body text again, at the column's edge
+        x0, x1, end = min(x0, r[0]), max(x1, r[2]), max(end, r[3])
+        prev = r
+    # a raised anchor sits about a line above its text; further than that
+    # and the gap is content (a figure), not air
+    top = (ty if first_d > 14 else first[1]) - 3
+    bottom = min(end + 3, top + LINK_PREVIEW_MAX_H)
+    # the padding stops at the neighbours: a tight bibliography's lines touch,
+    # and a sliver of the next entry reads as part of this one
+    above = [r[3] for r in rows[:i] if r[3] <= first[1] + 1]
+    if above:
+        top = max(top, min(max(above), first[1]))
+    if after is not None:
+        bottom = min(bottom, max(after[1], end))
+    art = [r for r in art if incol(r.x0)]
+    # climb through graphics stacked directly above (a figure over its
+    # caption, for a link that does not say it is one)
+    grew = True
+    while grew:
+        grew = False
+        for r in art:
+            if (r.y0 < top - 1 and r.y1 >= top - 14
+                    and min(r.x1, x1) - max(r.x0, x0) > 0):
+                top, x0, x1 = r.y0 - 3, min(x0, r.x0), max(x1, r.x1)
+                grew = True
+    top, bottom, x0, x1 = _walk_table(top, bottom, x0, x1, art, mine)
+    top = max(top, bottom - pr.height / 2)    # ceiling: half a page tall
+    return fitz.Rect(x0 - 4, top, x1 + 4, bottom) & pr
+
+
+def _walk_table(top, bottom, x0, x1, art, lines):
+    """A TABLE: a horizontal rule touching the strip (booktabs, \\hline) means
+    a caption's gap to the rows is not a paragraph break. Walk on through
+    rules and the rows between them, both ways (a caption may sit above or
+    below), while each next piece is within TABLE_GAP — rows sit 2-3 pt
+    apart, the body text after a float 12 pt or more. Only RULES switch this
+    on, so a figure under a figure is never swallowed."""
+    rules = [r for r in art if r.height <= 2.5 and r.width >= 15
+             and min(r.x1, x1) - max(r.x0, x0) > 0]
+    if not any(top - TABLE_GAP <= r.y0 <= bottom + TABLE_GAP for r in rules):
+        return top, bottom, x0, x1
+    span = (min([x0] + [r.x0 for r in rules]), max([x1] + [r.x1 for r in rules]))
+    pieces = rules + [fitz.Rect(ln[:4]) for ln in lines
+                      if min(ln[2], span[1]) - max(ln[0], span[0]) > 0]
+    grew = True
+    while grew:
+        grew = False
+        for r in pieces:
+            if r.y1 > bottom and bottom - 1 <= r.y0 <= bottom + TABLE_GAP:
+                bottom, grew = r.y1 + 2, True
+            elif r.y0 < top and top - TABLE_GAP <= r.y1 <= top + 1:
+                top, grew = r.y0 - 2, True
+            else:
+                continue
+            x0, x1 = min(x0, r.x0), max(x1, r.x1)
+    return top, bottom, x0, x1
+
+
+def _float_clip(pr, tx, ty, lines, art, gutter, incol):
+    """A figure or table, found by its CAPTION (the first row at or below the
+    point that starts `Figure 3` / `FIG. 3` / `Table 2` …), or None to fall
+    back to the generic strip. Two placements of the anchor:
+    - at the TOP of the float (the caption package's hypcap, most papers
+      today): everything from the point down to the end of the caption;
+    - AT the caption (plain hyperref): the caption, then up through the
+      float's graphics and the small text inside them (tick labels, legends)
+      until a gap or a full-width body line.
+    A caption that crosses the gutter is a full-width float (figure*), which
+    spans both columns; otherwise only the point's column counts. A caption
+    ABOVE its content (tables) is walked down by `_walk_table`."""
+    caps = []
+    for ln in sorted(lines, key=lambda ln: ln[1]):
+        if ln[1] >= ty - 4 and _CAPTION.match(ln[4]) and (
+                incol(ln[0]) or gutter is None):
+            caps.append(ln)
+            break
+    if not caps or caps[0][1] - ty > 0.7 * pr.height:
+        return None
+    cap = caps[0]
+    wide = gutter is not None and cap[0] < gutter[0] and cap[2] > gutter[1]
+    scope = (lambda x0: True) if wide or gutter is None else incol
+    # the caption paragraph: tight rows under the caption's first line
+    crow = [ln for ln in lines if scope(ln[0]) and ln[0] >= cap[0] - 2
+            and ln[0] < cap[2]]
+    end, prev = cap[3], cap
+    for r in _rows([ln for ln in crow if ln[1] > cap[1] + 1]):
+        if r[1] - prev[3] > 0.6 * (prev[3] - prev[1]):
+            break
+        end, prev = max(end, r[3]), r
+    hypcap = cap[1] - ty > 14
+    if hypcap:
+        top, bottom = ty - 3, end + 3
+    else:
+        top, bottom = cap[1] - 3, end + 3
+        # up through the graphics and the text INSIDE them: tick labels and
+        # legends lie within (or just under) a graphic's vertical span. A
+        # paragraph's short last line does not, and another float's caption
+        # never counts — that is where the figure above begins.
+        colw = (gutter[0] - pr.x0) if gutter and not wide else pr.width
+        graphics = [r for r in art if scope(r.x0)]
+        labels = [fitz.Rect(ln[:4]) for ln in lines if scope(ln[0])
+                  and ln[2] - ln[0] < 0.5 * colw and not _CAPTION.match(ln[4])
+                  and any(g.y0 - 10 <= ln[1] and ln[3] <= g.y1 + 20
+                          for g in graphics)]
+        grew = True
+        while grew:
+            grew = False
+            for r in graphics + labels:
+                if r.y0 < top - 1 and r.y1 >= top - 14:
+                    top, grew = r.y0 - 3, True
+    inside = ([fitz.Rect(ln[:4]) for ln in lines if scope(ln[0])
+               and ln[1] >= top - 1 and ln[3] <= bottom + 1]
+              + [r for r in art if scope(r.x0)
+                 and r.y0 >= top - 1 and r.y1 <= bottom + 1])
+    x0 = min([cap[0]] + [r.x0 for r in inside])
+    x1 = max([cap[2]] + [r.x1 for r in inside])
+    top, bottom, x0, x1 = _walk_table(
+        top, bottom, x0, x1, [r for r in art if scope(r.x0)],
+        [ln for ln in lines if scope(ln[0])])
+    top = max(top, bottom - 0.7 * pr.height)   # ceiling: most of a page
+    return fitz.Rect(x0 - 4, top, x1 + 4, bottom) & pr
+
+
+# ── reference preview: what a cited paper IS (row 200) ───────────────────────
+# Behind Settings → "Look up cited papers" (`reference_preview`, off by
+# default): hovering a citation, or a link to an article, asks arXiv, Crossref,
+# Semantic Scholar or the publisher's page what the paper is. Only for a link
+# that is IN the document — a DOI, an arXiv id or a web address you could
+# follow — never a search by title, which finds the wrong paper.
+
+REF_CACHE_DIR = os.path.join(os.path.dirname(LOG_DIR), "refs")
+REF_TIMEOUT_S = 8
+REF_MAX_BYTES = 2_000_000          # a publisher page is read only this far
+REF_MISS_TTL_S = 24 * 3600         # a failed lookup is retried after a day
+# no user details in it: CLAUDE.md's privacy rule, and the services ask only
+# for a contact when you want their higher rate limits
+REF_USER_AGENT = "Sidemark-reference-preview/1 (+https://github.com/brokkoli71/sidemark)"
+
+_DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s?#\"<>]+)", re.I)
+_ARXIV_RE = re.compile(
+    r"arxiv\.org/(?:abs|pdf)/([^\s?#]+?)(?:v\d+)?(?:\.pdf)?/?$", re.I)
+
+
+def classify_reference_url(uri):
+    """("arxiv", id) / ("doi", doi) / ("web", url) for a link that can name a
+    paper, or None. arXiv before DOI (an arXiv page carries both, and the
+    arXiv API answers with the abstract); a DOI anywhere in the address —
+    doi.org, a publisher's /doi/ path — counts."""
+    from urllib.parse import unquote
+    if not uri:
+        return None
+    u = uri.strip()
+    m = _ARXIV_RE.search(u)
+    if m:
+        return ("arxiv", m.group(1))
+    m = _DOI_RE.search(unquote(u))
+    if m:
+        return ("doi", m.group(1).rstrip(".,;)]"))
+    if u.lower().startswith(("http://", "https://")):
+        return ("web", u)
+    return None
+
+
+def _clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _strip_tags(text):
+    return _clean(re.sub(r"<[^>]+>", " ", text or ""))
+
+
+def parse_arxiv_atom(xml_text):
+    import xml.etree.ElementTree as ET
+    ns = {"a": "http://www.w3.org/2005/Atom",
+          "x": "http://arxiv.org/schemas/atom"}
+    entry = ET.fromstring(xml_text).find("a:entry", ns)
+    if entry is None or entry.find("a:title", ns) is None:
+        return None
+    title = _clean(entry.findtext("a:title", "", ns))
+    if not title or title.lower() == "error":
+        return None
+    published = entry.findtext("a:published", "", ns)
+    return {"title": title,
+            "authors": [_clean(a.findtext("a:name", "", ns))
+                        for a in entry.findall("a:author", ns)],
+            "year": published[:4] or None,
+            "venue": _clean(entry.findtext("x:journal_ref", "", ns)) or "arXiv",
+            "abstract": _clean(entry.findtext("a:summary", "", ns)) or None,
+            "source": "arXiv"}
+
+
+def parse_crossref(data):
+    msg = (data or {}).get("message") or {}
+    title = _clean((msg.get("title") or [""])[0])
+    if not title:
+        return None
+    authors = [_clean(f"{a.get('given', '')} {a.get('family', '')}")
+               or _clean(a.get("name", "")) for a in msg.get("author") or []]
+    year = None
+    for k in ("published-print", "published-online", "issued", "created"):
+        parts = (msg.get(k) or {}).get("date-parts") or [[None]]
+        if parts and parts[0] and parts[0][0]:
+            year = str(parts[0][0])
+            break
+    return {"title": title, "authors": [a for a in authors if a],
+            "year": year,
+            "venue": _clean((msg.get("container-title") or [""])[0]) or None,
+            "abstract": _strip_tags(msg.get("abstract")) or None,
+            "citations": msg.get("is-referenced-by-count"),
+            "source": "Crossref"}
+
+
+def parse_semantic_scholar(data):
+    if not data or not data.get("title"):
+        return None
+    return {"title": _clean(data["title"]),
+            "authors": [_clean(a.get("name", ""))
+                        for a in data.get("authors") or []],
+            "year": str(data["year"]) if data.get("year") else None,
+            "venue": _clean(data.get("venue")) or None,
+            "abstract": _clean(data.get("abstract")) or None,
+            "tldr": _clean((data.get("tldr") or {}).get("text")) or None,
+            "citations": data.get("citationCount"),
+            "source": "Semantic Scholar"}
+
+
+def parse_citation_meta(html_text):
+    """The Highwire/Google-Scholar `citation_*` tags almost every publisher
+    page carries, with the page's description as the abstract's stand-in."""
+    from html.parser import HTMLParser
+    metas = {}
+
+    class P(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag != "meta":
+                return
+            a = dict(attrs)
+            key = (a.get("name") or a.get("property") or "").lower()
+            if key and a.get("content"):
+                metas.setdefault(key, []).append(a["content"])
+
+    try:
+        P().feed(html_text)
+    except Exception:
+        pass
+    first = lambda *ks: next((_clean(metas[k][0]) for k in ks if metas.get(k)),
+                             None)
+    title = first("citation_title", "dc.title", "og:title")
+    if not title:
+        return None
+    date = first("citation_publication_date", "citation_date",
+                 "citation_online_date", "citation_year", "dc.date")
+    m = re.search(r"(1[89]|20)\d\d", date or "")
+    return {"title": title,
+            "authors": [_clean(a) for a in metas.get("citation_author", [])]
+            or [_clean(a) for a in metas.get("dc.creator", [])],
+            "year": m.group(0) if m else None,
+            "venue": first("citation_journal_title", "citation_conference_title",
+                           "citation_publisher", "og:site_name"),
+            "abstract": first("citation_abstract", "dc.description",
+                              "description", "og:description"),
+            "source": "the publisher's page",
+            "doi": first("citation_doi")}
+
+
+def _merge_reference(base, extra):
+    """Fill what `base` lacks from `extra` (a second service)."""
+    if not base:
+        return extra
+    if extra:
+        for k, v in extra.items():
+            if v and not base.get(k) and k != "source":
+                base[k] = v
+    return base
+
+
+def _http_get(url, accept="application/json"):
+    """(content type, text) of a GET, or None. Bounded in time and size."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": REF_USER_AGENT, "Accept": accept})
+    try:
+        with urllib.request.urlopen(req, timeout=REF_TIMEOUT_S) as r:
+            ctype = r.headers.get("Content-Type", "")
+            body = r.read(REF_MAX_BYTES)
+        return ctype, body.decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.info(f"reference lookup: {url} — {e}")
+        return None
+
+
+def fetch_reference(uri, get=_http_get):
+    """What the paper behind `uri` is: {title, authors, year, venue, abstract,
+    tldr, citations, source, url}, or None. arXiv answers for arXiv ids,
+    Crossref for DOIs; Semantic Scholar fills in the abstract Crossref often
+    lacks and adds its one-sentence TL;DR; any other page is read for its
+    citation_* tags. `get` is injectable so the parsing is tested offline."""
+    from urllib.parse import quote
+    kind = classify_reference_url(uri)
+    if kind is None:
+        return None
+    what, ident = kind
+    S2 = ("https://api.semanticscholar.org/graph/v1/paper/{}?fields="
+           "title,authors,year,venue,abstract,tldr,citationCount")
+
+    def s2(key):
+        res = get(S2.format(quote(key, safe=":/")))
+        try:
+            return parse_semantic_scholar(json.loads(res[1])) if res else None
+        except ValueError:
+            return None
+
+    info = None
+    if what == "arxiv":
+        res = get("https://export.arxiv.org/api/query?id_list="
+                  + quote(ident, safe="/"), accept="application/atom+xml")
+        try:
+            info = parse_arxiv_atom(res[1]) if res else None
+        except Exception:
+            info = None
+        info = _merge_reference(info, s2(f"arXiv:{ident}"))
+    elif what == "doi":
+        res = get("https://api.crossref.org/works/" + quote(ident, safe="/"))
+        try:
+            info = parse_crossref(json.loads(res[1])) if res else None
+        except ValueError:
+            info = None
+        if info is None or not info.get("abstract"):
+            info = _merge_reference(info, s2(f"DOI:{ident}"))
+    else:
+        if ident.lower().split("?")[0].endswith(".pdf"):
+            return None            # a whole PDF on a hover is too much
+        res = get(ident, accept="text/html")
+        if res and "html" in (res[0] or "").lower():
+            info = parse_citation_meta(res[1])
+    if info:
+        info["url"] = uri
+    return info
+
+
+class ReferenceLookups:
+    """Lookups run on a worker thread and answer on the main loop; one per
+    address at a time. Answers are kept in memory and on disk
+    (REF_CACHE_DIR, one JSON per address); a miss is kept REF_MISS_TTL_S so
+    an unreachable service is not asked on every hover.
+    ceiling: a found paper is never re-fetched; delete the cache to refresh."""
+
+    def __init__(self, fetch=None):
+        self._fetch = fetch or fetch_reference
+        self._mem = {}
+        self._waiting = {}
+
+    @staticmethod
+    def _path(uri):
+        import hashlib
+        return os.path.join(REF_CACHE_DIR,
+                            hashlib.sha1(uri.encode()).hexdigest() + ".json")
+
+    def cached(self, uri):
+        """(found?, info) — found False means ask."""
+        if uri in self._mem:
+            return True, self._mem[uri]
+        try:
+            with open(self._path(uri), encoding="utf-8") as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            return False, None
+        if rec.get("info") is None and time.time() - rec.get("t", 0) > REF_MISS_TTL_S:
+            return False, None
+        self._mem[uri] = rec.get("info")
+        return True, self._mem[uri]
+
+    def request(self, uri, callback):
+        """callback(info or None) on the main loop — at once when cached."""
+        hit, info = self.cached(uri)
+        if hit:
+            callback(info)
+            return
+        if uri in self._waiting:
+            self._waiting[uri].append(callback)
+            return
+        self._waiting[uri] = [callback]
+
+        def work():
+            try:
+                info = self._fetch(uri)
+            except Exception:
+                logger.warning("reference lookup failed", exc_info=True)
+                info = None
+            GLib.idle_add(self._done, uri, info)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self, uri, info):
+        self._mem[uri] = info
+        try:
+            os.makedirs(REF_CACHE_DIR, exist_ok=True)
+            with open(self._path(uri), "w", encoding="utf-8") as f:
+                json.dump({"t": time.time(), "info": info}, f)
+        except OSError:
+            pass
+        for cb in self._waiting.pop(uri, []):
+            try:
+                cb(info)
+            except Exception:
+                logger.error("reference callback:\n" + traceback.format_exc())
+        return False
+
+
+REFERENCES = ReferenceLookups()
+
+
+def reference_preview_enabled():
+    return _load_settings().get("reference_preview", False) is True
+
+
+def _rounded_rect_path(ctx, x, y, w, h, r):
+    ctx.new_sub_path()
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+
+# ── zoom-to-region: a click steps back out (row 202) ─────────────────────────
+# Each region zoom leaves (view before, view after) on its surface's TRAIL. A
+# plain click with the zoom tool takes back the latest one while you are still
+# about where it left you — so nested zooms come undone one click at a time —
+# and once you have zoomed out or moved a lot the trail is stale, and the click
+# goes to the whole page instead. One rule for both surfaces; each says what
+# "about where it left you" means for its own view (`near`).
+ZOOM_TRAIL_DRIFT = 0.25    # of the viewport: a pan further than this is "a lot"
+ZOOM_TRAIL_SCALE = 1.15    # a zoom change beyond this ratio is "zoomed"
+
+
+def zoom_trail_click(trail, current, near):
+    """The view a zoom-tool click goes back to, or None for "the whole page".
+    Pops what it uses; a stale trail is dropped whole."""
+    if trail and near(current, trail[-1][1]):
+        return trail.pop()[0]
+    trail.clear()
+    return None
+
+
+def _near_ratio(a, b):
+    return 1 / ZOOM_TRAIL_SCALE <= (a / b if b else 0) <= ZOOM_TRAIL_SCALE
+
+
 # ── view history: back / forward through where you were (row 195) ────────────
 # One per surface (a PDF canvas, a text sheet), so one per tab. A STEP is one
 # continuous movement — a drag, a pinch, a burst of scrolling, zooming or page
@@ -4065,6 +4811,12 @@ class PDFCanvas(Gtk.DrawingArea):
     SCROLL_FLIP_THRESHOLD = 3.0   # mouse-wheel notches past the page edge before flipping
     TOUCHPAD_FLIP_THRESHOLD = 180.0   # px of touchpad scroll past the edge before flipping
     WHEEL_PAN_STEP = 30.0         # px panned per mouse-wheel notch
+    # px panned per px of touchpad two-finger scroll (row 204). Above 1 because
+    # one-for-one felt slow beside every GTK list (which use 2.5, see
+    # SURFACE_SCROLL_FACTOR); below it because "a bit faster" was the ask. Only
+    # the PAN is scaled: the edge flip still measures the raw deltas, so
+    # TOUCHPAD_FLIP_THRESHOLD keeps its meaning.
+    TOUCHPAD_PAN_GAIN = 1.75
     STRAIGHT_HOLD_MS = 500        # hold still this long mid-stroke to snap to a line
 
     def __init__(self, interactive=True):
@@ -4400,6 +5152,28 @@ class PDFCanvas(Gtk.DrawingArea):
         self._hover_x = 0.0
         self._hover_y = 0.0
         self._hovered_link_rect = None
+        self._hovered_link = None      # the link dict under the pointer
+        # the hover card (rows 197/199): a dict once shown — a rendered strip
+        # with its anchor link, or a backlinks list with its target region —
+        # and the timer before that
+        self._link_preview = None
+        self._link_preview_id = None
+        self._pending_view = None      # Ctrl+R's view, applied at the next draw
+        self._device_px = None         # device px per logical px, at the last draw
+        self._last_link_preview = None # the last preview shown, for F12
+        # backlinks (row 199): the document's link index, the target regions
+        # per page, the words per page for snippets, and the hover timer
+        self._backlinks, self._backlinks_key = None, None
+        self._targets_cache, self._words_cache = {}, {}
+        self._layout_cache, self._layout_cache_key = {}, None
+        self._card_hide_id = None      # the grace before a hover card goes
+        self._targets_idle_id = None   # finding this page's targets, once
+        self._backlink_icons = []      # [(screen box, key, region)] as drawn
+        self._ctx_actions = None       # the context menu's actions (row 201)
+        self._zoom_trail = []          # [(view before, after)] per region zoom
+        self._ctx_popover = None
+        self._flash, self._flash_id = None, None   # a jumped-to citation
+        self._origin_px = (0.0, 0.0)   # canvas origin in its window surface
         # is the pointer over the canvas? — paste_point() lands a paste under
         # the mouse when it is, so the answer must be tracked, not guessed
         self._pointer_in = False
@@ -4543,6 +5317,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _load_page(self, idx, keep_view=False):
         self.clear_lasso_selection()   # selection is per-page and transient
+        self._hide_link_preview()      # it belonged to a link on the old page
         self.current_page_idx = idx
         self.page = self.document[idx]
         self.page_width  = self.page.rect.width
@@ -4877,12 +5652,14 @@ class PDFCanvas(Gtk.DrawingArea):
             self.offset_y = height / 2 - cy_pdf * self.scale
         self.queue_draw()
 
-    def _page_to_surface(self, page, logical_scale):
-        """Render a fitz page to a cairo surface at logical_scale × the widget's
-        device scale factor."""
-        sf = self.get_scale_factor()
+    def _page_to_surface(self, page, logical_scale, clip=None, device=None):
+        """Render a fitz page (or the `clip` rect of it) to a cairo surface at
+        logical_scale × the widget's device scale factor (or `device`, the
+        exact device pixels per logical one, fractional scaling included)."""
+        sf = device or self.get_scale_factor()
         device_scale = logical_scale * sf
-        pix = page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale), alpha=True, annots=False)
+        pix = page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale),
+                              alpha=True, annots=False, clip=clip)
         w, h = pix.width, pix.height
         # fitz RGBA → cairo ARGB32 (BGRA in memory on little-endian): swap R and B channels
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 4).copy()
@@ -5066,6 +5843,12 @@ class PDFCanvas(Gtk.DrawingArea):
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def _draw(self, area, ctx, width, height):
+        # how many DEVICE pixels a logical one is — 1.5 on a fractionally
+        # scaled display, where get_scale_factor() says 2 — and where the
+        # canvas sits on the pixel grid: the link preview renders at exactly
+        # this density and lands on a pixel corner, so it maps 1:1.
+        self._device_px = self._device_scale()
+        self._origin_px = self._surface_origin()
         ctx.set_source_rgb(*self.surround_color)
         ctx.paint()
 
@@ -5086,6 +5869,15 @@ class PDFCanvas(Gtk.DrawingArea):
             self._fit_page()
         elif self.offset_x == 0 and self.offset_y == 0 and self.scale == 1.0:
             self._fit_page()
+        if self._pending_view is not None and width > 0 and height > 0:
+            # Ctrl+R's view (restore_view_anchor), after the fit it overrides
+            scale, cx, cy = self._pending_view
+            self._pending_view = None
+            self.scale = scale
+            self.offset_x = width / 2 - cx * scale
+            self.offset_y = height / 2 - cy * scale
+            self._is_fitted = False
+            self._schedule_rerender()
 
         # presenting: the next page shows behind the current one (stack look)
         if self.stack_preview and self._is_fitted:
@@ -5260,6 +6052,14 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.rectangle(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0)
             ctx.stroke()
             ctx.restore()
+
+        if self._flash is not None:
+            self._draw_flash(ctx)
+        self._draw_backlink_icons(ctx)
+        # what the hovered link points at (row 197), or who points at what is
+        # hovered (row 199), above the page and ink
+        if self._link_preview is not None:
+            self._draw_link_preview(ctx, width, height)
 
         # zoom-selection rubber-band (shared look with the text sheet)
         if self._zoom_selecting and self._zoom_start and self._zoom_end:
@@ -5935,6 +6735,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._hover_x, self._hover_y = x, y
         self._update_link_hover()
         self._update_anchor_hover(x, y)
+        if self._backlink_icons:
+            self.queue_draw()            # an icon lights up under the pointer
 
     def _update_anchor_hover(self, x, y):
         """Show a grab cursor over anchor circles and callout boxes so it's clear
@@ -5971,7 +6773,7 @@ class PDFCanvas(Gtk.DrawingArea):
             if self._handle_boundary_flip(dx, dy, flip_threshold):
                 return True
             self._scroll_past = 0.0
-            step = 1.0 if smooth else self.WHEEL_PAN_STEP
+            step = self.TOUCHPAD_PAN_GAIN if smooth else self.WHEEL_PAN_STEP
             self.history.moving()
             self.offset_x -= dx * step
             self.offset_y -= dy * step
@@ -6021,7 +6823,7 @@ class PDFCanvas(Gtk.DrawingArea):
             if dx >= ZOOM_RECT_MIN_PX and dy >= ZOOM_RECT_MIN_PX:
                 self._execute_zoom_to_rect(self._zoom_start, self._zoom_end)
             else:
-                self.zoom_to_fit()   # Shift+click with no rect → fit page
+                self.zoom_click()    # a click: out of the zoom, or whole page
         self._zoom_selecting = False
         self._zoom_start = None
         self._zoom_end = None
@@ -6182,8 +6984,11 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_motion_leave(self, _ctrl):
         self._pointer_in = False
+        if not (self._link_preview or {}).get("pinned"):
+            self._hide_link_preview()
         if self._hovered_link_rect is not None:
             self._hovered_link_rect = None
+            self._hovered_link = None
             self.set_cursor(None)
             self.queue_draw()
 
@@ -6272,17 +7077,47 @@ class PDFCanvas(Gtk.DrawingArea):
             mode=self.doc_mode) == "text"
 
     def _update_link_hover(self):
-        new_rect = None
+        """Which link the pointer is on, while links are live — the glow, the
+        pointer cursor, and the hover card's timer. On the card itself
+        nothing changes: what is under it is covered, and the card stays."""
+        p = self._link_preview
+        if p is not None and self._pointer_in_card():
+            if self._card_hide_id is not None:
+                GLib.source_remove(self._card_hide_id)
+                self._card_hide_id = None
+            self.queue_draw()            # what is under the pointer lights up
+            return
+        new_rect, new_link = None, None
         if self.link_hover_active() and self.page:
             px, py = self._screen_to_pdf(self._hover_x, self._hover_y)
             for link in self.page.get_links():
                 r = link["from"]
                 if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
-                    new_rect = r
+                    new_rect, new_link = r, link
                     break
+        if p is not None and not p.get("pinned"):
+            if new_rect is not None and new_rect == p.get("anchor"):
+                if self._card_hide_id is not None:      # back on its link
+                    GLib.source_remove(self._card_hide_id)
+                    self._card_hide_id = None
+            else:
+                self._schedule_card_hide()
         if new_rect == self._hovered_link_rect:
+            if p is not None:
+                self.queue_draw()        # icons light up under the pointer
             return
         self._hovered_link_rect = new_rect
+        self._hovered_link = new_link
+        if self._link_preview_id is not None:
+            GLib.source_remove(self._link_preview_id)
+            self._link_preview_id = None
+        if p is not None and not p.get("pinned") and new_link is not None:
+            self._hide_link_preview()    # onto ANOTHER link: its own card
+            p = None
+        if (new_link is not None and p is None
+                and self._previewable(new_link)):
+            self._link_preview_id = GLib.timeout_add(
+                LINK_PREVIEW_DELAY_MS, self._show_link_preview)
         # falling off a link goes back to the TOOL's cursor, not to none — with
         # the caret on the left button the I-beam is what the page should wear
         self.set_cursor(Gdk.Cursor.new_from_name("pointer", None) if new_rect
@@ -6323,6 +7158,11 @@ class PDFCanvas(Gtk.DrawingArea):
             self._post_pinch = False
         self._dismissed_selection = False
         self._text_highlighting = False
+        if self._card_press(start_x, start_y):
+            # the card or a backlink icon (rows 197-200) took the press; one
+            # elsewhere closed the card and goes on to the page below
+            self._ignoring = True
+            return
         btn = button_for_event(gesture.get_current_event(),
                                gesture.get_current_button(),
                                self._barrel_held)
@@ -6378,7 +7218,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._panning = False
         self._text_selecting = False
         self._zoom_selecting = False
-        self._text_segments = []
+        if tool != "menu":
+            # a press ends a text selection — except the menu's, which is
+            # ABOUT that selection (Highlight, Copy)
+            self._text_segments = []
         self._press_event = gesture.get_current_event()
         if mark is not None:
             self._press_tool = None
@@ -6419,6 +7262,11 @@ class PDFCanvas(Gtk.DrawingArea):
     def _begin_tool(self, tool, start_x, start_y, chorded, additive=False):
         """Start `tool` at this point. Called only by the press router, so the
         tool is already resolved — everything below is what that tool DOES."""
+        if tool == "menu":
+            # first: a press ON a selection must open its menu, not grab it
+            self._ignoring = True
+            self.open_context_menu(start_x, start_y)
+            return
         # A LIVE selection is grabbable with ANY tool in hand (see
         # selection_grab_at): ahead of the tool dispatch, so a press on the
         # selection edits it rather than drawing/erasing over it — but behind
@@ -7460,6 +8308,44 @@ class PDFCanvas(Gtk.DrawingArea):
     def _finish_text_selection(self):
         self.queue_draw()   # highlight stays; copy on Ctrl+C
 
+    # ── the context menu (row 201) ───────────────────────────────────────────
+
+    def has_text_selection(self):
+        return bool(self._text_segments)
+
+    def highlight_text_selection(self):
+        """The menu's Highlight: the same ink the text-marking highlighter
+        lays, over what the text cursor selected."""
+        self._commit_text_highlight()
+
+    def context_menu_entries(self):
+        """What the menu would offer now (and arms exactly those actions)."""
+        if self._ctx_actions is None:
+            self._ctx_actions = install_context_actions(self, self, "pdf")
+        return refresh_context_actions(self._ctx_actions, self, "pdf")
+
+    def open_context_menu(self, x, y):
+        self.context_menu_entries()
+        if not self.get_mapped():
+            return       # a popover needs a surface (tests; CLAUDE.md rule 2)
+        if self._ctx_popover is None:
+            pop = Gtk.PopoverMenu.new_from_model(context_menu_model("pdf"))
+            pop.set_parent(self)
+            pop.set_has_arrow(False)
+            pop.set_halign(Gtk.Align.START)
+            self._ctx_popover = pop
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self._ctx_popover.set_pointing_to(rect)
+        self._ctx_popover.popup()
+
+    def do_size_allocate(self, width, height, baseline):
+        # A popover's parent must place it on every allocation; a bare
+        # DrawingArea does not, so the context menu's is presented here.
+        Gtk.DrawingArea.do_size_allocate(self, width, height, baseline)
+        if self._ctx_popover is not None:
+            self._ctx_popover.present()
+
     def copy_text_selection(self):
         text = self._page_text().text(self._text_segments,
                                       keep_lines=self._sel_range is None)
@@ -7473,6 +8359,756 @@ class PDFCanvas(Gtk.DrawingArea):
             Gdk.Display.get_default().get_clipboard().set_content(content)
         if self.on_text_copied:
             self.on_text_copied(text)
+
+    def _link_destination(self, link):
+        """(page_index, (x, y) or None) an internal link goes to, or (-1, None)
+        for anything else. THE resolution, shared by following a link and
+        previewing it, so the preview always shows where a click would land.
+        LINK_NAMED is what LaTeX/hyperref emits for \\cite, \\ref and
+        cross-references; PyMuPDF usually resolves it into the same page/to
+        fields as a plain GOTO, and `_resolve_named_dest` covers the rest."""
+        kind = link.get("kind", 0)
+        if kind not in (fitz.LINK_GOTO, fitz.LINK_NAMED):
+            return -1, None
+        page_no = link.get("page", -1)
+        to = link.get("to")
+        to = (to[0], to[1]) if to is not None else None
+        if page_no < 0 and kind == fitz.LINK_NAMED:
+            page_no, to_y = self._resolve_named_dest(
+                link.get("name") or link.get("nameddest"))
+            to = (0.0, to_y) if to_y is not None else None
+        if self.document is None or not 0 <= page_no < self.n_pages:
+            return -1, None
+        if kind == fitz.LINK_NAMED and to is not None:
+            # PyMuPDF hands a GOTO's point over in page space (y down) but a
+            # NAMED one — every LaTeX \\cite and \\ref — raw from the PDF,
+            # y counted UP from the bottom (as resolve_names does). Unconverted
+            # it lands a citation at the mirror height of its entry.
+            p = fitz.Point(*to) * self.document[page_no].transformation_matrix
+            to = (p.x, p.y)
+        return page_no, to
+
+    # ── the hover card: link preview (197), backlinks (199), paper (200) ─────
+    # ONE card at a time, `self._link_preview`, a dict whose "type" is
+    #   "link"      an internal link's target, rendered (plus the paper behind a
+    #               citation when lookups are on, and "Also cited on p. …")
+    #   "ref"       a web link to an article: just the paper's details
+    #   "backlinks" who cites a target — opened by its icon, and PINNED
+    # A hover card stays while the pointer is on its link OR on the card (a
+    # short grace covers the gap between them), so the abstract can be opened
+    # and a title clicked. A pinned card stays until a press elsewhere,
+    # Escape, or a page change. Presses on a card are the card's.
+
+    CARD_HIDE_GRACE_MS = 300    # pointer between link and card: not gone yet
+
+    @staticmethod
+    def _link_kind(link):
+        return link_target_kind(link.get("nameddest") or link.get("name"))
+
+    def _hide_link_preview(self):
+        for attr in ("_link_preview_id", "_card_hide_id"):
+            sid = getattr(self, attr)
+            if sid is not None:
+                GLib.source_remove(sid)
+                setattr(self, attr, None)
+        if self._link_preview is not None:
+            self._link_preview = None
+            self.queue_draw()
+
+    def _previewable(self, link):
+        """Does resting on this link show a card? An internal link always; a
+        web link only when lookups are on and it can name a paper."""
+        if self._link_destination(link)[0] >= 0:
+            return True
+        return (link.get("kind") == fitz.LINK_URI
+                and reference_preview_enabled()
+                and classify_reference_url(link.get("uri")) is not None)
+
+    def _schedule_card_hide(self):
+        if self._card_hide_id is None:
+            self._card_hide_id = GLib.timeout_add(self.CARD_HIDE_GRACE_MS,
+                                                  self._card_hide_check)
+
+    def _card_hide_check(self):
+        self._card_hide_id = None
+        p = self._link_preview
+        if p is None or p.get("pinned"):
+            return False
+        if self._pointer_in_card() or (
+                self._hovered_link_rect is not None
+                and self._hovered_link_rect == p.get("anchor")):
+            return False
+        self._hide_link_preview()
+        return False
+
+    def _preview_scale(self, clip):
+        """The page's own zoom, but never below 100% (a preview you cannot
+        read is no preview), never wider than the canvas, nor taller than most
+        of it — which a whole figure can be."""
+        cw = self.get_width() or 800
+        ch = self.get_height() or 600
+        s = max(1.0, min(self.scale, 2.0))
+        s = min(s, (cw - 2 * self.LINK_PREVIEW_MARGIN - 16) / clip.width,
+                0.7 * ch / clip.height)
+        return max(s, 0.3)
+
+    def _show_link_preview(self):
+        """The hover timer ran out with the pointer still on a link. An
+        internal link: render where it points (`link_preview_clip`) at the
+        display's real pixel density, with "Also cited on p. …" (row 199) and,
+        for a citation whose entry carries a followable link, the paper itself
+        (row 200). A web link to an article: the paper's details alone."""
+        self._link_preview_id = None
+        link = self._hovered_link
+        if link is None or self.document is None:
+            return False
+        page_no, to = self._link_destination(link)
+        if page_no < 0:
+            uri = link.get("uri")
+            if not (reference_preview_enabled()
+                    and classify_reference_url(uri)):
+                return False
+            self._link_preview = {"type": "ref", "anchor": link["from"],
+                                  "ref": None, "x0": self._hover_x - 24}
+            self._start_reference(uri)
+            self.queue_draw()
+            return False
+        kind = self._link_kind(link)
+        try:
+            page = self.document[page_no]
+            clip = link_preview_clip(page, to, kind, self._page_layout(page_no))
+            if clip.is_empty:
+                return False
+            device = self._device_px or float(self.get_scale_factor())
+            surf = self._page_to_surface(page, self._preview_scale(clip),
+                                         clip=clip, device=device)
+        except Exception:
+            logger.error("link preview failed:\n" + traceback.format_exc())
+            return False
+        here = (self.current_page_idx, round(link["from"].y0))
+        others = sorted({src for src, r in self._backlinks_to(link)
+                         if (src, round(r.y0)) != here})
+        footer = None
+        if others:
+            verb = "cited" if kind == "cite" else "referenced"
+            footer = (f"Also {verb} on p. "
+                      + ", ".join(str(p + 1) for p in others))
+        self._link_preview = {"type": "link", "anchor": link["from"],
+                              "surface": surf,
+                              "w": surf.get_width() / device,
+                              "h": surf.get_height() / device,
+                              "page": page_no, "clip": clip, "device": device,
+                              "footer": footer, "ref": None,
+                              "x0": self._hover_x - 24}
+        if kind == "cite" and reference_preview_enabled():
+            uri = self._entry_reference_uri(page_no, clip)
+            if uri:
+                self._start_reference(uri)
+        # kept past the hide, so a capture (F12) taken a moment later still
+        # names the preview that looked wrong
+        self._last_link_preview = {"link": dict(link), "page": page_no,
+                                   "to": to, "clip": clip}
+        self.queue_draw()
+        return False
+
+    def _entry_reference_uri(self, page_no, clip):
+        """The followable link INSIDE a bibliography entry that names the
+        paper: a DOI or arXiv link before any other address."""
+        found = []
+        for l in self.document[page_no].get_links():
+            if l.get("kind") != fitz.LINK_URI or not l["from"].intersects(clip):
+                continue
+            c = classify_reference_url(l.get("uri"))
+            if c:
+                found.append(({"arxiv": 0, "doi": 1}.get(c[0], 2), l["uri"]))
+        return min(found)[1] if found else None
+
+    def _start_reference(self, uri):
+        """Ask for the paper behind `uri`; the card shows "Looking up…" until
+        the answer, which lands only if the card is still about that paper."""
+        p = self._link_preview
+        p["ref"] = {"uri": uri, "state": "loading", "info": None}
+        p["abstract_open"] = False
+
+        def answered(info):
+            q = self._link_preview
+            if q is None or (q.get("ref") or {}).get("uri") != uri:
+                return
+            if info is None and q["type"] == "ref":
+                self._hide_link_preview()   # nothing to say about that link
+                return
+            q["ref"] = {"uri": uri, "info": info,
+                        "state": "done" if info else "missing"}
+            self.queue_draw()
+
+        REFERENCES.request(uri, answered)
+
+    # ── backlinks: who links HERE (row 199) ──────────────────────────────────
+
+    def _page_layout(self, page_no):
+        """`page_layout` of one page, cached for the document: the target
+        regions of a bibliography page reuse it dozens of times."""
+        key = (id(self.document), self.n_pages)
+        if self._layout_cache_key != key:
+            self._layout_cache, self._layout_cache_key = {}, key
+        if page_no not in self._layout_cache:
+            self._layout_cache[page_no] = page_layout(self.document[page_no])
+        return self._layout_cache[page_no]
+
+    def _link_key(self, link):
+        """What a link points at, as something two links can share: the
+        destination NAME when there is one (every \\cite of one key carries
+        it), else the page and height."""
+        name = link.get("nameddest") or link.get("name")
+        if name and link.get("kind") == fitz.LINK_NAMED:
+            return ("n", name)
+        page_no, to = self._link_destination(link)
+        if page_no < 0:
+            return None
+        return ("g", page_no, round(to[1]) if to else None)
+
+    def _backlink_index(self):
+        """({link key: [(source page, link rect), …]}, {key: (target page,
+        point, kind)}) over the whole document — built once per document on
+        first use (one get_links per page) and rebuilt when the page count
+        changes. A link wrapped over two lines is two rects; one is kept."""
+        key = (id(self.document), self.n_pages)
+        if self._backlinks_key == key:
+            return self._backlinks
+        sources, targets = {}, {}
+        for pno in range(self.n_pages):
+            try:
+                links = self.document[pno].get_links()
+            except Exception:
+                continue
+            for link in links:
+                k = self._link_key(link)
+                if k is None:
+                    continue
+                if k not in targets:
+                    dest_page, to = self._link_destination(link)
+                    targets[k] = (dest_page, to, self._link_kind(link))
+                lst = sources.setdefault(k, [])
+                r = fitz.Rect(link["from"])
+                if not any(p == pno and abs(q.y0 - r.y0) < 1 and
+                           abs(q.x0 - r.x0) < 1 for p, q in lst):
+                    lst.append((pno, r))
+        self._backlinks = (sources, targets)
+        self._backlinks_key = key
+        self._targets_cache, self._words_cache = {}, {}
+        return self._backlinks
+
+    def _backlinks_to(self, link):
+        k = self._link_key(link)
+        return self._backlink_index()[0].get(k, []) if k else []
+
+    def _targets_on_page(self, page_no):
+        """[(region, key)] — every place on `page_no` some link points at, as
+        the strip its preview would show (`link_preview_clip`), so a
+        bibliography entry's icon sits at the entry its citations name."""
+        sources, targets = self._backlink_index()
+        if page_no in self._targets_cache:
+            return self._targets_cache[page_no]
+        found = []
+        layout = None
+        for k, (dest_page, to, kind) in targets.items():
+            if dest_page != page_no or to is None:
+                continue
+            if layout is None:
+                layout = self._page_layout(page_no)
+            try:
+                clip = link_preview_clip(self.document[page_no], to, kind,
+                                         layout)
+            except Exception:
+                continue
+            if not clip.is_empty:
+                found.append((clip, k))
+        self._targets_cache[page_no] = found
+        return found
+
+    def _link_snippet(self, page_no, rect):
+        """The words around a citation in READING order, across line breaks:
+        '…community structure detection [43], as illustrated in…'. Words come
+        in PyMuPDF's block/line order — a column at a time on a LaTeX page —
+        so the other column's words level with it never interleave, and a
+        word hyphenated at a line end is joined again."""
+        if page_no not in self._words_cache:
+            words = self.document[page_no].get_text("words")
+            self._words_cache[page_no] = sorted(
+                words, key=lambda w: (w[5], w[6], w[7]))
+        words = self._words_cache[page_no]
+        at = next((i for i, w in enumerate(words)
+                   if fitz.Rect(w[:4]).intersects(rect)), None)
+        if at is None:
+            return ""
+        lo, hi = max(0, at - 7), min(len(words), at + 8)
+        out = []
+        for i in range(lo, hi):
+            w = words[i]
+            if (out and out[-1].endswith("-") and i > lo
+                    and (words[i - 1][5], words[i - 1][6]) != (w[5], w[6])):
+                out[-1] = out[-1][:-1] + w[4]      # hyphen at a line end
+            else:
+                out.append(w[4])
+        return (("…" if lo > 0 else "") + " ".join(out)
+                + ("…" if hi < len(words) else ""))
+
+    def _show_backlink_icons(self):
+        """The icons belong to the page you READ: not on the projector's
+        mirror, not in presentation mode."""
+        return self._interactive and not self.stack_preview
+
+    def _prepare_targets(self):
+        """Idle: find this page's targets once, then draw their icons — the
+        first time costs tens of ms, which a draw must not."""
+        self._targets_idle_id = None
+        if self.document is not None and self.page is not None:
+            try:
+                self._targets_on_page(self.current_page_idx)
+            except Exception:
+                logger.error("backlink targets:\n" + traceback.format_exc())
+                self._targets_cache[self.current_page_idx] = []
+            self.queue_draw()
+        return False
+
+    BACKLINK_ROWS = 8           # rows a backlinks card lists before "+N more"
+
+    def _open_backlinks(self, key, region):
+        """The icon of a target was clicked: list who cites it, PINNED (it
+        stays until a press elsewhere or Escape). The same icon again closes
+        it."""
+        p = self._link_preview
+        if p is not None and p.get("type") == "backlinks" and p["key"] == key:
+            self._hide_link_preview()
+            return
+        sources = self._backlink_index()[0]
+        srcs = sorted(sources.get(key, []), key=lambda s: (s[0], s[1].y0))
+        if not srcs:
+            return
+        self._hide_link_preview()
+        rows = [{"page": pno, "rect": r, "text": self._link_snippet(pno, r)}
+                for pno, r in srcs[:self.BACKLINK_ROWS]]
+        self._link_preview = {"type": "backlinks", "pinned": True, "key": key,
+                              "anchor": region, "rows": rows,
+                              "more": len(srcs) - len(rows)}
+        self.queue_draw()
+
+    def _follow_backlink(self, row):
+        """Go to the place that cites this — a step in the history, so
+        Alt+Left comes back — and flash the citation so the eye finds it."""
+        self._hide_link_preview()
+        r = row["rect"]
+        self.follow_goto(row["page"], r.y0)
+        self._flash = (row["page"], fitz.Rect(r))
+        if self._flash_id is not None:
+            GLib.source_remove(self._flash_id)
+        self._flash_id = GLib.timeout_add(1200, self._end_flash)
+        self.queue_draw()
+
+    def _end_flash(self):
+        self._flash = None
+        self._flash_id = None
+        self.queue_draw()
+        return False
+
+    # ── presses on the card and the icons ────────────────────────────────────
+
+    def _pointer_in_card(self, x=None, y=None):
+        box = (self._link_preview or {}).get("box")
+        if not box:
+            return False
+        x = self._hover_x if x is None else x
+        y = self._hover_y if y is None else y
+        bx, by, bw, bh = box
+        return bx <= x <= bx + bw and by <= y <= by + bh
+
+    def _backlink_icon_at(self, x, y):
+        for (bx, by, bw, bh), key, region in self._backlink_icons:
+            if bx - 2 <= x <= bx + bw + 2 and by - 2 <= y <= by + bh + 2:
+                return key, region
+        return None
+
+    def _card_press(self, x, y):
+        """A press at (x, y): True when the card or an icon took it. A press
+        elsewhere closes a pinned card and goes on to the page as usual."""
+        p = self._link_preview
+        if p is not None and self._pointer_in_card(x, y):
+            for (bx, by, bw, bh), action in p.get("hits", ()):
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    self._card_action(action)
+                    break
+            return True
+        icon = self._backlink_icon_at(x, y)
+        if icon is not None:
+            self._open_backlinks(*icon)
+            return True
+        self._hide_link_preview()
+        return False
+
+    def _card_action(self, action):
+        what = action[0]
+        if what == "abstract":
+            p = self._link_preview
+            p["abstract_open"] = not p.get("abstract_open")
+            self.queue_draw()
+        elif what == "open":
+            try:
+                Gio.AppInfo.launch_default_for_uri(action[1], None)
+            except Exception:
+                logger.debug("card: launch failed", exc_info=True)
+        elif what == "row":
+            self._follow_backlink(action[1])
+
+    def debug_snapshot(self):
+        """What a capture (F12) records about this canvas: the view, the
+        pointer, the card, and the link preview — the link under the pointer
+        (else the last one previewed), where it resolves to, the strip chosen,
+        and every text line and graphic on the target page, so the choice can
+        be replayed exactly without the PDF in hand."""
+        snap = {"page": self.current_page_idx, "n_pages": self.n_pages,
+                "scale": self.scale, "offset": (self.offset_x, self.offset_y),
+                "fitted": self._is_fitted,
+                "device_px": self._device_px,
+                "origin_px": self._origin_px,
+                "scale_factor": self.get_scale_factor(),
+                "canvas": (self.get_width(), self.get_height()),
+                "hover": (self._hover_x, self._hover_y),
+                "links_live": self.link_hover_active(),
+                "reference_preview": reference_preview_enabled()}
+        if self.page is not None:
+            snap["hover_pdf"] = self._screen_to_pdf(self._hover_x, self._hover_y)
+        card = self._link_preview
+        if card is not None:
+            snap["card"] = {k: card.get(k) for k in
+                            ("type", "pinned", "anchor", "page", "clip", "w",
+                             "h", "device", "box", "footer", "more", "ref",
+                             "abstract_open")}
+            if card.get("rows") is not None:
+                snap["card"]["rows"] = [{"page": r["page"], "rect": r["rect"],
+                                         "text": r["text"]}
+                                        for r in card["rows"]]
+        link = self._hovered_link
+        last = self._last_link_preview
+        if link is None and last is not None:
+            link = last["link"]
+            snap["preview_source"] = "last shown"
+        elif link is not None:
+            snap["preview_source"] = "under the pointer"
+        if link is None or self.document is None:
+            return _jsonable(snap)
+        snap["link"] = dict(link)
+        page_no, to = self._link_destination(link)
+        snap["destination"] = {"page": page_no, "to": to}
+        if page_no < 0:
+            return _jsonable(snap)
+        page = self.document[page_no]
+        snap["target_page_rect"] = page.rect
+        snap["kind"] = self._link_kind(link)
+        try:
+            snap["clip"] = link_preview_clip(page, to, snap["kind"])
+            snap["clip_text"] = page.get_textbox(snap["clip"])
+        except Exception:
+            snap["clip_error"] = traceback.format_exc()
+        snap["lines"] = [
+            {"bbox": ln["bbox"],
+             "text": "".join(sp.get("text", "") for sp in ln.get("spans", ()))}
+            for b in page.get_text("dict").get("blocks", ())
+            if b.get("type") == 0 for ln in b.get("lines", ())]
+        try:
+            snap["art"] = [(t, r) for t, r in page.get_bboxlog()
+                           if not t.endswith("text")][:2000]
+        except Exception:
+            pass
+        return _jsonable(snap)
+
+    # ── drawing the card ─────────────────────────────────────────────────────
+
+    LINK_PREVIEW_MARGIN = 12    # px between the card and the canvas edge
+    LINK_PREVIEW_PAD = 8        # px of white inside the card
+    CARD_TEXT_PX = 12.5         # the card's own text
+    CARD_TITLE_PX = 14.0        # a paper's title
+    CARD_ROW_H = 22             # px per backlink row
+    CARD_LIST_W = 440           # px: a backlinks card's width, at most
+    CARD_REF_W = 400            # px: the paper section's width, at least
+
+    def _device_scale(self):
+        """Device pixels per logical pixel where this canvas is shown — 1.5 at
+        150 %. The cairo context `_draw` gets cannot say (GTK records it and
+        rasterises later, at the window's scale), and get_scale_factor()
+        rounds a fractional scale UP, so the window surface is asked."""
+        native = self.get_native()
+        surface = native.get_surface() if native is not None else None
+        try:
+            s = float(surface.get_scale()) if surface is not None else 0.0
+        except Exception:
+            s = 0.0
+        return s if s > 0 else float(self.get_scale_factor())
+
+    def _surface_origin(self):
+        """This canvas' top-left in its window SURFACE's coordinates — what
+        decides where its pixels fall on the screen's pixel grid."""
+        native = self.get_native()
+        if native is None:
+            return (0.0, 0.0)
+        res = self.translate_coordinates(native, 0.0, 0.0)
+        if not res:
+            return (0.0, 0.0)
+        tx, ty = native.get_surface_transform()
+        return (res[0] + tx, res[1] + ty)
+
+    def _card_position(self, width, height, w, h):
+        """Where a w×h card goes: under its anchor (the link), left-aligned
+        with the pointer, flipped above when there is no room below — or, for
+        a backlinks list, under its icon. Always on the canvas."""
+        p = self._link_preview
+        m = self.LINK_PREVIEW_MARGIN
+        r = p["anchor"]
+        lx, top = self._pdf_to_screen(r.x0, r.y0)
+        _rx, bottom = self._pdf_to_screen(r.x1, r.y1)
+        if p["type"] == "backlinks":
+            icon = next((b for b, k, _r in self._backlink_icons
+                         if k == p["key"]), None)
+            if icon is not None:
+                x0, top, bottom = icon[0], icon[1], icon[1] + icon[3]
+            else:
+                x0, bottom = lx, top + 16
+        else:
+            x0 = p.get("x0", self._hover_x - 24)   # fixed when it opened
+        x = min(max(m, x0), width - m - w)
+        y = bottom + 6
+        if y + h > height - m and top - 6 - h >= m:
+            y = top - 6 - h
+        y = min(max(m, y), max(m, height - m - h))
+        return max(m, x), y
+
+    def _card_text(self, ctx, text, width_px, size=None, bold=False,
+                   italic=False, lines=1):
+        lay = PangoCairo.create_layout(ctx)
+        d = Pango.FontDescription("Sans")
+        d.set_absolute_size((size or self.CARD_TEXT_PX) * Pango.SCALE)
+        if bold:
+            d.set_weight(Pango.Weight.BOLD)
+        if italic:
+            d.set_style(Pango.Style.ITALIC)
+        lay.set_font_description(d)
+        lay.set_width(int(max(10, width_px) * Pango.SCALE))
+        lay.set_ellipsize(Pango.EllipsizeMode.END)
+        if lines > 1:
+            lay.set_wrap(Pango.WrapMode.WORD_CHAR)
+            lay.set_height(-lines)          # at most this many lines
+        lay.set_text(text, -1)
+        return lay
+
+    @staticmethod
+    def _authors_line(info):
+        a = [x for x in info.get("authors") or [] if x]
+        names = ", ".join(a[:3]) + (" et al." if len(a) > 3 else "")
+        bits = [b for b in (names, info.get("venue"), info.get("year")) if b]
+        return " · ".join(bits)
+
+    def _ref_section(self, ctx, inner):
+        """[(kind, layout, action or None)] of the paper section: TITLE first
+        (it is what you want to know), then who/where/when, the one-sentence
+        TL;DR when there is one, and the abstract behind a toggle."""
+        p = self._link_preview
+        ref = p.get("ref")
+        if ref is None:
+            return []
+        if ref["state"] == "loading":
+            return [("note", self._card_text(ctx, "Looking up the paper…",
+                                             inner), None)]
+        info = ref.get("info")
+        if not info:
+            return [("note", self._card_text(
+                ctx, "No details found for this paper", inner), None)]
+        out = [("title", self._card_text(ctx, info["title"], inner,
+                                         size=self.CARD_TITLE_PX, bold=True,
+                                         lines=3), ("open", ref["uri"]))]
+        meta = self._authors_line(info)
+        if info.get("citations"):
+            meta += f" · cited by {info['citations']}"
+        if meta:
+            out.append(("meta", self._card_text(ctx, meta, inner, lines=2),
+                        None))
+        if info.get("tldr"):
+            out.append(("tldr", self._card_text(ctx, "TL;DR " + info["tldr"],
+                                                inner, italic=True, lines=4),
+                        None))
+        if info.get("abstract"):
+            opened = p.get("abstract_open")
+            out.append(("toggle", self._card_text(
+                ctx, ("▾ Abstract" if opened else "▸ Abstract"), inner,
+                bold=True), ("abstract",)))
+            if opened:
+                out.append(("abstract", self._card_text(
+                    ctx, info["abstract"], inner, lines=16), None))
+        out.append(("source", self._card_text(
+            ctx, f"from {info.get('source', 'the web')}", inner,
+            size=self.CARD_TEXT_PX - 2), None))
+        return out
+
+    def _draw_link_preview(self, ctx, width, height):
+        p = self._link_preview
+        if (p.get("surface") is not None and self._device_px is not None
+                and abs(p.get("device", 0) - self._device_px) > 0.01):
+            # rendered for another density (the window moved screens, or
+            # it was shown before the first draw measured it): redo it once
+            # the draw is over, at the right one
+            if self._link_preview_id is None:
+                self._link_preview_id = GLib.idle_add(self._show_link_preview)
+        pad, m = self.LINK_PREVIEW_PAD, self.LINK_PREVIEW_MARGIN
+        maxw = width - 2 * m
+        if p["type"] == "backlinks":
+            w = min(self.CARD_LIST_W, maxw)
+        else:
+            w = (p["w"] + 2 * pad) if p.get("surface") is not None else 0
+            if p.get("ref") is not None:
+                w = max(w, self.CARD_REF_W)
+            w = min(w, maxw)
+        inner = w - 2 * pad
+        # lay out first: the card's height is the sum of its parts
+        parts = []                 # (y offset, height, draw(x, y), action)
+        h = pad
+        for kind, lay, action in self._ref_section(ctx, inner):
+            lh = lay.get_pixel_size()[1]
+            gap = 6 if kind in ("toggle", "source") else 3
+            parts.append((h, lh, ("text", kind, lay), action))
+            h += lh + gap
+        if p["type"] == "link":
+            if parts:
+                h += 4
+            parts.append((h, p["h"], ("image",), None))
+            h += p["h"]
+            if p.get("footer"):
+                lay = self._card_text(ctx, p["footer"], inner)
+                h += 6
+                parts.append((h, lay.get_pixel_size()[1],
+                              ("text", "footer", lay), None))
+                h += lay.get_pixel_size()[1]
+        elif p["type"] == "backlinks":
+            for row in p["rows"]:
+                parts.append((h, self.CARD_ROW_H, ("row", row), ("row", row)))
+                h += self.CARD_ROW_H
+            if p.get("more"):
+                lay = self._card_text(ctx, f"+{p['more']} more", inner)
+                parts.append((h + 3, self.CARD_ROW_H, ("text", "note", lay),
+                              None))
+                h += self.CARD_ROW_H
+        h += pad
+        x, y = self._card_position(width, height, w, h)
+        ix, iy = snap_to_device(x + pad, y + pad, self._origin_px,
+                                self._device_px or 1.0)
+        x, y = ix - pad, iy - pad
+        p["box"] = (x, y, w, h)
+        ar, ag, ab = self.zoom_accent
+        ctx.save()
+        _rounded_rect_path(ctx, x + 1, y + 3, w, h, 8)       # shadow
+        ctx.set_source_rgba(0, 0, 0, 0.22)
+        ctx.fill()
+        _rounded_rect_path(ctx, x, y, w, h, 8)
+        ctx.set_source_rgb(1, 1, 1)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(ar, ag, ab, 0.7)
+        ctx.set_line_width(1.0)
+        ctx.stroke()
+        colours = {"title": (0.08, 0.08, 0.1), "meta": (0.35, 0.35, 0.38),
+                   "tldr": (0.2, 0.2, 0.22), "abstract": (0.15, 0.15, 0.17),
+                   "toggle": (ar, ag, ab), "note": (0.45, 0.45, 0.48),
+                   "source": (0.55, 0.55, 0.58), "footer": (0.35, 0.35, 0.38)}
+        hits = []
+        for oy, ph, what, action in parts:
+            top = y + oy
+            box = (x + 2, top - 1, w - 4, ph + 2)
+            hot = (action is not None and box[0] <= self._hover_x <= box[0] + box[2]
+                   and box[1] <= self._hover_y <= box[1] + box[3])
+            if action is not None:
+                hits.append((box, action))
+            if hot:
+                ctx.set_source_rgba(ar, ag, ab, 0.12)
+                ctx.rectangle(*box)
+                ctx.fill()
+            if what[0] == "image":
+                # its own pixel corner: an odd offset is half a pixel at 1.5x
+                sx, sy = snap_to_device(ix, top, self._origin_px,
+                                        self._device_px or 1.0)
+                ctx.set_source_surface(p["surface"], sx, sy)
+                ctx.paint()
+            elif what[0] == "text":
+                ctx.set_source_rgb(*colours.get(what[1], (0.2, 0.2, 0.22)))
+                ctx.move_to(ix, top)
+                PangoCairo.show_layout(ctx, what[2])
+            elif what[0] == "row":
+                row = what[1]
+                label = self._card_text(ctx, f"p. {row['page'] + 1}", 48,
+                                        bold=True)
+                ctx.set_source_rgb(ar, ag, ab)
+                ctx.move_to(ix, top + 3)
+                PangoCairo.show_layout(ctx, label)
+                snippet = self._card_text(ctx, row["text"] or "(link)",
+                                          inner - 52)
+                ctx.set_source_rgb(0.2, 0.2, 0.22)
+                ctx.move_to(ix + 52, top + 3)
+                PangoCairo.show_layout(ctx, snippet)
+        p["hits"] = hits
+        ctx.restore()
+
+    def _draw_backlink_icons(self, ctx):
+        """A small "↩ n" beside every target on this page that something
+        links to — a bibliography entry, a figure, an equation. Faint until
+        the pointer is on it; a click lists who cites it (`_open_backlinks`).
+        The page's targets are found on an idle the first time."""
+        self._backlink_icons = []
+        if (not self._show_backlink_icons() or self.document is None
+                or self.page is None):
+            return
+        pno = self.current_page_idx
+        if self._backlinks_key != (id(self.document), self.n_pages) \
+                or pno not in self._targets_cache:
+            if self._targets_idle_id is None:
+                self._targets_idle_id = GLib.idle_add(self._prepare_targets)
+            return
+        sources = self._backlinks[0]
+        ar, ag, ab = self.zoom_accent
+        open_key = (self._link_preview or {}).get("key")
+        for region, key in self._targets_cache[pno]:
+            n = len(sources.get(key, ()))
+            if not n:
+                continue
+            lay = self._card_text(ctx, f"↩ {n}", 60, size=10.5)
+            tw, th = lay.get_pixel_size()
+            bw, bh = tw + 8, th + 2
+            sx, sy = self._pdf_to_screen(region.x0, region.y0)
+            bx = max(2.0, sx - bw - 3)
+            by = sy + 1
+            box = (bx, by, bw, bh)
+            self._backlink_icons.append((box, key, region))
+            hot = (bx <= self._hover_x <= bx + bw
+                   and by <= self._hover_y <= by + bh) or key == open_key
+            a = 1.0 if hot else 0.55
+            ctx.save()
+            _rounded_rect_path(ctx, bx, by, bw, bh, bh / 2)
+            ctx.set_source_rgba(1, 1, 1, 0.9 * a)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(ar, ag, ab, a)
+            ctx.set_line_width(1.0)
+            ctx.stroke()
+            ctx.move_to(bx + 4, by + 1)
+            PangoCairo.show_layout(ctx, lay)
+            ctx.restore()
+
+    def _draw_flash(self, ctx):
+        """The citation a backlink row jumped to, outlined for a moment."""
+        page_no, r = self._flash
+        if page_no != self.current_page_idx:
+            return
+        ctx.save()
+        ctx.translate(self.offset_x, self.offset_y)
+        ctx.scale(self.scale, self.scale)
+        ar, ag, ab = self.zoom_accent
+        ctx.set_source_rgba(ar, ag, ab, 0.25)
+        ctx.rectangle(r.x0 - 2, r.y0 - 2, r.width + 4, r.height + 4)
+        ctx.fill()
+        ctx.restore()
 
     def _open_link_at(self, sx, sy):
         if not self.page:
@@ -7504,19 +9140,10 @@ class PDFCanvas(Gtk.DrawingArea):
                             logger.debug("link: launch_default_for_uri failed",
                                          exc_info=True)
                 elif kind in (fitz.LINK_GOTO, fitz.LINK_NAMED):
-                    # LINK_NAMED is what LaTeX/hyperref emits for \cite, \ref and
-                    # cross-references; PyMuPDF resolves the named destination into
-                    # the same page/to fields as a plain GOTO.
-                    page_no = link.get("page", -1)
-                    to = link.get("to")
-                    to_y = to.y if to is not None else None
+                    page_no, to = self._link_destination(link)
+                    to_y = to[1] if to is not None else None
                     kname = "NAMED" if kind == fitz.LINK_NAMED else "GOTO"
                     logger.debug(f"link: {kname} page={page_no} to_y={to_y}")
-                    if page_no < 0 and kind == fitz.LINK_NAMED:
-                        page_no, to_y = self._resolve_named_dest(
-                            link.get("name") or link.get("nameddest"))
-                        logger.debug(
-                            f"link: NAMED resolved to page={page_no} to_y={to_y}")
                     if page_no >= 0:
                         self.follow_goto(page_no, to_y)
                     else:
@@ -7553,6 +9180,7 @@ class PDFCanvas(Gtk.DrawingArea):
         logger.debug(
             f"follow_goto: page {self.current_page_idx} -> {page_no} to_y={to_y}")
         self.history.jump()
+        self._hide_link_preview()      # you went there; the peek is done
         if self.on_nav_history:
             self.on_nav_history(True)
         if page_no != self.current_page_idx:
@@ -7578,6 +9206,30 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _view_state(self):
         return (self.current_page_idx, self.offset_x, self.offset_y, self.scale)
+
+    def view_anchor(self):
+        """The zoom and the page point at the middle of the canvas — what
+        Ctrl+R hands the new process so it opens on the same view — or None
+        when the page is simply fitted, which the new window does anyway.
+        Centre-anchored rather than raw offsets, because the new window's
+        canvas is not yet the size it ends up (maximize lands later)."""
+        if self.page is None or self._is_fitted:
+            return None
+        w, h = self.get_width() or 800, self.get_height() or 600
+        cx, cy = self._screen_to_pdf(w / 2, h / 2)
+        return [self.scale, cx, cy]
+
+    def restore_view_anchor(self, anchor):
+        """Ask the next draw to put `view_anchor()`'s view back. Deferred to
+        the draw, because the first draw is where a freshly opened page is
+        fitted — anything set before it would be fitted away."""
+        try:
+            scale, cx, cy = (float(v) for v in anchor)
+        except (TypeError, ValueError):
+            return
+        if scale > 0:
+            self._pending_view = (scale, cx, cy)
+            self.queue_draw()
 
     def _restore_view_state(self, state):
         page, ox, oy, scale = state
@@ -8307,12 +9959,34 @@ class PDFCanvas(Gtk.DrawingArea):
         cw = self.get_width() or 800
         ch = self.get_height() or 600
         self.history.jump()
+        before = self._view_state()
         new_scale = min(cw / pdf_w, ch / pdf_h) * 0.97
         self.scale = new_scale
         self._is_fitted = False
         self.offset_x = (cw - pdf_w * new_scale) / 2 - px1 * new_scale
         self.offset_y = (ch - pdf_h * new_scale) / 2 - py1 * new_scale
+        self._zoom_trail.append((before, self._view_state()))
         self._schedule_rerender()
+
+    def _near_zoom(self, a, b):
+        """Is view `a` still about view `b` — same page, the zoom within
+        ZOOM_TRAIL_SCALE, panned less than ZOOM_TRAIL_DRIFT of the canvas?"""
+        cw = self.get_width() or 800
+        ch = self.get_height() or 600
+        return (a[0] == b[0] and _near_ratio(a[3], b[3])
+                and abs(a[1] - b[1]) < ZOOM_TRAIL_DRIFT * cw
+                and abs(a[2] - b[2]) < ZOOM_TRAIL_DRIFT * ch)
+
+    def zoom_click(self):
+        """A zoom-tool click: out of the last region zoom, or the whole page
+        (`zoom_trail_click`). Either is a step in the history."""
+        back = zoom_trail_click(self._zoom_trail, self._view_state(),
+                                self._near_zoom)
+        if back is None:
+            self.zoom_to_fit()
+            return
+        self.history.jump()
+        self._restore_view_state(back)
 
     def zoom_to_fit(self):
         """Reset to fit-page view — a step, so back returns to the zoom."""
@@ -15871,6 +17545,8 @@ class TextPageView(Gtk.Overlay):
         # Shift+drag rubber-bands a region to zoom to; a Shift+click (no rect)
         # fits the paper to the window — both PDF-canvas parity (#106 item 5).
         self._zoom_selecting = False
+        self._zoom_trail = []         # [(view before, after)] per region zoom
+        self._ctx_actions = None      # the context menu's actions (row 201)
         self._zoom_start = None       # overlay coords of the drag origin
         self._zoom_end = None         # overlay coords of the current corner
         self._zoom_cancelled = False  # right-click aborted the rect mid-drag
@@ -16396,6 +18072,7 @@ class TextPageView(Gtk.Overlay):
         # a step, so back (or Escape) returns to where this zoom started — the
         # canvas records the same way in _execute_zoom_to_rect
         self.history.jump()
+        before = self._view_state()
         # fit both axes (like the PDF canvas), leaving a hair of margin
         self.set_zoom(old * min(vw / rw, vh / rh) * 0.97)
         f = self.zoom / old
@@ -16408,8 +18085,31 @@ class TextPageView(Gtk.Overlay):
         vv = (va.get_value() + y1) * f - my
         ha.set_value(hv)
         va.set_value(vv)
+        # where this zoom MEANT to land: the adjustments clamp until the async
+        # relayout below gives them the new range, so reading them back now
+        # would record the old sheet's limits
+        self._zoom_trail.append((before, (self.zoom, hv, vv)))
         # the relayout to the new width is async — re-apply once it lands
         GLib.idle_add(lambda: (ha.set_value(hv), va.set_value(vv)) and False)
+
+    def _near_zoom(self, a, b):
+        """The PDF canvas' `_near_zoom`, for the sheet's (zoom, h, v)."""
+        vw = self.scroll.get_width() or 800
+        vh = self.scroll.get_height() or 600
+        return (_near_ratio(a[0], b[0])
+                and abs(a[1] - b[1]) < ZOOM_TRAIL_DRIFT * vw
+                and abs(a[2] - b[2]) < ZOOM_TRAIL_DRIFT * vh)
+
+    def zoom_click(self):
+        """A zoom-tool click: out of the last region zoom, or the whole width
+        (`zoom_trail_click`, shared with the PDF canvas)."""
+        back = zoom_trail_click(self._zoom_trail, self._view_state(),
+                                self._near_zoom)
+        if back is None:
+            self.fit_width()
+            return
+        self.history.jump()
+        self._restore_view_state(back)
 
     def _sheet_center(self):
         return (self.get_width() / 2, self.get_height() / 2)
@@ -17176,7 +18876,7 @@ class TextPageView(Gtk.Overlay):
         # here: a pasted image would otherwise be unmovable until you fetched
         # the lasso (row 125).
         grab = self.selection_grab_at(x, y)
-        if grab and tool != "lasso":
+        if grab and tool not in ("lasso", "menu"):
             tool, additive = "lasso", False
 
         log_press("text", chord_id(btn, ctrl, shift, alt), tool,
@@ -17190,6 +18890,11 @@ class TextPageView(Gtk.Overlay):
         # input bug came through. The caret is a TOOL now, implemented on the
         # notes view (`caret_press`), and an unbound button does nothing at all
         # — which is what the empty stripe in the toolbar has always promised.
+        if tool == "menu":
+            # row 201: GTK's own text menu, with CONTEXT_MENU's entries in it
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._reopen_context_menu(x, y)
+            return
         if tool is None or tool == "text":
             if plain != "lasso":
                 # a press ends a live selection, exactly as it does on a PDF
@@ -17311,8 +19016,72 @@ class TextPageView(Gtk.Overlay):
         bounds = buf.get_selection_bounds()
         if not (bounds and it.in_range(bounds[0], bounds[1])):
             buf.place_cursor(it)
+        self.context_menu_entries()      # our entries, armed for NOW
         self.view.grab_focus()
         self.view.activate_action("menu.popup", None)
+
+    # ── the context menu (row 201) ───────────────────────────────────────────
+
+    def context_menu_entries(self):
+        """Arm CONTEXT_MENU's text-page entries for what is selected now (they
+        sit in GTK's own text menu, via the view's extra menu); returns the
+        labels that will show."""
+        if self._ctx_actions is None:
+            self._ctx_actions = install_context_actions(self.view, self, "text")
+            self.view.set_extra_menu(context_menu_model("text"))
+        return refresh_context_actions(self._ctx_actions, self, "text")
+
+    def has_text_selection(self):
+        return self.view.get_buffer().get_has_selection()
+
+    def highlight_text_selection(self):
+        """Highlighter ink over every display line of the selected text, one
+        stroke per line — the PDF page's Highlight, on the sheet. Anchored to
+        the text like any sheet ink (`_anchor_stroke_at`), so it rides along
+        with edits above it; one undo takes all of it."""
+        buf = self.view.get_buffer()
+        bounds = buf.get_selection_bounds()
+        if not bounds:
+            return
+        start, end = bounds
+        color, _width, opacity = self.pen_style(True)
+        strokes = []
+        it = start.copy()
+        while it.compare(end) < 0:
+            r0 = self.view.get_iter_location(it)
+            line_end = it.copy()
+            self.view.forward_display_line_end(line_end)
+            if self.view.get_iter_location(line_end).y != r0.y:
+                line_end = it.copy()      # an empty line: it jumped past it
+            if line_end.compare(end) > 0:
+                line_end = end.copy()
+            r1 = self.view.get_iter_location(line_end)
+            x0, y0 = self._buffer_to_overlay(r0.x, r0.y)
+            x1, _y1 = self._buffer_to_overlay(r1.x, r1.y)
+            h = float(max(r0.height, 1))
+            if x1 - x0 > 1:
+                ymid = y0 + h / 2
+                mark, rel = self._anchor_stroke_at([(x0, ymid), (x1, ymid)])
+                strokes.append({"mark": mark, "pts": rel,
+                                "color": tuple(color), "width": h,
+                                "opacity": opacity, "font_px": self.font_px})
+            nxt = line_end.copy()
+            if not self.view.forward_display_line(nxt) or nxt.compare(it) <= 0:
+                break
+            if not self.view.starts_display_line(nxt):
+                self.view.backward_display_line_start(nxt)
+            it = nxt
+        if not strokes:
+            return
+        self.strokes.extend(strokes)
+        self._undo_ops.append(("add", strokes))
+        self._redo_ops.clear()
+        buf.place_cursor(end)
+        self.ink.queue_draw()
+        if self.on_ink_action:
+            self.on_ink_action()
+        if self.on_ink_changed:
+            self.on_ink_changed()
 
     # ── the caret tool's own plumbing ─────────────────────────────────────────
 
@@ -17429,7 +19198,7 @@ class TextPageView(Gtk.Overlay):
             if rw >= ZOOM_RECT_MIN_PX and rh >= ZOOM_RECT_MIN_PX:
                 self._zoom_to_region(start, end)
             else:
-                self.fit_width()   # Shift+click with no rect → fit page
+                self.zoom_click()  # a click: out of the zoom, or whole width
         self.ink.queue_draw()
 
     def _on_ink_update(self, gesture, dx, dy):
@@ -20026,6 +21795,25 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         cy - ext.height / 2 - ext.y_bearing)
             ctx.show_text("1")
 
+        def _draw_mode_menu(_a, ctx, w, h):
+            # a little context menu: a card with three entries, pointer at
+            # its corner
+            ctx.set_source_rgb(*fg)
+            ctx.set_line_width(1.3)
+            x0, y0 = w * 0.28, h * 0.22
+            ctx.rectangle(x0, y0, w * 0.52, h * 0.58)
+            ctx.stroke()
+            for i in range(3):
+                y = y0 + h * (0.14 + 0.15 * i)
+                ctx.move_to(x0 + w * 0.09, y)
+                ctx.line_to(x0 + w * 0.42, y)
+            ctx.stroke()
+            ctx.move_to(w * 0.16, h * 0.12)
+            ctx.line_to(w * 0.16, h * 0.42)
+            ctx.line_to(w * 0.25, h * 0.33)
+            ctx.close_path()
+            ctx.fill()
+
         def _draw_mode_eraser(_a, ctx, w, h):
             # a tilted eraser block with a band marking the worn rubber tip
             ctx.set_source_rgb(*fg)
@@ -20132,6 +21920,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._mode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._mode_zoom.set_tooltip_text(
             "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
+        self._mode_menu = Gtk.Button()
+        self._mode_menu.set_child(_glyph(_draw_mode_menu))
+        self._mode_menu.set_tooltip_text(
+            "Context menu — Highlight / Copy what you selected, and more. "
+            "Click this with the button you want it on (e.g. right)")
         self._mode_anchor = Gtk.Button()
         self._mode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._mode_anchor.set_tooltip_text("Anchor / callout")
@@ -20149,8 +21942,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         tools_box.add_css_class("linked")
         self._tool_btns = (self._mode_pen, self._mode_hl, self._mode_eraser,
                            self._mode_lasso, self._mode_text, self._mode_pan,
-                           self._mode_zoom, self._mode_anchor,
-                           self._mode_phoneview)
+                           self._mode_zoom, self._mode_menu,
+                           self._mode_anchor, self._mode_phoneview)
         for b, m in zip(self._tool_btns, self._TOOL_BAR_ORDER):
             b.connect("clicked", lambda _b, m=m: self._pick_tool(m))
             b.add_css_class("tool-btn")
@@ -20197,6 +21990,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._pmode_zoom.set_icon_name(_themed_icon("zoom-in-symbolic"))
         self._pmode_zoom.set_tooltip_text(
             "Zoom to region (Shift+drag · Alt+Shift+drag · Shift+middle/thumb-drag)")
+        self._pmode_menu = Gtk.Button()
+        self._pmode_menu.set_child(_glyph(_draw_mode_menu))
+        self._pmode_menu.set_tooltip_text("Context menu")
         self._pmode_anchor = Gtk.Button()
         self._pmode_anchor.set_child(_glyph(_draw_mode_anchor))
         self._pmode_anchor.set_tooltip_text("Anchor / callout")
@@ -20214,8 +22010,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         pmode_box.add_css_class("linked")
         self._ptool_btns = (self._pmode_pen, self._pmode_hl, self._pmode_eraser,
                             self._pmode_lasso, self._pmode_text, self._pmode_pan,
-                            self._pmode_zoom, self._pmode_anchor,
-                            self._pmode_phoneview)
+                            self._pmode_zoom, self._pmode_menu,
+                            self._pmode_anchor, self._pmode_phoneview)
         for b, m in zip(self._ptool_btns, self._TOOL_BAR_ORDER):
             b.connect("clicked", lambda _b, m=m: self._pick_tool(m))
             b.add_css_class("tool-btn")
@@ -20661,16 +22457,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if event is None or event.get_event_type() != Gdk.EventType.BUTTON_PRESS:
             return False
         btn = event.get_button()
-        step = side_button_step(btn)
-        if step:
-            # one button is back, the other forward (side_button_step), the
-            # same direction in both modes, so Ctrl swapping the mode never
-            # swaps the direction. A text page has no pages, so there it is
-            # always the history.
-            back = step < 0
+        if btn in (8, 9):
+            # which button is back depends on what the press does
+            # (side_button_step): history is browser-style, page turning has
+            # its own swap. A text page has no pages, so there it is always
+            # the history.
             ctrl = (bool(event.get_modifier_state() & Gdk.ModifierType.CONTROL_MASK)
                     or self._held_mods[0])
             history = (self._side_buttons == "history") != ctrl or self._text_mode
+            back = side_button_step(btn, pages=not history) < 0
             if history:
                 surface = self._history_surface()
                 if back:
@@ -20700,6 +22495,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # ONE table for the whole window: rebinding in any tab is instantly
         # true in every other, and on the text pages too (row 132)
         s.canvas.bindings = self.bindings
+        # the select / highlighter variants are the APP's, like the pen: a new
+        # tab and a restart (Ctrl+R) keep the one you picked
+        saved = _load_settings()
+        if saved.get("select_style") in ("reading", "rect"):
+            s.canvas.select_style = saved["select_style"]
+        if saved.get("highlight_style") in ("free", "text"):
+            s.canvas.highlight_style = saved["highlight_style"]
         s.canvas.surround_color = self._theme_surround
         s.canvas.zoom_accent = self._theme_acc
         # The stock pen wears the THEME's accent, which a canvas cannot know —
@@ -23443,6 +25245,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         specific keys are consumed; every other key passes through to typing."""
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if keyval == Gdk.KEY_F12:
+            # a capture for a bug report: a key, not a button — it is pressed
+            # with the pointer resting on the thing that looks wrong
+            self.capture_diagnostics()
+            return True
         if ctrl_held and shift_held and keyval in (Gdk.KEY_t, Gdk.KEY_T):
             # reopen the most recently closed tab (browser-style)
             self._reopen_closed_tab()
@@ -25266,6 +27073,52 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         dialog.connect("response", on_resp)
         dialog.present(self)
 
+    def capture_diagnostics(self):
+        """F12: write what is on screen right now to a JSON file in
+        CAPTURE_DIR, keep this session's log, and put one line naming both on
+        the clipboard — something to paste into a bug report or a chat. Taken
+        with the pointer still where the problem is, since the snapshot
+        includes the hover state (`PDFCanvas.debug_snapshot`).
+        Returns the capture's path, or None if it could not be written."""
+        now = datetime.datetime.now()
+        info = _build_info()
+        s = self._active_session
+        snap = {"time": now.isoformat(timespec="seconds"),
+                "sidemark": {k: info.get(k) for k in
+                             ("version", "commit", "dirty", "by")},
+                "file": __file__, "log": _log_path,
+                "document": (s._path or s._notes_path) if s else None,
+                "mode": s.doc_mode if s else None}
+        try:
+            if s is not None and s.doc_mode == "text" and s._text_page:
+                snap["sheet"] = _jsonable(s._text_page._view_state())
+            elif self.canvas is not None:
+                snap["canvas"] = self.canvas.debug_snapshot()
+        except Exception:
+            snap["snapshot_error"] = traceback.format_exc()
+        name = f"capture_{now:%Y%m%d-%H%M%S}.json"
+        path = os.path.join(CAPTURE_DIR, name)
+        try:
+            os.makedirs(CAPTURE_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=1, ensure_ascii=False)
+            caps = sorted((n for n in os.listdir(CAPTURE_DIR)
+                           if n.startswith("capture_")), reverse=True)
+            for old in caps[CAPTURE_KEEP:]:
+                os.remove(os.path.join(CAPTURE_DIR, old))
+        except OSError:
+            logger.warning("capture could not be written", exc_info=True)
+            self._toast("Couldn't write the capture — see the log")
+            return None
+        _keep_log()
+        logger.info(f"CAPTURE {name}: {path}")
+        line = f"Sidemark capture {path} (log {_log_path})"
+        Gdk.Display.get_default().get_clipboard().set_content(
+            Gdk.ContentProvider.new_for_bytes(
+                "text/plain;charset=utf-8", GLib.Bytes.new(line.encode("utf-8"))))
+        self._toast("Captured — paste the clipboard to report it", timeout=3)
+        return path
+
     def _toast(self, msg, timeout=2):
         toast = Adw.Toast.new(msg)
         toast.set_timeout(timeout)
@@ -25751,7 +27604,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if getattr(self, "_syncing_select_style", False):
             return
         self._syncing_select_style = True
-        self.canvas.select_style = style
+        _save_setting("select_style", style)
+        for sess in self._sessions:
+            if sess.canvas is not None:
+                sess.canvas.select_style = style
         for s, cb in self._select_style_radios:
             cb.set_active(s == style)
         self._syncing_select_style = False
@@ -25792,7 +27648,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if getattr(self, "_syncing_highlight_style", False):
             return
         self._syncing_highlight_style = True
-        self.canvas.highlight_style = style
+        _save_setting("highlight_style", style)
+        for sess in self._sessions:
+            if sess.canvas is not None:
+                sess.canvas.highlight_style = style
         for s, cb in self._highlight_style_radios:
             cb.set_active(s == style)
         self._syncing_highlight_style = False
@@ -25815,6 +27674,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         log_press("bind", "left", mode,
                   f"was {self.bindings.tool_for_chord('left')}")
         self.canvas.tool = mode
+        # the plain click binds left like every other binding path — and is
+        # saved like them, or the tool you picked is gone after Ctrl+R
+        self.bindings.save()
         if mode != "lasso":
             self.canvas.clear_lasso_selection()
         # cursor reflects what the left button would do right now
@@ -26458,6 +28320,18 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         notes.add(comments)
         page.add(notes)
 
+        reading = Adw.PreferencesGroup(title="Reading")
+        refs = Adw.SwitchRow(title="Look up cited papers")
+        refs.set_subtitle(
+            "Hovering a citation or a link to an article shows the paper's "
+            "title and abstract. Sends that link to arXiv, Crossref, Semantic "
+            "Scholar or the publisher's site.")
+        refs.set_active(reference_preview_enabled())
+        refs.connect("notify::active", lambda r, _p:
+                     _save_setting("reference_preview", r.get_active()))
+        reading.add(refs)
+        page.add(reading)
+
         mouse = Adw.PreferencesGroup(title="Mouse")
         thumb = Adw.SwitchRow(title="Thumb button")
         thumb.set_subtitle("The side button some mice have. Off, Sidemark "
@@ -26474,12 +28348,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         side.connect("notify::selected", lambda r, _p: self._on_side_buttons(
             "history" if r.get_selected() == 1 else "pages"))
         mouse.add(side)
-        swap = Adw.SwitchRow(title="Swap back and forward")
-        swap.set_subtitle("For a mouse whose side buttons go the wrong way.")
-        swap.set_active(_load_settings().get("swap_side_buttons", True)
+        swap = Adw.SwitchRow(title="Swap for page turning")
+        swap.set_subtitle("Back turns to the next page, forward to the "
+                          "previous. Where you were always goes like a "
+                          "browser.")
+        swap.set_active(_load_settings().get("swap_page_buttons", True)
                         is not False)
         swap.connect("notify::active", lambda r, _p:
-                     _save_setting("swap_side_buttons", r.get_active()))
+                     _save_setting("swap_page_buttons", r.get_active()))
         mouse.add(swap)
         page.add(mouse)
 
@@ -28815,11 +30691,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 continue
             if s is self._active_session:
                 active = len(tabs)
+            text = s.doc_mode == "text"
+            if text:
+                tp = s._text_page
+                view = list(tp._view_state()) if tp is not None else None
+            else:
+                view = s.canvas.view_anchor() if s.canvas is not None else None
             tabs.append({
                 "path": os.path.abspath(path),
                 # a text-first page is one sheet: it has no page to come back to
                 "page": (s.canvas.current_page_idx
                          if s._path and s.canvas is not None else 0),
+                # the zoom and where you were on the page / sheet
+                "view": view,
+                "view_kind": "sheet" if text else "page",
             })
         return {
             "tabs": tabs,
@@ -29021,6 +30906,12 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # "cancel") and only claims Escape when there is somewhere to go back
         # to, so the key stays free for everything else.
         zoom_surface = tp if tp is not None else self.canvas
+        if (keyval == Gdk.KEY_Escape and tp is None
+                and self.canvas._link_preview is not None):
+            # an open card (a pinned backlinks list above all) is the more
+            # immediate thing to cancel than a step back
+            self.canvas._hide_link_preview()
+            return True
         if keyval == Gdk.KEY_Escape and zoom_surface.can_go_back():
             zoom_surface.go_back()
             return True
@@ -29526,7 +31417,7 @@ class PresenterWindow(Adw.Window):
 
     def _on_click(self, gesture, _n_press, _x, _y):
         button = gesture.get_current_button()
-        step = side_button_step(button)
+        step = side_button_step(button, pages=True)
         if button == Gdk.BUTTON_PRIMARY or step > 0:     # click / forward → next
             self._nav(1)
         elif button == Gdk.BUTTON_SECONDARY or step < 0:  # right / back → prev
@@ -29734,14 +31625,49 @@ class PDFEditorApp(Adw.Application):
             # the first open reuses the pristine scratchpad tab, the rest add
             # one each — the same path a user's own File▸Open takes
             win.open_file_in_tab(tab["path"])
+            s = win._active_session
             page = int(tab.get("page") or 0)
-            if page > 0:
-                win._go_to_page(page)
+            # the app moving, not you: canvas.go_to_page, no history step
+            if page > 0 and s.doc_mode != "text":
+                s.canvas.go_to_page(page)
+            view = tab.get("view")
+            if view and tab.get("view_kind") == "sheet":
+                try:
+                    st = tuple(float(v) for v in view)
+                except (TypeError, ValueError):
+                    st = None
+                if st is not None and len(st) == 3:
+                    self._restore_sheet_view(win, tab["path"], st)
+            elif view and s.canvas is not None:
+                s.canvas.restore_view_anchor(view)
         if not tabs:
             return
         active = max(0, min(int(state.get("active") or 0), len(win._sessions) - 1))
         win._tab_view.set_selected_page(win._sessions[active]._tab_page)
         win.apply_view_state(state)
+
+    def _restore_sheet_view(self, win, path, st, tries=60):
+        """Put a text tab's sheet back at (zoom, h, v) once it exists and has
+        laid its text out — a scroll set before that is clamped to the empty
+        sheet's height. The TAB is found by its file WHEN this runs, not held
+        from the moment it opened: on a busy machine the open completes later,
+        in a session other than the one in front at that moment, and a
+        restore aimed at that one silently missed."""
+        def attempt(left=tries):
+            s = next((x for x in win._sessions
+                      if x.doc_mode == "text" and x._text_page is not None
+                      and os.path.abspath(x._notes_path or "") == path), None)
+            tp = s._text_page if s is not None else None
+            if tp is None:
+                if left > 0:
+                    GLib.timeout_add(50, lambda: attempt(left - 1) and False)
+                return False
+            tp._restore_view_state(st)
+            return False
+        # a short timer, not a low-priority idle: an idle at LOW waits for
+        # the loop to be otherwise empty, which a busy window never is, and
+        # the restore simply never ran. 150 ms is after the first layout.
+        GLib.timeout_add(150, lambda: attempt() and False)
 
     def do_activate(self):
         # bare activation (e.g. via D-Bus) with no command line → empty window

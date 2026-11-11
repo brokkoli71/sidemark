@@ -50,10 +50,10 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Navigation
 
-- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Ctrl+drag` to pan, `Shift+drag` to zoom to region, `Shift+click` to fit page
+- **Pan & zoom** — scroll to pan, `Ctrl+scroll` or pinch to zoom (centered on the cursor), `Ctrl+drag` to pan, `Shift+drag` to zoom to region, `Shift+click` to step back out of it (or, once you have moved on, to fit the page)
 - **Page flip** — `PageDown` / `PageUp` or the mouse **back/forward side buttons** (they work even while typing notes); scrolling past a page edge flips automatically
 - **Back to where you were** — `Alt+Left` / `Alt+Right` (or `Escape`) step back and forward through your pans, zooms, page flips and jumps, like a browser. In Settings the side buttons can do this instead of turning pages; holding `Ctrl` gives you the other one
-- **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser. Links light up while `Alt` is held, or whenever the text-cursor tool is in hand
+- **Follow links** — `Alt+click` a footnote, citation, or cross-reference to jump to its target (scrolling to the exact spot, even on the same page); `Alt+Left` jumps back to where you were reading. External URLs open in your browser. Links light up while `Alt` is held, or whenever the text-cursor tool is in hand; rest on one to preview what it points at — the bibliography entry, figure or table — without leaving your place, and the small ↩ beside a cited entry or figure lists every place that cites it. With *Look up cited papers* on in Settings, a citation or a link to an article also shows the paper's title, authors and abstract
 - **Outline & thumbnails** — `Ctrl+T` toggles a sidebar between table of contents and page thumbnails; drag thumbnails to reorder pages, drop documents onto the sidebar to import them as chapters at that spot, drag a chapter in the outline to move all of its pages at once, or drag pages **out to a file manager** to export them as a standalone PDF (annotations and notes included), like macOS Preview
 - **Add / delete pages** — insert blank pages with the same dimensions as the current page
 - **Presenter view** (`F5`) — mirrors the current page fullscreen on a second screen, your ink updating **live** while you draw, and can be driven from either side (clicker-friendly). Your own window switches to a presenter layout — current slide, a **peek at the next one**, a presentation timer and large prev/next buttons — none of it visible to the audience
@@ -69,7 +69,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 - **Recent files** — in-app menu, XDG recent-files integration (GTK / GNOME / KDE file dialogs), and an optional walker / Omarchy launcher menu
 - **Text selection** — `Alt+drag` selects text the way a browser does, from any character to any other, with double-click for a word and triple-click for a paragraph; copying joins wrapped lines back into paragraphs (or put the text-cursor tool on a button to make plain drags select); long-press the select tool for a **rectangular** marquee, handy for tables and code
 - **Design scheme** — inherits accent color and dark / light mode from Omarchy, GNOME, or KDE automatically
-- **Tools live on mouse buttons** — there is no "active tool" to switch between: left draws, right erases and middle lassos *at the same time*, and every button and modifier chord is rebindable. Click a tool in the header with the button you want it on, and it goes there — coloured stripes under each tool show which buttons run it, and they repaint live as you hold a modifier, so the bar is always a readout of what your hand would do right now
+- **Tools live on mouse buttons** — there is no "active tool" to switch between: left draws, right erases and middle lassos *at the same time*, and every button and modifier chord is rebindable. Click a tool in the header with the button you want it on, and it goes there — coloured stripes under each tool show which buttons run it, and they repaint live as you hold a modifier, so the bar is always a readout of what your hand would do right now. The **context menu** is one of these tools: put it on the right button and a right-click on selected text offers Highlight and Copy
 - **Stylus and touchscreen** — a pen's ends *are* mouse buttons: the tip draws, the eraser barrel button erases, the other barrel button lassos, so the defaults work the moment you pick up a stylus. A finger pans rather than draws, which keeps a resting palm from scribbling on the page while you write — rebind it like any other button if you'd rather draw with your finger
 - **Responsive header** — the compact single-row toolbar folds progressively as the window narrows (file actions live in the ☰ menu), so the core controls stay reachable at any width
 
@@ -160,6 +160,7 @@ pip install pymupdf
 | `Alt+Left` / `Alt+Right` | Back / forward through where you were — links, jumps, pans and zooms |
 | `Ctrl+Shift+N` | Add blank page after current |
 | `Ctrl+Shift+Delete` | Delete current page |
+| `F12` | Capture what is on screen for a bug report — copies a line naming the capture and the log (point at the problem first) |
 | `F5` | Toggle presenter view — mirror the page fullscreen on a second screen (`Esc` to close) |
 | `Ctrl+T` | Toggle outline / page-thumbnail sidebar (Outline ⇄ Pages switcher when the PDF has both) |
 | Click / `Shift` / `Ctrl+click` thumbnail | Click selects a single page; `Shift+click` marks every page between it and the last one you clicked; `Ctrl+click` adds or removes one |
