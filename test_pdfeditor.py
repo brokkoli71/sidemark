@@ -674,12 +674,35 @@ class TestLinkPreview(unittest.TestCase):
         c.go_back()
         self.assertEqual(c.current_page_idx, 0)
 
-    def test_a_press_elsewhere_closes_the_list_and_reaches_the_page(self):
+    @staticmethod
+    def _left_press():
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        return g
+
+    def test_a_press_that_closes_a_card_draws_nothing(self):
+        """Clicking away to dismiss must not leave a pen dot."""
         c = self.c
         self._click_icon(("n", "cite.b"))
         c._draw_link_preview(cairo.Context(
             cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)), 600, 800)
-        self.assertFalse(c._card_press(590, 790))
+        self.assertEqual(c.tool, "pen")
+        c._on_drag_begin(self._left_press(), 500, 700)
+        self.assertIsNone(c._link_preview)
+        self.assertTrue(c._ignoring)
+        self.assertEqual(c.current_stroke, [])
+        c._on_drag_begin(self._left_press(), 500, 700)   # the next press draws
+        self.assertFalse(c._ignoring)
+
+    def test_pressing_the_cards_own_link_still_follows_it(self):
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            c._show_link_preview()
+        self.assertFalse(c._card_press(*self.centres["cite.b"]))
         self.assertIsNone(c._link_preview)
 
     def test_the_hover_card_stays_while_the_pointer_is_on_it(self):

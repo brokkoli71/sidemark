@@ -9093,8 +9093,8 @@ class PDFCanvas(Gtk.DrawingArea):
         return None
 
     def _card_press(self, x, y):
-        """A press at (x, y): True when the card or an icon took it. A press
-        elsewhere closes a pinned card and goes on to the page as usual."""
+        """A press at (x, y): True when the card, an icon, or closing an open
+        card took it — then the press does nothing else."""
         p = self._link_preview
         if p is not None and self._pointer_in_card(x, y):
             for (bx, by, bw, bh), action in p.get("hits", ()):
@@ -9114,8 +9114,19 @@ class PDFCanvas(Gtk.DrawingArea):
         if icon is not None:
             self._open_backlinks(*icon)
             return True
+        if p is None:
+            return False
+        # A card is open and the press is elsewhere: it CLOSES the card and
+        # does nothing else — a click meant to dismiss must not leave a pen dot
+        # or start a lasso. The one exception is the card's own link: pressing
+        # it still follows it, exactly as without the card.
         self._hide_link_preview()
-        return False
+        anchor = p.get("anchor")
+        if p.get("type") != "backlinks" and anchor is not None:
+            px, py = self._screen_to_pdf(x, y)
+            if anchor.x0 <= px <= anchor.x1 and anchor.y0 <= py <= anchor.y1:
+                return False
+        return True
 
     def _card_action(self, action):
         what = action[0]
