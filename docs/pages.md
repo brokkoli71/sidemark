@@ -93,8 +93,9 @@
   (`_draw_backlink_icons`; regions from `_targets_on_page`, found on an IDLE
   the first time — tens of ms a draw must not spend). Clicking it pins the
   list; a row jumps via `follow_goto` (a history step) and flashes the
-  citation. No icons on the projector canvas (`interactive=False`) or while
-  presenting.
+  citation. No icons on the projector canvas (`interactive=False`), while
+  presenting, or with Settings → Reference badges off (`PDFCanvas.show_badges`,
+  row 208, read once at start-up); hidden badges keep no hit boxes.
 - **Reference lookup (row 200)** — Settings → *Look up cited papers*
   (`reference_preview`, OFF by default: it sends the link to outside
   services). Only a link IN the document is looked up — the URI inside the

@@ -633,6 +633,15 @@ class TestLinkPreview(unittest.TestCase):
         self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
         self.assertIsNone(c._link_preview)           # the same "i" closes it
 
+    def test_badges_can_be_switched_off(self):
+        """Settings → Reference badges: off, none is drawn — and none can be
+        clicked, since a hidden badge must not catch a press."""
+        self.assertTrue(self._bib_page_icons())
+        with mock.patch.object(sidemark.PDFCanvas, "show_badges", False):
+            self.assertEqual(self._bib_page_icons(), {})
+            self.assertEqual(self.c._info_icons, [])
+            self.assertEqual(self.c._zotero_icons, [])
+
     def test_no_icons_on_the_projector_or_while_presenting(self):
         c = self.c
         c._interactive = False
@@ -15597,6 +15606,10 @@ class TestBindingToolbar(unittest.TestCase):
                                  not was)
             finally:
                 sidemark.MarkdownNotesView.show_comments = was
+            rows["Reference badges"].set_active(False)
+            self.assertIs(sidemark._load_settings()["reference_badges"], False)
+            self.assertFalse(sidemark.PDFCanvas.show_badges)
+            rows["Reference badges"].set_active(True)
             rows["Look up cited papers"].set_active(True)
             self.assertIs(sidemark._load_settings()["reference_preview"], True)
             rows["Swap for page turning"].set_active(False)

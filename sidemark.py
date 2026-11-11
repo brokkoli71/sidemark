@@ -9010,10 +9010,16 @@ class PDFCanvas(Gtk.DrawingArea):
         return (("…" if lo > 0 else "") + " ".join(out)
                 + ("…" if hi < len(words) else ""))
 
+    # Settings → "Reference badges" (`reference_badges`, row 208): a class-wide
+    # display preference like MarkdownNotesView.show_comments, read once at
+    # window start-up rather than from settings.json on every frame.
+    show_badges = True
+
     def _show_backlink_icons(self):
-        """The icons belong to the page you READ: not on the projector's
-        mirror, not in presentation mode."""
-        return self._interactive and not self.stack_preview
+        """The ↩ / Z / i badges: when Settings shows them, and only on the
+        page you READ — not on the projector's mirror, not while presenting."""
+        return (PDFCanvas.show_badges and self._interactive
+                and not self.stack_preview)
 
     def _prepare_targets(self):
         """Idle: find this page's targets once, then draw their icons — the
@@ -9519,7 +9525,9 @@ class PDFCanvas(Gtk.DrawingArea):
         links to — a bibliography entry, a figure, an equation. Faint until
         the pointer is on it; a click lists who cites it (`_open_backlinks`).
         The page's targets are found on an idle the first time."""
-        self._backlink_icons = []
+        # every badge's hit box goes with its drawing: a hidden badge that
+        # still caught clicks would be a trap
+        self._backlink_icons, self._zotero_icons, self._info_icons = [], [], []
         if (not self._show_backlink_icons() or self.document is None
                 or self.page is None):
             return
@@ -21739,6 +21747,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # before any view renders
         MarkdownNotesView.show_comments = bool(
             _load_settings().get("show_comments", False))
+        PDFCanvas.show_badges = (
+            _load_settings().get("reference_badges", True) is not False)
         self._bindings_list = None   # built with the pen popover
         self._tool_btns = None       # built with the header
         self._tool_strips = {}       # tool -> the painted binding stripes
@@ -28832,6 +28842,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         page.add(notes)
 
         reading = Adw.PreferencesGroup(title="Reading")
+        badges = Adw.SwitchRow(title="Reference badges")
+        badges.set_subtitle(
+            "Beside each cited entry, figure and equation: ↩ lists where it is "
+            "cited, Z opens it from Zotero, i shows the paper.")
+        badges.set_active(PDFCanvas.show_badges)
+        badges.connect("notify::active", lambda r, _p:
+                       self._on_badges_toggled(r.get_active()))
+        reading.add(badges)
         refs = Adw.SwitchRow(title="Look up cited papers")
         refs.set_subtitle(
             "Hovering a citation or a link to an article shows the paper's "
@@ -28875,6 +28893,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _on_page_bg_changed(self, index):
         _save_setting("page_background", PAGE_BACKGROUNDS[index])
+
+    def _on_badges_toggled(self, on):
+        _save_setting("reference_badges", on)
+        PDFCanvas.show_badges = on
+        for sess in self._sessions:
+            if sess.canvas is not None:
+                if not on and (sess.canvas._link_preview or {}).get("pinned"):
+                    sess.canvas._hide_link_preview()   # its badge is gone
+                sess.canvas.queue_draw()
 
     def _on_side_buttons(self, mode):
         _save_setting("side_buttons", mode)
