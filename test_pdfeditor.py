@@ -1383,6 +1383,168 @@ class TestReferenceLookup(unittest.TestCase):
                     "https://x.org/miss"), (False, None))
 
 
+def make_zotero_library(root, items):
+    """A Zotero data directory at `root` with the tables Sidemark reads.
+    `items`: dicts of {key, type, fields, creators [(first, last)], pdf}
+    where pdf is a file name to create under storage/<key>-PDF/."""
+    import sqlite3
+    os.makedirs(os.path.join(root, "storage"), exist_ok=True)
+    con = sqlite3.connect(os.path.join(root, "zotero.sqlite"))
+    con.executescript("""
+        CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
+        CREATE TABLE items (itemID INTEGER PRIMARY KEY, key TEXT,
+                            itemTypeID INT, libraryID INT);
+        CREATE TABLE deletedItems (itemID INT);
+        CREATE TABLE groups (libraryID INT, groupID INT);
+        CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value);
+        CREATE TABLE itemData (itemID INT, fieldID INT, valueID INT);
+        CREATE TABLE creators (creatorID INTEGER PRIMARY KEY,
+                               firstName TEXT, lastName TEXT);
+        CREATE TABLE itemCreators (itemID INT, creatorID INT, orderIndex INT);
+        CREATE TABLE itemAttachments (itemID INT, parentItemID INT,
+                                      contentType TEXT, path TEXT, linkMode INT);
+        INSERT INTO itemTypes VALUES (1, 'journalArticle'), (2, 'attachment');
+    """)
+    fids, nid = {}, [100]
+
+    def new_id():
+        nid[0] += 1
+        return nid[0]
+    for it in items:
+        iid = new_id()
+        con.execute("INSERT INTO items VALUES (?,?,1,1)", (iid, it["key"]))
+        for name, value in it.get("fields", {}).items():
+            if name not in fids:
+                fids[name] = len(fids) + 1
+                con.execute("INSERT INTO fields VALUES (?,?)", (fids[name], name))
+            vid = new_id()
+            con.execute("INSERT INTO itemDataValues VALUES (?,?)", (vid, value))
+            con.execute("INSERT INTO itemData VALUES (?,?,?)",
+                        (iid, fids[name], vid))
+        for i, (first, last) in enumerate(it.get("creators", [])):
+            cid = new_id()
+            con.execute("INSERT INTO creators VALUES (?,?,?)", (cid, first, last))
+            con.execute("INSERT INTO itemCreators VALUES (?,?,?)", (iid, cid, i))
+        if it.get("pdf"):
+            akey = it["key"] + "PDF"
+            aid = new_id()
+            con.execute("INSERT INTO items VALUES (?,?,2,1)", (aid, akey))
+            con.execute("INSERT INTO itemAttachments VALUES (?,?,?,?,1)",
+                        (aid, iid, "application/pdf", "storage:" + it["pdf"]))
+            os.makedirs(os.path.join(root, "storage", akey), exist_ok=True)
+            make_pdf(os.path.join(root, "storage", akey, it["pdf"]))
+    con.commit()
+    con.close()
+
+
+class TestZotero(unittest.TestCase):
+    """Row 205: reading a paper from your Zotero library, a citation of a
+    paper that is ALSO in it shows it from there — and opens its PDF."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = os.path.join(self._tmp.name, "Zotero")
+        make_zotero_library(self.root, [
+            {"key": "BRAVO001", "fields": {
+                "title": "Second title that also wraps bravoword",
+                "date": "2019", "abstractNote": "What bravo found."},
+             "creators": [("Bravo", "Writer")], "pdf": "Writer 2019.pdf"},
+            {"key": "CHARL002", "fields": {
+                "title": "Charlie's paper", "archiveID": "arXiv:2101.00001"},
+             "creators": [("C.", "Third")]},
+            {"key": "FORTU003", "fields": {
+                "title": "Community detection in graphs",
+                "publicationTitle": "Physics Reports", "volume": "486",
+                "pages": "75-174", "date": "2010-02-01",
+                "DOI": "10.1016/j.physrep.2009.11.002"},
+             "creators": [("Santo", "Fortunato")]},
+        ])
+        sidemark._ZOTERO_LIBRARIES.clear()
+        self.addCleanup(sidemark._ZOTERO_LIBRARIES.clear)
+        here = os.path.join(self.root, "storage", "READING9")
+        os.makedirs(here)
+        self.pdf = os.path.join(here, "paper.pdf")
+        self.centres = make_bib_pdf(self.pdf)
+        # no network may be asked: Zotero is local
+        lookups = sidemark.ReferenceLookups(fetch=lambda u: self.fail(u))
+        patcher = mock.patch.object(sidemark, "REFERENCES", lookups)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_only_a_pdf_inside_a_zotero_storage_counts(self):
+        f = sidemark.ZoteroLibrary.find_for
+        self.assertEqual(f(self.pdf), self.root)
+        self.assertIsNone(f(os.path.join(self.root, "loose.pdf")))
+        self.assertIsNone(f(os.path.join(self._tmp.name, "elsewhere.pdf")))
+
+    def test_matching_a_bibliography_entry(self):
+        lib = sidemark.ZoteroLibrary(self.root)
+        m = lambda text, uris=(): (lib.match(text, uris) or {}).get("key")
+        self.assertEqual(m("S. Fortunato, doi:10.1016/J.PHYSREP.2009.11.002"),
+                         "FORTU003")
+        self.assertEqual(m("[3] C. Third, arXiv:2101.00001 (2021)."), "CHARL002")
+        self.assertEqual(m("[3] C. Third.", ["https://arxiv.org/abs/2101.00001v2"]),
+                         "CHARL002")
+        self.assertEqual(m("B. Writer, Second title that also wraps "
+                           "bravo-\nword, 2019."), "BRAVO001")
+        # physics style, no title: volume + first page + year + first author
+        self.assertEqual(m("[54] S. Fortunato, Phys. Rep. 486, 75 (2010)."),
+                         "FORTU003")
+        self.assertIsNone(m("[54] S. Fortunato, Phys. Rep. 486, 99 (2010)."))
+        self.assertIsNone(m("[9] Somebody Else, Phys. Rep. 486, 75 (2010)."))
+
+    def _hover(self, c, name):
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres[name]
+            c._update_link_hover()
+            c._show_link_preview()
+        return c._link_preview
+
+    def _canvas(self, path):
+        c = PDFCanvas()
+        c.load(path)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        return c
+
+    def test_a_cited_library_paper_shows_from_zotero_and_opens(self):
+        c = self._canvas(self.pdf)
+        opened = []
+        c.on_open_document = opened.append
+        card = self._hover(c, "cite.b")
+        self.assertEqual(card["zotero"]["key"], "BRAVO001")
+        self.assertEqual(card["ref"]["state"], "done")       # no lookup
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
+        parts = c._ref_section(ctx, 380)
+        self.assertEqual(parts[0][0], "title")
+        actions = [a for _k, _l, a in parts if a]
+        pdf = next(a for a in actions if a[0] == "open-file")
+        self.assertTrue(pdf[1].endswith("Writer 2019.pdf"))
+        self.assertIn(("open", "zotero://select/library/items/BRAVO001"),
+                      actions)
+        c._card_action(pdf)
+        self.assertEqual(opened, [pdf[1]])
+
+    def test_an_article_link_in_the_library_previews_without_lookups(self):
+        c = self._canvas(self.pdf)
+        sidemark._save_setting("reference_preview", False)
+        uri_link = next(l for l in c.document[1].get_links()
+                        if l["kind"] == fitz.LINK_URI)
+        self.assertTrue(c._previewable(uri_link))
+        c._hovered_link = uri_link
+        c._show_link_preview()
+        self.assertEqual(c._link_preview["zotero"]["key"], "CHARL002")
+
+    def test_outside_zotero_nothing_is_matched(self):
+        elsewhere = os.path.join(self._tmp.name, "paper.pdf")
+        shutil.copy(self.pdf, elsewhere)
+        c = self._canvas(elsewhere)
+        card = self._hover(c, "cite.b")
+        self.assertNotIn("zotero", card)
+        self.assertIsNone(card["ref"])            # lookups are off, too
+
+
 class TestCapture(unittest.TestCase):
     """F12 writes a capture for a bug report: a JSON file, the session log
     kept beside it, and one line naming both on the clipboard."""

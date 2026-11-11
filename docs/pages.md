@@ -104,6 +104,17 @@
   and take an injectable `get`, so tests never touch the network. The User-
   Agent names the app only.
 
+- **Zotero (row 205)** — active only when the open PDF sits under a Zotero
+  data directory's `storage/` (`ZoteroLibrary.find_for`). The library is
+  read straight from `zotero.sqlite`, opened **immutable** read-only: Zotero
+  locks the database while it runs and a plain read-only open is refused;
+  immutable also skips the WAL, so a paper added minutes ago may not show
+  yet. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
+  entry, then volume + first page + year + first author for title-less
+  physics entries. A match fills the card's paper section locally (no
+  lookup, no switch) and adds Open the PDF (`on_open_document` → a tab in
+  the document's window) and Show in Zotero (`zotero://select/…`).
+
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a
   background you write on is one you hand in, so it must print and export.

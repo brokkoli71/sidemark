@@ -4674,6 +4674,226 @@ def reference_preview_enabled():
     return _load_settings().get("reference_preview", False) is True
 
 
+# ── Zotero: is the cited paper already in your library? (row 205) ────────────
+# Active ONLY when the open PDF lives inside a Zotero data directory (one
+# holding zotero.sqlite, the PDF under its storage/): reading a paper from
+# your library is when its citations are likely to be in it too. Everything is
+# local — no service, no switch.
+
+def _znorm(text):
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+_ARXIV_ID_RE = re.compile(
+    r"(?:arxiv[:\s/]*|arxiv\.org/(?:abs|pdf)/)"
+    r"(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})", re.I)
+
+
+class ZoteroLibrary:
+    """One Zotero data directory, read straight from its database.
+
+    Opened `immutable` read-only: Zotero holds its database locked while it
+    runs, and a plain read-only open is refused. Immutable reads the file
+    without the lock — and without the write-ahead log, so a paper added in
+    the last minutes may not show until Zotero checkpoints.
+    ceiling: if that becomes a nuisance, Zotero 7's local API (port 23119,
+    when enabled) answers live; it is not needed for papers already there."""
+
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self._items = None
+        self._stamp = None
+
+    @staticmethod
+    def find_for(pdf_path):
+        """The data directory `pdf_path` lives in, or None."""
+        if not pdf_path:
+            return None
+        p = os.path.abspath(pdf_path)
+        d = os.path.dirname(p)
+        while True:
+            parent = os.path.dirname(d)
+            if (os.path.basename(d) == "storage"
+                    and os.path.isfile(os.path.join(parent, "zotero.sqlite"))):
+                return parent
+            if parent == d:
+                return None
+            d = parent
+
+    def _db_stamp(self):
+        db = os.path.join(self.data_dir, "zotero.sqlite")
+        try:
+            return (os.path.getmtime(db), os.path.getsize(db))
+        except OSError:
+            return None
+
+    def items(self):
+        """Every regular item: {key, title, creators, year, venue, abstract,
+        doi, arxiv, volume, first_page, pdf, select_uri}. Re-read when the
+        database file changes."""
+        stamp = self._db_stamp()
+        if self._items is not None and stamp == self._stamp:
+            return self._items
+        import sqlite3
+        db = os.path.join(self.data_dir, "zotero.sqlite")
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True,
+                                  timeout=1)
+            try:
+                items = self._read(con)
+            finally:
+                con.close()
+        except Exception:
+            logger.warning("zotero: could not read the library", exc_info=True)
+            items = self._items or []
+        self._items, self._stamp = items, stamp
+        return items
+
+    def _read(self, con):
+        q = con.execute
+        skip = {r[0] for r in q("SELECT itemTypeID FROM itemTypes WHERE "
+                                "typeName IN ('attachment','note','annotation')")}
+        try:
+            deleted = {r[0] for r in q("SELECT itemID FROM deletedItems")}
+        except Exception:
+            deleted = set()
+        groups = {}
+        try:
+            groups = dict(q("SELECT libraryID, groupID FROM groups"))
+        except Exception:
+            pass
+        base = {}
+        for item_id, key, type_id, lib in q(
+                "SELECT itemID, key, itemTypeID, libraryID FROM items"):
+            if type_id in skip or item_id in deleted:
+                continue
+            lib_part = (f"groups/{groups[lib]}" if lib in groups
+                        else "library")
+            base[item_id] = {"key": key, "fields": {}, "creators": [],
+                             "select_uri": f"zotero://select/{lib_part}/items/{key}",
+                             "pdf": None}
+        for item_id, name, value in q(
+                "SELECT d.itemID, f.fieldName, v.value FROM itemData d "
+                "JOIN fields f ON f.fieldID = d.fieldID "
+                "JOIN itemDataValues v ON v.valueID = d.valueID"):
+            if item_id in base:
+                base[item_id]["fields"][name] = value
+        for item_id, first, last in q(
+                "SELECT ic.itemID, c.firstName, c.lastName FROM itemCreators ic "
+                "JOIN creators c ON c.creatorID = ic.creatorID "
+                "ORDER BY ic.itemID, ic.orderIndex"):
+            if item_id in base:
+                base[item_id]["creators"].append(((first or ""), (last or "")))
+        for parent, key, path, mode in q(
+                "SELECT ia.parentItemID, i.key, ia.path, ia.linkMode "
+                "FROM itemAttachments ia JOIN items i ON i.itemID = ia.itemID "
+                "WHERE ia.contentType = 'application/pdf' "
+                "AND ia.parentItemID IS NOT NULL"):
+            it = base.get(parent)
+            if it is None or it["pdf"] or not path:
+                continue
+            if path.startswith("storage:"):
+                f = os.path.join(self.data_dir, "storage", key,
+                                 path[len("storage:"):])
+            elif os.path.isabs(path):
+                f = path               # a linked file
+            else:
+                continue               # relative to a base dir we do not know
+            if os.path.isfile(f):
+                it["pdf"] = f
+        out = []
+        for it in base.values():
+            f = it["fields"]
+            arxiv = None
+            for src in (f.get("archiveID"), f.get("url"), f.get("extra"),
+                        f.get("DOI")):
+                m = _ARXIV_ID_RE.search(src or "") or re.search(
+                    r"10\.48550/arxiv\.(\S+)", src or "", re.I)
+                if m:
+                    arxiv = m.group(1)
+                    break
+            m = re.search(r"(1[89]|20)\d\d", f.get("date") or "")
+            out.append({
+                "key": it["key"], "select_uri": it["select_uri"],
+                "pdf": it["pdf"],
+                "title": _clean(f.get("title")) or None,
+                "creators": [_clean(f"{a} {b}") for a, b in it["creators"]],
+                "last_names": [_znorm(b) for _a, b in it["creators"] if b],
+                "year": m.group(0) if m else None,
+                "venue": _clean(f.get("publicationTitle")
+                                or f.get("proceedingsTitle")
+                                or f.get("conferenceName")) or None,
+                "abstract": _clean(f.get("abstractNote")) or None,
+                "doi": (f.get("DOI") or "").strip().lower() or None,
+                "arxiv": arxiv.lower() if arxiv else None,
+                "volume": (f.get("volume") or "").strip() or None,
+                "first_page": re.split(r"[-–—]", f.get("pages") or "")[0].strip()
+                or None,
+            })
+        return out
+
+    def match(self, text, uris=()):
+        """The library item a bibliography entry (its text, and the links in
+        it) names, or None. Strongest evidence first: a DOI, an arXiv id, the
+        item's whole title in the entry; then — for physics-style entries that
+        carry no title ("S. Fortunato, Phys. Rep. 486, 75 (2010)") — volume,
+        first page and year together with the first author's surname."""
+        items = self.items()
+        if not items:
+            return None
+        blob = " ".join([text or ""] + [u or "" for u in uris])
+        from urllib.parse import unquote
+        dois = {m.group(1).rstrip(".,;)]").lower()
+                for m in _DOI_RE.finditer(unquote(blob))}
+        arx = {m.group(1).lower() for m in _ARXIV_ID_RE.finditer(blob)}
+        for u in uris:
+            c = classify_reference_url(u)
+            if c and c[0] == "arxiv":
+                arx.add(c[1].lower())
+        for it in items:
+            if it["doi"] and it["doi"] in dois:
+                return it
+        for it in items:
+            if it["arxiv"] and it["arxiv"] in arx:
+                return it
+        flat = _znorm(text)
+        for it in items:
+            t = _znorm(it["title"])
+            if len(t) >= 15 and t in flat:
+                return it
+        numbers = set(re.findall(r"\d+", text or ""))
+        for it in items:
+            if (it["volume"] and it["first_page"] and it["year"]
+                    and it["volume"] in numbers and it["first_page"] in numbers
+                    and it["year"] in numbers and it["last_names"]
+                    and it["last_names"][0] in flat):
+                return it
+        return None
+
+    @staticmethod
+    def as_reference(it):
+        """A matched item in `fetch_reference`'s shape, so the card shows it
+        the same way — title first."""
+        return {"title": it["title"] or "(untitled)",
+                "authors": it["creators"], "year": it["year"],
+                "venue": it["venue"], "abstract": it["abstract"],
+                "source": "your Zotero library"}
+
+
+_ZOTERO_LIBRARIES = {}
+
+
+def zotero_library_for(pdf_path):
+    """The ZoteroLibrary `pdf_path` belongs to — shared per data directory —
+    or None when the file is not in one."""
+    d = ZoteroLibrary.find_for(pdf_path)
+    if d is None:
+        return None
+    if d not in _ZOTERO_LIBRARIES:
+        _ZOTERO_LIBRARIES[d] = ZoteroLibrary(d)
+    return _ZOTERO_LIBRARIES[d]
+
+
 def _rounded_rect_path(ctx, x, y, w, h, r):
     ctx.new_sub_path()
     ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
@@ -5171,6 +5391,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._backlink_icons = []      # [(screen box, key, region)] as drawn
         self._ctx_actions = None       # the context menu's actions (row 201)
         self._zoom_trail = []          # [(view before, after)] per region zoom
+        # the Zotero library this document is in (row 205), looked up once
+        self._zotero_for = self._zotero_lib = None
+        self.on_open_document = None   # callback(path): open a file as a tab
         self._ctx_popover = None
         self._flash, self._flash_id = None, None   # a jumped-to citation
         self._origin_px = (0.0, 0.0)   # canvas origin in its window surface
@@ -8417,12 +8640,35 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _previewable(self, link):
         """Does resting on this link show a card? An internal link always; a
-        web link only when lookups are on and it can name a paper."""
+        web link when it names a paper in your Zotero library, or can name
+        one and lookups are on."""
         if self._link_destination(link)[0] >= 0:
             return True
-        return (link.get("kind") == fitz.LINK_URI
-                and reference_preview_enabled()
+        if link.get("kind") != fitz.LINK_URI:
+            return False
+        if self._zotero_match("", [link.get("uri")]) is not None:
+            return True
+        return (reference_preview_enabled()
                 and classify_reference_url(link.get("uri")) is not None)
+
+    def _zotero(self):
+        """The Zotero library THIS document lives in, or None (row 205)."""
+        doc = self.document
+        name = getattr(doc, "name", None) if doc is not None else None
+        if self._zotero_for != name:
+            self._zotero_for = name
+            self._zotero_lib = zotero_library_for(name) if name else None
+        return self._zotero_lib
+
+    def _zotero_match(self, text, uris):
+        lib = self._zotero()
+        if lib is None:
+            return None
+        try:
+            return lib.match(text, [u for u in uris if u])
+        except Exception:
+            logger.warning("zotero match failed", exc_info=True)
+            return None
 
     def _schedule_card_hide(self):
         if self._card_hide_id is None:
@@ -8465,12 +8711,16 @@ class PDFCanvas(Gtk.DrawingArea):
         page_no, to = self._link_destination(link)
         if page_no < 0:
             uri = link.get("uri")
-            if not (reference_preview_enabled()
-                    and classify_reference_url(uri)):
+            zot = self._zotero_match("", [uri])
+            if zot is None and not (reference_preview_enabled()
+                                    and classify_reference_url(uri)):
                 return False
             self._link_preview = {"type": "ref", "anchor": link["from"],
                                   "ref": None, "x0": self._hover_x - 24}
-            self._start_reference(uri)
+            if zot is not None:
+                self._set_zotero_reference(zot)
+            else:
+                self._start_reference(uri)
             self.queue_draw()
             return False
         kind = self._link_kind(link)
@@ -8500,9 +8750,17 @@ class PDFCanvas(Gtk.DrawingArea):
                               "page": page_no, "clip": clip, "device": device,
                               "footer": footer, "ref": None,
                               "to": to, "x0": self._hover_x - 24}
-        if kind == "cite" and reference_preview_enabled():
+        if kind == "cite":
             uri = self._entry_reference_uri(page_no, clip)
-            if uri:
+            zot = None
+            if self._zotero() is not None:
+                uris = [l.get("uri") for l in page.get_links()
+                        if l.get("kind") == fitz.LINK_URI
+                        and l["from"].intersects(clip)]
+                zot = self._zotero_match(page.get_textbox(clip), uris)
+            if zot is not None:
+                self._set_zotero_reference(zot)   # local: no lookup needed
+            elif uri and reference_preview_enabled():
                 self._start_reference(uri)
         # kept past the hide, so a capture (F12) taken a moment later still
         # names the preview that looked wrong
@@ -8522,6 +8780,15 @@ class PDFCanvas(Gtk.DrawingArea):
             if c:
                 found.append(({"arxiv": 0, "doi": 1}.get(c[0], 2), l["uri"]))
         return min(found)[1] if found else None
+
+    def _set_zotero_reference(self, item):
+        """The paper is in your Zotero library: show it from there — offline,
+        title first like any lookup — with Open PDF / Show in Zotero."""
+        p = self._link_preview
+        p["ref"] = {"uri": None, "state": "done",
+                    "info": ZoteroLibrary.as_reference(item)}
+        p["zotero"] = item
+        p["abstract_open"] = False
 
     def _start_reference(self, uri):
         """Ask for the paper behind `uri`; the card shows "Looking up…" until
@@ -8756,6 +9023,11 @@ class PDFCanvas(Gtk.DrawingArea):
                 Gio.AppInfo.launch_default_for_uri(action[1], None)
             except Exception:
                 logger.debug("card: launch failed", exc_info=True)
+        elif what == "open-file":
+            # a paper from your Zotero library: as a tab beside this one
+            self._hide_link_preview()
+            if self.on_open_document is not None:
+                self.on_open_document(action[1])
         elif what == "row":
             self._follow_backlink(action[1])
         elif what == "follow":
@@ -8788,7 +9060,7 @@ class PDFCanvas(Gtk.DrawingArea):
             snap["card"] = {k: card.get(k) for k in
                             ("type", "pinned", "anchor", "page", "clip", "w",
                              "h", "device", "box", "footer", "more", "ref",
-                             "abstract_open")}
+                             "abstract_open", "zotero")}
             if card.get("rows") is not None:
                 snap["card"]["rows"] = [{"page": r["page"], "rect": r["rect"],
                                          "text": r["text"]}
@@ -8927,9 +9199,13 @@ class PDFCanvas(Gtk.DrawingArea):
         if not info:
             return [("note", self._card_text(
                 ctx, "No details found for this paper", inner), None)]
+        zot = p.get("zotero")
         out = [("title", self._card_text(ctx, info["title"], inner,
                                          size=self.CARD_TITLE_PX, bold=True,
-                                         lines=3), ("open", ref["uri"]))]
+                                         lines=3),
+                ("open", ref["uri"]) if ref.get("uri")
+                else (("open-file", zot["pdf"]) if zot and zot.get("pdf")
+                      else None))]
         meta = self._authors_line(info)
         if info.get("citations"):
             meta += f" · cited by {info['citations']}"
@@ -8948,6 +9224,14 @@ class PDFCanvas(Gtk.DrawingArea):
             if opened:
                 out.append(("abstract", self._card_text(
                     ctx, info["abstract"], inner, lines=16), None))
+        if zot is not None:
+            # in your library: the paper itself is one click away
+            if zot.get("pdf"):
+                out.append(("toggle", self._card_text(
+                    ctx, "Open the PDF from Zotero", inner, bold=True),
+                    ("open-file", zot["pdf"])))
+            out.append(("toggle", self._card_text(
+                ctx, "Show in Zotero", inner), ("open", zot["select_uri"])))
         out.append(("source", self._card_text(
             ctx, f"from {info.get('source', 'the web')}", inner,
             size=self.CARD_TEXT_PX - 2), None))
@@ -22503,6 +22787,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # ONE table for the whole window: rebinding in any tab is instantly
         # true in every other, and on the text pages too (row 132)
         s.canvas.bindings = self.bindings
+        # a paper opened from a card (Zotero, row 205) lands as a tab in the
+        # window this document is in NOW (s.win follows a torn-off tab)
+        s.canvas.on_open_document = lambda path, s=s: s.win.open_file_in_tab(path)
         # the select / highlighter variants are the APP's, like the pen: a new
         # tab and a restart (Ctrl+R) keep the one you picked
         saved = _load_settings()
