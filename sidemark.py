@@ -4702,6 +4702,17 @@ _ARXIV_ID_RE = re.compile(
     r"(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})", re.I)
 
 
+def zotero_note_text(html_note):
+    """A Zotero note's HTML as plain text: one line per paragraph, list item
+    or line break, entities decoded, the wrapper divs gone."""
+    import html as _html
+    t = re.sub(r"(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr|blockquote)>", "\n",
+               html_note or "")
+    t = _html.unescape(re.sub(r"<[^>]+>", "", t))
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in t.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
+
+
 class ZoteroLibrary:
     """One Zotero data directory, read straight from its database.
 
@@ -4832,6 +4843,21 @@ class ZoteroLibrary:
                 "ORDER BY ic.itemID, ic.orderIndex"):
             if item_id in base:
                 base[item_id]["creators"].append(((first or ""), (last or "")))
+        # the notes attached to each paper (row 210), newest first — shown,
+        # never written: Zotero offers no local way to edit one
+        try:
+            notes = q("SELECT n.itemID, n.parentItemID, n.note FROM itemNotes n "
+                      "JOIN items i ON i.itemID = n.itemID "
+                      "WHERE n.parentItemID IS NOT NULL "
+                      "ORDER BY i.dateModified DESC").fetchall()
+        except Exception:
+            notes = []          # a schema we do not know: no notes, not no library
+        for note_id, parent, note in notes:
+            it = base.get(parent)
+            if it is not None and note_id not in deleted:   # not in the trash
+                text = zotero_note_text(note)
+                if text:
+                    it.setdefault("notes", []).append(text)
         for parent, key, path, mode in q(
                 "SELECT ia.parentItemID, i.key, ia.path, ia.linkMode "
                 "FROM itemAttachments ia JOIN items i ON i.itemID = ia.itemID "
@@ -4863,7 +4889,7 @@ class ZoteroLibrary:
             m = re.search(r"(1[89]|20)\d\d", f.get("date") or "")
             out.append({
                 "key": it["key"], "select_uri": it["select_uri"],
-                "pdf": it["pdf"],
+                "pdf": it["pdf"], "notes": it.get("notes", []),
                 "title": _clean(f.get("title")) or None,
                 "creators": [_clean(f"{a} {b}") for a, b in it["creators"]],
                 "last_names": [_znorm(b) for _a, b in it["creators"] if b],
@@ -9466,6 +9492,7 @@ class PDFCanvas(Gtk.DrawingArea):
     CARD_ROW_H = 22             # px per backlink row
     CARD_LIST_W = 440           # px: a backlinks card's width, at most
     CARD_REF_W = 400            # px: the paper section's width, at least
+    CARD_NOTES = 4              # Zotero notes a card shows, newest first
 
     def _device_scale(self):
         """Device pixels per logical pixel where this canvas is shown — 1.5 at
@@ -9600,6 +9627,11 @@ class PDFCanvas(Gtk.DrawingArea):
                         self._card_text(ctx, label, inner, bold=state is None),
                         ("zotero-add",) if state is None else None))
         if zot is not None:
+            # your notes on it in Zotero (row 210), read-only: edited there
+            for note in zot.get("notes", [])[:self.CARD_NOTES]:
+                out.append(("znote", self._card_text(
+                    ctx, "✎ " + note, inner, lines=6), None))
+        if zot is not None:
             # in your library: the paper itself is one click away
             if zot.get("pdf"):
                 out.append(("toggle", self._card_text(
@@ -9686,7 +9718,7 @@ class PDFCanvas(Gtk.DrawingArea):
                    "tldr": (0.2, 0.2, 0.22), "abstract": (0.15, 0.15, 0.17),
                    "toggle": (ar, ag, ab), "note": (0.45, 0.45, 0.48),
                    "source": (0.55, 0.55, 0.58), "footer": (0.35, 0.35, 0.38),
-                   "zsource": self.ZOTERO_RED}
+                   "zsource": self.ZOTERO_RED, "znote": (0.12, 0.12, 0.14)}
         hits = []
         for oy, ph, what, action in parts:
             top = y + oy

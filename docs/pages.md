@@ -115,7 +115,12 @@
   an immutable open of the live file is only the fallback — it cannot see
   the WAL. The page re-stats the library at most every 2 s while drawn and,
   if it changed, re-matches its entries (`_zotero_targets` cleared), so a
-  paper added in Zotero turns its "i" into a Z. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
+  paper added in Zotero turns its "i" into a Z. A library paper's card also
+  shows its Zotero NOTES (row 210; `zotero_note_text`, newest first, trash
+  left out, at most `CARD_NOTES`) — read-only: Zotero offers no local way to
+  edit a note (writing its database while it runs would be overwritten or
+  corrupt it; only the zotero.org web API edits), so "Show in Zotero" is the
+  way to change one. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
   entry, then volume + first page + year + first author for title-less
   physics entries. A match fills the card's paper section locally (no
   lookup, no switch) and adds Open the PDF (`on_open_document` → a tab in

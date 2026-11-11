@@ -1498,7 +1498,10 @@ def make_zotero_library(root, items):
     con.executescript("""
         CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
         CREATE TABLE items (itemID INTEGER PRIMARY KEY, key TEXT,
-                            itemTypeID INT, libraryID INT);
+                            itemTypeID INT, libraryID INT,
+                            dateModified TEXT DEFAULT '2026-01-01');
+        CREATE TABLE itemNotes (itemID INT, parentItemID INT, note TEXT,
+                                title TEXT);
         CREATE TABLE deletedItems (itemID INT);
         CREATE TABLE groups (libraryID INT, groupID INT);
         CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
@@ -1509,7 +1512,8 @@ def make_zotero_library(root, items):
         CREATE TABLE itemCreators (itemID INT, creatorID INT, orderIndex INT);
         CREATE TABLE itemAttachments (itemID INT, parentItemID INT,
                                       contentType TEXT, path TEXT, linkMode INT);
-        INSERT INTO itemTypes VALUES (1, 'journalArticle'), (2, 'attachment');
+        INSERT INTO itemTypes VALUES (1, 'journalArticle'), (2, 'attachment'),
+                                     (3, 'note');
     """)
     fids, nid = {}, [100]
 
@@ -1518,7 +1522,8 @@ def make_zotero_library(root, items):
         return nid[0]
     for it in items:
         iid = new_id()
-        con.execute("INSERT INTO items VALUES (?,?,1,1)", (iid, it["key"]))
+        con.execute("INSERT INTO items (itemID, key, itemTypeID, libraryID) "
+                    "VALUES (?,?,1,1)", (iid, it["key"]))
         for name, value in it.get("fields", {}).items():
             if name not in fids:
                 fids[name] = len(fids) + 1
@@ -1531,10 +1536,19 @@ def make_zotero_library(root, items):
             cid = new_id()
             con.execute("INSERT INTO creators VALUES (?,?,?)", (cid, first, last))
             con.execute("INSERT INTO itemCreators VALUES (?,?,?)", (iid, cid, i))
+        for i, (html, trashed) in enumerate(it.get("notes", [])):
+            nid_ = new_id()
+            con.execute("INSERT INTO items VALUES (?,?,3,1,?)",
+                        (nid_, f"{it['key']}N{i}", f"2026-01-0{i + 1}"))
+            con.execute("INSERT INTO itemNotes VALUES (?,?,?,'')",
+                        (nid_, iid, html))
+            if trashed:
+                con.execute("INSERT INTO deletedItems VALUES (?)", (nid_,))
         if it.get("pdf"):
             akey = it["key"] + "PDF"
             aid = new_id()
-            con.execute("INSERT INTO items VALUES (?,?,2,1)", (aid, akey))
+            con.execute("INSERT INTO items (itemID, key, itemTypeID, libraryID)"
+                        " VALUES (?,?,2,1)", (aid, akey))
             con.execute("INSERT INTO itemAttachments VALUES (?,?,?,?,1)",
                         (aid, iid, "application/pdf", "storage:" + it["pdf"]))
             os.makedirs(os.path.join(root, "storage", akey), exist_ok=True)
@@ -1555,7 +1569,12 @@ class TestZotero(unittest.TestCase):
             {"key": "BRAVO001", "fields": {
                 "title": "Second title that also wraps bravoword",
                 "date": "2019", "abstractNote": "What bravo found."},
-             "creators": [("Bravo", "Writer")], "pdf": "Writer 2019.pdf"},
+             "creators": [("Bravo", "Writer")], "pdf": "Writer 2019.pdf",
+             "notes": [('<div class="zotero-note znv1"><div><p>referenz f&uuml;r'
+                        ' mapping</p>\n<p>second &amp; line</p></div></div>',
+                        False),
+                       ("<p>this one is in the trash</p>", True),
+                       ("<p>older note</p>", False)]},
             {"key": "CHARL002", "fields": {
                 "title": "Charlie's paper", "archiveID": "arXiv:2101.00001"},
              "creators": [("C.", "Third")]},
@@ -1684,7 +1703,8 @@ class TestZotero(unittest.TestCase):
         # "Zotero" adds [1] — the write stays in the WAL while it runs
         fid = con.execute("SELECT fieldID FROM fields WHERE fieldName='title'"
                           ).fetchone()[0]
-        con.execute("INSERT INTO items VALUES (900, 'ALPHA009', 1, 1)")
+        con.execute("INSERT INTO items (itemID, key, itemTypeID, libraryID) "
+                    "VALUES (900, 'ALPHA009', 1, 1)")
         con.execute("INSERT INTO itemDataValues VALUES (901, "
                     "'A first title that wraps onto alphaword lines')")
         con.execute("INSERT INTO itemData VALUES (900, ?, 901)", (fid,))
@@ -1777,6 +1797,27 @@ class TestZotero(unittest.TestCase):
         ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
         actions = [a for _k, _l, a in c._ref_section(ctx, 380) if a]
         self.assertNotIn(("zotero-add",), actions)
+
+    def test_a_papers_zotero_notes_show_on_its_card(self):
+        """Row 210: the notes attached to the paper in Zotero, newest first,
+        as text — the trash left out — read-only on its card."""
+        c = self._canvas(self.pdf)
+        card = self._hover(c, "cite.b")
+        notes = card["zotero"]["notes"]
+        # newest first (the fixture dates them 01-01, 01-02, 01-03), the
+        # trashed one gone
+        self.assertEqual(notes, ["older note",
+                                 "referenz für mapping\nsecond & line"])
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
+        shown = [l.get_text() for k, l, _a in c._ref_section(ctx, 380)
+                 if k == "znote"]
+        self.assertTrue(any("referenz für mapping" in t for t in shown))
+
+    def test_note_html_becomes_text(self):
+        t = sidemark.zotero_note_text(
+            '<div class="zotero-note znv1"><h1>Title</h1><p>a&nbsp;b</p>'
+            '<ul><li>one</li><li>two</li></ul>line<br/>break</div>')
+        self.assertEqual(t, "Title\na\xa0b\none\ntwo\nline\nbreak")
 
     def test_outside_zotero_nothing_is_matched(self):
         elsewhere = os.path.join(self._tmp.name, "paper.pdf")
