@@ -9511,7 +9511,9 @@ class PDFCanvas(Gtk.DrawingArea):
                 zs = bh
                 zbox = (max(2.0, bx - zs - 2 * f), by, zs, zs)
                 self._zotero_icons.append((zbox, item))
-                self._draw_zotero_badge(ctx, zbox)
+                zhot = (zbox[0] <= self._hover_x <= zbox[0] + zbox[2]
+                        and zbox[1] <= self._hover_y <= zbox[1] + zbox[3])
+                self._draw_zotero_badge(ctx, zbox, 1.0 if zhot else 0.55)
             hot = (bx <= self._hover_x <= bx + bw
                    and by <= self._hover_y <= by + bh) or key == open_key
             a = 1.0 if hot else 0.55
@@ -9528,20 +9530,22 @@ class PDFCanvas(Gtk.DrawingArea):
 
     ZOTERO_RED = (0.80, 0.16, 0.16)   # Zotero's own red
 
-    def _draw_zotero_badge(self, ctx, box):
-        """The little red "Z": this paper is in your Zotero library."""
+    def _draw_zotero_badge(self, ctx, box, alpha=1.0):
+        """The little red "Z": this paper is in your Zotero library. Drawn
+        like the ↩ icon beside it — the same 1 px border, faint until the
+        pointer is on it — but outlined, never filled."""
         x, y, w, h = box
         ctx.save()
-        _rounded_rect_path(ctx, x + 0.5, y + 0.5, w - 1, h - 1, h * 0.22)
-        ctx.set_source_rgb(*self.ZOTERO_RED)
-        ctx.set_line_width(max(1.0, h * 0.09))
+        _rounded_rect_path(ctx, x, y, w, h, h * 0.22)
+        ctx.set_source_rgba(*self.ZOTERO_RED, alpha)
+        ctx.set_line_width(1.0)
         ctx.stroke()
         lay = self._card_text(ctx, "Z", w * 2, size=None, bold=True)
         d = lay.get_font_description()
         d.set_absolute_size(h * 0.72 * Pango.SCALE)
         lay.set_font_description(d)
         tw, th = lay.get_pixel_size()
-        ctx.set_source_rgb(*self.ZOTERO_RED)       # outlined: border and Z
+        ctx.set_source_rgba(*self.ZOTERO_RED, alpha)  # outlined: border and Z
         ctx.move_to(x + (w - tw) / 2, y + (h - th) / 2)
         PangoCairo.show_layout(ctx, lay)
         ctx.restore()
