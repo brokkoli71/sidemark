@@ -1660,6 +1660,45 @@ class TestZotero(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         self.assertTrue(opened[0].endswith("Writer 2019.pdf"))
 
+    def test_a_paper_just_added_shows_and_its_i_turns_into_a_z(self):
+        """Zotero writes a new item to its write-ahead log first and keeps
+        the database locked. The library is re-read when either changes —
+        from a copy, which sees the log — and the page re-matches."""
+        import sqlite3
+        db = os.path.join(self.root, "zotero.sqlite")
+        con = sqlite3.connect(db)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.commit()
+        c = self._canvas(self.pdf)
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)
+
+        def badges():
+            c._prepare_targets()
+            c._draw_backlink_icons(cairo.Context(surface))
+            return ({k for _b, k, _r in c._info_icons},
+                    {i["key"] for _b, i in c._zotero_icons})
+        infos, zs = badges()
+        self.assertIn(("n", "cite.a"), infos)          # [1] not in Zotero yet
+        # "Zotero" adds [1] — the write stays in the WAL while it runs
+        fid = con.execute("SELECT fieldID FROM fields WHERE fieldName='title'"
+                          ).fetchone()[0]
+        con.execute("INSERT INTO items VALUES (900, 'ALPHA009', 1, 1)")
+        con.execute("INSERT INTO itemDataValues VALUES (901, "
+                    "'A first title that wraps onto alphaword lines')")
+        con.execute("INSERT INTO itemData VALUES (900, ?, 901)", (fid,))
+        con.commit()
+        self.assertGreater(os.path.getsize(db + "-wal"), 0)
+        try:
+            c._zotero_checked = 0.0                    # the 2 s have passed
+            c._draw_backlink_icons(cairo.Context(surface))   # notices
+            infos, zs = badges()
+            self.assertIn("ALPHA009", zs)
+            self.assertNotIn(("n", "cite.a"), infos)
+        finally:
+            con.close()
+
     def test_outside_zotero_nothing_is_matched(self):
         elsewhere = os.path.join(self._tmp.name, "paper.pdf")
         shutil.copy(self.pdf, elsewhere)

@@ -4705,17 +4705,17 @@ _ARXIV_ID_RE = re.compile(
 class ZoteroLibrary:
     """One Zotero data directory, read straight from its database.
 
-    Opened `immutable` read-only: Zotero holds its database locked while it
-    runs, and a plain read-only open is refused. Immutable reads the file
-    without the lock — and without the write-ahead log, so a paper added in
-    the last minutes may not show until Zotero checkpoints.
-    ceiling: if that becomes a nuisance, Zotero 7's local API (port 23119,
-    when enabled) answers live; it is not needed for papers already there."""
+    Zotero holds its database locked while it runs, so a plain read-only open
+    is refused. Each time the database OR its write-ahead log changes, both
+    are copied aside and the copy is read: a paper you just added lives in
+    the log until Zotero checkpoints, and an `immutable` open of the live
+    file (the fallback) cannot see it."""
 
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self._items = None
         self._stamp = None
+        self._copy_dir = None
 
     @staticmethod
     def find_for(pdf_path):
@@ -4734,11 +4734,39 @@ class ZoteroLibrary:
             d = parent
 
     def _db_stamp(self):
+        """What changes when the library does: the database and its WAL."""
         db = os.path.join(self.data_dir, "zotero.sqlite")
-        try:
-            return (os.path.getmtime(db), os.path.getsize(db))
-        except OSError:
-            return None
+        out = []
+        for f in (db, db + "-wal"):
+            try:
+                out.append((os.path.getmtime(f), os.path.getsize(f)))
+            except OSError:
+                out.append(None)
+        return tuple(out) if out[0] else None
+
+    def changed(self):
+        """Has the library changed since it was last read? Two stats."""
+        return self._items is None or self._db_stamp() != self._stamp
+
+    def _open_snapshot(self):
+        """A connection to a fresh COPY of the database and its log — no
+        lock taken, recent writes included."""
+        import sqlite3
+        import shutil
+        db = os.path.join(self.data_dir, "zotero.sqlite")
+        if self._copy_dir is None:
+            self._copy_dir = tempfile.mkdtemp(prefix="sidemark-zotero-")
+            atexit.register(shutil.rmtree, self._copy_dir, True)
+        copy = os.path.join(self._copy_dir, "zotero.sqlite")
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.remove(copy + suffix)
+            except OSError:
+                pass
+        shutil.copyfile(db, copy)
+        if os.path.exists(db + "-wal") and os.path.getsize(db + "-wal"):
+            shutil.copyfile(db + "-wal", copy + "-wal")
+        return sqlite3.connect(copy, timeout=1)
 
     def items(self):
         """Every regular item: {key, title, creators, year, venue, abstract,
@@ -4749,15 +4777,22 @@ class ZoteroLibrary:
             return self._items
         import sqlite3
         db = os.path.join(self.data_dir, "zotero.sqlite")
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True,
-                                  timeout=1)
+        items = None
+        for opener in (self._open_snapshot,
+                       lambda: sqlite3.connect(
+                           f"file:{db}?mode=ro&immutable=1", uri=True,
+                           timeout=1)):
             try:
-                items = self._read(con)
-            finally:
-                con.close()
-        except Exception:
-            logger.warning("zotero: could not read the library", exc_info=True)
+                con = opener()
+                try:
+                    items = self._read(con)
+                finally:
+                    con.close()
+                break
+            except Exception:
+                logger.warning("zotero: could not read the library",
+                               exc_info=True)
+        if items is None:
             items = self._items or []
         self._items, self._stamp = items, stamp
         return items
@@ -5414,6 +5449,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zotero_icons = []        # [(screen box, Zotero item)] as drawn
         self._info_icons = []          # [(screen box, key, region)]: the "i"s
         self._zotero_targets = {}      # page -> {target key: Zotero item}
+        self._zotero_checked = 0.0     # when the library was last stat'ed
         self._ctx_actions = None       # the context menu's actions (row 201)
         self._zoom_trail = []          # [(view before, after)] per region zoom
         # the Zotero library this document is in (row 205), looked up once
@@ -9563,8 +9599,17 @@ class PDFCanvas(Gtk.DrawingArea):
                 or self.page is None):
             return
         pno = self.current_page_idx
+        lib = self._zotero()
+        now = time.monotonic()
+        if lib is not None and now - self._zotero_checked > 2.0:
+            # the library may have changed in Zotero meanwhile (a paper just
+            # added): two stats, at most every 2 s, and a re-match if so
+            self._zotero_checked = now
+            if lib.changed():
+                self._zotero_targets = {}
         if self._backlinks_key != (id(self.document), self.n_pages) \
-                or pno not in self._targets_cache:
+                or pno not in self._targets_cache \
+                or pno not in self._zotero_targets:
             if self._targets_idle_id is None:
                 self._targets_idle_id = GLib.idle_add(self._prepare_targets)
             return

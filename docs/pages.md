@@ -108,11 +108,14 @@
   Agent names the app only.
 
 - **Zotero (row 205)** — active only when the open PDF sits under a Zotero
-  data directory's `storage/` (`ZoteroLibrary.find_for`). The library is
-  read straight from `zotero.sqlite`, opened **immutable** read-only: Zotero
-  locks the database while it runs and a plain read-only open is refused;
-  immutable also skips the WAL, so a paper added minutes ago may not show
-  yet. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
+  data directory's `storage/` (`ZoteroLibrary.find_for`). Zotero locks
+  `zotero.sqlite` while it runs (a plain read-only open is refused), and a
+  new item sits in its WAL until a checkpoint. So when the database OR the
+  WAL changes, both are COPIED aside and the copy read (`_open_snapshot`);
+  an immutable open of the live file is only the fallback — it cannot see
+  the WAL. The page re-stats the library at most every 2 s while drawn and,
+  if it changed, re-matches its entries (`_zotero_targets` cleared), so a
+  paper added in Zotero turns its "i" into a Z. Matching (`ZoteroLibrary.match`): DOI, arXiv id, whole title in the
   entry, then volume + first page + year + first author for title-less
   physics entries. A match fills the card's paper section locally (no
   lookup, no switch) and adds Open the PDF (`on_open_document` → a tab in
