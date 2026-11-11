@@ -1636,6 +1636,21 @@ class TestTouchpadCoast(unittest.TestCase):
             c._on_decelerate(None, 0.0, 3000.0)
         start.assert_not_called()
 
+    def test_a_coast_moves_in_both_directions_even_when_the_page_fits(self):
+        """A flick is 2-D. A page narrower than the window still glides
+        sideways — up to the window's edge, never out of sight."""
+        c = self.c
+        c._fit_page(800, 600)                    # fits: width < window
+        c._is_fitted = False
+        x0, y0 = c.offset_x, c.offset_y
+        self.assertTrue(c._glide_pan(30, 0))
+        self.assertLess(c.offset_x, x0)
+        for _ in range(2000):
+            if not c._glide_pan(30, 0):
+                break
+        self.assertAlmostEqual(c.offset_x, 0.0)   # left edge at the window's
+        self.assertEqual(c.offset_y, y0)
+
     def test_a_coast_moves_the_page_and_stops_at_its_edge(self):
         c = self.c
         y0 = c.offset_y

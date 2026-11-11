@@ -7059,12 +7059,12 @@ class PDFCanvas(Gtk.DrawingArea):
         cw, ch = self.get_width() or 800, self.get_height() or 600
 
         def stop_at_edges(v, before, view, size):
-            # the page's edges hold a coast: a page that fits does not move on
-            # that axis, one that is larger stops with its edge at the window's
-            # — and one already panned past that (a drag may) only comes back
-            if size <= view:
-                return before
-            lo, hi = view - size, 0.0
+            # the page's edges hold a coast, on BOTH axes (a flick is 2-D, like
+            # the drag before it): a page larger than the window stops with its
+            # edge at the window's, one that fits stops with its edge at the
+            # window's other side — it can glide across, never out of sight.
+            # One already panned past that (a drag may) only comes back.
+            lo, hi = min(0.0, view - size), max(0.0, view - size)
             if lo <= v <= hi:
                 return v
             if before < lo:              # already past it: only inward
@@ -9521,15 +9521,16 @@ class PDFCanvas(Gtk.DrawingArea):
         """The little red "Z": this paper is in your Zotero library."""
         x, y, w, h = box
         ctx.save()
-        _rounded_rect_path(ctx, x, y, w, h, h * 0.22)
+        _rounded_rect_path(ctx, x + 0.5, y + 0.5, w - 1, h - 1, h * 0.22)
         ctx.set_source_rgb(*self.ZOTERO_RED)
-        ctx.fill()
+        ctx.set_line_width(max(1.0, h * 0.09))
+        ctx.stroke()
         lay = self._card_text(ctx, "Z", w * 2, size=None, bold=True)
         d = lay.get_font_description()
         d.set_absolute_size(h * 0.72 * Pango.SCALE)
         lay.set_font_description(d)
         tw, th = lay.get_pixel_size()
-        ctx.set_source_rgb(1, 1, 1)
+        ctx.set_source_rgb(*self.ZOTERO_RED)       # outlined: border and Z
         ctx.move_to(x + (w - tw) / 2, y + (h - th) / 2)
         PangoCairo.show_layout(ctx, lay)
         ctx.restore()
