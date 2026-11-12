@@ -1381,6 +1381,35 @@ class TestContinuousScroll(unittest.TestCase):
         self.assertEqual((c.all_strokes.get(0, []), c.all_strokes.get(1, [])),
                          ([], []))
 
+    def test_other_pages_show_their_anchors_and_search_hits(self):
+        """Their anchors, callouts and search hits are drawn by the current
+        page's own code, as that page — and the canvas is put back exactly,
+        its click targets the current page's."""
+        c = self.c
+        c._anchors = {1: [{"x": 50, "y": 60, "callout": None, "text": ""}]}
+        c.search_hits_all = {1: [fitz.Rect(10, 10, 80, 30)]}
+        c._needs_fit = False                       # as after the first draw
+        c.offset_y -= 400                          # page 2 in view
+        before = (c.current_page_idx, c.offset_x, c.offset_y,
+                  c.page_width, c.page_height)
+        seen = []
+        real_a, real_s = c._draw_anchors, c._draw_search_rects
+        with mock.patch.object(c, "_draw_anchors",
+                               lambda ctx: seen.append(("a", c.current_page_idx,
+                                                        c.offset_y))
+                               or real_a(ctx)), \
+                mock.patch.object(c, "_draw_search_rects",
+                                  lambda ctx, rects, cur: seen.append(
+                                      ("s", c.current_page_idx, len(rects or [])))
+                                  or real_s(ctx, rects, cur)):
+            c._draw(None, cairo.Context(
+                cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)), 800, 600)
+        y1 = next(y for i, _x, y, _w, _h in c._strip_layout() if i == 1)
+        self.assertIn(("a", 1, y1), seen)          # drawn AS page 2, there
+        self.assertIn(("s", 1, 1), seen)
+        self.assertEqual((c.current_page_idx, c.offset_x, c.offset_y,
+                          c.page_width, c.page_height), before)
+
     def test_never_on_the_projector_nor_while_presenting(self):
         c = self.c
         self.assertTrue(c._continuous())

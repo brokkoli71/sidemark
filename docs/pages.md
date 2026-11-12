@@ -191,8 +191,12 @@
   stop at the strip's ends (`_clamp_strip`); `_flip_page` scrolls. The strip
   is the pages not set aside (`strip_pages`, row 158). Off on the projector
   (`interactive=False`) and while presenting. A new tool needs no strip code
-  — only a new per-page DRAWING does (anchors are not drawn on the other
-  pages yet).
+  — only a new per-page DRAWING does: the other pages' anchors, callouts and
+  search hits are drawn by the current page's own methods inside
+  `_as_strip_page(i, x, y)`, which points the canvas at page i for the
+  block and restores it exactly (the callout hit boxes recorded meanwhile
+  are discarded — clicks belong to the current page). The window hands the
+  canvas EVERY page's search hits (`search_hits_all`).
   - **Across pages (row 214)**: a text drag that leaves its page selects on
     (`_select_across`): the current page keeps `_text_segments`, the others
     sit in `_other_segments` {page: segments} — every place that clears a

@@ -9,6 +9,7 @@ import threading
 import tempfile
 import logging
 import atexit
+import contextlib
 import faulthandler
 import ctypes
 import traceback
@@ -5750,6 +5751,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._backlink_icons = []      # [(screen box, key, region)] as drawn
         self._zotero_icons = []        # [(screen box, item, key, region)] drawn
         self._gutters = {}             # page -> its column gutter, or None
+        # the touchpad coast (row 206) — on EVERY canvas, the projector's mirror
+        # included: page loads and presses stop it, and a canvas without one
+        # crashed the moment the presenter opened
+        self._glide = KineticGlide(self, self._glide_pan)
         self._badge_worker = None      # the document the badge queue serves
         # continuous scroll (row 213)
         self._strip_cache = {}         # page -> (scale, rendered surface)
@@ -5757,6 +5762,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._dims, self._dims_key = {}, None
         self.strip_pages = None        # callable -> pages of the strip
         self.on_strip_moved = None     # callback() after a strip draw
+        self.search_hits_all = {}      # page -> search rects, every page
+        self.search_current_any = None # (page, rect) of the current hit
         self._strip_chosen = None      # the view when a page was CHOSEN
         self._strip_follow_id = None
         self._pressing = False         # a button is down on the canvas
@@ -5808,7 +5815,6 @@ class PDFCanvas(Gtk.DrawingArea):
         scroll.connect("scroll", self._on_scroll)
         scroll.connect("decelerate", self._on_decelerate)
         self.add_controller(scroll)
-        self._glide = KineticGlide(self, self._glide_pan)
         self._zoomed_by_scroll = False   # the last scroll was Ctrl+scroll
 
         drag = Gtk.GestureDrag.new()
@@ -6585,41 +6591,7 @@ class PDFCanvas(Gtk.DrawingArea):
 
         # anchor markers and their callouts (legacy text boxes included — see
         # _parse_page_marks)
-        anchors = self._anchors.get(self.current_page_idx, [])
-        self._callout_boxes = []
-        self._covered_anchors = set()
-        if anchors:
-            # callout boxes go under the circles, so an anchor inside SOMEBODY
-            # ELSE's box stays visible; one inside its OWN box draws nothing
-            # (_draw_callout decides), which is what makes a callout dragged
-            # onto its anchor a plain text box
-            for i, a in enumerate(anchors):
-                if a.get("callout"):
-                    self._draw_callout(ctx, a, i)
-            ctx.save()
-            ctx.translate(self.offset_x, self.offset_y)
-            ctx.scale(self.scale, self.scale)
-            r, g, b = self.zoom_accent
-            radius = 8.0 / self.scale
-            for i, a in enumerate(anchors):
-                if i in self._covered_anchors:
-                    continue
-                ax, ay = a["x"], a["y"]
-                if i in self._active_anchors:
-                    ctx.set_source_rgba(r, g, b, 0.3)
-                    ctx.arc(ax, ay, radius * 1.9, 0, 2 * math.pi)
-                    ctx.fill()
-                ctx.set_source_rgba(r, g, b, 0.88)
-                ctx.arc(ax, ay, radius, 0, 2 * math.pi)
-                ctx.fill()
-                ctx.set_source_rgb(1, 1, 1)
-                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-                ctx.set_font_size(radius * 1.3)
-                label = str(i + 1)
-                ext = ctx.text_extents(label)
-                ctx.move_to(ax - ext.width / 2 - ext.x_bearing, ay - ext.height / 2 - ext.y_bearing)
-                ctx.show_text(label)
-            ctx.restore()
+        self._draw_anchors(ctx)
 
         # callout placement preview (an anchor-tool drag in progress)
         if self._callout_dragging and self._callout_start and self._callout_cur:
@@ -6633,18 +6605,7 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.set_dash([])
 
         # search highlights
-        if self.search_rects:
-            ctx.save()
-            ctx.translate(self.offset_x, self.offset_y)
-            ctx.scale(self.scale, self.scale)
-            for rect in self.search_rects:
-                if rect == self.search_current_rect:
-                    ctx.set_source_rgba(1.0, 0.55, 0.0, 0.55)
-                else:
-                    ctx.set_source_rgba(1.0, 0.88, 0.0, 0.40)
-                ctx.rectangle(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0)
-                ctx.fill()
-            ctx.restore()
+        self._draw_search_rects(ctx, self.search_rects, self.search_current_rect)
 
         # text selection: one even band per line
         if self._text_segments:
@@ -7795,6 +7756,81 @@ class PDFCanvas(Gtk.DrawingArea):
         return ((cached[1], cached[0], False) if cached is not None
                 else (None, logical, False))
 
+    def _draw_anchors(self, ctx):
+        """This page's anchor markers and their callouts — for the current
+        page, and through `_as_strip_page` for the strip's others (row 213)."""
+        anchors = self._anchors.get(self.current_page_idx, [])
+        self._callout_boxes = []
+        self._covered_anchors = set()
+        if anchors:
+            # callout boxes go under the circles, so an anchor inside SOMEBODY
+            # ELSE's box stays visible; one inside its OWN box draws nothing
+            # (_draw_callout decides), which is what makes a callout dragged
+            # onto its anchor a plain text box
+            for i, a in enumerate(anchors):
+                if a.get("callout"):
+                    self._draw_callout(ctx, a, i)
+            ctx.save()
+            ctx.translate(self.offset_x, self.offset_y)
+            ctx.scale(self.scale, self.scale)
+            r, g, b = self.zoom_accent
+            radius = 8.0 / self.scale
+            for i, a in enumerate(anchors):
+                if i in self._covered_anchors:
+                    continue
+                ax, ay = a["x"], a["y"]
+                if i in self._active_anchors:
+                    ctx.set_source_rgba(r, g, b, 0.3)
+                    ctx.arc(ax, ay, radius * 1.9, 0, 2 * math.pi)
+                    ctx.fill()
+                ctx.set_source_rgba(r, g, b, 0.88)
+                ctx.arc(ax, ay, radius, 0, 2 * math.pi)
+                ctx.fill()
+                ctx.set_source_rgb(1, 1, 1)
+                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(radius * 1.3)
+                label = str(i + 1)
+                ext = ctx.text_extents(label)
+                ctx.move_to(ax - ext.width / 2 - ext.x_bearing, ay - ext.height / 2 - ext.y_bearing)
+                ctx.show_text(label)
+            ctx.restore()
+
+    def _draw_search_rects(self, ctx, rects, current):
+        if not rects:
+            return
+        ctx.save()
+        ctx.translate(self.offset_x, self.offset_y)
+        ctx.scale(self.scale, self.scale)
+        for rect in rects:
+            if rect == current:
+                ctx.set_source_rgba(1.0, 0.55, 0.0, 0.55)
+            else:
+                ctx.set_source_rgba(1.0, 0.88, 0.0, 0.40)
+            ctx.rectangle(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0)
+            ctx.fill()
+        ctx.restore()
+
+    @contextlib.contextmanager
+    def _as_strip_page(self, i, x, y):
+        """Draw page `i` of the strip with the CURRENT page's drawing code: for
+        the length of the block the canvas looks at `i`, placed at (x, y), and
+        then is put back exactly. Only for read-only drawing — the hit boxes a
+        callout records while drawn are the current page's, so they are kept
+        aside and restored."""
+        saved = (self.current_page_idx, self.offset_x, self.offset_y,
+                 self.page_width, self.page_height, self._callout_boxes,
+                 self._covered_anchors, self._active_anchors)
+        self.current_page_idx = i
+        self.offset_x, self.offset_y = x, y
+        self.page_width, self.page_height = self._page_dims(i)
+        self._active_anchors = set()
+        try:
+            yield
+        finally:
+            (self.current_page_idx, self.offset_x, self.offset_y,
+             self.page_width, self.page_height, self._callout_boxes,
+             self._covered_anchors, self._active_anchors) = saved
+
     def _draw_strip_others(self, ctx, width, height):
         """The strip's other visible pages: paper, rendering, images, ink —
         read-only views; the current page is drawn by `_draw` as always."""
@@ -7843,6 +7879,14 @@ class PDFCanvas(Gtk.DrawingArea):
                     ctx.rectangle(bx0, by0, bx1 - bx0, by1 - by0)
                 ctx.fill()
             ctx.restore()
+            # its anchors, callouts and search hits, by the current page's
+            # own drawing code (row 213)
+            with self._as_strip_page(i, x, y):
+                self._draw_anchors(ctx)
+                cur = self.search_current_any
+                self._draw_search_rects(
+                    ctx, self.search_hits_all.get(i),
+                    cur[1] if cur and cur[0] == i else None)
         if behind:
             # a page still to render (one per frame): come back for it
             GLib.idle_add(lambda: self.queue_draw() and False)
@@ -33206,6 +33250,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _update_search_canvas(self):
         page_idx = self.canvas.current_page_idx
         self.canvas.search_rects = list(self._search_hits.get(page_idx, []))
+        # every page's hits, for the continuous strip's other pages (row 213)
+        self.canvas.search_hits_all = self._search_hits
+        cur_any = (self._search_matches[self._search_current]
+                   if self._search_current >= 0 and self._search_matches
+                   else None)
+        self.canvas.search_current_any = (
+            (cur_any[1], self._search_hits[cur_any[1]][cur_any[2]])
+            if cur_any and cur_any[0] == "pdf" else None)
         cur = (self._search_matches[self._search_current]
                if self._search_current >= 0 and self._search_matches else None)
         if cur and cur[0] == "pdf" and cur[1] == page_idx:
