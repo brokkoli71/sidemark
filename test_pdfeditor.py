@@ -1431,6 +1431,16 @@ class TestNotesBesideTheStrip(unittest.TestCase):
             self.assertAlmostEqual(bands[1][0], lay[1] + at[1], delta=0.5)
             self.assertEqual(win._note_band_text(s, 1),
                              "notes of the second page")
+            # the other pages' notes draw in the EDITOR's own font
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 400, 800)
+            fonts = []
+            real = sidemark.Pango.Layout.set_font_description
+            with mock.patch.object(sidemark.Pango.Layout, "set_font_description",
+                                   lambda lay, d: fonts.append(d.to_string())
+                                   or real(lay, d)):
+                win._draw_note_bands(s, cairo.Context(surf), 400, 800)
+            editor = s._notes_view.get_pango_context().get_font_description()
+            self.assertIn(editor.to_string(), fonts)
         self._run(body)
 
     def test_a_press_on_another_pages_notes_makes_it_current(self):

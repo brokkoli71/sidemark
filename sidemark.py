@@ -22965,6 +22965,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         bg_hex  = theme["background"]
         surround_hex = "#{:02x}{:02x}{:02x}".format(
             *(int(c * 255) for c in surround))
+        # the notes' background, for fading a cut note into it (row 215)
+        self._notes_bg = tuple(int(bg_hex.lstrip("#")[k:k + 2], 16) / 255
+                               for k in (0, 2, 4)) if len(bg_hex) >= 7 else None
         css = f"""
             .notes-view {{
                 font-family: monospace;
@@ -30142,8 +30145,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not bands:
             return
         cur = s.canvas.current_page_idx
-        fg = self.get_color() if hasattr(self, "get_color") else None
-        pad = 10.0
+        # the EDITOR's own font, colour and margins — the other pages' notes
+        # must read as the same notes, not as a different panel
+        view = s._notes_view
+        font = view.get_pango_context().get_font_description()
+        fg = view.get_color()
+        pad = float(view.get_left_margin() or 10)
+        top_pad = float(view.get_top_margin() or 6)
         for i, (top, bh) in bands.items():
             if top > h or top + bh < 0:
                 continue
@@ -30165,9 +30173,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 text = self._note_band_text(s, i)
                 if text:
                     lay = PangoCairo.create_layout(ctx)
-                    d = Pango.FontDescription("Sans")
-                    d.set_absolute_size(self._notes_font_px * Pango.SCALE)
-                    lay.set_font_description(d)
+                    lay.set_font_description(font)
                     lay.set_width(int(max(10, w - 2 * pad) * Pango.SCALE))
                     lay.set_wrap(Pango.WrapMode.WORD_CHAR)
                     markup = "\n".join(_notes_to_pango_markup(line)
@@ -30176,11 +30182,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         lay.set_markup(markup, -1)
                     except GLib.Error:
                         lay.set_text(text, -1)
-                    y0 = max(top, 0.0) + pad + 6
-                    if fg is not None:
-                        ctx.set_source_rgba(fg.red, fg.green, fg.blue, 0.75)
-                    else:
-                        ctx.set_source_rgba(0.2, 0.2, 0.22, 1)
+                    y0 = max(top, 0.0) + top_pad + 4
+                    # a little quieter than the page being edited
+                    ctx.set_source_rgba(fg.red, fg.green, fg.blue, 0.8)
                     ctx.move_to(pad, y0)
                     PangoCairo.show_layout(ctx, lay)
                     _tw, th = lay.get_pixel_size()
@@ -30197,6 +30201,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _notes_bg_rgb(self):
         """The notes panel's background, for fading cut text into it."""
+        if getattr(self, "_notes_bg", None):
+            return self._notes_bg
         try:
             dark = Adw.StyleManager.get_default().get_dark()
         except Exception:
