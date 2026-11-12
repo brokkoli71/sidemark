@@ -550,6 +550,22 @@ class TestLinkPreview(unittest.TestCase):
             self.assertIsNone(c._link_preview)
             self.assertIsNone(c._link_preview_id)
 
+    def test_a_narrow_target_does_not_cut_its_footer_short(self):
+        """An F12 capture: a section heading's card was as narrow as the
+        heading, and "Also referenced on p. 2" read "Also reference…"."""
+        c = self.c
+        with mock.patch.object(c, "link_hover_active", return_value=True):
+            c._hover_x, c._hover_y = self.centres["cite.b"]
+            c._update_link_hover()
+            c._show_link_preview()
+        p = c._link_preview
+        p["w"] = 40.0                               # a short heading
+        p["footer"] = "Also referenced on p. 2, 5, 11"
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 900, 900))
+        c._draw_link_preview(ctx, 900, 900)
+        full = c._card_text(ctx, p["footer"], 10000).get_pixel_size()[0]
+        self.assertGreaterEqual(p["box"][2], full)
+
     def test_a_capture_replays_the_preview_it_saw(self):
         """F12's canvas snapshot: plain JSON, naming the link, its target and
         the strip chosen — and every line of the target page, so the choice

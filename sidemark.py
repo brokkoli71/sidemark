@@ -9966,6 +9966,11 @@ class PDFCanvas(Gtk.DrawingArea):
             w = (p["w"] + 2 * pad) if show_image else 0
             if p.get("ref") is not None:
                 w = max(w, self.CARD_REF_W * f)
+            if show_image and p.get("footer"):
+                # a narrow target (a section heading) must not cut its own
+                # footer short: the card is at least as wide as that line
+                fw = self._card_text(ctx, p["footer"], 10000).get_pixel_size()[0]
+                w = max(w, fw + 2 * pad)
             w = min(w, maxw)
         inner = w - 2 * pad
         # lay out first: the card's height is the sum of its parts
