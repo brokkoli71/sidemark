@@ -1202,6 +1202,118 @@ class TestViewHistoryOnSurfaces(unittest.TestCase):
         self.assertTrue(tp.can_go_back())
 
 
+class TestContinuousScroll(unittest.TestCase):
+    """Row 213: Settings → Continuous scroll shows the pages as one strip.
+    The canvas keeps ONE current page (every tool works on it, unchanged);
+    the strip is laid out around it, and the current role moves to the page
+    in the middle of the view, or the page pressed."""
+
+    def setUp(self):
+        patcher = mock.patch.object(sidemark.PDFCanvas, "continuous", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        pdf = os.path.join(self._tmp.name, "a.pdf")
+        make_pdf(pdf, n_pages=5)
+        self.c = PDFCanvas()
+        self.c.load(pdf)
+        self.c._fit_page(800, 600)
+        self.c._is_fitted = False
+        self.changed = []
+        self.c.on_page_changed = lambda i, n: self.changed.append(i)
+
+    @staticmethod
+    def _touchpad(c, dy):
+        ctrl = mock.Mock()
+        ctrl.get_current_event_state.return_value = Gdk.ModifierType(0)
+        ctrl.get_unit.return_value = Gdk.ScrollUnit.SURFACE
+        c._on_scroll(ctrl, 0, dy)
+
+    def test_the_strip_stacks_the_pages_around_the_current_one(self):
+        c = self.c
+        lay = c._strip_layout()
+        self.assertEqual([e[0] for e in lay], [0, 1, 2, 3, 4])
+        _i, x0, y0, w0, h0 = lay[0]
+        self.assertEqual((x0, y0), (c.offset_x, c.offset_y))
+        for (_a, _x, ya, _w, ha), (_b, _x2, yb, _w2, _h2) in zip(lay, lay[1:]):
+            self.assertAlmostEqual(yb - (ya + ha), c.STRIP_GAP)
+
+    def test_scrolling_crosses_pages_without_flipping(self):
+        c = self.c
+        for _ in range(30):
+            self._touchpad(c, 10)              # ~a page: 30 x 10 px x the gain
+        self.assertEqual(c.current_page_idx, 0)   # not flipped by the scroll
+        top_of_1 = c._strip_layout()[1][2]
+        self.assertLess(top_of_1, 300)            # page 2 has come up
+        c._strip_follow()                         # the idle after the move
+        self.assertEqual(c.current_page_idx, 1)   # the page in the middle
+        self.assertEqual(self.changed[-1], 1)     # …and the notes follow
+
+    def test_handing_over_moves_nothing_on_screen(self):
+        c = self.c
+        c.offset_y -= 700
+        before = {i: (x, y) for i, x, y, _w, _h in c._strip_layout()}
+        c._switch_current(2)
+        after = {i: (x, y) for i, x, y, _w, _h in c._strip_layout()}
+        self.assertEqual(c.current_page_idx, 2)
+        for i in before:
+            self.assertAlmostEqual(before[i][0], after[i][0])
+            self.assertAlmostEqual(before[i][1], after[i][1])
+
+    def test_the_strip_ends_hold_the_scroll(self):
+        c = self.c
+        c.scale *= 3
+        self._touchpad(c, -10000)                 # far past the top
+        self.assertLessEqual(c._strip_layout()[0][2], 0.0)
+        self.assertGreaterEqual(c._strip_layout()[0][2], -1.0)
+        self._touchpad(c, 10 ** 6)                # far past the bottom
+        last = c._strip_layout()[-1]
+        self.assertAlmostEqual(last[2] + last[4], c.get_height() or 600)
+
+    def test_a_press_on_another_page_makes_it_current(self):
+        c = self.c
+        _i, x, y, w, h = c._strip_layout()[1]
+        g = mock.Mock()
+        g.get_current_button.return_value = 1
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        c._on_drag_begin(g, x + w / 2, y + h / 2)
+        self.assertEqual(c.current_page_idx, 1)
+        c._strip_follow()                    # mid-gesture: never handed back
+        self.assertEqual(c.current_page_idx, 1)
+
+    def test_turning_a_page_scrolls_to_it(self):
+        c = self.c
+        c._flip_page(2)
+        self.assertEqual(c.current_page_idx, 2)
+        self.assertAlmostEqual(c.offset_y, 8.0, delta=1)
+
+    def test_pages_set_aside_are_not_in_the_strip(self):
+        c = self.c
+        c.strip_pages = lambda: [0, 1, 3, 4]       # page 3 is hidden
+        self.assertEqual([e[0] for e in c._strip_layout()], [0, 1, 3, 4])
+        c._switch_current(1)
+        c._flip_page(2)                 # the window's step over the hidden one
+        self.assertEqual(c.current_page_idx, 3)
+
+    def test_the_other_pages_are_drawn(self):
+        c = self.c
+        c.offset_y -= 400                     # pages 1 and 2 in view too
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 800, 600)
+        c._draw(None, cairo.Context(surf), 800, 600)
+        self.assertTrue(c._strip_cache)       # a neighbour was rendered
+
+    def test_never_on_the_projector_nor_while_presenting(self):
+        c = self.c
+        self.assertTrue(c._continuous())
+        c._interactive = False
+        self.assertFalse(c._continuous())
+        c._interactive = True
+        c.stack_preview = True
+        self.assertFalse(c._continuous())
+
+
 class TestZoomClickStepsBackOut(unittest.TestCase):
     """Row 202: after zoom-to-region, a plain click with the zoom tool takes
     back the latest zoom — nested ones one click at a time — until you have
@@ -16040,6 +16152,10 @@ class TestBindingToolbar(unittest.TestCase):
                                  not was)
             finally:
                 sidemark.MarkdownNotesView.show_comments = was
+            rows["Continuous scroll"].set_active(True)
+            self.assertTrue(sidemark.PDFCanvas.continuous)
+            self.assertIs(sidemark._load_settings()["continuous_scroll"], True)
+            rows["Continuous scroll"].set_active(False)
             rows["Reference badges"].set_active(False)
             self.assertIs(sidemark._load_settings()["reference_badges"], False)
             self.assertFalse(sidemark.PDFCanvas.show_badges)

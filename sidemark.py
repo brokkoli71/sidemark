@@ -5746,6 +5746,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zotero_icons = []        # [(screen box, item, key, region)] drawn
         self._gutters = {}             # page -> its column gutter, or None
         self._badge_worker = None      # the document the badge queue serves
+        # continuous scroll (row 213)
+        self._strip_cache = {}         # page -> (scale, rendered surface)
+        self._strip_cache_key = None
+        self._dims, self._dims_key = {}, None
+        self.strip_pages = None        # callable -> pages of the strip
+        self._strip_follow_id = None
+        self._pressing = False         # a button is down on the canvas
         self._badge_queue = []         # pages still to prepare, next first
         self._badge_job = None         # the generator working through it
         self._info_icons = []          # [(screen box, key, region)]: the "i"s
@@ -6475,6 +6482,17 @@ class PDFCanvas(Gtk.DrawingArea):
         # presenting: the next page shows behind the current one (stack look)
         if self.stack_preview and self._is_fitted:
             self._draw_stack_peek(ctx, width, height)
+        # continuous scroll: the strip's other pages around this one, and —
+        # once the view has moved on — the page in the middle takes over
+        if self._continuous():
+            key = (id(self.document), self.n_pages)
+            if self._strip_cache_key != key:
+                self._strip_cache, self._strip_cache_key = {}, key
+            self._draw_strip_others(ctx, width, height)
+            page_h = self.page_height * self.scale
+            if (not (self.offset_y <= height / 2 <= self.offset_y + page_h)
+                    and self._strip_follow_id is None and not self._pressing):
+                self._strip_follow_id = GLib.idle_add(self._strip_follow)
 
         ctx.set_source_rgb(1, 1, 1)
         ctx.rectangle(self.offset_x, self.offset_y,
@@ -7364,7 +7382,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 and self._thumb_gesture is None):
             flip_threshold = (self.TOUCHPAD_FLIP_THRESHOLD if smooth
                               else self.SCROLL_FLIP_THRESHOLD)
-            if self._handle_boundary_flip(dx, dy, flip_threshold):
+            if (not self._continuous()
+                    and self._handle_boundary_flip(dx, dy, flip_threshold)):
                 return True
             self._scroll_past = 0.0
             step = self.TOUCHPAD_PAN_GAIN if smooth else self.WHEEL_PAN_STEP
@@ -7372,7 +7391,10 @@ class PDFCanvas(Gtk.DrawingArea):
             self.history.moving()
             self.offset_x -= dx * step
             self.offset_y -= dy * step
-            self._clamp_scroll_offset()
+            if self._continuous():
+                self._clamp_strip()      # the strip scrolls on past a page
+            else:
+                self._clamp_scroll_offset()
             self._is_fitted = False
             self.queue_draw()
             return True
@@ -7418,8 +7440,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self.history.moving()
         self.offset_x = stop_at_edges(self.offset_x - dx, was[0], cw,
                                       self.page_width * self.scale)
-        self.offset_y = stop_at_edges(self.offset_y - dy, was[1], ch,
-                                      self.page_height * self.scale)
+        if self._continuous():
+            # the strip: a coast carries on across pages, to the strip's end
+            self.offset_y -= dy
+            self._clamp_strip()
+        else:
+            self.offset_y = stop_at_edges(self.offset_y - dy, was[1], ch,
+                                          self.page_height * self.scale)
         if abs(self.offset_x - was[0]) < 1e-6 and abs(self.offset_y - was[1]) < 1e-6:
             return False
         self._is_fitted = False
@@ -7583,8 +7610,217 @@ class PDFCanvas(Gtk.DrawingArea):
         if target != self.current_page_idx:
             self._flip_page(target - self.current_page_idx)
 
+    # ── continuous scroll: the pages as one strip (row 213) ──────────────────
+    # Settings → "Continuous scroll". The canvas keeps ONE current page, as it
+    # always has: its page object, its offsets, its ink are what every tool,
+    # coordinate conversion and overlay works on — unchanged. The strip only
+    # adds the other pages AROUND it (`_strip_layout`, measured from the
+    # current page's own offsets, so zoom and pan move them all), draws them
+    # (`_draw_strip_others`), and hands the "current" role to whichever page
+    # is in the middle of the view, or is pressed (`_switch_current`) — the
+    # notes panel follows it, as it follows a page flip. So the one-page view
+    # is the special case of a strip of one, and no tool has two versions.
+    # Off on the projector's mirror and while presenting: a slide is shown
+    # whole and alone.
+
+    continuous = False          # class-wide, like show_badges (Settings)
+    STRIP_GAP = 14.0            # px between two pages of the strip
+    STRIP_CACHE = 12            # rendered neighbour pages kept
+
+    def _continuous(self):
+        return (PDFCanvas.continuous and self._interactive
+                and not self.stack_preview and self.document is not None
+                and self.page is not None)
+
+    def _strip_order(self):
+        """The pages of the strip, in order: every page, less those set aside
+        (the window's `strip_pages`, row 158) — the current one always."""
+        pages = (list(self.strip_pages()) if self.strip_pages is not None
+                 else list(range(self.n_pages)))
+        if self.current_page_idx not in pages:
+            pages.append(self.current_page_idx)
+        return sorted(p for p in set(pages) if 0 <= p < self.n_pages)
+
+    def _page_dims(self, i):
+        key = (id(self.document), self.n_pages)
+        if self._dims_key != key:
+            self._dims, self._dims_key = {}, key
+        if i not in self._dims:
+            r = self.document[i].rect
+            self._dims[i] = (r.width, r.height)
+        return self._dims[i]
+
+    def _strip_layout(self):
+        """[(page, x, y, w, h)] on screen, for the whole strip, measured from
+        the current page's own offsets — pages centred on its middle line,
+        STRIP_GAP apart. Cheap: arithmetic on cached page sizes."""
+        order = self._strip_order()
+        cur = self.current_page_idx
+        k = order.index(cur)
+        s, gap = self.scale, self.STRIP_GAP
+        mid = self.offset_x + self.page_width * s / 2
+        out = {cur: (self.offset_y, self.page_width, self.page_height)}
+        y = self.offset_y + self.page_height * s
+        for i in order[k + 1:]:
+            w, h = self._page_dims(i)
+            out[i] = (y + gap, w, h)
+            y += gap + h * s
+        y = self.offset_y
+        for i in reversed(order[:k]):
+            w, h = self._page_dims(i)
+            y -= gap + h * s
+            out[i] = (y, w, h)
+        return [(i, mid - out[i][1] * s / 2, out[i][0], out[i][1] * s,
+                 out[i][2] * s) for i in order]
+
+    def _strip_page_at(self, sx, sy):
+        """The strip page under a screen point, or None (a gap, or off it)."""
+        for i, x, y, w, h in self._strip_layout():
+            if x <= sx <= x + w and y <= sy <= y + h:
+                return i
+        return None
+
+    def _switch_current(self, i):
+        """Make strip page `i` the current one WITHOUT moving anything on
+        screen: its offsets become its place in the strip. The rendered page
+        trades places with the strip cache, so neither is rendered again."""
+        cur = self.current_page_idx
+        if i == cur or self.document is None:
+            return
+        place = next((e for e in self._strip_layout() if e[0] == i), None)
+        if place is None:
+            return
+        if self._page_surface is not None:
+            self._strip_cache[cur] = (self._surface_scale, self._page_surface)
+        if self.on_page_will_change:
+            self.on_page_will_change()
+        self._load_page(i, keep_view=True)
+        self.offset_x, self.offset_y = place[1], place[2]
+        cached = self._strip_cache.pop(i, None)
+        if cached is not None and cached[0] == min(max(self.scale, 0.5), 4.0):
+            self._surface_scale, self._page_surface = cached
+        self.queue_draw()
+
+    def _strip_follow(self):
+        """Idle, after the view moved: the page in the middle of the view
+        becomes the current one — the notes follow what you read. Never in
+        the middle of a gesture: the page you draw on stays yours."""
+        self._strip_follow_id = None
+        if not self._continuous() or self._pressing or self.current_stroke:
+            return False
+        ch = self.get_height() or 600
+        best, best_d = None, None
+        for i, _x, y, _w, h in self._strip_layout():
+            d = 0.0 if y <= ch / 2 <= y + h else min(abs(y - ch / 2),
+                                                     abs(y + h - ch / 2))
+            if best is None or d < best_d:
+                best, best_d = i, d
+        if best is not None and best != self.current_page_idx:
+            self._switch_current(best)
+        return False
+
+    def _clamp_strip(self):
+        """The strip's ends hold a scroll: the first page's top does not come
+        below the window's top, the last page's bottom not above its bottom
+        (a strip shorter than the window is centred)."""
+        lay = self._strip_layout()
+        if not lay:
+            return
+        ch = self.get_height() or 600
+        top = lay[0][2]
+        bottom = lay[-1][2] + lay[-1][4]
+        if bottom - top <= ch:
+            self.offset_y += (ch - (bottom - top)) / 2 - top
+        elif top > 0:
+            self.offset_y -= top
+        elif bottom < ch:
+            self.offset_y += ch - bottom
+
+    def _strip_surface(self, i, budget):
+        """Page `i` rendered at the current zoom, from the cache — or, when it
+        is missing or stale and `budget` allows (one page per frame), rendered
+        now. Returns (surface or None, its scale, used the budget?)."""
+        logical = min(max(self.scale, 0.5), 4.0)
+        cached = self._strip_cache.get(i)
+        if cached is not None and cached[0] == logical:
+            return cached[1], cached[0], False
+        if budget:
+            try:
+                surf = self._page_to_surface(self.document[i], logical)
+            except Exception:
+                logger.error("strip render:\n" + traceback.format_exc())
+                return None, logical, True
+            self._strip_cache[i] = (logical, surf)
+            while len(self._strip_cache) > self.STRIP_CACHE:
+                far = max(self._strip_cache,
+                          key=lambda p: abs(p - self.current_page_idx))
+                del self._strip_cache[far]
+            return surf, logical, True
+        # a stale one stretched beats a blank page while the next frame renders
+        return ((cached[1], cached[0], False) if cached is not None
+                else (None, logical, False))
+
+    def _draw_strip_others(self, ctx, width, height):
+        """The strip's other visible pages: paper, rendering, images, ink —
+        read-only views; the current page is drawn by `_draw` as always."""
+        budget, behind = True, False
+        for i, x, y, w, h in self._strip_layout():
+            if i == self.current_page_idx or y > height or y + h < 0:
+                continue
+            ctx.set_source_rgb(1, 1, 1)
+            ctx.rectangle(x, y, w, h)
+            ctx.fill()
+            surf, sscale, used = self._strip_surface(i, budget)
+            budget = budget and not used
+            if surf is None:
+                behind = True
+            else:
+                if sscale != min(max(self.scale, 0.5), 4.0):
+                    behind = True
+                ctx.save()
+                ctx.translate(x, y)
+                ctx.scale(self.scale / sscale, self.scale / sscale)
+                ctx.set_source_surface(surf, 0, 0)
+                ctx.get_source().set_filter(cairo.Filter.BILINEAR)
+                ctx.paint()
+                ctx.restore()
+            ctx.save()
+            ctx.translate(x, y)
+            ctx.scale(self.scale, self.scale)
+            for im in self.all_images.get(i, ()):
+                ix, iy, iw, ih = im["rect"]
+                if iw > 0 and ih > 0:
+                    draw_image(ctx, im["texture"], ix, iy, iw, ih,
+                               rotate=self._image_draw_rotate(im))
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            for st in self.all_strokes.get(i, ()):
+                r, g, b = st["color"]
+                ctx.set_source_rgba(r, g, b, st.get("opacity", 1.0))
+                draw_ink_stroke(ctx, st["pts"], st["width"], st.get("press"))
+            ctx.restore()
+        if behind:
+            # a page still to render (one per frame): come back for it
+            GLib.idle_add(lambda: self.queue_draw() and False)
+
     def _flip_page(self, delta):
         self.history.moving()   # a run of flips is one step, like a scroll
+        if self._continuous():
+            # the strip: SCROLL to the page — its top a little below the
+            # window's — keeping the zoom; it becomes the current page
+            # `delta` is in PAGES, as the window counts it (it has already
+            # stepped over pages set aside); the strip has no others to skip
+            order = self._strip_order()
+            want = self.current_page_idx + delta
+            target = (want if want in order else
+                      min(order, key=lambda p: (abs(p - want), p)))
+            place = next(e for e in self._strip_layout() if e[0] == target)
+            self.offset_y += 8.0 - place[2]
+            self._switch_current(target)
+            self._clamp_strip()
+            self._schedule_rerender()
+            self.queue_draw()
+            return
         if self._is_fitted:
             self.go_to_page(self.current_page_idx + delta)   # refit on the new page
             return
@@ -7800,6 +8036,13 @@ class PDFCanvas(Gtk.DrawingArea):
         self._dismissed_selection = False
         self._text_highlighting = False
         self._glide.stop()               # a press catches a coasting page
+        self._pressing = True
+        if self._continuous():
+            # a press on another page of the strip makes it the current one,
+            # so every tool below works on the page you pressed
+            hit = self._strip_page_at(start_x, start_y)
+            if hit is not None and hit != self.current_page_idx:
+                self._switch_current(hit)
         if self._card_press(start_x, start_y):
             # the card or a backlink icon (rows 197-200) took the press; one
             # elsewhere closed the card and goes on to the page below
@@ -8490,6 +8733,9 @@ class PDFCanvas(Gtk.DrawingArea):
             self._drag_end(gesture, offset_x, offset_y)
         finally:
             self._press_tool = None   # `tool` means the left button again
+            self._pressing = False
+            if self._continuous():
+                self.queue_draw()     # the strip may hand the page on now
 
     def _drag_end(self, gesture, offset_x, offset_y):
         logger.debug(f"drag end offset=({offset_x:.0f},{offset_y:.0f})")
@@ -22391,6 +22637,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             _load_settings().get("show_comments", False))
         PDFCanvas.show_badges = (
             _load_settings().get("reference_badges", True) is not False)
+        PDFCanvas.continuous = (
+            _load_settings().get("continuous_scroll", False) is True)
         self._bindings_list = None   # built with the pen popover
         self._tool_btns = None       # built with the header
         self._tool_strips = {}       # tool -> the painted binding stripes
@@ -23661,6 +23909,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # a paper opened from a card (Zotero, row 205) lands as a tab in the
         # window this document is in NOW (s.win follows a torn-off tab)
         s.canvas.on_open_document = lambda path, s=s: s.win.open_file_in_tab(path)
+        # the continuous strip (row 213) shows every page you have not set
+        # aside (row 158) — the same rule page-turning follows
+        s.canvas.strip_pages = lambda s=s: [
+            i for i in range(s.canvas.n_pages)
+            if i not in s.notes_model.hidden_pages()]
         # the select / highlighter variants are the APP's, like the pen: a new
         # tab and a restart (Ctrl+R) keep the one you picked
         saved = _load_settings()
@@ -29472,6 +29725,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         ruling.connect("notify::selected", lambda r, _p:
                        self._on_page_bg_changed(r.get_selected()))
         pages.add(ruling)
+        cont = Adw.SwitchRow(title="Continuous scroll")
+        cont.set_subtitle(
+            "Pages follow one another as you scroll, instead of one page at a "
+            "time. Presenting still shows one slide at a time.")
+        cont.set_active(PDFCanvas.continuous)
+        cont.connect("notify::active", lambda r, _p:
+                     self._on_continuous_toggled(r.get_active()))
+        pages.add(cont)
         page.add(pages)
 
         notes = Adw.PreferencesGroup(title="Notes")
@@ -29538,6 +29799,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _on_page_bg_changed(self, index):
         _save_setting("page_background", PAGE_BACKGROUNDS[index])
+
+    def _on_continuous_toggled(self, on):
+        _save_setting("continuous_scroll", on)
+        PDFCanvas.continuous = on
+        for sess in self._sessions:
+            if sess.canvas is not None:
+                sess.canvas.queue_draw()
 
     def _on_badges_toggled(self, on):
         _save_setting("reference_badges", on)

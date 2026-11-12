@@ -178,6 +178,22 @@
   and the ↩ / Z icons. The rendered target strip keeps its own readable
   scale (`_preview_scale`).
 
+- **Continuous scroll (row 213)** — Settings → Continuous scroll
+  (`PDFCanvas.continuous`, off by default). There is STILL one current page:
+  its page object, offsets and ink are what every tool and coordinate works
+  on, unchanged. The strip only adds the other pages around it
+  (`_strip_layout`, measured from the current page's offsets — so zoom and
+  pan move them all), draws them read-only (`_draw_strip_others`: a render
+  cache, one new render per frame, their images and ink), and moves the
+  current role (`_switch_current`, which moves NOTHING on screen) to the page
+  in the middle of the view (`_strip_follow`, idle, never mid-gesture —
+  `_pressing`) or the page pressed. Scrolling and coasting cross pages and
+  stop at the strip's ends (`_clamp_strip`); `_flip_page` scrolls. The strip
+  is the pages not set aside (`strip_pages`, row 158). Off on the projector
+  (`interactive=False`) and while presenting. A new tool needs no strip code
+  — only a new per-page DRAWING does (anchors are not drawn on the other
+  pages yet).
+
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a
   background you write on is one you hand in, so it must print and export.
