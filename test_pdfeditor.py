@@ -1410,6 +1410,42 @@ class TestContinuousScroll(unittest.TestCase):
         self.assertEqual((c.current_page_idx, c.offset_x, c.offset_y,
                           c.page_width, c.page_height), before)
 
+    def test_the_eraser_works_on_whichever_page_it_is_over(self):
+        c = self.c
+        c._needs_fit = False
+        mark = {"pts": [(100, 100), (200, 100)], "color": (0, 0, 0),
+                "width": 2.0, "opacity": 1.0}
+        top_mark = {"pts": [(100, 800), (200, 800)], "color": (0, 0, 0),
+                    "width": 2.0, "opacity": 1.0}
+        c.all_strokes = {0: [top_mark], 1: [mark]}
+        _i, x1, y1, _w, _h = c._strip_layout()[1]
+        scale = c.scale
+        c._erase_group += 1
+        sx, sy = c._pdf_to_screen(150, 800)           # page 1's foot…
+        c._erase_at(sx, sy)
+        c._erase_at(x1 + 150 * c.scale, y1 + 100 * c.scale)  # …then page 2
+        self.assertEqual(c.all_strokes[0], [])
+        self.assertEqual(c.all_strokes[1], [])
+        self.assertEqual(c.current_page_idx, 0)
+        c.undo_last()                                  # one drag, one undo
+        self.assertEqual(c.all_strokes[0], [top_mark])
+        self.assertEqual(c.all_strokes[1], [mark])
+        self.assertEqual(c.scale, scale)               # not re-fitted
+
+    def test_a_marquee_selects_on_every_page_it_covers(self):
+        c = self._text_pdf()
+        c.select_style = "rect"
+        c.tool = "text"
+        self.addCleanup(setattr, c, "tool", "pen")
+        sx, sy = c._pdf_to_screen(60, 785)
+        c._on_drag_begin(self._gesture(start=(sx, sy)), sx, sy)
+        _i, x1, y1, _w, _h = c._strip_layout()[1]
+        c._update_text_select(x1 + 500 * c.scale, y1 + 110 * c.scale)
+        self.assertTrue(c._text_segments)              # page 1's foot
+        self.assertIn(1, c._other_segments)            # page 2's head
+        self.assertIn("alpha1",
+                      c._page_text_of(1).text(c._other_segments[1]))
+
     def test_never_on_the_projector_nor_while_presenting(self):
         c = self.c
         self.assertTrue(c._continuous())

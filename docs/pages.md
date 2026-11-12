@@ -205,7 +205,12 @@
     `_selection_by_page`. A pen stroke drawn across pages is cut at each page
     edge it crosses (`_split_across_pages`) into per-page strokes sharing a
     draw GROUP — undo/redo collapse a group across pages, each op on its own
-    page.
+    page. The ERASER works on the page under it (`_erase_at`), so one drag
+    crosses pages; erase groups collapse across pages the same way. The
+    rectangular marquee selects on every page it covers. An undo/redo that
+    lands on another page SHOWS it with `_show_page_of_change`: in the strip
+    a page in view stays put, one out of view is scrolled to — never
+    re-fitted (`go_to_page` would).
   - **Notes beside their pages (row 215)**: the notes panel's editing area
     is a `NotesStage` — the editor (still ONE page's notes: model, anchors,
     links, commit/restore untouched) sits in the CURRENT page's band, the

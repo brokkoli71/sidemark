@@ -9273,6 +9273,20 @@ class PDFCanvas(Gtk.DrawingArea):
             self._sel_keep_lines = True
             self._text_segments = pt.rect_segments(*p0, *p1)
             self._other_segments = {}
+            if self._continuous():
+                # the marquee in the strip (row 214): every page it covers
+                # gives the text inside ITS part of the rectangle
+                ax, ay = self._alt_start
+                top, bottom = min(ay, y), max(ay, y)
+                for i, px0, py0, _w, ph in self._strip_layout():
+                    if i == self.current_page_idx or py0 > bottom \
+                            or py0 + ph < top:
+                        continue
+                    q0 = ((ax - px0) / self.scale, (top - py0) / self.scale)
+                    q1 = ((x - px0) / self.scale, (bottom - py0) / self.scale)
+                    segs = self._page_text_of(i).rect_segments(*q0, *q1)
+                    if segs:
+                        self._other_segments[i] = segs
             self.queue_draw()
             return
         other = self._strip_select_page(x, y)
@@ -9343,6 +9357,26 @@ class PDFCanvas(Gtk.DrawingArea):
                 part.pop("press", None)
             out.append((e[0], part))
         return out
+
+    def _show_page_of_change(self, page):
+        """An undo/redo landed on another page: show it. In the continuous
+        strip a page already in view is left where it is (and the canvas
+        does not move at all); one out of view is scrolled to, keeping the
+        zoom — never re-fitted, which a page flip would do."""
+        self.history.jump()
+        if not self._continuous():
+            self.go_to_page(page)
+            return
+        ch = self.get_height() or 600
+        place = next((e for e in self._strip_layout() if e[0] == page), None)
+        if place is None:
+            self.go_to_page(page)
+            return
+        if place[2] + place[4] < 0 or place[2] > ch:
+            self.offset_y += 8.0 - place[2]
+            self._clamp_strip()
+            self._schedule_rerender()
+        self.queue_draw()
 
     def _strip_select_page(self, x, y):
         """In the continuous strip, the OTHER page a text drag has reached
@@ -10897,10 +10931,19 @@ class PDFCanvas(Gtk.DrawingArea):
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)
         page = self.current_page_idx
-        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) strokes={len(self.strokes)}")
+        if self._continuous():
+            # the strip (row 214): the eraser works on whichever page is
+            # under it, so one drag can clean ink off several pages
+            hit = self._strip_page_at(sx, sy)
+            if hit is not None and hit != page:
+                place = next(e for e in self._strip_layout() if e[0] == hit)
+                page = hit
+                px, py = (sx - place[1]) / self.scale, (sy - place[2]) / self.scale
+        strokes_here = self.all_strokes.setdefault(page, [])
+        logger.debug(f"erase at pdf=({px:.1f},{py:.1f}) strokes={len(strokes_here)}")
         kept = []
         removed = 0
-        for i, s in enumerate(self.strokes):
+        for i, s in enumerate(strokes_here):
             if self._stroke_hits(s["pts"], px, py, erase_radius(s["width"])):
                 # record the index as if strokes were removed one at a time,
                 # so undo can reinsert by popping ops in reverse order
@@ -11761,19 +11804,20 @@ class PDFCanvas(Gtk.DrawingArea):
                 s["pts"] = list(old_pts)
         else:
             self._undo_erase_op(page, op)
+            # one erase GESTURE — which in the continuous strip may have
+            # crossed pages (row 214): the group is unique, each op restores
+            # on its own page
             group = op[4]
             while (self._undo_stack
                    and self._undo_stack[-1][0] in ("erase", "erase_images")
-                   and self._undo_stack[-1][1] == page
                    and self._undo_stack[-1][4] == group):
                 op = self._undo_stack.pop()
                 popped.append(op)
-                self._undo_erase_op(page, op)
+                self._undo_erase_op(op[1], op)
         self.clear_lasso_selection()
         self._redo_stack.append(popped)
         if page != self.current_page_idx:
-            self.history.jump()
-            self.go_to_page(page)   # show the user what was undone
+            self._show_page_of_change(page)   # show the user what was undone
         if self.on_change:
             self.on_change()
         self.queue_draw()
@@ -11825,14 +11869,14 @@ class PDFCanvas(Gtk.DrawingArea):
             for s, _old, new_pts in entries:
                 s["pts"] = list(new_pts)
         else:
-            # re-remove in the gesture's chronological order (reverse of pop order)
+            # re-remove in the gesture's chronological order (reverse of pop
+            # order), each on its own page (row 214)
             for op in reversed(ops):
-                self._redo_erase_op(page, op)
+                self._redo_erase_op(op[1], op)
         self.clear_lasso_selection()
         self._undo_stack.extend(reversed(ops))
         if page != self.current_page_idx:
-            self.history.jump()
-            self.go_to_page(page)
+            self._show_page_of_change(page)
         if self.on_change:
             self.on_change()
         self.queue_draw()
