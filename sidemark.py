@@ -5708,6 +5708,11 @@ class PDFCanvas(Gtk.DrawingArea):
         # press that needs it, and the selection as painted segments
         self._page_text_cache = None
         self._text_segments = []     # [(line, a, b)] into _page_text()
+        # a selection reaching OTHER pages of the continuous strip (row 214):
+        # {page: segments} — the current page's part stays _text_segments
+        self._other_segments = {}
+        self._pt_cache = {}          # PageText of strip pages other than this
+        self._sel_keep_lines = False # copy one line per line (rect style)
         self._sel_anchor = (0, 0)    # the unit the press took, as a caret range
         self._sel_gran = 1           # 1 char, 2 word, 3 paragraph
         self._sel_range = None       # the live (lo, hi); None for the rect style
@@ -5935,6 +5940,7 @@ class PDFCanvas(Gtk.DrawingArea):
             self._needs_fit = True    # re-fit on first draw with real canvas dimensions
         self._page_text_cache = None    # read lazily: most pages are never selected on
         self._text_segments = []
+        self._other_segments = {}      # _switch_current puts a selection back
         self._sel_range = None
         self.queue_draw()
         if self.on_page_changed:
@@ -7692,10 +7698,21 @@ class PDFCanvas(Gtk.DrawingArea):
             return
         if self._page_surface is not None:
             self._strip_cache[cur] = (self._surface_scale, self._page_surface)
+        # a selection (one reaching several pages included, row 214) is the
+        # reader's — handing the current role on must not drop it
+        sel = dict(self._selection_by_page())
+        keep_lines = self._sel_keep_lines
+        if self._page_text_cache is not None:
+            self._page_text_of(i)                     # sets the strip's key
+            self._pt_cache[cur] = self._page_text_cache
         if self.on_page_will_change:
             self.on_page_will_change()
         self._load_page(i, keep_view=True)
         self.offset_x, self.offset_y = place[1], place[2]
+        self._page_text_cache = self._pt_cache.pop(i, None)
+        self._text_segments = sel.pop(i, [])
+        self._other_segments = sel
+        self._sel_keep_lines = keep_lines
         cached = self._strip_cache.pop(i, None)
         if cached is not None and cached[0] == min(max(self.scale, 0.5), 4.0):
             self._surface_scale, self._page_surface = cached
@@ -7798,6 +7815,15 @@ class PDFCanvas(Gtk.DrawingArea):
                 r, g, b = st["color"]
                 ctx.set_source_rgba(r, g, b, st.get("opacity", 1.0))
                 draw_ink_stroke(ctx, st["pts"], st["width"], st.get("press"))
+            segs = self._other_segments.get(i)
+            if segs:
+                # a selection reaching this page (row 214): the same bands
+                ctx.set_source_rgba(0.2, 0.5, 0.9, 0.35)
+                pt = self._page_text_of(i)
+                for seg in segs:
+                    bx0, by0, bx1, by1 = pt.band(seg)
+                    ctx.rectangle(bx0, by0, bx1 - bx0, by1 - by0)
+                ctx.fill()
             ctx.restore()
         if behind:
             # a page still to render (one per frame): come back for it
@@ -8107,6 +8133,7 @@ class PDFCanvas(Gtk.DrawingArea):
             # a press ends a text selection — except the menu's, which is
             # ABOUT that selection (Highlight, Copy)
             self._text_segments = []
+            self._other_segments = {}
         self._press_event = gesture.get_current_event()
         if mark is not None:
             self._press_tool = None
@@ -8877,6 +8904,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 # a plain click: no selection (as in a browser), and the
                 # caret's click follows a link under it
                 self._text_segments = []
+                self._other_segments = {}
                 self._sel_range = None
                 self.queue_draw()
                 sx, sy = self._alt_start
@@ -8909,10 +8937,20 @@ class PDFCanvas(Gtk.DrawingArea):
                 }
                 if prof:
                     stroke["press"] = prof
+                parts = (self._split_across_pages(stroke)
+                         if self._continuous() else None)
                 if self._snap_kind in ("vdiv", "hdiv"):
                     # a grid divider re-spaces its rectangle's dividers evenly,
                     # itself included — one undo entry for the whole gesture
                     self._finish_grid_divider(stroke)
+                elif parts is not None and len(parts) > 1:
+                    # drawn across pages of the strip (row 214): each page
+                    # keeps its part, one undo takes the whole stroke
+                    self._draw_group += 1
+                    for page_no, part in parts:
+                        self.all_strokes.setdefault(page_no, []).append(part)
+                        self._undo_stack.append(
+                            ("draw", page_no, part, self._draw_group))
                 else:
                     self.strokes.append(stroke)
                     self._undo_stack.append(
@@ -9109,7 +9147,25 @@ class PDFCanvas(Gtk.DrawingArea):
         return self._page_text_cache
 
     def has_text_selection(self):
-        return bool(self._text_segments)
+        return bool(self._text_segments or self._other_segments)
+
+    def _selection_by_page(self):
+        """[(page, segments)] of the whole selection, in page order."""
+        parts = dict(self._other_segments)
+        if self._text_segments:
+            parts[self.current_page_idx] = self._text_segments
+        return sorted(parts.items())
+
+    def _page_text_of(self, i):
+        """PageText of any page: this one's own cache, or the strip's."""
+        if i == self.current_page_idx:
+            return self._page_text()
+        key = (id(self.document), self.n_pages)
+        if self._pt_cache.get("key") != key:
+            self._pt_cache = {"key": key}
+        if i not in self._pt_cache:
+            self._pt_cache[i] = PageText.from_page(self.document[i])
+        return self._pt_cache[i]
 
     def _begin_text_select(self, x, y, highlight=False):
         """A press of the text cursor (or the text-marking highlighter), the
@@ -9136,7 +9192,9 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _set_text_range(self, rng):
         self._sel_range = rng
+        self._sel_keep_lines = False
         self._text_segments = self._page_text().segments(*rng)
+        self._other_segments = {}
         self.queue_draw()
 
     def _update_text_select(self, x, y):
@@ -9150,21 +9208,134 @@ class PDFCanvas(Gtk.DrawingArea):
             p0 = self._screen_to_pdf(*self._alt_start)
             p1 = self._screen_to_pdf(x, y)
             self._sel_range = None
+            self._sel_keep_lines = True
             self._text_segments = pt.rect_segments(*p0, *p1)
+            self._other_segments = {}
             self.queue_draw()
+            return
+        other = self._strip_select_page(x, y)
+        if other is not None:
+            self._select_across(pt, other, x, y)
             return
         caret, li = pt.caret_at(*self._screen_to_pdf(x, y))
         self._set_text_range(pt.extend(self._sel_anchor, caret, self._sel_gran, li))
+
+    def _split_across_pages(self, stroke):
+        """[(page, stroke)] — a stroke drawn in the strip, cut where it
+        crosses from one page onto the next (row 214). Points are in the
+        current page's coordinates while drawing; each run is moved into its
+        own page's, and every cut is made exactly at the page edge it
+        crosses, the point added to both sides, so the line meets each edge.
+        A point in the gap between two pages counts for the nearer one."""
+        lay = self._strip_layout()
+        s = self.scale
+
+        def page_at(sy):
+            best = min(lay, key=lambda e: (0 if e[2] <= sy <= e[2] + e[4]
+                                           else min(abs(sy - e[2]),
+                                                    abs(sy - e[2] - e[4]))))
+            return best
+
+        def local(e, sx, sy):
+            return ((sx - e[1]) / s, (sy - e[2]) / s)
+
+        pts = stroke["pts"]
+        press = stroke.get("press")
+        if press is not None and len(press) != len(pts):
+            press = None
+        screen = [(self.offset_x + x * s, self.offset_y + y * s) for x, y in pts]
+        runs = []                      # [entry, [points], [pressures]]
+        for k, (sx, sy) in enumerate(screen):
+            e = page_at(sy)
+            pr = press[k] if press is not None else None
+            if runs and runs[-1][0][0] != e[0]:
+                prev = runs[-1][0]
+                psx, psy = screen[k - 1]
+                # the edge between the two pages that this segment crosses
+                edge = (prev[2] + prev[4] if e[2] > prev[2] else prev[2])
+                nxt = (e[2] if e[2] > prev[2] else e[2] + e[4])
+                for ey, owner, run in ((edge, prev, runs[-1]), (nxt, e, None)):
+                    t = (ey - psy) / (sy - psy) if sy != psy else 0.0
+                    t = min(max(t, 0.0), 1.0)
+                    cx = psx + (sx - psx) * t
+                    if run is not None:
+                        run[1].append(local(owner, cx, ey))
+                        if press is not None:
+                            run[2].append(pr)
+                    else:
+                        runs.append([e, [local(e, cx, ey)],
+                                     [pr] if press is not None else []])
+            if not runs:
+                runs.append([e, [], []])
+            runs[-1][1].append(local(e, sx, sy))
+            if press is not None:
+                runs[-1][2].append(pr)
+        out = []
+        for e, rpts, rpress in runs:
+            if len(rpts) < 2:
+                continue
+            part = dict(stroke, pts=rpts)
+            if press is not None:
+                part["press"] = rpress
+            else:
+                part.pop("press", None)
+            out.append((e[0], part))
+        return out
+
+    def _strip_select_page(self, x, y):
+        """In the continuous strip, the OTHER page a text drag has reached
+        (the one under the pointer, or across a gap the last one it passed),
+        as its strip entry — or None while it is still on this page."""
+        if not self._continuous():
+            return None
+        page_h = self.page_height * self.scale
+        if self.offset_y <= y <= self.offset_y + page_h:
+            return None
+        below = y > self.offset_y + page_h
+        cands = [e for e in self._strip_layout()
+                 if (e[2] >= self.offset_y + page_h if below
+                     else e[2] + e[4] <= self.offset_y)]
+        hit = next((e for e in cands if e[2] <= y <= e[2] + e[4]), None)
+        if hit is None:      # in a gap: the last page the pointer passed
+            passed = [e for e in cands if (e[2] <= y if below
+                                           else e[2] + e[4] >= y)]
+            hit = (passed[-1] if below else passed[0]) if passed else None
+        return hit
+
+    def _select_across(self, pt, place, x, y):
+        """A text drag that left its page (row 214): the selection runs from
+        the press to the end of this page (or its start, dragging up), takes
+        every page between whole, and the reached page up to the pointer."""
+        j, px0, py0, _w, _h = place
+        order = self._strip_order()
+        cur = self.current_page_idx
+        ptj = self._page_text_of(j)
+        caret, _li = ptj.caret_at((x - px0) / self.scale, (y - py0) / self.scale)
+        lo, hi = self._sel_anchor
+        down = j > cur
+        self._sel_range = (lo, len(pt.chars)) if down else (0, hi)
+        self._sel_keep_lines = False
+        self._text_segments = pt.segments(*self._sel_range)
+        between = [p for p in order if (cur < p < j if down else j < p < cur)]
+        others = {}
+        for p in between:
+            ptp = self._page_text_of(p)
+            others[p] = ptp.segments(0, len(ptp.chars))
+        others[j] = (ptj.segments(0, caret) if down
+                     else ptj.segments(caret, len(ptj.chars)))
+        self._other_segments = {p: segs for p, segs in others.items() if segs}
+        self.queue_draw()
 
     def _commit_text_highlight(self):
         """Turn the selected text into highlighter ink: one wide stroke per text
         line covering its selected characters. Stored as ink, so save / eraser / undo all
         work unchanged; the per-line strokes share a draw group so a single undo
         removes the whole highlight."""
-        segments = self._text_segments
+        per_page = self._selection_by_page()
         self._text_segments = []
+        self._other_segments = {}
         self._sel_range = None
-        if not segments:
+        if not per_page:
             self.queue_draw()
             return
         color = self.hl_color
@@ -9172,19 +9343,22 @@ class PDFCanvas(Gtk.DrawingArea):
         self._draw_group += 1
         group = self._draw_group
         committed = False
-        pt = self._page_text()
-        for seg in segments:
-            x0, y0, x1, y1 = pt.band(seg)      # exactly what the selection painted
-            ymid = 0.5 * (y0 + y1)
-            stroke = {
-                "pts": [(x0, ymid), (x1, ymid)],
-                "color": color,
-                "width": max(y1 - y0, 1.0),   # span the line height
-                "opacity": opacity,
-            }
-            self.strokes.append(stroke)
-            self._undo_stack.append(("draw", self.current_page_idx, stroke, group))
-            committed = True
+        # every page the selection reaches (row 214), one undo for all of it
+        for page_no, segments in per_page:
+            pt = self._page_text_of(page_no)
+            strokes = self.all_strokes.setdefault(page_no, [])
+            for seg in segments:
+                x0, y0, x1, y1 = pt.band(seg)  # exactly what the selection painted
+                ymid = 0.5 * (y0 + y1)
+                stroke = {
+                    "pts": [(x0, ymid), (x1, ymid)],
+                    "color": color,
+                    "width": max(y1 - y0, 1.0),   # span the line height
+                    "opacity": opacity,
+                }
+                strokes.append(stroke)
+                self._undo_stack.append(("draw", page_no, stroke, group))
+                committed = True
         if committed:
             self._redo_stack.clear()
             if self.on_change:
@@ -9197,9 +9371,6 @@ class PDFCanvas(Gtk.DrawingArea):
         self.queue_draw()   # highlight stays; copy on Ctrl+C
 
     # ── the context menu (row 201) ───────────────────────────────────────────
-
-    def has_text_selection(self):
-        return bool(self._text_segments)
 
     def highlight_text_selection(self):
         """The menu's Highlight: the same ink the text-marking highlighter
@@ -9235,9 +9406,13 @@ class PDFCanvas(Gtk.DrawingArea):
             self._ctx_popover.present()
 
     def copy_text_selection(self):
-        text = self._page_text().text(self._text_segments,
-                                      keep_lines=self._sel_range is None)
+        # in page order, each page's part read as that page reads (row 214)
+        text = "\n".join(
+            t for t in (self._page_text_of(pno).text(
+                segs, keep_lines=self._sel_keep_lines)
+                for pno, segs in self._selection_by_page()) if t)
         self._text_segments = []
+        self._other_segments = {}
         self._sel_range = None
         self.queue_draw()
         if text:
@@ -11473,16 +11648,18 @@ class PDFCanvas(Gtk.DrawingArea):
             # and a duplicate of a mixed selection is strokes AND images
             # sharing one; collapse them into a single undo, like an erase
             # gesture
+            # — and a highlight or stroke reaching across pages of the
+            # continuous strip (row 214) shares one over several pages: a
+            # group number is unique, so each op goes back on its OWN page
             if len(op) > 3:
                 group = op[3]
                 while (self._undo_stack
                        and self._undo_stack[-1][0] in ("draw", "add_images")
-                       and self._undo_stack[-1][1] == page
                        and len(self._undo_stack[-1]) > 3
                        and self._undo_stack[-1][3] == group):
                     op = self._undo_stack.pop()
                     popped.append(op)
-                    self._undo_add_op(page, op)
+                    self._undo_add_op(op[1], op)
         elif op[0] == "import_images":
             # an import moved pixels between two places that both draw them;
             # putting it back means BOTH halves, or the page shows it twice
@@ -11546,9 +11723,10 @@ class PDFCanvas(Gtk.DrawingArea):
         ops = self._redo_stack.pop()
         page = ops[0][1]
         if ops[0][0] in ("draw", "add_images"):
-            # re-add in chronological order (reverse of the pop order)
+            # re-add in chronological order (reverse of the pop order), each
+            # on its own page (a group may span the strip's pages, row 214)
             for op in reversed(ops):
-                self._redo_add_op(page, op)
+                self._redo_add_op(op[1], op)
         elif ops[0][0] == "reshape":
             for st, _old, new_pts in ops[0][2]:
                 st["pts"] = list(new_pts)

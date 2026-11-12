@@ -1304,6 +1304,83 @@ class TestContinuousScroll(unittest.TestCase):
         c._draw(None, cairo.Context(surf), 800, 600)
         self.assertTrue(c._strip_cache)       # a neighbour was rendered
 
+    def _text_pdf(self):
+        """Three pages, each with two lines of text near its top and bottom."""
+        doc = fitz.open()
+        for n in range(3):
+            page = doc.new_page(width=595, height=842)
+            page.insert_text((72, 100), f"top line of page {n} alpha{n}",
+                             fontsize=12)
+            page.insert_text((72, 800), f"bottom line of page {n} omega{n}",
+                             fontsize=12)
+        path = os.path.join(self._tmp.name, "text.pdf")
+        doc.save(path)
+        c = PDFCanvas()
+        c.load(path)
+        c._fit_page(800, 600)
+        c._is_fitted = False
+        return c
+
+    @staticmethod
+    def _gesture(button=1, start=(0.0, 0.0)):
+        g = mock.Mock()
+        g.get_current_button.return_value = button
+        g.get_current_event.return_value = None
+        g.get_current_event_state.return_value = Gdk.ModifierType(0)
+        g.get_start_point.return_value = (True, *start)
+        return g
+
+    def test_text_can_be_marked_across_pages(self):
+        """Row 214: a text drag from one page onto the next selects the rest
+        of the first and the start of the next — copied in order, and
+        highlighted on both pages with one undo."""
+        c = self._text_pdf()
+        c.tool = "text"
+        self.addCleanup(setattr, c, "tool", "pen")
+        sx, sy = c._pdf_to_screen(72, 795)            # "bottom line" of page 0
+        g = self._gesture()
+        c._on_drag_begin(g, sx, sy)
+        _i, x1, y1, _w, _h = c._strip_layout()[1]
+        tx, ty = x1 + 200 * c.scale, y1 + 97 * c.scale  # into page 1's top line
+        c._update_text_select(tx, ty)
+        self.assertTrue(c._text_segments)
+        self.assertIn(1, c._other_segments)
+        text = (c._page_text().text(c._text_segments) + " "
+                + c._page_text_of(1).text(c._other_segments[1]))
+        self.assertIn("omega0", text)
+        self.assertIn("top line", text)
+        self.assertNotIn("alpha0", text)
+        # the hand-over to the next page keeps the whole selection
+        c._switch_current(1)
+        self.assertTrue(c._text_segments)
+        self.assertIn(0, c._other_segments)
+        c._commit_text_highlight()
+        self.assertTrue(c.all_strokes.get(0))
+        self.assertTrue(c.all_strokes.get(1))
+        c.undo_last()
+        self.assertFalse(c.all_strokes.get(0))
+        self.assertFalse(c.all_strokes.get(1))
+
+    def test_a_stroke_drawn_across_pages_is_split_between_them(self):
+        """Row 214: each page keeps its part, cut at the page edges, and one
+        undo takes the whole stroke."""
+        c = self.c
+        page_h = c.page_height * c.scale
+        sx = c.offset_x + 100
+        y0 = c.offset_y + page_h - 40              # near page 0's foot
+        g = self._gesture(start=(sx, y0))
+        c._on_drag_begin(g, sx, y0)
+        for dy in range(0, 100, 5):                # down, across the gap
+            c._on_drag_update(g, 0, dy)
+        c._on_drag_end(g, 0, 95)
+        on0, on1 = c.all_strokes.get(0, []), c.all_strokes.get(1, [])
+        self.assertEqual((len(on0), len(on1)), (1, 1))
+        self.assertAlmostEqual(on0[0]["pts"][-1][1], c.page_height, delta=0.5)
+        self.assertAlmostEqual(on1[0]["pts"][0][1], 0.0, delta=0.5)
+        c.undo_last()
+        self.assertEqual((c.all_strokes.get(0, []), c.all_strokes.get(1, [])),
+                         ([], []))
+
     def test_never_on_the_projector_nor_while_presenting(self):
         c = self.c
         self.assertTrue(c._continuous())

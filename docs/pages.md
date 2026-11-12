@@ -193,6 +193,15 @@
   (`interactive=False`) and while presenting. A new tool needs no strip code
   — only a new per-page DRAWING does (anchors are not drawn on the other
   pages yet).
+  - **Across pages (row 214)**: a text drag that leaves its page selects on
+    (`_select_across`): the current page keeps `_text_segments`, the others
+    sit in `_other_segments` {page: segments} — every place that clears a
+    selection clears both, and `_switch_current` CARRIES them over (the hand-
+    over must not drop what you marked). Copy and Highlight walk
+    `_selection_by_page`. A pen stroke drawn across pages is cut at each page
+    edge it crosses (`_split_across_pages`) into per-page strokes sharing a
+    draw GROUP — undo/redo collapse a group across pages, each op on its own
+    page.
 
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a
