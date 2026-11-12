@@ -4234,7 +4234,7 @@ def link_preview_clip(page, to, kind=None, layout=None, max_h=None):
     margin = min((r[0] for r in body), default=col[0])
     first, first_d, best = None, None, None
     for r in rows:
-        if r[3] < ty - 2:
+        if r[3] < ty - 0.5:      # a row ENDING above the point is not it
             continue
         d = max(0.0, r[1] - ty)     # 0 when the point is on the row
         # line boxes may overlap a little: on two at once, the nearer centre

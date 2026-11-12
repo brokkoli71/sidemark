@@ -457,6 +457,21 @@ class TestLinkPreview(unittest.TestCase):
                 mid = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
                 self.assertFalse(clip.contains(mid), word)
 
+    def test_an_anchor_in_the_gap_belongs_to_the_entry_below(self):
+        """An F12 capture: [3]'s anchor sat in the gap, 1.7 pt below [2]'s
+        last line and 3 pt above its own — and [3] was shown as [2]. A row
+        that ENDS above the point is never the target."""
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((106, 131), "[2] Johnnie Gray and Stefanos Kourtis.",
+                         fontsize=9)
+        page.insert_text((106, 146), "[3] Pietro Silvi, Ferdinand Tschirsich.",
+                         fontsize=9)
+        last_of_2 = page.search_for("Kourtis")[0].y1
+        clip = sidemark.link_preview_clip(page, (101, last_of_2 + 1.7), "cite")
+        self.assertIn("Silvi", page.get_textbox(clip))
+        self.assertNotIn("Kourtis", page.get_textbox(clip))
+
     def test_an_equation_ends_where_the_body_text_resumes(self):
         doc, page = self._two_column_page()
         for y in range(60, 300, 12):
