@@ -685,6 +685,63 @@ class TestLinkPreview(unittest.TestCase):
         ibox = next(b for b, k, _r in c._info_icons if k[1] == "cite.R")
         self.assertGreaterEqual(ibox[0], rbox[0] + rbox[2])    # i outside it
 
+    def test_an_entrys_text_comes_from_the_page_layout(self):
+        c = self.c
+        page = c.document[1]
+        layout = sidemark.page_layout(page)
+        region = dict((k, r) for r, k in c._targets_on_page(1))[("n", "cite.b")]
+        text = sidemark.region_text(layout[0], region)
+        self.assertIn("bravoword", text)
+        self.assertNotIn("alphaword", text)
+        self.assertNotIn("Charlie", text)
+
+    def test_a_reference_page_is_prepared_in_small_steps(self):
+        """Row 212: drawing a page whose badges are not ready works nothing
+        out on the spot; the page is prepared in pieces from idle callbacks
+        (at least one per entry), and its badges appear once done."""
+        c = self.c
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800))
+        clips = []
+        real = sidemark.link_preview_clip
+        with mock.patch.object(sidemark, "link_preview_clip",
+                               lambda *a, **k: clips.append(1) or real(*a, **k)):
+            c._draw_backlink_icons(ctx)            # schedules, draws nothing
+            self.assertEqual(clips, [])
+            self.assertEqual(c._backlink_icons, [])
+            steps = 0
+            deadline = time.time() + 5
+            while 1 not in c._targets_cache and time.time() < deadline:
+                if GLib.MainContext.default().iteration(False):
+                    steps += 1
+        self.assertIn(1, c._targets_cache)
+        self.assertGreaterEqual(steps, len(c._targets_cache[1]))
+        c._draw_backlink_icons(ctx)
+        self.assertTrue(c._backlink_icons)
+
+    def test_the_steps_add_up_to_the_same_answer(self):
+        c = self.c
+        targets = c._page_targets(1)
+        one_go = sidemark.page_badge_data(c.document[1], targets)
+        steps = sidemark.page_badge_steps(c.document[1], targets)
+        n = 0
+        while True:
+            try:
+                next(steps)
+                n += 1
+            except StopIteration as done:
+                pieced = done.value
+                break
+        self.assertGreater(n, len(targets))       # lines, art, each entry
+        self.assertEqual(pieced[0], one_go[0])
+        self.assertEqual(pieced[2], one_go[2])
+
+    def test_a_late_answer_for_another_document_is_dropped(self):
+        c = self.c
+        c._badges_done(("not", "this document"), 1, ([], {}, None, None))
+        self.assertNotIn(1, c._targets_cache)
+
     def test_no_icons_on_the_projector_or_while_presenting(self):
         c = self.c
         c._interactive = False

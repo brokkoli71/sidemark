@@ -4147,20 +4147,28 @@ def page_layout(page):
     bounds of every path/image drawn (the bounds log is cheap, unlike
     get_drawings on a dense plot). A fill covering most of the page is a
     background, not content, and is left out."""
-    pr = page.rect
+    return page_lines(page), page_art(page)
+
+
+def page_lines(page):
+    """`page_layout`'s text half: (x0, y0, x1, y1, text) per line."""
     lines = [(*ln["bbox"],
               "".join(sp.get("text", "") for sp in ln.get("spans", ())))
              for b in page.get_text("dict").get("blocks", ())
              if b.get("type") == 0
              for ln in b.get("lines", ())]
-    lines = [ln for ln in lines if ln[4].strip()]
+    return [ln for ln in lines if ln[4].strip()]
+
+
+def page_art(page):
+    """`page_layout`'s graphics half: the bounds of every path / image."""
+    pr = page.rect
     try:
         art = [fitz.Rect(r) for t, r in page.get_bboxlog()
                if t.endswith(("path", "image", "imgmask"))]
     except Exception:
         art = []
-    art = [r for r in art if r.height < 0.8 * pr.height and not r.is_empty]
-    return lines, art
+    return [r for r in art if r.height < 0.8 * pr.height and not r.is_empty]
 
 
 def snap_to_device(x, y, origin, scale):
@@ -4727,6 +4735,7 @@ class ZoteroLibrary:
         self._items = None
         self._stamp = None
         self._copy_dir = None
+        self._lock = threading.RLock()
 
     @staticmethod
     def find_for(pdf_path):
@@ -4783,6 +4792,10 @@ class ZoteroLibrary:
         """Every regular item: {key, title, creators, year, venue, abstract,
         doi, arxiv, volume, first_page, pdf, select_uri}. Re-read when the
         database file changes."""
+        with self._lock:          # the badge worker matches on its own thread
+            return self._items_locked()
+
+    def _items_locked(self):
         stamp = self._db_stamp()
         if self._items is not None and stamp == self._stamp:
             return self._items
@@ -5152,6 +5165,78 @@ def add_to_zotero(info, uri, post=_connector_post, get=_http_get_bytes,
         logger.warning(f"add to zotero: saveAttachment {status}: {text[:300]}")
         return True, "Added to Zotero (without the PDF)"
     return True, "Added to Zotero with its PDF"
+
+
+def region_text(lines, rect):
+    """The text of `page_layout` lines whose middle is inside `rect`, top to
+    bottom — an entry's words, without extracting the page again. (MuPDF's
+    get_textbox walks every character of the page per call: 25 entries cost
+    a second; this costs a millisecond.)"""
+    inside = [ln for ln in lines
+              if rect.contains(fitz.Point((ln[0] + ln[2]) / 2,
+                                          (ln[1] + ln[3]) / 2))]
+    inside.sort(key=lambda ln: (round(ln[1]), ln[0]))
+    return "\n".join(ln[4] for ln in inside)
+
+
+def page_badge_steps(page, page_targets, zotero=None, layout=None):
+    """Everything a page's badges need (row 212), as a GENERATOR that yields
+    between pieces — the text lines, the graphics, one entry at a time —
+    and returns ([(region, key)], {key: Zotero item}, the column gutter, the
+    layout). Run piecewise from idle callbacks it never holds the main loop
+    for long; a reference page is otherwise up to a second in one block, and
+    a thread does not help: MuPDF holds Python's GIL through its calls.
+    `page_targets`: [(key, point, kind)]. A citation's region is its WHOLE
+    entry: the Zotero match reads it, and a long author list hides the DOI
+    at its end."""
+    if layout is None:
+        lines = page_lines(page)
+        yield
+        # graphics only matter for a figure or table above / below its
+        # caption; a bibliography page skips them — on a page of dense plots
+        # that one MuPDF call alone takes a third of a second
+        art = ([] if all(kind == "cite" for _k, _to, kind in page_targets)
+               else page_art(page))
+        yield
+        layout = (lines, art)
+    found = []
+    for key, to, kind in page_targets:
+        try:
+            clip = link_preview_clip(
+                page, to, kind, layout,
+                max_h=page.rect.height if kind == "cite" else None)
+        except Exception:
+            clip = None
+        if clip is not None and not clip.is_empty:
+            found.append((clip, key, kind))
+        yield
+    hits = {}
+    if zotero is not None:
+        uris = [l for l in page.get_links() if l.get("kind") == fitz.LINK_URI]
+        for region, key, kind in found:
+            if kind != "cite":
+                continue
+            try:
+                item = zotero.match(
+                    region_text(layout[0], region),
+                    [l.get("uri") for l in uris
+                     if link_inside(l["from"], region)])
+            except Exception:
+                item = None
+            if item is not None:
+                hits[key] = item
+    return ([(r, k) for r, k, _kind in found], hits,
+            _page_gutter(layout[0], page.rect), layout)
+
+
+def page_badge_data(page, page_targets, zotero=None, layout=None):
+    """`page_badge_steps` run to the end, in one go."""
+    steps = page_badge_steps(page, page_targets, zotero, layout)
+    while True:
+        try:
+            next(steps)
+        except StopIteration as done:
+            return done.value
 
 
 def link_inside(rect, region):
@@ -5660,6 +5745,9 @@ class PDFCanvas(Gtk.DrawingArea):
         self._backlink_icons = []      # [(screen box, key, region)] as drawn
         self._zotero_icons = []        # [(screen box, item, key, region)] drawn
         self._gutters = {}             # page -> its column gutter, or None
+        self._badge_worker = None      # the document the badge queue serves
+        self._badge_queue = []         # pages still to prepare, next first
+        self._badge_job = None         # the generator working through it
         self._info_icons = []          # [(screen box, key, region)]: the "i"s
         self._zotero_targets = {}      # page -> {target key: Zotero item}
         self._zotero_checked = 0.0     # when the library was last stat'ed
@@ -9110,7 +9198,8 @@ class PDFCanvas(Gtk.DrawingArea):
                 uris = [l.get("uri") for l in page.get_links()
                         if l.get("kind") == fitz.LINK_URI
                         and link_inside(l["from"], entry)]
-                zot = self._zotero_match(page.get_textbox(entry), uris)
+                zot = self._zotero_match(
+                    region_text(layout[0], entry), uris)
             if zot is not None:
                 self._set_zotero_reference(zot)   # local: no lookup needed
             elif uri and reference_preview_enabled():
@@ -9296,33 +9385,30 @@ class PDFCanvas(Gtk.DrawingArea):
         k = self._link_key(link)
         return self._backlink_index()[0].get(k, []) if k else []
 
+    def _page_targets(self, page_no):
+        """[(key, point, kind)] of everything some link points at on a page."""
+        return [(k, to, kind) for k, (dest, to, kind)
+                in self._backlink_index()[1].items()
+                if dest == page_no and to is not None]
+
+    def _store_badges(self, page_no, data):
+        regions, hits, gutter, layout = data
+        self._targets_cache[page_no] = regions
+        self._zotero_targets[page_no] = hits
+        self._gutters[page_no] = gutter
+        self._layout_cache.setdefault(page_no, layout)
+
     def _targets_on_page(self, page_no):
         """[(region, key)] — every place on `page_no` some link points at, as
-        the strip its preview would show (`link_preview_clip`), so a
-        bibliography entry's icon sits at the entry its citations name."""
-        sources, targets = self._backlink_index()
-        if page_no in self._targets_cache:
-            return self._targets_cache[page_no]
-        found = []
-        layout = None
-        for k, (dest_page, to, kind) in targets.items():
-            if dest_page != page_no or to is None:
-                continue
-            if layout is None:
-                layout = self._page_layout(page_no)
-            try:
-                # a citation's region is its WHOLE entry — the Zotero match
-                # reads it, and a long author list hides the DOI at its end
-                clip = link_preview_clip(
-                    self.document[page_no], to, kind, layout,
-                    max_h=self.document[page_no].rect.height
-                    if kind == "cite" else None)
-            except Exception:
-                continue
-            if not clip.is_empty:
-                found.append((clip, k))
-        self._targets_cache[page_no] = found
-        return found
+        the strip its preview would show, so a bibliography entry's icon sits
+        at the entry its citations name. Computed HERE only when asked for
+        directly; the badges get theirs from the worker (row 212)."""
+        self._backlink_index()
+        if page_no not in self._targets_cache:
+            self._store_badges(page_no, page_badge_data(
+                self.document[page_no], self._page_targets(page_no),
+                self._zotero(), self._page_layout(page_no)))
+        return self._targets_cache[page_no]
 
     def _link_snippet(self, page_no, rect):
         """The words around a citation in READING order, across line breaks:
@@ -9363,33 +9449,113 @@ class PDFCanvas(Gtk.DrawingArea):
                 and not self.stack_preview)
 
     def _prepare_targets(self):
-        """Idle: find this page's targets once, then draw their icons — the
-        first time costs tens of ms, which a draw must not."""
+        """This page's badges, computed right here — the fallback when the
+        worker cannot (an edited document no longer matches its file), and
+        what tests call."""
         self._targets_idle_id = None
         if self.document is not None and self.page is not None:
             pno = self.current_page_idx
             try:
-                targets = self._targets_on_page(pno)
+                self._targets_cache.pop(pno, None)
+                self._targets_on_page(pno)
             except Exception:
                 logger.error("backlink targets:\n" + traceback.format_exc())
-                self._targets_cache[pno] = targets = []
-            # which cited entries on this page are in your Zotero library
-            # (row 205) — once per page, beside the targets themselves
-            hits = {}
-            if self._zotero() is not None:
-                page = self.document[pno]
-                kinds = self._backlinks[1]
-                links = [l for l in page.get_links()
-                         if l.get("kind") == fitz.LINK_URI]
-                for region, key in targets:
-                    if kinds.get(key, (None, None, None))[2] != "cite":
-                        continue
-                    uris = [l.get("uri") for l in links
-                            if link_inside(l["from"], region)]
-                    item = self._zotero_match(page.get_textbox(region), uris)
-                    if item is not None:
-                        hits[key] = item
-            self._zotero_targets[pno] = hits
+                self._store_badges(pno, ([], {}, None,
+                                         self._page_layout(pno)))
+            self.queue_draw()
+        return False
+
+    def _index_then_badges(self):
+        """Idle: the link index (one get_links a page, ~25 ms for a paper),
+        then the worker for the badges."""
+        self._targets_idle_id = None
+        if self.document is None:
+            return False
+        self._backlink_index()
+        if not self._start_badge_worker():
+            self._targets_idle_id = GLib.idle_add(self._prepare_targets)
+        self.queue_draw()
+        return False
+
+    def _rematch_zotero(self, page_no):
+        """The library changed: re-match this page's cited entries against it
+        — cheap, from the regions and layout already in hand."""
+        lib = self._zotero()
+        kinds = self._backlinks[1]
+        page = self.document[page_no]
+        lines = self._page_layout(page_no)[0]
+        uris = [l for l in page.get_links() if l.get("kind") == fitz.LINK_URI]
+        hits = {}
+        for region, key in self._targets_cache.get(page_no, []):
+            if lib is None or kinds.get(key, (None, None, None))[2] != "cite":
+                continue
+            item = self._zotero_match(region_text(lines, region),
+                                      [l.get("uri") for l in uris
+                                       if link_inside(l["from"], region)])
+            if item is not None:
+                hits[key] = item
+        self._zotero_targets[page_no] = hits
+
+    def _start_badge_worker(self):
+        """Prepare badges piece by piece from idle callbacks (row 212;
+        `page_badge_steps`), from a QUEUE: the page you are on goes to its
+        front, and the pages citations point at (the bibliography) are queued
+        ahead of time, nearest first, so they are ready before you reach
+        them. A page of referenced figures or equations is done only when
+        visited: its text or graphics can take a third of a second in ONE
+        MuPDF call, which must not stall the page you are reading. No step
+        holds the main loop for more than one such call; a new document (or
+        page count) abandons the queue."""
+        gen = (id(self.document), self.n_pages)
+        here = self.current_page_idx
+        if self._badge_worker != gen:
+            self._badge_worker = gen
+            cited = {dest for dest, to, kind
+                     in self._backlink_index()[1].values()
+                     if to is not None and dest >= 0 and kind == "cite"}
+            self._badge_queue = sorted(cited, key=lambda p: abs(p - here))
+            self._badge_job = None
+        if here not in self._targets_cache:
+            if here in self._badge_queue:
+                self._badge_queue.remove(here)
+            self._badge_queue.insert(0, here)
+        if self._badge_job is None:
+            self._badge_job = self._badge_steps(gen)
+            GLib.idle_add(self._badge_step, gen)
+        return True
+
+    def _badge_steps(self, gen):
+        lib = self._zotero()
+        while self._badge_queue:
+            pno = self._badge_queue.pop(0)
+            if pno in self._targets_cache:
+                continue
+            data = yield from page_badge_steps(
+                self.document[pno], self._page_targets(pno), lib)
+            self._badges_done(gen, pno, data)
+            yield
+
+    def _badge_step(self, gen):
+        if self._badge_worker != gen or gen != (id(self.document), self.n_pages):
+            return False
+        try:
+            next(self._badge_job)
+        except StopIteration:
+            self._badge_job = None
+            return False
+        except Exception:
+            logger.warning("badges", exc_info=True)
+            self._badge_job = None
+            return False
+        return True
+
+    def _badges_done(self, gen, pno, data):
+        if gen != (id(self.document), self.n_pages) or self.document is None:
+            return False
+        if data[3] is None:
+            data = (data[0], data[1], data[2], self._page_layout(pno))
+        self._store_badges(pno, data)
+        if pno == self.current_page_idx:
             self.queue_draw()
         return False
 
@@ -9981,11 +10147,18 @@ class PDFCanvas(Gtk.DrawingArea):
             self._zotero_checked = now
             if lib.changed():
                 self._zotero_targets = {}
-        if self._backlinks_key != (id(self.document), self.n_pages) \
-                or pno not in self._targets_cache \
-                or pno not in self._zotero_targets:
-            if self._targets_idle_id is None:
-                self._targets_idle_id = GLib.idle_add(self._prepare_targets)
+        if pno in self._targets_cache and pno not in self._zotero_targets:
+            self._rematch_zotero(pno)         # the library changed: cheap
+        if (self._backlinks_key != (id(self.document), self.n_pages)
+                or pno not in self._targets_cache):
+            # never on this thread: a reference page costs up to a second
+            # to work out — the worker does it (row 212)
+            if self._backlinks_key != (id(self.document), self.n_pages):
+                if self._targets_idle_id is None:
+                    self._targets_idle_id = GLib.idle_add(self._index_then_badges)
+            elif not self._start_badge_worker():
+                if self._targets_idle_id is None:
+                    self._targets_idle_id = GLib.idle_add(self._prepare_targets)
             return
         sources = self._backlinks[0]
         ar, ag, ab = self.zoom_accent

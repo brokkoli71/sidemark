@@ -92,8 +92,17 @@
   every target on the page with sources wears a faint "↩ n" icon in the
   margin beside its column — left of a left-column entry, RIGHT of a
   right-column one (`_gutters`, `_page_gutter`), never in the gutter
-  (`_draw_backlink_icons`; regions from `_targets_on_page`, found on an IDLE
-  the first time — tens of ms a draw must not spend). Clicking it pins the
+  (`_draw_backlink_icons`). **Never worked out in a draw** (row 212): a
+  draw only reads `_targets_cache`; what is missing is QUEUED
+  (`_start_badge_worker`) and prepared piece by piece from idle callbacks
+  by the generator `page_badge_steps` — text lines, graphics, one entry at a
+  time. The bibliography (pages citations point at) is queued ahead of
+  time; the page you are on goes first; a figure/equation page is done only
+  when visited, and a bibliography page skips the graphics read. NOT a
+  thread: MuPDF holds the GIL through its calls, and a worker thread made
+  every draw wait up to a second for it. An entry's text comes from the
+  cached lines (`region_text`), never `get_textbox` (it walks the whole
+  page per call: 25 entries were a second). Clicking it pins the
   list; a row jumps via `follow_goto` (a history step) and flashes the
   citation. No icons on the projector canvas (`interactive=False`), while
   presenting, or with Settings → Reference badges off (`PDFCanvas.show_badges`,
