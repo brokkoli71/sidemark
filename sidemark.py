@@ -4972,16 +4972,18 @@ class ZoteroLibrary:
     @staticmethod
     def select_uri(item, selected=None, reading=None):
         """Where "Show in Zotero" opens `item`: in a COLLECTION it is in —
-        the one selected in Zotero right now (`selected`, a collectionID)
-        if it is there, else one it shares with the paper you are reading,
-        else its first — and only failing all that, the whole library."""
+        one it shares with the paper you are READING first (that is the
+        project you are in), else the one selected in Zotero right now
+        (`selected`, a collectionID), else its first — and only failing all
+        that, the whole library."""
         colls = item.get("collections") or []
         if not colls:
             return item["select_uri"]
         ids = [cid for cid, _k in colls]
         mine = {cid for cid, _k in (reading or {}).get("collections") or []}
-        pick = (selected if selected in ids else
-                next((cid for cid in ids if cid in mine), ids[0]))
+        shared = next((cid for cid in ids if cid in mine), None)
+        pick = (shared if shared is not None else
+                selected if selected in ids else ids[0])
         ckey = dict(colls)[pick]
         return (f"zotero://select/{item['lib_part']}/collections/{ckey}"
                 f"/items/{item['key']}")
@@ -5093,7 +5095,35 @@ def zotero_item_from_reference(info, uri):
     return item, pdf
 
 
-def add_to_zotero(info, uri, post=_connector_post, get=_http_get_bytes):
+def find_open_pdf(uri, lookup=None):
+    """A free PDF of the paper behind `uri`, or None: arXiv's for an arXiv
+    id; for a DOI, the open-access copy Semantic Scholar knows of, or the
+    arXiv version it links. What Zotero's "Find Available PDF" would do
+    for a DOI, done for it (row 209)."""
+    from urllib.parse import quote
+    kind = classify_reference_url(uri)
+    if kind is None:
+        return None
+    if kind[0] == "arxiv":
+        return f"https://arxiv.org/pdf/{kind[1]}"
+    if kind[0] != "doi":
+        return None
+    res = (lookup or _http_get)(
+        "https://api.semanticscholar.org/graph/v1/paper/DOI:"
+        + quote(kind[1], safe="/") + "?fields=openAccessPdf,externalIds")
+    try:
+        data = json.loads(res[1]) if res else {}
+    except ValueError:
+        return None
+    url = ((data.get("openAccessPdf") or {}).get("url") or "").strip()
+    if url:
+        return url
+    arxiv = (data.get("externalIds") or {}).get("ArXiv")
+    return f"https://arxiv.org/pdf/{arxiv}" if arxiv else None
+
+
+def add_to_zotero(info, uri, post=_connector_post, get=_http_get_bytes,
+                  lookup=None):
     """Save the paper to Zotero. Returns (ok, what to tell the user)."""
     import uuid
     item, pdf_url = zotero_item_from_reference(info, uri)
@@ -5107,9 +5137,12 @@ def add_to_zotero(info, uri, post=_connector_post, get=_http_get_bytes):
         logger.warning(f"add to zotero: saveItems {status}: {text[:300]}")
         return False, "Zotero refused it"
     if not pdf_url:
-        return True, "Added to Zotero"
+        pdf_url = find_open_pdf(uri, lookup)
+    if not pdf_url:
+        return True, "Added to Zotero (no free PDF found)"
     data = get(pdf_url)
-    if data is None:
+    if data is None or not data.lstrip()[:5].startswith(b"%PDF"):
+        # an "open access" link is sometimes a landing page, not the file
         return True, "Added to Zotero (without the PDF)"
     meta = {"sessionID": session, "parentItemID": item["id"],
             "title": "Full Text PDF", "url": pdf_url}
@@ -5625,7 +5658,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._card_hide_id = None      # the grace before a hover card goes
         self._targets_idle_id = None   # finding this page's targets, once
         self._backlink_icons = []      # [(screen box, key, region)] as drawn
-        self._zotero_icons = []        # [(screen box, Zotero item)] as drawn
+        self._zotero_icons = []        # [(screen box, item, key, region)] drawn
+        self._gutters = {}             # page -> its column gutter, or None
         self._info_icons = []          # [(screen box, key, region)]: the "i"s
         self._zotero_targets = {}      # page -> {target key: Zotero item}
         self._zotero_checked = 0.0     # when the library was last stat'ed
@@ -9111,10 +9145,10 @@ class PDFCanvas(Gtk.DrawingArea):
         return min(found)[1] if found else None
 
     def _show_in_zotero(self, item):
-        """Open the paper in Zotero IN A COLLECTION (row 211) — the one
-        selected there now if the paper is in it (Zotero's connector says
-        which; a local call, off the main loop), else one it shares with the
-        paper you are reading — not in the whole library."""
+        """Open the paper in Zotero IN A COLLECTION (row 211) — one it shares
+        with the paper you are reading, else the one selected in Zotero now
+        (its connector says which; a local call, off the main loop) — not in
+        the whole library."""
         lib = self._zotero()
         doc = getattr(self.document, "name", None)
 
@@ -9254,7 +9288,7 @@ class PDFCanvas(Gtk.DrawingArea):
                     lst.append((pno, r))
         self._backlinks = (sources, targets)
         self._backlinks_key = key
-        self._targets_cache, self._words_cache = {}, {}
+        self._targets_cache, self._words_cache, self._gutters = {}, {}, {}
         self._zotero_targets = {}
         return self._backlinks
 
@@ -9451,13 +9485,11 @@ class PDFCanvas(Gtk.DrawingArea):
                     self._card_action(action)
                     break
             return True
-        for (bx, by, bw, bh), item in self._zotero_icons:
+        for (bx, by, bw, bh), item, key, region in self._zotero_icons:
             if bx - 2 <= x <= bx + bw + 2 and by - 2 <= y <= by + bh + 2:
-                # the Z: straight to the paper — its PDF, else its entry
-                if item.get("pdf"):
-                    self._card_action(("open-file", item["pdf"]))
-                else:
-                    self._card_action(("open", item["select_uri"]))
+                # the Z: the paper's card, as hovering a citation shows it —
+                # its PDF and Zotero are one click further, on the card
+                self._open_info_card(key, region)
                 return True
         for (bx, by, bw, bh), key, region in self._info_icons:
             if bx - 2 <= x <= bx + bw + 2 and by - 2 <= y <= by + bh + 2:
@@ -9963,6 +9995,14 @@ class PDFCanvas(Gtk.DrawingArea):
         kinds = self._backlinks[1]
         self._zotero_icons = []
         self._info_icons = []
+        # badges go in the MARGIN beside their column: left of an entry in
+        # the left (or only) column, right of one in the right column, where
+        # the left side would be the gutter, crowding the other column's text
+        if pno not in self._gutters:
+            self._gutters[pno] = _page_gutter(self._page_layout(pno)[0],
+                                              self.document[pno].rect)
+        gutter = self._gutters[pno]
+        width = self.get_width() or 800
         for region, key in self._targets_cache[pno]:
             n = len(sources.get(key, ()))
             if not n:
@@ -9970,29 +10010,35 @@ class PDFCanvas(Gtk.DrawingArea):
             lay = self._card_text(ctx, f"↩ {n}", 60 * f, size=10.5)
             tw, th = lay.get_pixel_size()
             bw, bh = tw + 8 * f, th + 2 * f
+            right = gutter is not None and region.x0 > sum(gutter) / 2
             sx, sy = self._pdf_to_screen(region.x0, region.y0)
-            bx = max(2.0, sx - bw - 3 * f)
+            if right:
+                sx1, _sy = self._pdf_to_screen(region.x1, region.y0)
+                bx = min(width - bw - 2.0, sx1 + 3 * f)
+            else:
+                bx = max(2.0, sx - bw - 3 * f)
             by = sy + 1 * f
             box = (bx, by, bw, bh)
             self._backlink_icons.append((box, key, region))
-            if kinds.get(key, (None, None, None))[2] != "cite":
-                continue
-            # a cited entry: a small badge just left of the ↩ — the red Z when
-            # the paper is in your Zotero library (opens its PDF), else an "i"
-            # (shows the card hovering one of its citations would)
-            item = zot.get(key)
-            zs = bh
-            zbox = (max(2.0, bx - zs - 2 * f), by, zs, zs)
-            zhot = (zbox[0] <= self._hover_x <= zbox[0] + zbox[2]
-                    and zbox[1] <= self._hover_y <= zbox[1] + zbox[3]) \
-                or (self._link_preview or {}).get("info_key") == key
-            a = 1.0 if zhot else 0.55
-            if item is not None:
-                self._zotero_icons.append((zbox, item))
-                self._draw_letter_badge(ctx, zbox, "Z", self.ZOTERO_RED, a)
-            else:
-                self._info_icons.append((zbox, key, region))
-                self._draw_letter_badge(ctx, zbox, "i", (ar, ag, ab), a)
+            if kinds.get(key, (None, None, None))[2] == "cite":
+                # a cited entry: a small badge on the far side of the ↩ — the
+                # red Z when the paper is in your Zotero library, else an "i";
+                # either opens the card hovering a citation shows
+                item = zot.get(key)
+                zs = bh
+                zx = (min(width - zs - 2.0, bx + bw + 2 * f) if right
+                      else max(2.0, bx - zs - 2 * f))
+                zbox = (zx, by, zs, zs)
+                zhot = (zbox[0] <= self._hover_x <= zbox[0] + zbox[2]
+                        and zbox[1] <= self._hover_y <= zbox[1] + zbox[3]) \
+                    or (self._link_preview or {}).get("info_key") == key
+                za = 1.0 if zhot else 0.55
+                if item is not None:
+                    self._zotero_icons.append((zbox, item, key, region))
+                    self._draw_letter_badge(ctx, zbox, "Z", self.ZOTERO_RED, za)
+                else:
+                    self._info_icons.append((zbox, key, region))
+                    self._draw_letter_badge(ctx, zbox, "i", (ar, ag, ab), za)
             hot = (bx <= self._hover_x <= bx + bw
                    and by <= self._hover_y <= by + bh) or key == open_key
             a = 1.0 if hot else 0.55
@@ -23272,7 +23318,10 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         header.pack_start(start_scroll)
         header.pack_end(self._header_end)
 
-        self._set_tool_mode("pen")
+        # put up the chrome for the tool the SAVED table has on left — never a
+        # fixed "pen": that rebound left on every new window, and so undid
+        # your choice on every start and every Ctrl+R (row 203)
+        self._set_tool_mode(self.bindings.tool_for_chord("left") or "pen")
 
         # responsive collapse: each session's canvas fires ::resize on every
         # window resize (the HeaderBar does not) and is hooked in

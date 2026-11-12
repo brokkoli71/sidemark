@@ -89,7 +89,9 @@
   of a key shares it — else page + height) to every source link, built once
   per document on first use (~25 ms for a 22-page paper) and rebuilt when the
   page count changes. A link preview's footer says "Also cited on p. …";
-  every target on the page with sources wears a faint "↩ n" icon at its left
+  every target on the page with sources wears a faint "↩ n" icon in the
+  margin beside its column — left of a left-column entry, RIGHT of a
+  right-column one (`_gutters`, `_page_gutter`), never in the gutter
   (`_draw_backlink_icons`; regions from `_targets_on_page`, found on an IDLE
   the first time — tens of ms a draw must not spend). Clicking it pins the
   list; a row jumps via `follow_goto` (a history step) and flashes the
@@ -121,11 +123,11 @@
   edit a note (writing its database while it runs would be overwritten or
   corrupt it; only the zotero.org web API edits), so "Show in Zotero" is the
   way to change one. "Show in Zotero" opens the paper IN A COLLECTION
-  (`ZoteroLibrary.select_uri`): the one selected in Zotero now (asked of
-  its connector, `zotero_selected_collection`, off the main loop) if the
-  paper is in it, else one it shares with the paper being read
-  (`item_for_pdf`), else its first; an unfiled paper can only be shown in
-  the library.
+  (`ZoteroLibrary.select_uri`): one it shares with the paper being read
+  (`item_for_pdf` — the project you are in), else the one selected in
+  Zotero now (asked of its connector, `zotero_selected_collection`, off the
+  main loop), else its first; an unfiled paper can only be shown in the
+  library.
 - **A paper card is as few lines as say it (row 211)**: title (click: the
   paper), who/where/when, TL;DR, Zotero notes, ONE action row (`actions`
   segments laid out by `_layout_actions`: the Z badge, Abstract, PDF / Web,
@@ -139,7 +141,8 @@
   the document's window) and Show in Zotero (`zotero://select/…`). A cited
   entry in the library also wears a red "Z" left of its ↩ icon (matched once
   per page in `_prepare_targets`, `_zotero_targets`); clicking it opens the
-  PDF. Every OTHER cited entry wears an "i" there instead (never both):
+  card (the Z no longer opens the PDF straight away). Every OTHER cited
+  entry wears an "i" there instead (never both):
   `_open_info_card` builds the card a hovered citation shows
   (`_build_link_card`, with every citing page in its footer), pinned. It
   fakes the link as a GOTO already in page space plus a `_key` — as NAMED its

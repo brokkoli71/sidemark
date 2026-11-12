@@ -642,6 +642,49 @@ class TestLinkPreview(unittest.TestCase):
             self.assertEqual(self.c._info_icons, [])
             self.assertEqual(self.c._zotero_icons, [])
 
+    def test_a_right_column_entry_wears_its_badges_on_the_right(self):
+        """Two-column bibliography: the right column's badges go in the
+        right margin, not into the gutter against the left column's text."""
+        pdf = os.path.join(self._tmp.name, "twocol.pdf")
+        surf = cairo.PDFSurface(pdf, 595, 842)
+        ctx = cairo.Context(surf)
+        ctx.select_font_face("Sans")
+        ctx.set_font_size(9)
+        for i, name in enumerate(("cite.L", "cite.R")):
+            ctx.tag_begin(cairo.TAG_LINK, f"dest='{name}'")
+            ctx.move_to(100 + 40 * i, 110)
+            ctx.show_text(f"[{i + 1}]")
+            ctx.tag_end(cairo.TAG_LINK)
+        ctx.show_page()
+        for y in range(60, 400, 12):                 # body text, both columns
+            for x in (57, 310):
+                ctx.move_to(x, y)
+                ctx.show_text("lorem ipsum dolor sit amet consectetur adip")
+        ctx.tag_begin(cairo.TAG_DEST, "name='cite.L' x=50 y=432")
+        ctx.tag_end(cairo.TAG_DEST)
+        ctx.move_to(57, 440)
+        ctx.show_text("[1] Left Author, A left paper, 2020.")
+        ctx.tag_begin(cairo.TAG_DEST, "name='cite.R' x=305 y=432")
+        ctx.tag_end(cairo.TAG_DEST)
+        ctx.move_to(310, 440)
+        ctx.show_text("[2] Right Author, A right paper, 2021.")
+        ctx.show_page()
+        surf.finish()
+        c = PDFCanvas()
+        c.load(pdf)
+        c.go_to_page(1)
+        c.scale, c.offset_x, c.offset_y = 1.0, 0.0, 0.0
+        c._prepare_targets()
+        c._draw_backlink_icons(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 700, 900)))
+        icons = {k[1]: (box, region) for box, k, region in c._backlink_icons}
+        lbox, lreg = icons["cite.L"]
+        rbox, rreg = icons["cite.R"]
+        self.assertLessEqual(lbox[0] + lbox[2], lreg.x0)       # left of [1]
+        self.assertGreaterEqual(rbox[0], rreg.x1)              # right of [2]
+        ibox = next(b for b, k, _r in c._info_icons if k[1] == "cite.R")
+        self.assertGreaterEqual(ibox[0], rbox[0] + rbox[2])    # i outside it
+
     def test_no_icons_on_the_projector_or_while_presenting(self):
         c = self.c
         c._interactive = False
@@ -1273,6 +1316,11 @@ class TestToolsSurviveAReload(unittest.TestCase):
                 fresh = sidemark.Bindings.load()       # what a new process reads
                 self.assertEqual(fresh.tool_for_chord("left"), "lasso")
                 win2 = PDFEditorWindow(a)
+                # opening a window must not put the pen back on left (it
+                # did, on every start — so every Ctrl+R lost the tool)
+                self.assertEqual(win2.bindings.tool_for_chord("left"), "lasso")
+                self.assertEqual(
+                    sidemark.Bindings.load().tool_for_chord("left"), "lasso")
                 self.assertEqual(win2.canvas.select_style, "rect")
                 self.assertEqual(win2.canvas.highlight_style, "text")
             except Exception:
@@ -1670,7 +1718,7 @@ class TestZotero(unittest.TestCase):
         c._show_link_preview()
         self.assertEqual(c._link_preview["zotero"]["key"], "CHARL002")
 
-    def test_a_library_entry_wears_a_red_z_that_opens_its_pdf(self):
+    def test_a_library_entry_wears_a_red_z_that_opens_its_card(self):
         c = self._canvas(self.pdf)
         opened = []
         c.on_open_document = opened.append
@@ -1679,15 +1727,18 @@ class TestZotero(unittest.TestCase):
         c._prepare_targets()
         c._draw_backlink_icons(cairo.Context(
             cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 800)))
-        z = {item["key"]: box for box, item in c._zotero_icons}
+        z = {item["key"]: box for box, item, _k, _r in c._zotero_icons}
         self.assertIn("BRAVO001", z)                  # entry [2] is in Zotero
         self.assertEqual(len(z), 2)                   # [2] by title, [3] by arXiv
         # the one that is not wears the "i" instead — never both
         self.assertEqual([k for _b, k, _r in c._info_icons], [("n", "cite.a")])
         bx, by, bw, bh = z["BRAVO001"]
         self.assertTrue(c._card_press(bx + bw / 2, by + bh / 2))
-        self.assertEqual(len(opened), 1)
-        self.assertTrue(opened[0].endswith("Writer 2019.pdf"))
+        # the Z opens the card hovering a citation shows — not the PDF itself
+        self.assertEqual(opened, [])
+        card = c._link_preview
+        self.assertTrue(card["pinned"])
+        self.assertEqual(card["zotero"]["key"], "BRAVO001")
 
     def test_a_paper_just_added_shows_and_its_i_turns_into_a_z(self):
         """Zotero writes a new item to its write-ahead log first and keeps
@@ -1707,7 +1758,7 @@ class TestZotero(unittest.TestCase):
             c._prepare_targets()
             c._draw_backlink_icons(cairo.Context(surface))
             return ({k for _b, k, _r in c._info_icons},
-                    {i["key"] for _b, i in c._zotero_icons})
+                    {i["key"] for _b, i, _k, _r in c._zotero_icons})
         infos, zs = badges()
         self.assertIn(("n", "cite.a"), infos)          # [1] not in Zotero yet
         # "Zotero" adds [1] — the write stays in the WAL while it runs
@@ -1764,9 +1815,38 @@ class TestZotero(unittest.TestCase):
         ok, msg = sidemark.add_to_zotero(
             self.PAPER, "https://doi.org/10.1038/s41586-019-1666-5",
             post=lambda e, b, h: posts.append(e) or (201, ""),
-            get=lambda url: self.fail("no free PDF is known for a DOI"))
+            get=lambda url: self.fail("no free PDF is known"),
+            lookup=lambda url, accept=None: ("application/json", "{}"))
         self.assertTrue(ok)
         self.assertEqual(posts, ["saveItems"])
+        self.assertIn("no free PDF", msg)
+
+    def test_a_doi_papers_open_access_pdf_is_fetched_and_attached(self):
+        posts, asked = [], []
+
+        def lookup(url, accept=None):
+            asked.append(url)
+            return ("application/json", json.dumps({
+                "openAccessPdf": {"url": "https://example.org/oa.pdf"}}))
+        ok, msg = sidemark.add_to_zotero(
+            self.PAPER, "https://doi.org/10.1038/s41586-019-1666-5",
+            post=lambda e, b, h: posts.append(e) or (201, ""),
+            get=lambda url: b"%PDF-1.7 oa" if url.endswith("oa.pdf") else None,
+            lookup=lookup)
+        self.assertIn("DOI:10.1038/s41586-019-1666-5", asked[0])
+        self.assertEqual(posts, ["saveItems", "saveAttachment"])
+        self.assertIn("with its PDF", msg)
+
+    def test_an_open_access_link_to_a_landing_page_is_not_attached(self):
+        posts = []
+        ok, msg = sidemark.add_to_zotero(
+            self.PAPER, "https://doi.org/10.1234/x",
+            post=lambda e, b, h: posts.append(e) or (201, ""),
+            get=lambda url: b"<!DOCTYPE html><html>",
+            lookup=lambda url, accept=None: ("application/json", json.dumps(
+                {"externalIds": {"ArXiv": "2101.00001"}})))
+        self.assertEqual(posts, ["saveItems"])
+        self.assertIn("without the PDF", msg)
 
     def test_zotero_not_running_is_said_so(self):
         ok, msg = sidemark.add_to_zotero(
@@ -1853,6 +1933,10 @@ class TestZotero(unittest.TestCase):
                          "zotero://select/library/collections/MACOLLEC/items/K1")
         reading = {"collections": [(3, "MACOLLEC")]}
         self.assertEqual(u(item, selected=None, reading=reading),
+                         "zotero://select/library/collections/MACOLLEC/items/K1")
+        # the paper you are reading names the project: it outranks the
+        # selection in Zotero
+        self.assertEqual(u(item, selected=2, reading=reading),
                          "zotero://select/library/collections/MACOLLEC/items/K1")
         self.assertEqual(u(item), "zotero://select/library/collections/"
                                   "OTHERCOL/items/K1")
