@@ -14347,6 +14347,39 @@ def script_content(m):
     return m.group(2) if m.group(2) is not None else m.group(3)
 
 
+# What the notes EDITOR does to a whole line, for drawing another page's notes
+# the same way beside it (row 215): heading sizes are the editor's h1–h3 tag
+# scales, a task item shows its box glyph, a list keeps its dash.
+_BAND_HEADING_SCALE = {1: 150, 2: 125, 3: 110}
+
+
+def notes_band_markup(text):
+    """A page's notes as Pango markup laid out like the editor shows them:
+    `#`–`###` headings bold and larger, `- [ ]` / `- [x]` as ☐ / ☑, the rest
+    of each line through `_notes_to_pango_markup` (symbols, scripts, inline
+    emphasis). HTML comments are hidden, as the editor hides them."""
+    out = []
+    for line in text.split("\n"):
+        bare = re.sub(r"<!--.*?-->", "", line)
+        if bare.strip() == "" and line.strip() != "":
+            continue                     # a comment-only line is not there
+        line = bare
+        m = re.match(r"^(#{1,3}) +(.*)$", line)
+        if m:
+            pct = _BAND_HEADING_SCALE[len(m.group(1))]
+            weight = "bold" if len(m.group(1)) < 3 else "600"
+            out.append(f'<span size="{pct}%" weight="{weight}">'
+                       f"{_notes_to_pango_markup(m.group(2))}</span>")
+            continue
+        m = re.match(r"^([ \t]*)[-*+][ \t]+\[([ xX])\][ \t]+(.*)$", line)
+        if m:
+            box = "☑" if m.group(2) in "xX" else "☐"
+            out.append(f"{m.group(1)}{box} {_notes_to_pango_markup(m.group(3))}")
+            continue
+        out.append(_notes_to_pango_markup(line))
+    return "\n".join(out)
+
+
 def _notes_to_pango_markup(text):
     """One paragraph of notes source → Pango markup for callout rendering:
     \\commands become symbols, ^x/_x become super/subscripts, and **bold** /
@@ -30176,8 +30209,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                     lay.set_font_description(font)
                     lay.set_width(int(max(10, w - 2 * pad) * Pango.SCALE))
                     lay.set_wrap(Pango.WrapMode.WORD_CHAR)
-                    markup = "\n".join(_notes_to_pango_markup(line)
-                                        for line in text.split("\n"))
+                    markup = notes_band_markup(text)
                     try:
                         lay.set_markup(markup, -1)
                     except GLib.Error:

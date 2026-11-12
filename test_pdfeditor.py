@@ -1482,6 +1482,22 @@ class TestNotesBesideTheStrip(unittest.TestCase):
             self.assertEqual(calls, [1])           # once, after the frame
         self._run(body)
 
+    def test_other_pages_notes_are_laid_out_like_the_editor(self):
+        m = sidemark.notes_band_markup(
+            "# Title\n## Sub\n- [ ] milk\n- [x] done\n- item\n"
+            "<!-- page:3 -->\nx^2 & y")
+        lines = m.split("\n")
+        self.assertEqual(len(lines), 6)              # the comment line is gone
+        self.assertIn('size="150%"', lines[0])      # the editor's h1 scale
+        self.assertIn('size="125%"', lines[1])
+        self.assertTrue(lines[2].startswith("☐ "))
+        self.assertTrue(lines[3].startswith("☑ "))
+        self.assertTrue(lines[4].startswith("- "))
+        self.assertIn("&amp;", lines[5])             # still valid markup
+        lay = sidemark.PangoCairo.create_layout(cairo.Context(
+            cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10)))
+        lay.set_markup(m, -1)
+
     def test_without_the_strip_the_editor_fills_the_panel(self):
         def body(win):
             s = win._active_session
