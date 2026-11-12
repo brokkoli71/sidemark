@@ -1391,6 +1391,96 @@ class TestContinuousScroll(unittest.TestCase):
         self.assertFalse(c._continuous())
 
 
+class TestNotesBesideTheStrip(unittest.TestCase):
+    """Row 215: in the continuous strip the notes editor sits in the current
+    page's band and the other pages' notes in theirs — every page's notes
+    start level with the page."""
+
+    @staticmethod
+    def _settle(ms=300):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline:
+            ctx.iteration(False)
+
+    def _run(self, body):
+        # the window reads the switch from settings when it is built
+        sidemark._save_setting("continuous_scroll", True)
+        self.addCleanup(setattr, sidemark.PDFCanvas, "continuous", False)
+        TestSideButtons._run(self, body)
+
+    def test_the_editor_sits_level_with_its_page(self):
+        def body(win):
+            s = win._active_session
+            s.notes_model.set(1, "notes of the second page")
+            c = win.canvas
+            self._settle()
+            c.offset_y -= c.page_height * c.scale * 0.3   # page 2 comes up
+            c.queue_draw()
+            self._settle()
+            bands = s._note_bands_now
+            self.assertIsNotNone(bands)
+            cur = c.current_page_idx
+            top, h = bands[cur]
+            band = s._notes_stage.band
+            self.assertAlmostEqual(band[0], max(top, 0.0), delta=1)
+            # the band follows the page: its top is where the page's is,
+            # translated into the notes panel
+            at = c.translate_coordinates(s._notes_stage, 0, 0)
+            lay = {i: y for i, _x, y, _w, _h in c._strip_layout()}
+            self.assertAlmostEqual(bands[1][0], lay[1] + at[1], delta=0.5)
+            self.assertEqual(win._note_band_text(s, 1),
+                             "notes of the second page")
+        self._run(body)
+
+    def test_a_press_on_another_pages_notes_makes_it_current(self):
+        def body(win):
+            s = win._active_session
+            s.notes_model.set(1, "second page")
+            c = win.canvas
+            self._settle()
+            c.offset_y -= c.page_height * c.scale * 0.6
+            c.queue_draw()
+            self._settle()
+            bands = s._note_bands_now
+            other = next(i for i in bands if i != c.current_page_idx
+                         and bands[i][0] > 0)
+            top, h = bands[other]
+            win._on_note_bands_pressed(s, 20, top + min(h, 200) / 2)
+            self._settle(100)
+            self.assertEqual(c.current_page_idx, other)
+            self.assertEqual(s._notes_view.get_source_text().strip(),
+                             s.notes_model.get(other).strip())
+        self._run(body)
+
+    def test_the_notes_move_after_the_canvas_draws_never_during(self):
+        """Re-laying out the notes panel from inside the canvas' draw left it
+        unallocated for that frame — while scrolling, every frame: the notes
+        vanished. The canvas only QUEUES the move."""
+        def body(win):
+            s = win._active_session
+            c = win.canvas
+            self._settle()
+            calls = []
+            real = win._sync_note_bands
+            with mock.patch.object(win, "_sync_note_bands",
+                                   lambda sess: calls.append(1) or real(sess)):
+                c.on_strip_moved()                 # what a strip draw calls
+                self.assertEqual(calls, [])        # not now…
+                c.on_strip_moved()                 # …and coalesced
+                self._settle(100)
+            self.assertEqual(calls, [1])           # once, after the frame
+        self._run(body)
+
+    def test_without_the_strip_the_editor_fills_the_panel(self):
+        def body(win):
+            s = win._active_session
+            sidemark.PDFCanvas.continuous = False
+            win._sync_note_bands(s)
+            self.assertIsNone(s._notes_stage.band)
+        self._run(body)
+
+
 class TestZoomClickStepsBackOut(unittest.TestCase):
     """Row 202: after zoom-to-region, a plain click with the zoom tool takes
     back the latest zoom — nested ones one click at a time — until you have

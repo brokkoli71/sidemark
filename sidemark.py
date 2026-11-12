@@ -780,7 +780,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GtkSource", "5")
 from gi.repository import (Gtk, Adw, Gdk, GLib, Gio, GObject, GtkSource,
-                           Pango, PangoCairo, Graphene)
+                           Pango, PangoCairo, Graphene, Gsk)
 import cairo
 import fitz          # PyMuPDF
 import numpy as np
@@ -5756,6 +5756,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._strip_cache_key = None
         self._dims, self._dims_key = {}, None
         self.strip_pages = None        # callable -> pages of the strip
+        self.on_strip_moved = None     # callback() after a strip draw
+        self._strip_chosen = None      # the view when a page was CHOSEN
         self._strip_follow_id = None
         self._pressing = False         # a button is down on the canvas
         self._badge_queue = []         # pages still to prepare, next first
@@ -6495,9 +6497,12 @@ class PDFCanvas(Gtk.DrawingArea):
             if self._strip_cache_key != key:
                 self._strip_cache, self._strip_cache_key = {}, key
             self._draw_strip_others(ctx, width, height)
+            if self.on_strip_moved is not None:
+                self.on_strip_moved()        # the notes column follows (215)
             page_h = self.page_height * self.scale
             if (not (self.offset_y <= height / 2 <= self.offset_y + page_h)
-                    and self._strip_follow_id is None and not self._pressing):
+                    and self._strip_follow_id is None and not self._pressing
+                    and self._strip_chosen != self._view_key()):
                 self._strip_follow_id = GLib.idle_add(self._strip_follow)
 
         ctx.set_source_rgb(1, 1, 1)
@@ -7725,6 +7730,8 @@ class PDFCanvas(Gtk.DrawingArea):
         self._strip_follow_id = None
         if not self._continuous() or self._pressing or self.current_stroke:
             return False
+        if self._strip_chosen == self._view_key():
+            return False          # you chose this page and have not moved
         ch = self.get_height() or 600
         best, best_d = None, None
         for i, _x, y, _w, h in self._strip_layout():
@@ -7735,6 +7742,17 @@ class PDFCanvas(Gtk.DrawingArea):
         if best is not None and best != self.current_page_idx:
             self._switch_current(best)
         return False
+
+    def _view_key(self):
+        return (self.current_page_idx, round(self.offset_x, 1),
+                round(self.offset_y, 1), round(self.scale, 4))
+
+    def choose_strip_page(self, i):
+        """Make page `i` current BY CHOICE — a press on it, or on its notes
+        (row 215): it stays current, even off the middle of the view, until
+        the view moves; only then does the middle page take over again."""
+        self._switch_current(i)
+        self._strip_chosen = self._view_key()
 
     def _clamp_strip(self):
         """The strip's ends hold a scroll: the first page's top does not come
@@ -8068,7 +8086,7 @@ class PDFCanvas(Gtk.DrawingArea):
             # so every tool below works on the page you pressed
             hit = self._strip_page_at(start_x, start_y)
             if hit is not None and hit != self.current_page_idx:
-                self._switch_current(hit)
+                self.choose_strip_page(hit)
         if self._card_press(start_x, start_y):
             # the card or a backlink icon (rows 197-200) took the press; one
             # elsewhere closed the card and goes on to the page below
@@ -22640,6 +22658,56 @@ def _session_prop(name):
     )
 
 
+class NotesStage(Gtk.Widget):
+    """The notes panel's editing area (row 215). Normally the editor simply
+    fills it. In the continuous strip it holds the editor IN THE CURRENT
+    PAGE'S BAND — the stretch of height the page occupies beside it — over
+    `under`, a drawing of the other pages' notes in theirs, so every page's
+    notes start level with that page. The editor keeps holding ONE page's
+    notes, as it always has: nothing about the notes model, anchors, links or
+    commit/restore changes; only where the editor sits. A note longer than
+    its band scrolls inside the editor's own ScrolledWindow.
+
+    A widget of its own rather than a Gtk.Fixed/Overlay: the editor's band
+    can start ABOVE the panel (a page scrolled half out) and must be clipped
+    there, which a transform in `do_size_allocate` does and margins cannot."""
+
+    def __init__(self, under, editor):
+        super().__init__()
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self._under, self._editor = under, editor
+        under.set_parent(self)
+        editor.set_parent(self)       # added last: drawn and picked on top
+        self.band = None              # (y, height) of the editor, or None
+
+    def set_band(self, band):
+        if band != self.band:
+            self.band = band
+            self.queue_allocate()
+
+    def do_measure(self, orientation, for_size):
+        mn, nat, _b0, _b1 = self._editor.measure(orientation, for_size)
+        return 0, nat, -1, -1
+
+    def do_size_allocate(self, width, height, baseline):
+        self._under.allocate(width, height, -1, None)
+        if self.band is None:
+            self._editor.allocate(width, height, -1, None)
+            return
+        y, h = self.band
+        t = Gsk.Transform.new().translate(Graphene.Point().init(0, y))
+        self._editor.allocate(width, max(1, int(h)), -1, t)
+
+    def do_dispose(self):
+        for child in (self._under, self._editor):
+            if child is not None and child.get_parent() is self:
+                child.unparent()
+        self._under = self._editor = None
+        super().do_dispose()
+
+
 class DocumentSession:
     """One open document — its canvas, notes editor, sidebar, search bar and all
     the per-document state. The window owns an Adw.TabView of these and proxies
@@ -22689,7 +22757,7 @@ class DocumentSession:
         "_toc_list", "_toc_scroll", "_toc_revealer", "_toc_switch",
         "_toc_seg_outline", "_toc_seg_pages", "_toc_bookmarks_check",
         "content", "_body", "_text_page",
-        "_sheet_box",
+        "_sheet_box", "_notes_stage", "_notes_bands",
     )
 
     def __init__(self):
@@ -24087,6 +24155,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # a paper opened from a card (Zotero, row 205) lands as a tab in the
         # window this document is in NOW (s.win follows a torn-off tab)
         s.canvas.on_open_document = lambda path, s=s: s.win.open_file_in_tab(path)
+        s.canvas.on_strip_moved = lambda s=s: s.win._queue_note_bands(s)
         # the continuous strip (row 213) shows every page you have not set
         # aside (row 158) — the same rule page-turning follows
         s.canvas.strip_pages = lambda s=s: [
@@ -24191,7 +24260,26 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._notes_view.get_buffer().connect("changed", lambda *a: s.win._on_notes_changed(*a))
         s._notes_view.get_buffer().connect("notify::cursor-position", lambda *a: s.win._on_notes_cursor_moved(*a))
         notes_scroll.set_child(s._notes_view)
-        s._notes_box.append(notes_scroll)
+        # the stage puts the editor in its page's band in the continuous strip
+        # (row 215), over a drawing of the other pages' notes in theirs
+        s._notes_bands = Gtk.DrawingArea()
+        s._notes_bands.set_draw_func(
+            lambda _a, ctx, w, h, s=s: s.win._draw_note_bands(s, ctx, w, h))
+        bands_click = Gtk.GestureClick()
+        bands_click.connect("pressed", lambda _g, _n, x, y, s=s:
+                            s.win._on_note_bands_pressed(s, x, y))
+        s._notes_bands.add_controller(bands_click)
+        bands_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.BOTH_AXES
+            | Gtk.EventControllerScrollFlags.KINETIC)
+        # scrolling beside the notes scrolls the strip they follow
+        bands_scroll.connect("scroll", lambda ctrl, dx, dy, s=s:
+                             s.canvas._on_scroll(ctrl, dx, dy))
+        bands_scroll.connect("decelerate", lambda ctrl, vx, vy, s=s:
+                             s.canvas._on_decelerate(ctrl, vx, vy))
+        s._notes_bands.add_controller(bands_scroll)
+        s._notes_stage = NotesStage(s._notes_bands, notes_scroll)
+        s._notes_box.append(s._notes_stage)
         # must be attached ABOVE notes_scroll, or the ScrolledWindow swallows
         # Ctrl+scroll as soon as the notes are long enough to scroll
         s._notes_view.attach_zoom_scroll(s._notes_box)
@@ -29984,6 +30072,147 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         for sess in self._sessions:
             if sess.canvas is not None:
                 sess.canvas.queue_draw()
+                self._sync_note_bands(sess)
+
+    # ── notes beside their pages in the continuous strip (row 215) ──────────
+
+    NOTE_BAND_MIN = 60.0     # px: the editor's band is never shorter
+
+    def _note_bands(self, s):
+        """{page: (top, height)} in the notes stage's coordinates — each page's
+        stretch of the strip, its gap below included so the bands tile — or
+        None when the strip is not showing."""
+        c, stage = s.canvas, getattr(s, "_notes_stage", None)
+        if (stage is None or c is None or not c._continuous()
+                or self._full_notes_view(s) or s._text_mode):
+            return None
+        at = c.translate_coordinates(stage, 0.0, 0.0)
+        if not at:
+            return None
+        dy = at[1]
+        return {i: (y + dy, h + c.STRIP_GAP)
+                for i, _x, y, _w, h in c._strip_layout()}
+
+    def _queue_note_bands(self, s):
+        """The canvas just drew the strip somewhere new: move the notes after
+        the frame, once. NEVER from inside the draw — re-laying out the notes
+        panel during the canvas' snapshot leaves it with no allocation for
+        that frame ("snapshot … without a current allocation"), and while you
+        scroll that is every frame: the notes panel vanished."""
+        if getattr(s, "_note_bands_id", None) is None:
+            def run():
+                s._note_bands_id = None
+                self._sync_note_bands(s)
+                return False
+            s._note_bands_id = GLib.idle_add(run)
+
+    def _sync_note_bands(self, s):
+        """Put the editor in the current page's band and redraw the others'.
+        A band whose top has scrolled above the panel starts at the panel's
+        top instead: a note is always read from its first line."""
+        stage = getattr(s, "_notes_stage", None)
+        if stage is None:
+            return
+        bands = self._note_bands(s)
+        s._note_bands_now = bands
+        if bands is None or s.canvas.current_page_idx not in bands:
+            stage.set_band(None)
+        else:
+            top, h = bands[s.canvas.current_page_idx]
+            bottom = top + h
+            top = max(top, 0.0)
+            stage.set_band((top, max(self.NOTE_BAND_MIN, bottom - top)))
+        s._notes_bands.queue_draw()
+
+    def _note_band_text(self, s, i):
+        """What page `i`'s band shows: its own notes, or for a page that
+        continues a run (row 129) where its notes are."""
+        own = s.notes_model.own_text(i).strip()
+        if own:
+            return own
+        start = s.notes_model.run_start(i)
+        return f"↳ continued from p. {start + 1}" if start != i else ""
+
+    def _draw_note_bands(self, s, ctx, w, h):
+        """The other pages' notes, each in its page's band: a hairline and the
+        page number where the page begins, the text read-only (rendered like
+        a callout — symbols, scripts, inline Markdown), clipped to the band
+        and fading out where it does not fit."""
+        bands = getattr(s, "_note_bands_now", None)
+        if not bands:
+            return
+        cur = s.canvas.current_page_idx
+        fg = self.get_color() if hasattr(self, "get_color") else None
+        pad = 10.0
+        for i, (top, bh) in bands.items():
+            if top > h or top + bh < 0:
+                continue
+            ctx.save()
+            ctx.rectangle(0, top, w, bh)
+            ctx.clip()
+            ctx.set_source_rgba(0.5, 0.5, 0.55, 0.35)
+            ctx.rectangle(pad, top, w - 2 * pad, 1)
+            ctx.fill()
+            label = PangoCairo.create_layout(ctx)
+            label.set_font_description(Pango.FontDescription(
+                f"Sans {max(7, self._notes_font_px * 0.6):.1f}px"))
+            label.set_text(f"p. {i + 1}", -1)
+            lw, _lh = label.get_pixel_size()
+            ctx.set_source_rgba(0.5, 0.5, 0.55, 0.8)
+            ctx.move_to(w - pad - lw, top + 3)
+            PangoCairo.show_layout(ctx, label)
+            if i != cur:
+                text = self._note_band_text(s, i)
+                if text:
+                    lay = PangoCairo.create_layout(ctx)
+                    d = Pango.FontDescription("Sans")
+                    d.set_absolute_size(self._notes_font_px * Pango.SCALE)
+                    lay.set_font_description(d)
+                    lay.set_width(int(max(10, w - 2 * pad) * Pango.SCALE))
+                    lay.set_wrap(Pango.WrapMode.WORD_CHAR)
+                    markup = "\n".join(_notes_to_pango_markup(line)
+                                        for line in text.split("\n"))
+                    try:
+                        lay.set_markup(markup, -1)
+                    except GLib.Error:
+                        lay.set_text(text, -1)
+                    y0 = max(top, 0.0) + pad + 6
+                    if fg is not None:
+                        ctx.set_source_rgba(fg.red, fg.green, fg.blue, 0.75)
+                    else:
+                        ctx.set_source_rgba(0.2, 0.2, 0.22, 1)
+                    ctx.move_to(pad, y0)
+                    PangoCairo.show_layout(ctx, lay)
+                    _tw, th = lay.get_pixel_size()
+                    if y0 + th > top + bh:
+                        # cut by the band: fade rather than stop mid-line
+                        g = cairo.LinearGradient(0, top + bh - 24, 0, top + bh)
+                        bg = self._notes_bg_rgb()
+                        g.add_color_stop_rgba(0, *bg, 0)
+                        g.add_color_stop_rgba(1, *bg, 1)
+                        ctx.set_source(g)
+                        ctx.rectangle(0, top + bh - 24, w, 24)
+                        ctx.fill()
+            ctx.restore()
+
+    def _notes_bg_rgb(self):
+        """The notes panel's background, for fading cut text into it."""
+        try:
+            dark = Adw.StyleManager.get_default().get_dark()
+        except Exception:
+            dark = False
+        return (0.14, 0.14, 0.15) if dark else (1.0, 1.0, 1.0)
+
+    def _on_note_bands_pressed(self, s, x, y):
+        """A press on another page's notes makes that page current — its notes
+        come into the editor, in place — and puts you there to type."""
+        bands = getattr(s, "_note_bands_now", None) or {}
+        for i, (top, bh) in bands.items():
+            if top <= y <= top + bh and i != s.canvas.current_page_idx:
+                s.canvas.choose_strip_page(i)
+                self._sync_note_bands(s)
+                s._notes_view.grab_focus()
+                return
 
     def _on_badges_toggled(self, on):
         _save_setting("reference_badges", on)

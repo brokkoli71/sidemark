@@ -202,6 +202,19 @@
     edge it crosses (`_split_across_pages`) into per-page strokes sharing a
     draw GROUP — undo/redo collapse a group across pages, each op on its own
     page.
+  - **Notes beside their pages (row 215)**: the notes panel's editing area
+    is a `NotesStage` — the editor (still ONE page's notes: model, anchors,
+    links, commit/restore untouched) sits in the CURRENT page's band, the
+    stretch of height that page takes in the strip; a drawing under it
+    shows the other pages' notes in theirs (`_draw_note_bands`,
+    `_notes_to_pango_markup`). A band whose top scrolled above the panel
+    starts at the panel's top. A press on another band CHOOSES that page
+    (`choose_strip_page`) — a chosen page stays current until the view
+    moves, or the middle page would take it straight back. **The canvas only
+    QUEUES the move** (`on_strip_moved` → `_queue_note_bands`, idle):
+    re-allocating the notes panel from inside the canvas' draw leaves it
+    unallocated for that frame — scrolling, every frame, and the notes
+    vanish.
 
 - **Page backgrounds (rows 139 + 140)** — `draw_page_background` rules a blank
   page (plain/lines/squares/dots) into the page CONTENT at creation: a
