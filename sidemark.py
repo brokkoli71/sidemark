@@ -22,6 +22,7 @@ import shutil
 import time
 import datetime
 import base64
+import urllib.parse
 import struct
 import zlib
 import gzip
@@ -469,10 +470,12 @@ MCP_TOOLS = [
                     "paper when it is in the user's Zotero library.",
      "inputSchema": {"type": "object", "properties": {"document": _MCP_DOC}}},
     {"name": "go_to_page", "write": False,
-     "description": "Show a page in Sidemark (a step the user can go back "
-                    "from).",
+     "description": "Show a page in Sidemark — or, with y, the exact spot on "
+                    "it (points from the top; locate_text gives it). A step "
+                    "the user can go back from (Alt+Left).",
      "inputSchema": {"type": "object", "properties": {
-         "page": _MCP_PAGE, "document": _MCP_DOC}, "required": ["page"]}},
+         "page": _MCP_PAGE, "y": {"type": "number"},
+         "document": _MCP_DOC}, "required": ["page"]}},
     {"name": "open_document", "write": False,
      "description": "Open a paper in Sidemark, in a tab BEHIND the one the "
                     "user is reading (their view does not move): by path, or "
@@ -768,7 +771,13 @@ def ask_prompt(question, passage=None, title=None, page=None, pages=None,
         "enough; open_document opens a cited paper from my library, and the "
         "web is there for what neither has. When I ask you to mark, "
         "highlight, draw or note something in the document, do it with "
-        "annotate_page. Do not edit files."]
+        "annotate_page. Do not edit files.",
+        "Link every place you point me to, so one click takes me there: "
+        "[[#page=N|label]] for a page of this document, [[#page=N,y=Y|label]] "
+        "for a spot on it (Y in points from the top — locate_text gives it), "
+        "[[file.pdf#page=N|label]] for another open paper, [text](https://…) "
+        "for the web. When I ask you to take me somewhere, go_to_page (with "
+        "y) does it directly."]
     if sections:
         names = ", ".join(f'"{n}" ({ASK_SECTIONS[n]})' for n in sections)
         parts.append(
@@ -800,6 +809,42 @@ def ask_command(claude, session=None, script=None, python=None, read_dirs=()):
     if session:
         argv += ["--resume", session]
     return argv
+
+
+ASK_KEEP = 200          # transcript entries kept per document
+
+
+def ask_store_path(doc_path):
+    """Where a document's Ask conversation is kept: STATE, not cache — it is
+    the user's conversation, and a reload (Ctrl+R) or a restart must find it
+    again. Resolved at call time, so tests can point it elsewhere."""
+    base = os.path.join(os.environ.get("XDG_STATE_HOME",
+                                       os.path.expanduser("~/.local/state")),
+                        "sidemark", "ask")
+    key = hashlib.sha1(os.path.abspath(doc_path).encode("utf-8")).hexdigest()
+    return os.path.join(base, key[:16] + ".json")
+
+
+def ask_load(doc_path):
+    try:
+        with open(ask_store_path(doc_path), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def ask_save(doc_path, data):
+    path = ask_store_path(doc_path)
+    data = dict(data, entries=list(data.get("entries") or [])[-ASK_KEEP:])
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("could not keep the Ask conversation", exc_info=True)
 
 
 class AskStreamParser:
@@ -15182,17 +15227,23 @@ def _parse_note_link(inner):
     target, alias = (inner.split('|', 1) + [None])[:2]
     target = target.strip()
     path, frag = (target.split('#', 1) + [''])[:2] if '#' in target else (target, '')
-    page, anchor = None, None
+    page, anchor, y = None, None, None
     frag = frag.strip()
     if frag:
-        mm = re.fullmatch(r'(?:page=)?(\d+)', frag)
+        # `,y=N` names the SPOT on the page, in points from its top (row 219:
+        # an answer that says "see Eq. 4" takes you to Eq. 4, not its page)
+        mm = re.fullmatch(r'(?:page=)?(\d+)(?:\s*,\s*y=(\d+(?:\.\d+)?))?', frag)
         if mm:
             page = int(mm.group(1))
+            y = float(mm.group(2)) if mm.group(2) else None
         else:
             anchor = frag
     label = alias.strip() if alias is not None else target
-    return {"path": path.strip() or None, "page": page, "anchor": anchor,
-            "label": label}
+    out = {"path": path.strip() or None, "page": page, "anchor": anchor,
+           "label": label}
+    if y is not None:
+        out["y"] = y
+    return out
 
 
 # ── where a link can point: the named places in a document (row 165) ──────────
@@ -27941,7 +27992,11 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if full is not None:
             self.open_file_in_tab(full)
         if idx is not None and self.canvas.document:
-            self._go_to_page(idx)
+            if link.get("y") is not None:
+                self._commit_note()
+                self.canvas.follow_goto(idx, link["y"])   # the spot, not the page
+            else:
+                self._go_to_page(idx)
         # …and offer the way back, but only if it goes somewhere else: a link
         # to the page you are already on has nothing to return from.
         here = (self._path or self._notes_path,
@@ -28498,20 +28553,65 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s = self._active_session
         if s is None or not (passage or "").strip():
             return
+        self._ask_restore(s)
         st = s._ask = s._ask or {}
         st.update(passage=passage.strip(), page=page, fresh=True)
-        panel = st.get("panel")
-        if panel is None:
-            panel = st["panel"] = AskPanel(
-                on_send=lambda q, s=s: self._ask_send(s, q),
-                on_close=lambda s=s: self._ask_close(s),
-                on_add=lambda s=s: self._ask_add_to_notes(s))
-            s._sheet_box.append(panel)
+        panel = self._ask_panel(s)
         if not self._text_mode and not self._notes_box.get_visible():
             self._set_notes_shown(True)
         panel.set_visible(True)
         panel.show_passage(passage, page)
         panel.entry.grab_focus()
+        self._ask_persist(s)
+
+    def _ask_panel(self, s):
+        st = s._ask
+        if st.get("panel") is None:
+            st["panel"] = AskPanel(
+                on_send=lambda q, s=s: self._ask_send(s, q),
+                on_close=lambda s=s: self._ask_close(s),
+                on_add=lambda s=s: self._ask_add_to_notes(s),
+                on_link=lambda inner: self._follow_note_link(
+                    _parse_note_link(inner)))
+            s._sheet_box.append(st["panel"])
+        return st["panel"]
+
+    def _ask_restore(self, s):
+        """A document's kept conversation, back with it: after Ctrl+R, a
+        restart or reopening it — the transcript, the Claude session to go
+        on in, and the panel open if it was."""
+        if s is None or s._ask is not None:
+            return
+        path = self._path_of_session(s)
+        data = ask_load(path) if path and not s._is_untitled else None
+        if not data or not data.get("entries") and not data.get("session"):
+            return
+        s._ask = {"session": data.get("session"), "fresh": False,
+                  "passage": data.get("passage") or "",
+                  "page": data.get("page")}
+        for kind, text in data.get("entries") or []:
+            if kind == "question":
+                s._ask["question"] = text
+            elif kind == "answer":
+                s._ask["answer"] = text
+        panel = self._ask_panel(s)
+        panel.replay(data.get("entries") or [])
+        if data.get("passage"):
+            panel.show_passage(data["passage"], data.get("page"))
+        panel.set_visible(bool(data.get("open")))
+        if data.get("open") and not self._text_mode:
+            self._set_notes_shown(True)
+
+    def _ask_persist(self, s):
+        st = s._ask or {}
+        path = self._path_of_session(s)
+        if not path or s._is_untitled or st.get("panel") is None:
+            return
+        ask_save(path, {"path": os.path.abspath(path),
+                        "session": st.get("session"),
+                        "passage": st.get("passage"), "page": st.get("page"),
+                        "open": st["panel"].get_visible(),
+                        "entries": st["panel"].entries})
 
     def _ask_close(self, s):
         st = s._ask or {}
@@ -28520,6 +28620,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             st["run"] = None
         if st.get("panel"):
             st["panel"].set_visible(False)
+            self._ask_persist(s)
 
     @staticmethod
     def _ask_folder():
@@ -28563,7 +28664,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                 storages.append(os.path.join(d, "storage"))
         argv = ask_command(claude, session=st.get("session"),
                            read_dirs=storages)
-        panel.begin(question)
+        panel.begin(question, st["passage"] if st.get("fresh") else None,
+                    st.get("page"))
         try:
             st["run"] = AskRun(argv, prompt, folder, panel.add_text,
                                lambda parser, rc, err, s=s:
@@ -28588,6 +28690,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         answer, updates = split_context_updates(parser.text)
         st["answer"] = answer
         panel.finish(answer)
+        self._ask_persist(s)
         if parser.error or (rc and not answer):
             if st.get("session") and "session" in (parser.error or err).lower():
                 st["session"] = None       # gone: the next one starts afresh
@@ -32265,6 +32368,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # created lazily on first save once something is actually written.
         self._set_notes_shown(self.notes_model.has_content())
         self._remember_recent(path)
+        self._ask_restore(self._active_session)       # row 219: the chat too
         self._restoring_page = False
         self._restore_reading_page(path)
         # …and in the view it was left in (row 130): a document you were
@@ -32319,6 +32423,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._burst_base = self.notes_model.get(0)
         self._clear_dirty()
         self._remember_recent(md_path)
+        self._ask_restore(self._active_session)       # row 219: the chat too
         self._maybe_offer_text_recovery(md_path)
 
     def _on_new_pdf(self, _btn):
@@ -35008,12 +35113,15 @@ class AskRun:
 
 
 class AskPanel(Gtk.Box):
-    """The answer, beside the page (row 219): the passage asked about, the
-    answer as it streams in, one field for the next question, and the one
-    thing worth doing with an answer — putting it in the notes."""
+    """The conversation, beside the page (row 219): every question and its
+    answer for this document, scrollable back to the first, with a divider
+    where a new passage was asked about; one field for the next question,
+    and the one thing worth doing with an answer — putting it in the
+    notes. The latest answer streams in at the bottom."""
 
-    def __init__(self, on_send, on_close, on_add):
+    def __init__(self, on_send, on_close, on_add, on_link=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._on_link = on_link
         self.add_css_class("card")
         for side in ("start", "end", "top", "bottom"):
             getattr(self, f"set_margin_{side}")(6)
@@ -35032,16 +35140,17 @@ class AskPanel(Gtk.Box):
         head.append(close)
         for side in ("start", "end", "top"):
             getattr(head, f"set_margin_{side}")(8)
-        self.answer = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True)
-        self.answer.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.answer.set_margin_start(10)
-        self.answer.set_margin_end(10)
+        self.answer = None                 # the latest answer's label
+        self.log = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.log.set_margin_start(10)
+        self.log.set_margin_end(10)
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_propagate_natural_height(True)
-        scroll.set_max_content_height(320)
-        scroll.set_child(self.answer)
+        scroll.set_max_content_height(420)
+        scroll.set_child(self.log)
         self.scroll = scroll
+        self.entries = []                  # [(kind, text)]: the transcript
         status_row = Gtk.Box(spacing=6)
         status_row.set_margin_start(10)
         self.status = Gtk.Label(xalign=0, hexpand=True, wrap=True)
@@ -35074,9 +35183,36 @@ class AskPanel(Gtk.Box):
         self.entry.set_placeholder_text("Ask about this passage… (Enter: "
                                         "explain it)")
 
-    def begin(self, question):
+    def _add(self, kind, text, css=()):
+        label = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True)
+        label.connect("activate-link", self._activate)
+        label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        for c in css:
+            label.add_css_class(c)
+        if text:
+            label.set_text(text)
+        self.log.append(label)
+        self.entries.append([kind, text])
+        return label
+
+    def _follow(self):
+        """Keep the newest line in view — unless the reader has scrolled up
+        to an earlier answer, which must not be pulled away from them."""
+        adj = self.scroll.get_vadjustment()
+        if adj.get_value() + adj.get_page_size() >= adj.get_upper() - 24:
+            GLib.idle_add(lambda: adj.set_value(adj.get_upper()) and False)
+
+    def begin(self, question, passage=None, page=None):
         self._raw = ""
-        self.answer.set_text("")
+        self._follow()
+        if passage:
+            one = " ".join(passage.split())
+            self._add("passage", (f"p. {page} · " if page else "") + f"“{one}”",
+                      css=("dim-label", "caption"))
+        q = self._add("question", question.strip() or "Explain this passage.",
+                      css=("heading",))
+        q.set_margin_top(4)
+        self.answer = self._add("answer", "")
         self.set_status("Thinking…")
         self.undo.set_visible(False)
         self.add_btn.set_sensitive(False)
@@ -35086,20 +35222,74 @@ class AskPanel(Gtk.Box):
 
     def add_text(self, text):
         self._raw += text
+        self._follow()
         # a proposal for CLAUDE.md streams in last: it is never shown as answer
         self._render(self._raw.split("<sidemark-context")[0])
         return True
 
+    def replay(self, entries):
+        """A kept conversation, back on screen as it was."""
+        for kind, text in entries:
+            if kind == "passage":
+                self._add(kind, text, css=("dim-label", "caption"))
+            elif kind == "question":
+                self._add(kind, text, css=("heading",)).set_margin_top(4)
+            else:
+                self.answer = self._add(kind, "")
+                self._render(text)
+                self.entries[-1][1] = text
+        self.add_btn.set_sensitive(bool(entries) and entries[-1][0] == "answer")
+        adj = self.scroll.get_vadjustment()
+        GLib.idle_add(lambda: adj.set_value(adj.get_upper()) and False)
+
     def finish(self, answer):
         self._render(answer)
+        self.entries[-1][1] = answer
         self.add_btn.set_sensitive(bool(answer.strip()))
+
+    LINK_SCHEME = "sidemark-link:"
+    _WEB_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+
+    @classmethod
+    def line_markup(cls, line):
+        """One line of an answer as Pango markup: the notes' rendering, plus
+        LINKS — a [[place]] in the documents and a [text](url) on the web —
+        as clickable text."""
+        esc = GLib.markup_escape_text
+        out = []
+        for seg, kind in _split_markup(line):
+            if kind == "link":
+                inner = seg[2:-2]
+                link = _parse_note_link(inner)
+                label = link["label"]
+                if label == inner.strip() and link["page"]:
+                    label = f"p. {link['page']}"    # no alias: say it plainly
+                href = cls.LINK_SCHEME + urllib.parse.quote(inner)
+                out.append(f'<a href="{esc(href)}">{esc(label)}</a>')
+            elif kind == "code":
+                out.append(_notes_to_pango_markup(seg))
+            else:
+                pos = 0
+                for m in cls._WEB_LINK_RE.finditer(seg):
+                    out.append(_notes_to_pango_markup(seg[pos:m.start()]))
+                    out.append(f'<a href="{esc(m.group(2))}">{esc(m.group(1))}</a>')
+                    pos = m.end()
+                out.append(_notes_to_pango_markup(seg[pos:]))
+        return "".join(out)
+
+    def _activate(self, _label, uri):
+        if uri.startswith(self.LINK_SCHEME):
+            if self._on_link:
+                self._on_link(urllib.parse.unquote(uri[len(self.LINK_SCHEME):]))
+            return True
+        return False                        # a web link: the default opener
 
     def _render(self, text):
         lines = []
         for line in text.strip().split("\n"):
             head = re.match(r"^#{1,6}\s+(.*)", line)
             try:
-                body = _notes_to_pango_markup(head.group(1) if head else line)
+                body = self.line_markup(head.group(1) if head else line)
             except Exception:
                 body = GLib.markup_escape_text(line)
             lines.append(f"<b>{body}</b>" if head else body)
@@ -35511,12 +35701,16 @@ class McpBridge:
 
     # ── moving ───────────────────────────────────────────────────────────────
 
-    def _go_to_page(self, page, document=None):
+    def _go_to_page(self, page, y=None, document=None):
         w, s = self._pick(document)
         c = self._pdf(s)
         i = self._page_index(c, page)
         self._front(w, s)
-        w._go_to_page(i)
+        if y is not None:
+            w._commit_note()
+            c.follow_goto(i, float(y))
+        else:
+            w._go_to_page(i)
         return {"document": self._path_of(s), "page": i + 1}
 
     # ── seeing and drawing (row 217) ────────────────────────────────────────

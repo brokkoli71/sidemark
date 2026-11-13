@@ -10,6 +10,7 @@ import math
 import re
 import base64
 import io
+import urllib.parse
 import json
 import tempfile
 import shutil
@@ -3169,6 +3170,17 @@ class TestMcpDrawing(unittest.TestCase):
 class TestAskClaudePieces(unittest.TestCase):
     """Row 219: the parts of Ask Claude that need no window."""
 
+    def test_a_link_can_name_a_spot_on_its_page(self):
+        link = sidemark._parse_note_link("#page=5,y=320.5|Eq. 4")
+        self.assertEqual((link["page"], link["y"], link["label"]),
+                         (5, 320.5, "Eq. 4"))
+        self.assertNotIn("y", sidemark._parse_note_link("#page=5"))   # as ever
+        self.assertEqual(sidemark._parse_note_link("a.pdf#12, y=7")["y"], 7.0)
+        m = sidemark.AskPanel.line_markup(
+            "See [[#page=3,y=100]] and [docs](https://x.org/a?b=1&c=2).")
+        self.assertIn(">p. 3</a>", m)                    # no alias: plain words
+        self.assertIn('href="https://x.org/a?b=1&amp;c=2"', m)
+
     MD = ("# Thesis\n\nKeep this.\n\n<!-- sidemark:person -->\nOld person.\n"
           "<!-- /sidemark:person -->\n\nAnd this.\n\n<!-- sidemark:reading -->\n"
           "- Paper A\n<!-- /sidemark:reading -->\n")
@@ -3258,7 +3270,7 @@ with open(log, "a") as f:
                         "stdin": sys.stdin.read()}) + "\n")
 say = lambda o: print(json.dumps(o), flush=True)
 say({"type": "system", "subtype": "init", "session_id": "sess-1"})
-for t in ("Slicing **splits** ", "an index."):
+for t in ("Slicing **splits** ", "an index. See [[#page=2,y=300|Gl. 4]]."):
     say({"type": "stream_event", "event": {"type": "content_block_delta",
          "delta": {"type": "text_delta", "text": t}}})
 say({"type": "stream_event", "event": {"type": "content_block_delta",
@@ -3280,7 +3292,8 @@ say({"type": "result", "subtype": "success", "session_id": "sess-1"})
             log = os.path.join(d, "calls.jsonl")
             sidemark._save_setting("ask_claude_dir", folder)
             with mock.patch.dict(os.environ, {"SIDEMARK_CLAUDE": fake,
-                                              "FAKE_CLAUDE_LOG": log}):
+                                              "FAKE_CLAUDE_LOG": log,
+                                              "XDG_STATE_HOME": d}):
                 TestMcpBridge._run(self, lambda win, _b: body(win, folder, log))
 
     @staticmethod
@@ -3306,7 +3319,16 @@ say({"type": "result", "subtype": "success", "session_id": "sess-1"})
             self._until(lambda: s._ask.get("run") is None
                         and s._ask.get("answer"))
             # shown as the answer; the proposal is NOT part of it
-            self.assertEqual(s._ask["answer"], "Slicing **splits** an index.")
+            self.assertEqual(s._ask["answer"],
+                             "Slicing **splits** an index. See [[#page=2,y=300|Gl. 4]].")
+            # the link is a link — and following it goes to that spot
+            self.assertIn('href="sidemark-link:', panel.answer.get_label())
+            self.assertIn(">Gl. 4</a>", panel.answer.get_label())
+            panel._activate(panel.answer, "sidemark-link:"
+                            + urllib.parse.quote("#page=2,y=300"))
+            self.assertEqual(win.canvas.current_page_idx, 1)
+            win.canvas.go_back()                      # a step back from there
+            self.assertEqual(win.canvas.current_page_idx, 0)
             self.assertNotIn("sidemark", panel.answer.get_text())
             (call,) = [json.loads(l) for l in open(log)]
             self.assertEqual(os.path.realpath(call["cwd"]),
@@ -3331,6 +3353,14 @@ say({"type": "result", "subtype": "success", "session_id": "sess-1"})
             self.assertEqual(second["argv"][second["argv"].index("--resume") + 1],
                              "sess-1")
             self.assertEqual(second["stdin"].strip(), "and why?")
+            # the whole conversation stays, scrollable: passage, Q, A, Q, A
+            self.assertEqual([k for k, _t in panel.entries],
+                             ["passage", "question", "answer",
+                              "question", "answer"])
+            self.assertEqual(panel.entries[1][1], "What is this?")
+            self.assertTrue(panel.entries[2][1].startswith("Slicing **splits**"))
+            self.assertEqual(panel.log.get_first_child().get_next_sibling()
+                             .get_text(), "What is this?")
             # into the notes, as the assistant's
             panel.add_btn.emit("clicked")
             notes = win.notes_model.get(0)
@@ -3338,6 +3368,44 @@ say({"type": "result", "subtype": "success", "session_id": "sess-1"})
             self.assertIn(sidemark.ASSISTANT_OPEN, notes)
             win._global_undo()
             self.assertNotIn("and why?", win.notes_model.get(0))
+        self._run(body)
+
+    def test_the_conversation_survives_a_reload(self):
+        """Ctrl+R is a new process: the transcript, the Claude session and
+        the open panel must come back with the document."""
+        def body(win, folder, log):
+            win._ask_claude_about("a passage", 2)
+            s = win._active_session
+            s._ask["panel"].entry.set_text("first?")
+            s._ask["panel"].entry.emit("activate")
+            self._until(lambda: s._ask.get("run") is None
+                        and s._ask.get("answer"))
+            # what a reload amounts to: the same file opened in a fresh window
+            again = PDFEditorWindow(win.get_application())
+            again.present()
+            again._do_open_file(s._path)
+            st = again._active_session._ask
+            panel = st["panel"]
+            self.assertTrue(panel.get_visible())
+            self.assertEqual([k for k, _t in panel.entries],
+                             ["passage", "question", "answer"])
+            self.assertEqual(panel.entries[1][1], "first?")
+            self.assertEqual(st["session"], "sess-1")
+            panel.entry.set_text("and then?")
+            panel.entry.emit("activate")
+            self._until(lambda: len(open(log).readlines()) == 2
+                        and st.get("run") is None)
+            second = json.loads(open(log).readlines()[1])
+            self.assertIn("--resume", second["argv"])     # the same conversation
+            # closed stays closed
+            again._ask_close(again._active_session)
+            third = PDFEditorWindow(win.get_application())
+            third.present()
+            third._do_open_file(s._path)
+            self.assertFalse(third._active_session._ask["panel"].get_visible())
+            self.assertEqual(len(third._active_session._ask["panel"].entries), 5)
+            again.destroy()
+            third.destroy()
         self._run(body)
 
     def test_without_a_folder_it_says_where_to_set_one(self):

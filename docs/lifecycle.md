@@ -103,7 +103,11 @@
   between `<!-- sidemark:person -->` / `<!-- sidemark:reading -->` markers
   and Sidemark applies exactly those (`replace_context_section`), shown in
   the panel with an undo. Test it with a fake `claude` (`SIDEMARK_CLAUDE`),
-  never the real one.
+  never the real one. **The conversation is per document and survives a
+  reload**: `ask_store_path` (XDG_STATE_HOME, resolved at call time — the
+  test harness does not isolate it, so a test must point it elsewhere)
+  keeps the session id, transcript and open/closed state;
+  `_ask_restore` runs from both open paths (`_open_pdf`, `_open_markdown`).
 - **What an assistant made is tagged** (row 218): notes between
   `<!-- by:assistant -->` … `<!-- /by:assistant -->` (hidden like every
   marker, tinted in the editor, stripped by `_strip_markers` so a callout
