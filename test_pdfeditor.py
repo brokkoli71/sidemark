@@ -2734,6 +2734,63 @@ class TestMcpBridge(unittest.TestCase):
         while time.time() < deadline:
             ctx.iteration(False)
 
+    def test_opening_a_paper_does_not_move_the_reader(self):
+        def body(win, bridge):
+            reading = win._active_session
+            other = os.path.join(os.path.dirname(reading._path), "other.pdf")
+            make_pdf(other, n_pages=3)
+            res = bridge.call("open_document", {"path": other, "page": 2})
+            self.assertTrue(res["ok"], res)
+            self.assertEqual((res["result"]["document"], res["result"]["pages"]),
+                             (2, 3))
+            self.assertIs(win._active_session, reading)     # view stayed put
+            page = bridge.call("get_page", {"document": 2, "page": 2})
+            self.assertTrue(page["ok"])
+            again = bridge.call("open_document", {"path": other})
+            self.assertTrue(again["result"]["already_open"])
+            self.assertEqual(len(win._sessions), 2)
+            self.assertFalse(bridge.call("open_document",
+                                         {"path": "/nope.pdf"})["ok"])
+        self._run(body)
+
+    def test_a_paper_is_found_by_title_in_the_zotero_library(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "Zotero")
+            make_zotero_library(root, [
+                {"key": "READING1", "fields": {"title": "The paper being read"},
+                 "pdf": "reading.pdf"},
+                {"key": "CITED001", "fields": {
+                    "title": "Hyper-optimized tensor network contraction"},
+                 "pdf": "gray.pdf"}])
+            reading = os.path.join(root, "storage", "READING1PDF", "reading.pdf")
+            errors = []
+            app = Adw.Application(application_id="test.sidemark.mcpopen")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(reading)
+                    bridge = sidemark.McpBridge(a)
+                    res = bridge.call("open_document",
+                                      {"title": "hyper-optimized contraction"})
+                    self.assertTrue(res["ok"], res)
+                    self.assertTrue(res["result"]["path"].endswith("gray.pdf"))
+                    self.assertTrue(win._active_session._path.endswith(
+                        "reading.pdf"))
+                    miss = bridge.call("open_document", {"title": "zebra finch"})
+                    self.assertIn("Zotero", miss["error"])
+                except Exception:
+                    import traceback
+                    errors.append(traceback.format_exc())
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+            if errors:
+                raise AssertionError(errors[0])
+
     def test_moving(self):
         def body(win, bridge):
             res = bridge.call("go_to_page", {"page": 2})
@@ -3159,6 +3216,10 @@ class TestAskClaudePieces(unittest.TestCase):
         mcp = json.loads(argv[argv.index("--mcp-config") + 1])
         self.assertEqual(mcp["mcpServers"]["sidemark"]["args"][-1], "--mcp")
         self.assertNotIn("--resume", sidemark.ask_command("claude"))
+        self.assertIn("WebSearch", allowed)               # looking things up
+        self.assertIn("mcp__sidemark__open_document", allowed)
+        z = sidemark.ask_command("claude", read_dirs=["/z/storage"])
+        self.assertEqual(z[z.index("--add-dir") + 1], "/z/storage")
 
     def test_the_stream_is_read_once_whatever_its_shape(self):
         p = sidemark.AskStreamParser()

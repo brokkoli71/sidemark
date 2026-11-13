@@ -96,7 +96,10 @@
   `--mcp-config` (registered per project, it would not exist in that
   folder). The session never writes FILES (Edit/Write/Bash denied); it may
   annotate the document, since annotate_page has its own gate ("Let
-  assistants edit"). It PROPOSES rewrites of the CLAUDE.md sections
+  assistants edit"), search and fetch the web, and read the Zotero storage
+  of the open papers (`--add-dir`). `open_document` opens a paper in a tab
+  BEHIND the reader's and switches back — a tool may add tabs, never move
+  the view. It PROPOSES rewrites of the CLAUDE.md sections
   between `<!-- sidemark:person -->` / `<!-- sidemark:reading -->` markers
   and Sidemark applies exactly those (`replace_context_section`), shown in
   the panel with an undo. Test it with a fake `claude` (`SIDEMARK_CLAUDE`),

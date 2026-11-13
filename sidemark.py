@@ -473,6 +473,18 @@ MCP_TOOLS = [
                     "from).",
      "inputSchema": {"type": "object", "properties": {
          "page": _MCP_PAGE, "document": _MCP_DOC}, "required": ["page"]}},
+    {"name": "open_document", "write": False,
+     "description": "Open a paper in Sidemark, in a tab BEHIND the one the "
+                    "user is reading (their view does not move): by path, or "
+                    "by title from the Zotero library the open papers live "
+                    "in. Already open: just its number. Then read it with "
+                    "the other tools, using that number as document.",
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "A .pdf or .md file."},
+         "title": {"type": "string", "description": "(Part of) a title in "
+                   "the user's Zotero library."},
+         "page": _MCP_PAGE, "show": {"type": "boolean", "description":
+                                     "Bring it to the front (default false)."}}}},
     {"name": "get_page_image", "write": False,
      "description": "A picture of a page as it looks in Sidemark, ink "
                     "included, with a faint ruler in points (lines every 50, "
@@ -688,11 +700,11 @@ ASK_SECTIONS = {"person": "who the user is and what they know",
 # what the user can ask any assistant for — annotate_page goes through
 # Sidemark, is gated by "Let assistants edit", tagged and one Ctrl+Z, so it
 # needs no second gate here. Denying it made "mark this for me" impossible.
-ASK_TOOLS = ("Read", "Grep", "Glob") + tuple(
+ASK_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch") + tuple(
     f"mcp__sidemark__{t}" for t in (
         "list_documents", "get_page", "get_notes", "search", "list_references",
         "get_page_image", "locate_text", "get_selection", "go_to_page",
-        "annotate_page"))
+        "annotate_page", "open_document"))
 ASK_DENIED_TOOLS = ("Edit", "Write", "NotebookEdit", "Bash")
 _CONTEXT_UPDATE_RE = re.compile(
     r'<sidemark-context\s+section="(\w+)"\s*>\s*(.*?)\s*</sidemark-context>',
@@ -753,8 +765,10 @@ def ask_prompt(question, passage=None, title=None, page=None, pages=None,
         "the language it asks for. Sidemark's tools show you the rest of the "
         "document (get_page, get_page_image of a small region, "
         "list_references, search): use them only when the passage is not "
-        "enough. When I ask you to mark, highlight, draw or note something in "
-        "the document, do it with annotate_page. Do not edit files."]
+        "enough; open_document opens a cited paper from my library, and the "
+        "web is there for what neither has. When I ask you to mark, "
+        "highlight, draw or note something in the document, do it with "
+        "annotate_page. Do not edit files."]
     if sections:
         names = ", ".join(f'"{n}" ({ASK_SECTIONS[n]})' for n in sections)
         parts.append(
@@ -768,9 +782,11 @@ def ask_prompt(question, passage=None, title=None, page=None, pages=None,
     return "\n\n".join(parts)
 
 
-def ask_command(claude, session=None, script=None, python=None):
+def ask_command(claude, session=None, script=None, python=None, read_dirs=()):
     """argv for one question. The prompt goes on stdin; the tools are named
-    as single arguments so no list flag can swallow another."""
+    as single arguments so no list flag can swallow another. `read_dirs` are
+    folders it may read beyond its own — the user's Zotero storage, so a
+    paper that is not open is still within reach."""
     mcp = {"mcpServers": {"sidemark": {
         "command": python or sys.executable,
         "args": [script or os.path.abspath(__file__), "--mcp"]}}}
@@ -779,6 +795,8 @@ def ask_command(claude, session=None, script=None, python=None):
             "--mcp-config", json.dumps(mcp),
             "--allowedTools", ",".join(ASK_TOOLS),
             "--disallowedTools", ",".join(ASK_DENIED_TOOLS)]
+    for d in read_dirs:
+        argv += ["--add-dir", d]
     if session:
         argv += ["--resume", session]
     return argv
@@ -28538,7 +28556,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         prompt = ask_prompt(question, st["passage"] if st.get("fresh") else None,
                             title=title, page=st.get("page"), pages=pages,
                             sections=sections)
-        argv = ask_command(claude, session=st.get("session"))
+        storages = []
+        for _w, other in McpBridge(self.get_application())._all_sessions():
+            d = ZoteroLibrary.find_for(other._path)
+            if d and os.path.join(d, "storage") not in storages:
+                storages.append(os.path.join(d, "storage"))
+        argv = ask_command(claude, session=st.get("session"),
+                           read_dirs=storages)
         panel.begin(question)
         try:
             st["run"] = AskRun(argv, prompt, folder, panel.add_text,
@@ -35615,6 +35639,60 @@ class McpBridge:
                 round(vx1 / k, 1), round((vy1 - offs[n]) / k, 1)]})
             it = b
         return hits
+
+    def _zotero_libraries(self):
+        """The Zotero libraries the open documents live in, front first."""
+        out = []
+        for _w, s in self._all_sessions():
+            lib = zotero_library_for(s._path) if s._path else None
+            if lib is not None and lib not in out:
+                out.append(lib)
+        return out
+
+    def _open_document(self, path=None, title=None, page=None, show=False):
+        if not path and not title:
+            raise McpError("Give a path or a title.")
+        if not path:
+            want = [w for w in re.findall(r"\w+", str(title).lower()) if len(w) > 2]
+            best = None
+            for lib in self._zotero_libraries():
+                for it in lib.items() or []:
+                    have = (it.get("title") or "").lower()
+                    hits = sum(w in have for w in want)
+                    if it.get("pdf") and hits and (best is None or hits > best[0]):
+                        best = (hits, it)
+            if best is None or best[0] < max(1, (len(want) + 1) // 2):
+                raise McpError(f"No paper titled like {title!r} with a PDF in "
+                               "the Zotero library of the open documents.")
+            path = best[1]["pdf"]
+        path = os.path.abspath(os.path.expanduser(str(path)))
+        if not os.path.isfile(path):
+            raise McpError(f"There is no file at {path}.")
+        if not path.lower().endswith((".pdf", ".md", ".markdown")):
+            raise McpError("Sidemark opens .pdf and .md files here.")
+        docs = self._all_sessions()
+        for n, (w, s) in enumerate(docs, start=1):
+            if s._path and os.path.abspath(s._path) == path:
+                if show:
+                    self._front(w, s)
+                return {"document": n, "path": path, "already_open": True}
+        wins = self._windows()
+        if not wins:
+            raise McpError("Sidemark has no window open.")
+        w = wins[0]
+        before = w._active_session
+        w.open_file_in_tab(path)
+        new = w._active_session
+        if page and new.doc_mode != "text" and new.canvas.document is not None:
+            i = self._page_index(new.canvas, page)
+            new.canvas.go_to_page(i)
+        if not show and before is not None and before is not new:
+            w._activate_session_tab(before)      # the reader stays where they were
+        n = next(k for k, (_ww, s) in enumerate(self._all_sessions(), start=1)
+                 if s is new)
+        pages = (new.canvas.n_pages if new.doc_mode != "text"
+                 and new.canvas.document is not None else None)
+        return {"document": n, "path": path, "pages": pages}
 
     def _get_selection(self, document=None):
         """The text selection of a document, page by page, with the rect of
