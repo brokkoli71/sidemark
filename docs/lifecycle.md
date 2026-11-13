@@ -94,7 +94,9 @@
   STDIN, and every list flag gets one comma-joined argument, so a variadic
   flag cannot swallow the prompt. Sidemark's MCP server is passed with
   `--mcp-config` (registered per project, it would not exist in that
-  folder). The session may not edit: it PROPOSES rewrites of the sections
+  folder). The session never writes FILES (Edit/Write/Bash denied); it may
+  annotate the document, since annotate_page has its own gate ("Let
+  assistants edit"). It PROPOSES rewrites of the CLAUDE.md sections
   between `<!-- sidemark:person -->` / `<!-- sidemark:reading -->` markers
   and Sidemark applies exactly those (`replace_context_section`), shown in
   the panel with an undo. Test it with a fake `claude` (`SIDEMARK_CLAUDE`),

@@ -3145,15 +3145,17 @@ class TestAskClaudePieces(unittest.TestCase):
                          sidemark.ask_prompt("q", "x", sections=[]))
         self.assertEqual(sidemark.ask_prompt("and why?"), "and why?")
 
-    def test_the_session_is_read_only_and_resumable(self):
+    def test_the_session_never_writes_files_and_is_resumable(self):
         argv = sidemark.ask_command("claude", session="abc")
         self.assertEqual(argv[argv.index("--resume") + 1], "abc")
         allowed = argv[argv.index("--allowedTools") + 1].split(",")
         denied = argv[argv.index("--disallowedTools") + 1].split(",")
-        for t in ("Edit", "Write", "Bash", "mcp__sidemark__annotate_page"):
+        for t in ("Edit", "Write", "Bash"):           # never the files
             self.assertNotIn(t, allowed)
             self.assertIn(t, denied)
-        self.assertIn("mcp__sidemark__get_page", allowed)
+        # the document, through Sidemark's own gate ("Let assistants edit")
+        for t in ("mcp__sidemark__get_page", "mcp__sidemark__annotate_page"):
+            self.assertIn(t, allowed)
         mcp = json.loads(argv[argv.index("--mcp-config") + 1])
         self.assertEqual(mcp["mcpServers"]["sidemark"]["args"][-1], "--mcp")
         self.assertNotIn("--resume", sidemark.ask_command("claude"))

@@ -684,12 +684,16 @@ def mcp_object_path(app_id):
 
 ASK_SECTIONS = {"person": "who the user is and what they know",
                 "reading": "the papers they have read, one line each"}
-ASK_READ_TOOLS = ("Read", "Grep", "Glob") + tuple(
+# The session reads files but never writes them; in the DOCUMENT it may do
+# what the user can ask any assistant for — annotate_page goes through
+# Sidemark, is gated by "Let assistants edit", tagged and one Ctrl+Z, so it
+# needs no second gate here. Denying it made "mark this for me" impossible.
+ASK_TOOLS = ("Read", "Grep", "Glob") + tuple(
     f"mcp__sidemark__{t}" for t in (
         "list_documents", "get_page", "get_notes", "search", "list_references",
-        "get_page_image", "locate_text", "get_selection"))
-ASK_DENIED_TOOLS = ("Edit", "Write", "NotebookEdit", "Bash",
-                    "mcp__sidemark__annotate_page", "mcp__sidemark__go_to_page")
+        "get_page_image", "locate_text", "get_selection", "go_to_page",
+        "annotate_page"))
+ASK_DENIED_TOOLS = ("Edit", "Write", "NotebookEdit", "Bash")
 _CONTEXT_UPDATE_RE = re.compile(
     r'<sidemark-context\s+section="(\w+)"\s*>\s*(.*?)\s*</sidemark-context>',
     re.S)
@@ -749,7 +753,8 @@ def ask_prompt(question, passage=None, title=None, page=None, pages=None,
         "the language it asks for. Sidemark's tools show you the rest of the "
         "document (get_page, get_page_image of a small region, "
         "list_references, search): use them only when the passage is not "
-        "enough. Do not edit files."]
+        "enough. When I ask you to mark, highlight, draw or note something in "
+        "the document, do it with annotate_page. Do not edit files."]
     if sections:
         names = ", ".join(f'"{n}" ({ASK_SECTIONS[n]})' for n in sections)
         parts.append(
@@ -772,7 +777,7 @@ def ask_command(claude, session=None, script=None, python=None):
     argv = [claude, "-p", "--output-format", "stream-json", "--verbose",
             "--include-partial-messages",
             "--mcp-config", json.dumps(mcp),
-            "--allowedTools", ",".join(ASK_READ_TOOLS),
+            "--allowedTools", ",".join(ASK_TOOLS),
             "--disallowedTools", ",".join(ASK_DENIED_TOOLS)]
     if session:
         argv += ["--resume", session]
