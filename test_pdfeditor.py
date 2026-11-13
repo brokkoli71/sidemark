@@ -3109,6 +3109,202 @@ class TestMcpDrawing(unittest.TestCase):
         self._run(body)
 
 
+class TestAskClaudePieces(unittest.TestCase):
+    """Row 219: the parts of Ask Claude that need no window."""
+
+    MD = ("# Thesis\n\nKeep this.\n\n<!-- sidemark:person -->\nOld person.\n"
+          "<!-- /sidemark:person -->\n\nAnd this.\n\n<!-- sidemark:reading -->\n"
+          "- Paper A\n<!-- /sidemark:reading -->\n")
+
+    def test_only_the_marked_sections_are_ever_rewritten(self):
+        self.assertEqual(sidemark.context_sections(self.MD),
+                         {"person": "Old person.", "reading": "- Paper A"})
+        new = sidemark.replace_context_section(self.MD, "reading",
+                                               "- Paper A\n- Paper B")
+        self.assertIn("- Paper B", new)
+        self.assertEqual(new.replace("- Paper A\n- Paper B", "- Paper A"),
+                         self.MD)            # not a byte outside the markers
+        self.assertIsNone(sidemark.replace_context_section("# none", "person",
+                                                           "x"))
+
+    def test_proposals_come_off_the_answer(self):
+        answer, updates = sidemark.split_context_updates(
+            "Slicing splits an index.\n\n"
+            '<sidemark-context section="reading">\n- B\n</sidemark-context>\n'
+            '<sidemark-context section="secrets">x</sidemark-context>')
+        self.assertEqual(answer, "Slicing splits an index.")
+        self.assertEqual(updates, {"reading": "- B"})   # unknown name dropped
+
+    def test_the_prompt_and_the_follow_up(self):
+        p = sidemark.ask_prompt("", "the passage", title="paper.pdf", page=4,
+                                pages=19, sections=["person"])
+        for bit in ("the passage", "paper.pdf, page 4 of 19",
+                    "Explain this passage.", '"person"', "sidemark-context"):
+            self.assertIn(bit, p)
+        self.assertNotIn("sidemark-context",
+                         sidemark.ask_prompt("q", "x", sections=[]))
+        self.assertEqual(sidemark.ask_prompt("and why?"), "and why?")
+
+    def test_the_session_is_read_only_and_resumable(self):
+        argv = sidemark.ask_command("claude", session="abc")
+        self.assertEqual(argv[argv.index("--resume") + 1], "abc")
+        allowed = argv[argv.index("--allowedTools") + 1].split(",")
+        denied = argv[argv.index("--disallowedTools") + 1].split(",")
+        for t in ("Edit", "Write", "Bash", "mcp__sidemark__annotate_page"):
+            self.assertNotIn(t, allowed)
+            self.assertIn(t, denied)
+        self.assertIn("mcp__sidemark__get_page", allowed)
+        mcp = json.loads(argv[argv.index("--mcp-config") + 1])
+        self.assertEqual(mcp["mcpServers"]["sidemark"]["args"][-1], "--mcp")
+        self.assertNotIn("--resume", sidemark.ask_command("claude"))
+
+    def test_the_stream_is_read_once_whatever_its_shape(self):
+        p = sidemark.AskStreamParser()
+        lines = [
+            {"type": "system", "subtype": "init", "session_id": "s1"},
+            {"type": "stream_event", "event": {"type": "content_block_delta",
+             "delta": {"type": "text_delta", "text": "Hel"}}},
+            {"type": "stream_event", "event": {"type": "content_block_delta",
+             "delta": {"type": "text_delta", "text": "lo"}}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Hello"}]}},     # not a second time
+            "garbage",
+            {"type": "result", "subtype": "success", "result": "Hello",
+             "session_id": "s1"}]
+        shown = "".join(p.feed(l if isinstance(l, str) else json.dumps(l))
+                        for l in lines)
+        self.assertEqual((shown, p.text, p.session, p.done, p.error),
+                         ("Hello", "Hello", "s1", True, None))
+        q = sidemark.AskStreamParser()                 # no partial messages
+        q.feed(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Whole"}]}}))
+        q.feed(json.dumps({"type": "result", "subtype": "error_during_execution",
+                           "is_error": True, "result": "boom"}))
+        self.assertEqual((q.text, q.error), ("Whole", "boom"))
+
+
+class TestAskClaude(unittest.TestCase):
+    """Row 219 in the window, against a FAKE `claude` that records how it was
+    called and answers in stream-json — never the real one."""
+
+    FAKE = r'''#!/usr/bin/python3
+import json, os, sys
+log = os.environ["FAKE_CLAUDE_LOG"]
+with open(log, "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
+                        "stdin": sys.stdin.read()}) + "\n")
+say = lambda o: print(json.dumps(o), flush=True)
+say({"type": "system", "subtype": "init", "session_id": "sess-1"})
+for t in ("Slicing **splits** ", "an index."):
+    say({"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": t}}})
+say({"type": "stream_event", "event": {"type": "content_block_delta",
+     "delta": {"type": "text_delta", "text":
+     '\n<sidemark-context section="reading">\n- Staudt: S. 2\n</sidemark-context>'}}})
+say({"type": "result", "subtype": "success", "session_id": "sess-1"})
+'''
+
+    def _run(self, body):
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "claude")
+            with open(fake, "w") as f:
+                f.write(self.FAKE)
+            os.chmod(fake, 0o755)
+            folder = os.path.join(d, "thesis")
+            os.mkdir(folder)
+            with open(os.path.join(folder, "CLAUDE.md"), "w") as f:
+                f.write(TestAskClaudePieces.MD)
+            log = os.path.join(d, "calls.jsonl")
+            sidemark._save_setting("ask_claude_dir", folder)
+            with mock.patch.dict(os.environ, {"SIDEMARK_CLAUDE": fake,
+                                              "FAKE_CLAUDE_LOG": log}):
+                TestMcpBridge._run(self, lambda win, _b: body(win, folder, log))
+
+    @staticmethod
+    def _until(cond, s=10):
+        deadline = time.time() + s
+        while not cond() and time.time() < deadline:
+            GLib.MainContext.default().iteration(False)
+            time.sleep(0.005)
+
+    def test_ask_answer_follow_up_and_keep_the_context(self):
+        def body(win, folder, log):
+            c = win.canvas
+            pt = c._page_text()
+            lo = "".join(ch[4] for ch in pt.chars).find("[2]")
+            c._text_segments = pt.segments(lo, lo + 3)
+            self.assertIn("Ask Claude…", c.context_menu_entries())
+            c.ask_claude()                          # what the menu entry does
+            s = win._active_session
+            panel = s._ask["panel"]
+            self.assertTrue(panel.get_visible())
+            panel.entry.set_text("What is this?")
+            panel.entry.emit("activate")
+            self._until(lambda: s._ask.get("run") is None
+                        and s._ask.get("answer"))
+            # shown as the answer; the proposal is NOT part of it
+            self.assertEqual(s._ask["answer"], "Slicing **splits** an index.")
+            self.assertNotIn("sidemark", panel.answer.get_text())
+            (call,) = [json.loads(l) for l in open(log)]
+            self.assertEqual(os.path.realpath(call["cwd"]),
+                             os.path.realpath(folder))
+            self.assertIn("[2]", call["stdin"])
+            self.assertIn("What is this?", call["stdin"])
+            self.assertNotIn("--resume", call["argv"])
+            # CLAUDE.md: the reading section rewritten, the rest untouched
+            md = open(os.path.join(folder, "CLAUDE.md")).read()
+            self.assertIn("- Staudt: S. 2", md)
+            self.assertIn("Old person.", md)
+            self.assertIn("Keep this.", md)
+            panel.undo.emit("clicked")
+            self.assertEqual(open(os.path.join(folder, "CLAUDE.md")).read(),
+                             TestAskClaudePieces.MD)
+            # a follow-up: the same conversation, just the question
+            panel.entry.set_text("and why?")
+            panel.entry.emit("activate")
+            self._until(lambda: len(open(log).readlines()) == 2
+                        and s._ask.get("run") is None)
+            second = json.loads(open(log).readlines()[1])
+            self.assertEqual(second["argv"][second["argv"].index("--resume") + 1],
+                             "sess-1")
+            self.assertEqual(second["stdin"].strip(), "and why?")
+            # into the notes, as the assistant's
+            panel.add_btn.emit("clicked")
+            notes = win.notes_model.get(0)
+            self.assertIn("**and why?**", notes)
+            self.assertIn(sidemark.ASSISTANT_OPEN, notes)
+            win._global_undo()
+            self.assertNotIn("and why?", win.notes_model.get(0))
+        self._run(body)
+
+    def test_without_a_folder_it_says_where_to_set_one(self):
+        def body(win, _folder, log):
+            sidemark._save_setting("ask_claude_dir", "")
+            win._ask_claude_about("a passage", 1)
+            s = win._active_session
+            s._ask["panel"].entry.emit("activate")
+            self.assertIn("Settings", s._ask["panel"].status.get_text())
+            self.assertFalse(os.path.exists(log))      # nothing was run
+        self._run(body)
+
+    def test_a_text_page_asks_too(self):
+        def body(win, _folder, log):
+            win._on_new_text_page()
+            TestMcpDrawing._settle(400)
+            tp = win._text_page
+            buf = tp.view.get_buffer()
+            buf.set_text("Contraction trees are binary.\n")
+            TestMcpDrawing._settle(200)
+            buf.select_range(buf.get_iter_at_offset(0),
+                             buf.get_iter_at_offset(17))
+            self.assertIn("Ask Claude…", tp.context_menu_entries())
+            tp.ask_claude()
+            st = win._active_session._ask
+            self.assertEqual((st["passage"], st["page"]),
+                             ("Contraction trees", 1))
+        self._run(body)
+
+
 class TestMcpEndToEnd(unittest.TestCase):
     """The real thing: `sidemark.py --mcp` as its own process, talking to the
     app's bridge over D-Bus — on a PRIVATE dbus-daemon. Not Gio.TestDBus: GTK

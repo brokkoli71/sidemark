@@ -87,6 +87,18 @@
   `_record` write to the session itself. Places on a page are POINTS from
   its top left in both modes; a text page counts in the A4 pages it
   exports as (`TextPageView.export_pages`).
+- **Ask Claude (row 219) is `claude -p` in the user's FOLDER, read-only.**
+  The answer's context is that folder's CLAUDE.md, which is the whole point:
+  a session there knows the person. One conversation per document
+  (`--resume`, session id in `DocumentSession._ask`); the prompt goes on
+  STDIN, and every list flag gets one comma-joined argument, so a variadic
+  flag cannot swallow the prompt. Sidemark's MCP server is passed with
+  `--mcp-config` (registered per project, it would not exist in that
+  folder). The session may not edit: it PROPOSES rewrites of the sections
+  between `<!-- sidemark:person -->` / `<!-- sidemark:reading -->` markers
+  and Sidemark applies exactly those (`replace_context_section`), shown in
+  the panel with an undo. Test it with a fake `claude` (`SIDEMARK_CLAUDE`),
+  never the real one.
 - **What an assistant made is tagged** (row 218): notes between
   `<!-- by:assistant -->` … `<!-- /by:assistant -->` (hidden like every
   marker, tinted in the editor, stripped by `_strip_markers` so a callout

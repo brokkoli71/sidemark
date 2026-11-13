@@ -672,6 +672,167 @@ def mcp_object_path(app_id):
     return "/" + app_id.replace(".", "/").replace("-", "_") + "/mcp"
 
 
+# ── Ask Claude about a passage (row 219) ─────────────────────────────────────
+# Select text, right-click, "Ask Claude…": Sidemark runs Claude Code headless
+# (`claude -p`) in the user's chosen FOLDER — so the answer comes from the
+# context that folder's CLAUDE.md gives (who the user is, what they know,
+# where their work stands), not from a blank session. One conversation per
+# document, resumed for follow-ups. The session is READ-ONLY: it may look
+# around the document through Sidemark's own tools, and it may PROPOSE a
+# rewrite of the CLAUDE.md sections marked for Sidemark; Sidemark applies
+# those itself, to exactly those sections, and shows that it did.
+
+ASK_SECTIONS = {"person": "who the user is and what they know",
+                "reading": "the papers they have read, one line each"}
+ASK_READ_TOOLS = ("Read", "Grep", "Glob") + tuple(
+    f"mcp__sidemark__{t}" for t in (
+        "list_documents", "get_page", "get_notes", "search", "list_references",
+        "get_page_image", "locate_text", "get_selection"))
+ASK_DENIED_TOOLS = ("Edit", "Write", "NotebookEdit", "Bash",
+                    "mcp__sidemark__annotate_page", "mcp__sidemark__go_to_page")
+_CONTEXT_UPDATE_RE = re.compile(
+    r'<sidemark-context\s+section="(\w+)"\s*>\s*(.*?)\s*</sidemark-context>',
+    re.S)
+
+
+def _context_marker_re(name):
+    return re.compile(r'(<!--\s*sidemark:' + re.escape(name) + r'\s*-->)'
+                      r'(.*?)(<!--\s*/sidemark:' + re.escape(name) + r'\s*-->)',
+                      re.S)
+
+
+def context_sections(text):
+    """{name: body} of the CLAUDE.md sections Sidemark may keep current."""
+    out = {}
+    for name in ASK_SECTIONS:
+        m = _context_marker_re(name).search(text or "")
+        if m:
+            out[name] = m.group(2).strip()
+    return out
+
+
+def replace_context_section(text, name, body):
+    """`text` with section `name`'s body replaced, or None without markers.
+    Only what lies BETWEEN the markers changes — never a byte outside."""
+    rx = _context_marker_re(name)
+    if not rx.search(text):
+        return None
+    return rx.sub(lambda m: m.group(1) + "\n" + body.strip() + "\n" + m.group(3),
+                  text, count=1)
+
+
+def split_context_updates(answer):
+    """(the answer as shown, {section: new body}) — the proposals come off
+    the end of the answer; an unknown section name is dropped."""
+    updates = {m.group(1): m.group(2) for m in _CONTEXT_UPDATE_RE.finditer(answer)
+               if m.group(1) in ASK_SECTIONS}
+    return _CONTEXT_UPDATE_RE.sub("", answer).strip(), updates
+
+
+def ask_prompt(question, passage=None, title=None, page=None, pages=None,
+               sections=()):
+    """What Sidemark says to Claude: the passage and where it is (a follow-up
+    is just the question), the brief to answer at the level CLAUDE.md sets,
+    and — when that CLAUDE.md has sections for Sidemark — how to propose
+    keeping them current."""
+    q = (question or "").strip() or "Explain this passage."
+    if passage is None:
+        return q
+    where = f"Document: {title}" if title else "Document: (untitled)"
+    if page:
+        where += f", page {page}" + (f" of {pages}" if pages else "")
+    parts = [
+        "I am reading in Sidemark, my PDF reader, and have a question about "
+        "a passage.", where, "Passage:", "<passage>", passage.strip(),
+        "</passage>", f"Question: {q}",
+        "Answer directly and briefly, at the level CLAUDE.md describes and in "
+        "the language it asks for. Sidemark's tools show you the rest of the "
+        "document (get_page, get_page_image of a small region, "
+        "list_references, search): use them only when the passage is not "
+        "enough. Do not edit files."]
+    if sections:
+        names = ", ".join(f'"{n}" ({ASK_SECTIONS[n]})' for n in sections)
+        parts.append(
+            f"CLAUDE.md has sections Sidemark keeps current: {names}. If — and "
+            "only if — this exchange changes the broad picture one of them "
+            "gives, end your reply with that whole section rewritten:\n"
+            '<sidemark-context section="NAME">\n…\n</sidemark-context>\n'
+            "Each is a short snapshot of NOW: no history, no details of single "
+            "questions, one line per paper. Most answers change nothing — "
+            "then add nothing.")
+    return "\n\n".join(parts)
+
+
+def ask_command(claude, session=None, script=None, python=None):
+    """argv for one question. The prompt goes on stdin; the tools are named
+    as single arguments so no list flag can swallow another."""
+    mcp = {"mcpServers": {"sidemark": {
+        "command": python or sys.executable,
+        "args": [script or os.path.abspath(__file__), "--mcp"]}}}
+    argv = [claude, "-p", "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages",
+            "--mcp-config", json.dumps(mcp),
+            "--allowedTools", ",".join(ASK_READ_TOOLS),
+            "--disallowedTools", ",".join(ASK_DENIED_TOOLS)]
+    if session:
+        argv += ["--resume", session]
+    return argv
+
+
+class AskStreamParser:
+    """Claude Code's stream-json, one line at a time, as what a reader
+    needs: text as it arrives, the session id, the end. Lenient: the deltas
+    of a partial-messages stream and whole assistant messages both count,
+    never twice, and an unknown line is skipped."""
+
+    def __init__(self):
+        self.session = None
+        self.text = ""
+        self._streamed = False
+        self.done = False
+        self.error = None
+
+    def feed(self, line):
+        """Returns the new text to show, or ""."""
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return ""
+        if not isinstance(ev, dict):
+            return ""
+        self.session = ev.get("session_id") or self.session
+        kind = ev.get("type")
+        if kind == "stream_event":
+            e = ev.get("event") or {}
+            d = e.get("delta") or {}
+            if e.get("type") == "content_block_delta" and d.get("type") == "text_delta":
+                self._streamed = True
+                self.text += d.get("text", "")
+                return d.get("text", "")
+            if e.get("type") == "message_start" and self.text and \
+                    not self.text.endswith("\n\n"):
+                self.text += "\n\n"     # a new turn after a tool call
+                return "\n\n"
+            return ""
+        if kind == "assistant" and not self._streamed:
+            new = "".join(b.get("text", "") for b in
+                          (ev.get("message") or {}).get("content") or []
+                          if isinstance(b, dict) and b.get("type") == "text")
+            if new:
+                sep = "\n\n" if self.text else ""
+                self.text += sep + new
+                return sep + new
+            return ""
+        if kind == "result":
+            self.done = True
+            if ev.get("is_error") or ev.get("subtype", "success") != "success":
+                self.error = str(ev.get("result") or ev.get("subtype") or "failed")
+            elif not self.text and ev.get("result"):
+                self.text = str(ev["result"])
+                return self.text
+        return ""
+
+
 def _mcp_dbus_caller(app_id):
     """`call(tool, args)` for mcp_serve, over the session bus to the app."""
     import gi
@@ -3630,6 +3791,8 @@ CONTEXT_MENU = (
      "highlight_text_selection", ("pdf", "text")),
     ("copy-text", "Copy", "has_text_selection", "copy_text_selection",
      ("pdf",)),
+    ("ask-claude", "Ask Claude…", "has_text_selection", "ask_claude",
+     ("pdf", "text")),
     ("copy-ink", "Copy drawing", "has_lasso_selection", "copy_selection",
      ("pdf", "text")),
     ("duplicate", "Duplicate drawing", "has_lasso_selection",
@@ -10354,6 +10517,23 @@ class PDFCanvas(Gtk.DrawingArea):
         """The menu's Highlight: the same ink the text-marking highlighter
         lays, over what the text cursor selected."""
         self._commit_text_highlight()
+
+    def selection_text(self):
+        """(the selected text as a reader means it, its first page 1-based)."""
+        parts = [(pno, self._page_text_of(pno).text(
+                    segs, keep_lines=self._sel_keep_lines))
+                 for pno, segs in self._selection_by_page()]
+        parts = [(p, t) for p, t in parts if t]
+        if not parts:
+            return "", None
+        return "\n".join(t for _p, t in parts), parts[0][0] + 1
+
+    def ask_claude(self):
+        """The menu's Ask Claude…, about the selection (row 219)."""
+        cb = getattr(self, "on_ask_claude", None)
+        text, page = self.selection_text()
+        if cb and text:
+            cb(text, page)
 
     def context_menu_entries(self):
         """What the menu would offer now (and arms exactly those actions)."""
@@ -21762,6 +21942,22 @@ class TextPageView(Gtk.Overlay):
     def has_text_selection(self):
         return self.view.get_buffer().get_has_selection()
 
+    def ask_claude(self):
+        """The menu's Ask Claude…, about the selection (row 219)."""
+        cb = getattr(self, "on_ask_claude", None)
+        buf = self.view.get_buffer()
+        bounds = buf.get_selection_bounds()
+        if not (cb and bounds):
+            return
+        page = None
+        with contextlib.suppress(OSError, ValueError):
+            k, offs = self.export_pages()
+            ox, oy = self.view.window_to_buffer_coords(
+                Gtk.TextWindowType.WIDGET, 0, 0)
+            y = self.view.get_iter_location(bounds[0]).y - oy
+            page = max(j for j in range(len(offs) - 1) if offs[j] <= max(y, 0)) + 1
+        cb(buf.get_text(bounds[0], bounds[1], False), page)
+
     def highlight_text_selection(self):
         """Highlighter ink over every display line of the selected text, one
         stroke per line — the PDF page's Highlight, on the sheet. Anchored to
@@ -23897,6 +24093,7 @@ class DocumentSession:
         "_pane_settling", "_pane_watch_id", "_pane_settle_id",
         "_full_notes_from", "_full_notes_caret",
         "_throwaway",
+        "_ask",           # Ask Claude (row 219): panel, session id, last answer
     )
     WIDGETS = (
         "canvas", "_notes_view", "_panel_notes_view", "_notes_box",
@@ -23950,6 +24147,7 @@ class DocumentSession:
         # in the app sets this — it is a launch-time decision about a blank
         # page, never something a real file can become.
         self._throwaway = False
+        self._ask = None
         self._has_toc = False
         self._toc_thumbs = False
         self._drop_indicator_row = None
@@ -25352,6 +25550,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s.canvas.on_callout_placed = lambda *a: s.win._on_callout_placed(*a)
         s.canvas.on_callout_moved = lambda *a: s.win._on_callout_moved(*a)
         s.canvas.on_user_action = lambda *a: s.win._on_canvas_action(*a)
+        s.canvas.on_ask_claude = lambda t, p, s=s: s.win._ask_claude_about(t, p)
         s.canvas.on_canvas_press = lambda *a: s.win._clear_thumb_selection(*a)
         s.canvas.on_nav_history = lambda *a: s.win._on_nav_history(*a)
         s.canvas.on_modifier_tool = lambda *a: s.win._highlight_transient_tool(*a)
@@ -25636,6 +25835,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "changed", lambda *a: s.win._on_notes_changed(*a))
         tp.on_ink_action = lambda: s.win._on_ink_action()
         tp.on_ink_changed = lambda: s.win._mark_dirty()
+        tp.on_ask_claude = lambda t, p, s=s: s.win._ask_claude_about(t, p)
         # the session's canvas holds the window-fed modifier tracking; the
         # sheet merges it into chord routing so keyboard+touch chords work
         tp.get_held_mods = lambda s=s: (s.canvas._ctrl_held,
@@ -25643,7 +25843,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                                         s.canvas._alt_held)
         tp.set_visible(False)
         tp.set_vexpand(True)
-        s._sheet_box.append(tp)
+        # right under the notes: an Ask Claude panel stays LAST in the column
+        s._sheet_box.insert_child_after(tp, s._notes_box)
         s._text_page = tp
         return tp
 
@@ -28264,6 +28465,187 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         _, page, before, after = op
         self._set_notes_text(page, after)
         self._undo_timeline.append(("notes", page, before))
+
+    # ── Ask Claude about a passage (row 219) ────────────────────────────────
+
+    def _ask_claude_about(self, passage, page=None):
+        """The menu's "Ask Claude…": open the panel on this passage, the
+        question field ready. The conversation is the document's — a new
+        passage is asked in it, so follow-ups and earlier answers carry."""
+        s = self._active_session
+        if s is None or not (passage or "").strip():
+            return
+        st = s._ask = s._ask or {}
+        st.update(passage=passage.strip(), page=page, fresh=True)
+        panel = st.get("panel")
+        if panel is None:
+            panel = st["panel"] = AskPanel(
+                on_send=lambda q, s=s: self._ask_send(s, q),
+                on_close=lambda s=s: self._ask_close(s),
+                on_add=lambda s=s: self._ask_add_to_notes(s))
+            s._sheet_box.append(panel)
+        if not self._text_mode and not self._notes_box.get_visible():
+            self._set_notes_shown(True)
+        panel.set_visible(True)
+        panel.show_passage(passage, page)
+        panel.entry.grab_focus()
+
+    def _ask_close(self, s):
+        st = s._ask or {}
+        if st.get("run"):
+            st["run"].cancel()
+            st["run"] = None
+        if st.get("panel"):
+            st["panel"].set_visible(False)
+
+    @staticmethod
+    def _ask_folder():
+        d = (_load_settings().get("ask_claude_dir") or "").strip()
+        d = os.path.expanduser(d)
+        return d if d and os.path.isdir(d) else None
+
+    def _ask_send(self, s, question):
+        st = s._ask
+        panel = st["panel"]
+        if st.get("run"):
+            return                      # one question at a time
+        folder = self._ask_folder()
+        claude = os.environ.get("SIDEMARK_CLAUDE") or shutil.which("claude")
+        if folder is None:
+            panel.set_status("Choose the folder Claude should answer from: "
+                             "Settings → Assistants → Ask Claude in folder.")
+            return
+        if not claude:
+            panel.set_status("Claude Code is not installed — `claude` is not "
+                             "on PATH. Install it, sign in once in a "
+                             "terminal, then ask again.")
+            return
+        claude_md = os.path.join(folder, "CLAUDE.md")
+        try:
+            with open(claude_md, encoding="utf-8") as f:
+                sections = list(context_sections(f.read()))
+        except OSError:
+            sections = []
+        title = (os.path.basename(self._path_of_session(s) or "")
+                 or (s._tab_page.get_title() if s._tab_page else None))
+        pages = (s.canvas.n_pages if s.doc_mode != "text" and s.canvas
+                 and s.canvas.document else None)
+        prompt = ask_prompt(question, st["passage"] if st.get("fresh") else None,
+                            title=title, page=st.get("page"), pages=pages,
+                            sections=sections)
+        argv = ask_command(claude, session=st.get("session"))
+        panel.begin(question)
+        try:
+            st["run"] = AskRun(argv, prompt, folder, panel.add_text,
+                               lambda parser, rc, err, s=s:
+                               self._ask_done(s, parser, rc, err))
+        except OSError as e:
+            panel.set_status("Claude Code could not be started. Check that "
+                             "`claude` runs in a terminal.", tooltip=str(e))
+            return
+        st["fresh"] = False
+        st["question"] = question
+
+    @staticmethod
+    def _path_of_session(s):
+        return s._path or s._notes_path
+
+    def _ask_done(self, s, parser, rc, err):
+        st = s._ask
+        st["run"] = None
+        panel = st["panel"]
+        if parser.session:
+            st["session"] = parser.session
+        answer, updates = split_context_updates(parser.text)
+        st["answer"] = answer
+        panel.finish(answer)
+        if parser.error or (rc and not answer):
+            if st.get("session") and "session" in (parser.error or err).lower():
+                st["session"] = None       # gone: the next one starts afresh
+            panel.set_status("Claude Code could not answer. Check that `claude` "
+                             "works in a terminal (signed in, online), then ask "
+                             "again.", tooltip=(parser.error or err or "").strip())
+            return
+        panel.set_status("")
+        if updates:
+            self._ask_apply_context(panel, updates)
+
+    def _ask_apply_context(self, panel, updates):
+        """Write what the session proposed into CLAUDE.md — exactly the
+        marked sections, nothing else — and say so, with an undo."""
+        folder = self._ask_folder()
+        if folder is None:
+            return
+        path = os.path.join(folder, "CLAUDE.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                before = f.read()
+        except OSError:
+            return
+        after, done = before, []
+        for name, body in updates.items():
+            new = replace_context_section(after, name, body)
+            if new is not None and new != after:
+                after, done = new, done + [name]
+        if not done:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(after)
+        except OSError as e:
+            panel.set_status("Could not update CLAUDE.md.", tooltip=str(e))
+            return
+        panel.set_status("Updated CLAUDE.md: " + ", ".join(done),
+                         tooltip="\n\n".join(updates[n] for n in done))
+
+        def undo(_b):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    if f.read() != after:
+                        panel.set_status("CLAUDE.md changed since — not undone.")
+                        return
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(before)
+            except OSError:
+                return
+            panel.set_status("CLAUDE.md is back as it was.")
+            panel.undo.set_visible(False)
+
+        if getattr(panel, "_undo_id", None):
+            panel.undo.disconnect(panel._undo_id)
+        panel._undo_id = panel.undo.connect("clicked", undo)
+        panel.undo.set_visible(True)
+
+    def _ask_add_to_notes(self, s):
+        """The answer into the notes, as the assistant's (tinted, removable
+        with the rest of its marks), headed by the question asked."""
+        st = s._ask or {}
+        answer = (st.get("answer") or "").strip()
+        if not answer:
+            return
+        q = (st.get("question") or "").strip()
+        block = assistant_block((f"**{q}**\n\n" if q else "") + answer)
+        if s.doc_mode == "text":
+            buf = s._text_page.view.get_buffer()
+            bounds = buf.get_selection_bounds()
+            it = (bounds[1] if bounds else buf.get_iter_at_mark(buf.get_insert()))
+            if not it.ends_line():
+                it.forward_to_line_end()
+            buf.insert(it, "\n\n" + block + "\n")
+        else:
+            self._commit_note_for(s)
+            page = st.get("page")
+            i = (page - 1) if page else s.canvas.current_page_idx
+            old = s.notes_model.get(i)
+            s.notes_model.set(i, (old.rstrip() + "\n\n" if old.strip() else "")
+                              + block)
+            McpBridge._record(s, [("notes", i, old)])
+            if s is self._active_session and self.canvas.current_page_idx == i:
+                self._restore_note()
+                self._burst_base = self._notes_view.get_source_text()
+            self._mark_dirty(pdf=False)
+        st["panel"].add_btn.set_sensitive(False)
+        st["panel"].set_status("Added to the notes.")
 
     def _has_assistant_marks(self, s):
         if s is None:
@@ -31289,6 +31671,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         edits.connect("notify::active", lambda r, _p:
                       _save_setting("mcp_allow_edits", r.get_active()))
         assistants.add(edits)
+        ask_dir = Adw.EntryRow(title="Ask Claude in folder")
+        ask_dir.set_text(_load_settings().get("ask_claude_dir") or "")
+        ask_dir.set_tooltip_text(
+            "Select text, right-click → Ask Claude…: the answer comes from "
+            "Claude Code running in this folder, with its CLAUDE.md — who you "
+            "are, what you know, where your work stands.")
+        ask_dir.connect("changed", lambda r: _save_setting(
+            "ask_claude_dir", r.get_text().strip()))
+        assistants.add(ask_dir)
         page.add(assistants)
 
         mouse = Adw.PreferencesGroup(title="Mouse")
@@ -34548,6 +34939,150 @@ class PresenterWindow(Adw.Window):
             self._nav(1)
         elif button == Gdk.BUTTON_SECONDARY or step < 0:  # right / back → prev
             self._nav(-1)
+
+
+class AskRun:
+    """One `claude -p` question, off the main loop: the prompt goes in on
+    stdin, stream-json comes out a line at a time, and `on_text` / `on_done`
+    are called back ON the main loop. `cancel()` stops it, children too."""
+
+    def __init__(self, argv, prompt, cwd, on_text, on_done):
+        self.parser = AskStreamParser()
+        self._cancelled = False
+        self.proc = subprocess.Popen(
+            argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            start_new_session=True)
+
+        def work():
+            err = ""
+            try:
+                self.proc.stdin.write(prompt)
+                self.proc.stdin.close()
+                for line in self.proc.stdout:
+                    new = self.parser.feed(line)
+                    if new:
+                        GLib.idle_add(lambda t=new: on_text(t) and False)
+                err = self.proc.stderr.read()
+            except (OSError, ValueError) as e:
+                err = str(e)
+            rc = self.proc.wait()
+            if not self._cancelled:
+                GLib.idle_add(lambda: on_done(self.parser, rc, err) and False)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def cancel(self):
+        self._cancelled = True
+        with contextlib.suppress(OSError):
+            os.killpg(self.proc.pid, signal.SIGTERM)
+
+
+class AskPanel(Gtk.Box):
+    """The answer, beside the page (row 219): the passage asked about, the
+    answer as it streams in, one field for the next question, and the one
+    thing worth doing with an answer — putting it in the notes."""
+
+    def __init__(self, on_send, on_close, on_add):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add_css_class("card")
+        for side in ("start", "end", "top", "bottom"):
+            getattr(self, f"set_margin_{side}")(6)
+        head = Gtk.Box(spacing=6)
+        title = Gtk.Label(label="Claude", xalign=0)
+        title.add_css_class("heading")
+        self.passage = Gtk.Label(xalign=0, hexpand=True)
+        self.passage.add_css_class("dim-label")
+        self.passage.set_ellipsize(Pango.EllipsizeMode.END)
+        close = Gtk.Button(icon_name="window-close-symbolic")
+        close.add_css_class("flat")
+        close.set_tooltip_text("Close (the conversation is kept for follow-ups)")
+        close.connect("clicked", lambda _b: on_close())
+        head.append(title)
+        head.append(self.passage)
+        head.append(close)
+        for side in ("start", "end", "top"):
+            getattr(head, f"set_margin_{side}")(8)
+        self.answer = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True)
+        self.answer.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.answer.set_margin_start(10)
+        self.answer.set_margin_end(10)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_propagate_natural_height(True)
+        scroll.set_max_content_height(320)
+        scroll.set_child(self.answer)
+        self.scroll = scroll
+        status_row = Gtk.Box(spacing=6)
+        status_row.set_margin_start(10)
+        self.status = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        self.status.add_css_class("dim-label")
+        self.status.add_css_class("caption")
+        self.undo = Gtk.Button(label="Undo")
+        self.undo.add_css_class("flat")
+        self.undo.set_visible(False)
+        status_row.append(self.status)
+        status_row.append(self.undo)
+        row = Gtk.Box(spacing=6)
+        for side in ("start", "end", "bottom"):
+            getattr(row, f"set_margin_{side}")(8)
+        self.entry = Gtk.Entry(hexpand=True)
+        self.entry.set_placeholder_text("Ask about this passage…")
+        self.entry.connect("activate", lambda e: on_send(e.get_text()))
+        self.add_btn = Gtk.Button(label="Add to notes")
+        self.add_btn.set_sensitive(False)
+        self.add_btn.connect("clicked", lambda _b: on_add())
+        row.append(self.entry)
+        row.append(self.add_btn)
+        for w in (head, scroll, status_row, row):
+            self.append(w)
+        self._raw = ""
+
+    def show_passage(self, passage, page=None):
+        one = " ".join(passage.split())
+        self.passage.set_text((f"p. {page} · " if page else "") + f"“{one}”")
+        self.passage.set_tooltip_text(passage)
+        self.entry.set_placeholder_text("Ask about this passage… (Enter: "
+                                        "explain it)")
+
+    def begin(self, question):
+        self._raw = ""
+        self.answer.set_text("")
+        self.set_status("Thinking…")
+        self.undo.set_visible(False)
+        self.add_btn.set_sensitive(False)
+        self.entry.set_text("")
+        self.entry.set_placeholder_text("Ask a follow-up…")
+        self.question = question
+
+    def add_text(self, text):
+        self._raw += text
+        # a proposal for CLAUDE.md streams in last: it is never shown as answer
+        self._render(self._raw.split("<sidemark-context")[0])
+        return True
+
+    def finish(self, answer):
+        self._render(answer)
+        self.add_btn.set_sensitive(bool(answer.strip()))
+
+    def _render(self, text):
+        lines = []
+        for line in text.strip().split("\n"):
+            head = re.match(r"^#{1,6}\s+(.*)", line)
+            try:
+                body = _notes_to_pango_markup(head.group(1) if head else line)
+            except Exception:
+                body = GLib.markup_escape_text(line)
+            lines.append(f"<b>{body}</b>" if head else body)
+        try:
+            self.answer.set_markup("\n".join(lines))
+        except Exception:
+            self.answer.set_text(text)
+
+    def set_status(self, text, tooltip=None):
+        self.status.set_text(text)
+        self.status.set_tooltip_text(tooltip)
+        self.status.set_visible(bool(text))
 
 
 class InkPlayback:
