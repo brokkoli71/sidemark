@@ -2698,6 +2698,42 @@ class TestMcpBridge(unittest.TestCase):
             self.assertFalse(bridge.call("get_page", {"page": 9})["ok"])
         self._run(body)
 
+    def test_the_users_selection_is_what_this_means(self):
+        def body(win, bridge):
+            self.assertIsNone(
+                bridge.call("get_selection", {})["result"]["selection"])
+            c = win.canvas
+            pt = c._page_text()
+            lo = "".join(ch[4] for ch in pt.chars).find("[2]")
+            c._text_segments = pt.segments(lo, lo + 3)
+            sel = bridge.call("get_selection", {})["result"]["selection"]
+            self.assertEqual(sel["text"], "[2]")
+            (part,) = sel["pages"]
+            self.assertEqual(part["page"], 1)
+            x0, y0, x1, y1 = part["rects"][0]
+            r = c.document[0].search_for("[2]")[0]
+            self.assertTrue(x0 <= r.x0 + 1 and x1 >= r.x1 - 1)
+            self.assertTrue(y0 <= (r.y0 + r.y1) / 2 <= y1)
+            # a text page: the sheet's own selection
+            win._on_new_text_page()
+            self._settle(400)
+            buf = win._text_page.view.get_buffer()
+            buf.set_text("Some words to explain.\n")
+            self._settle(200)
+            a = buf.get_iter_at_offset(5)
+            buf.select_range(a, buf.get_iter_at_offset(10))
+            sel = bridge.call("get_selection", {})["result"]["selection"]
+            self.assertEqual(sel["text"], "words")
+            self.assertEqual(sel["pages"][0]["page"], 1)
+        self._run(body)
+
+    @staticmethod
+    def _settle(ms=200):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline:
+            ctx.iteration(False)
+
     def test_moving(self):
         def body(win, bridge):
             res = bridge.call("go_to_page", {"page": 2})

@@ -494,6 +494,12 @@ MCP_TOOLS = [
                     "description": "Longest side of the picture, default "
                                    "1000."},
          "document": _MCP_DOC}, "required": ["page"]}},
+    {"name": "get_selection", "write": False,
+     "description": "What the user has selected in Sidemark right now — "
+                    "the text, its page and where it is — so \"this\", "
+                    "\"what I marked\" and \"explain this passage\" have "
+                    "an answer. Null when nothing is selected.",
+     "inputSchema": {"type": "object", "properties": {"document": _MCP_DOC}}},
     {"name": "locate_text", "write": False,
      "description": "Where a phrase is on the page: one [x0, y0, x1, y1] "
                     "rectangle in points per occurrence (case-insensitive). "
@@ -35069,6 +35075,46 @@ class McpBridge:
                 round(vx1 / k, 1), round((vy1 - offs[n]) / k, 1)]})
             it = b
         return hits
+
+    def _get_selection(self, document=None):
+        """The text selection of a document, page by page, with the rect of
+        each selected line in page points — what "this passage" means."""
+        _w, s = self._pick(document)
+        kind, x = self._surface_of(s)
+        out = {"document": self._path_of(s), "selection": None}
+        if kind == "pdf":
+            parts = []
+            for pno, segs in x._selection_by_page():
+                pt = x._page_text_of(pno)
+                text = pt.text(segs, keep_lines=x._sel_keep_lines)
+                if text:
+                    parts.append({"page": pno + 1, "text": text, "rects": [
+                        [round(v, 1) for v in pt.band(seg)] for seg in segs]})
+            if parts:
+                out["selection"] = {
+                    "text": "\n".join(p["text"] for p in parts),
+                    "pages": parts}
+            return out
+        buf = x.view.get_buffer()
+        bounds = buf.get_selection_bounds()
+        if not bounds:
+            return out
+        a, b = bounds
+        text = buf.get_text(a, b, False)
+        if not text.strip():
+            return out
+        # where it starts and ends, in the export pages' points
+        k, offs = x.export_pages()
+        ox, oy = x.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, 0, 0)
+        ra, rb = x.view.get_iter_location(a), x.view.get_iter_location(b)
+        vy0, vy1 = ra.y - oy, rb.y + rb.height - oy
+        n = max(j for j in range(len(offs) - 1) if offs[j] <= max(vy0, 0))
+        out["selection"] = {"text": text, "pages": [{
+            "page": n + 1, "text": text, "rects": [[
+                0.0, round((vy0 - offs[n]) / k, 1),
+                round(x.view.get_width() / k, 1),
+                round((vy1 - offs[n]) / k, 1)]]}]}
+        return out
 
     def _locate_text(self, text, page=None, document=None):
         _w, s = self._pick(document)
