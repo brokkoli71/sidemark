@@ -6391,6 +6391,39 @@ VIEW_HISTORY_BURST_S = 1.0
 VIEW_HISTORY_MAX = 100
 
 
+# ── the landing glow (row 220) ───────────────────────────────────────────────
+# After a jump — a reference followed, Alt+Left back to where you clicked it —
+# the place it went to glows for a moment: an accent wash over exactly the
+# region the link means (the entry, the figure, the line) and a short bar in
+# the margin beside it, which lingers a little longer so the eye still finds
+# the place once the wash has gone. One look for every jump, both directions.
+LANDING_S = (0.1, 0.8, 1.0, 0.5)   # fade in, hold, fade out; the bar's extra
+LANDING_STATIC_S = 1.5             # without animations: shown, then gone
+
+
+def landing_alpha(t, animate=True):
+    """(wash, bar) opacity factors in 0..1, `t` seconds after landing; both
+    0 once it is over."""
+    fade_in, hold, fade_out, bar_extra = LANDING_S
+    if t < 0:
+        return 0.0, 0.0
+    if not animate:
+        on = 1.0 if t < LANDING_STATIC_S else 0.0
+        return on, on
+
+    def env(end_hold):
+        if t < fade_in:
+            return t / fade_in
+        if t < end_hold:
+            return 1.0
+        return max(0.0, 1.0 - (t - end_hold) / fade_out)
+    return env(fade_in + hold), env(fade_in + hold + bar_extra)
+
+
+def landing_over(t, animate=True):
+    return t >= (LANDING_STATIC_S if not animate else sum(LANDING_S))
+
+
 class ViewHistory:
     """Browser-style back/forward over a surface's view.
 
@@ -6882,7 +6915,11 @@ class PDFCanvas(Gtk.DrawingArea):
         self._zotero_for = self._zotero_lib = None
         self.on_open_document = None   # callback(path): open a file as a tab
         self._ctx_popover = None
-        self._flash, self._flash_id = None, None   # a jumped-to citation
+        # the landing glow (row 220): (page, rect, start µs) and its ticker;
+        # what a jump left from / arrived at, keyed by the view state the
+        # history holds, so Alt+Left/Right can glow the matching place
+        self._flash, self._flash_tick = None, None
+        self._jump_marks = {}
         self._origin_px = (0.0, 0.0)   # canvas origin in its window surface
         # is the pointer over the canvas? — paste_point() lands a paste under
         # the mouse when it is, so the answer must be tracked, not guessed
@@ -10837,6 +10874,7 @@ class PDFCanvas(Gtk.DrawingArea):
                               "page": page_no, "clip": clip, "device": device,
                               "footer": footer, "ref": None, "cut": cut,
                               "label": self._entry_label(page, entry, kind),
+                              "kind": kind,
                               "to": to, "x0": self._hover_x - 24}
         if kind == "cite":
             uri = self._entry_reference_uri(page_no, entry)
@@ -11258,18 +11296,7 @@ class PDFCanvas(Gtk.DrawingArea):
         Alt+Left comes back — and flash the citation so the eye finds it."""
         self._hide_link_preview()
         r = row["rect"]
-        self.follow_goto(row["page"], r.y0)
-        self._flash = (row["page"], fitz.Rect(r))
-        if self._flash_id is not None:
-            GLib.source_remove(self._flash_id)
-        self._flash_id = GLib.timeout_add(1200, self._end_flash)
-        self.queue_draw()
-
-    def _end_flash(self):
-        self._flash = None
-        self._flash_id = None
-        self.queue_draw()
-        return False
+        self.follow_goto(row["page"], r.y0, target=(row["page"], tuple(r)))
 
     # ── presses on the card and the icons ────────────────────────────────────
 
@@ -11352,8 +11379,15 @@ class PDFCanvas(Gtk.DrawingArea):
             # the preview clicked: go where the link goes (a history step,
             # Alt+Left returns — exactly as clicking the link itself)
             _w, page_no, to = action
+            p = self._link_preview or {}
+            a = p.get("anchor")
             self._hide_link_preview()
-            self.follow_goto(page_no, to[1] if to else None)
+            self.follow_goto(
+                page_no, to[1] if to else None,
+                origin=((self.current_page_idx, (a.x0, a.y0, a.x1, a.y1))
+                        if a is not None else None),
+                target=self._landing_region(
+                    page_no, to, p.get("kind")))
 
     def debug_snapshot(self):
         """What a capture (F12) records about this canvas: the view, the
@@ -11933,19 +11967,102 @@ class PDFCanvas(Gtk.DrawingArea):
         PangoCairo.show_layout(ctx, lay)
         ctx.restore()
 
+    @staticmethod
+    def _animations_on():
+        st = Gtk.Settings.get_default()
+        return st is None or bool(st.get_property("gtk-enable-animations"))
+
+    def flash_region(self, page, rect):
+        """Glow `rect` (page points) on `page` for a moment: where a jump
+        landed, or where it came from (row 220)."""
+        self._flash = (page, tuple(rect), GLib.get_monotonic_time())
+        if self._flash_tick is None and self.get_mapped():
+            self._flash_tick = self.add_tick_callback(self._flash_step)
+        self.queue_draw()
+
+    def _flash_t(self):
+        return (GLib.get_monotonic_time() - self._flash[2]) / 1e6
+
+    def _flash_step(self, _widget, _clock):
+        if self._flash is None or landing_over(self._flash_t(),
+                                               self._animations_on()):
+            self._flash = None
+            self._flash_tick = None
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
     def _draw_flash(self, ctx):
-        """The citation a backlink row jumped to, outlined for a moment."""
-        page_no, r = self._flash
+        page_no, (x0, y0, x1, y1), _t0 = self._flash
         if page_no != self.current_page_idx:
+            return
+        wash, bar = landing_alpha(self._flash_t(), self._animations_on())
+        if wash <= 0 and bar <= 0:
             return
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
         ctx.scale(self.scale, self.scale)
         ar, ag, ab = self.zoom_accent
-        ctx.set_source_rgba(ar, ag, ab, 0.25)
-        ctx.rectangle(r.x0 - 2, r.y0 - 2, r.width + 4, r.height + 4)
-        ctx.fill()
+        pad = 2.0
+        if wash > 0:
+            ctx.set_source_rgba(ar, ag, ab, 0.22 * wash)
+            ctx.rectangle(x0 - pad, y0 - pad, x1 - x0 + 2 * pad,
+                          y1 - y0 + 2 * pad)
+            ctx.fill()
+        if bar > 0:
+            # in the margin, clear of the text, the full height of the place
+            ctx.set_source_rgba(ar, ag, ab, 0.9 * bar)
+            ctx.rectangle(x0 - pad - 7, y0 - pad, 3.0, y1 - y0 + 2 * pad)
+            ctx.fill()
         ctx.restore()
+
+    def _landing_region(self, page_no, to, kind):
+        """The region a link MEANS on its target page — the bibliography
+        entry (all of it), the figure with its caption, the equation —
+        the hover card's own reading, so the glow and the preview agree."""
+        try:
+            page = self.document[page_no]
+            layout = self._page_layout(page_no)
+            clip = link_preview_clip(
+                page, to, kind, layout,
+                max_h=page.rect.height if kind == "cite" else None)
+            if not clip.is_empty:
+                return page_no, (clip.x0 + 4, clip.y0, clip.x1 - 4, clip.y1)
+        except Exception:
+            logger.debug("landing region", exc_info=True)
+        return None
+
+    def line_region(self, page_no, y):
+        """The text line at page point `y` (or the first one below it, close
+        by), as a glow region — for a jump that names a spot, not a thing."""
+        try:
+            lines = self._page_layout(page_no)[0]
+        except Exception:
+            return None
+        rows = [ln for ln in lines if ln[1] - 2 <= y <= ln[3] + 2] or \
+            sorted((ln for ln in lines if 0 <= ln[1] - y <= 14),
+                   key=lambda ln: ln[1])[:1]
+        if not rows:
+            return None
+        top = min(ln[1] for ln in rows)
+        row = [ln for ln in lines if abs(ln[1] - top) < 3]
+        return page_no, (min(ln[0] for ln in row), top,
+                         max(ln[2] for ln in row), max(ln[3] for ln in row))
+
+    def follow_link(self, link):
+        """Follow an internal link: go there, glow what it points at, and
+        remember the link itself, so Alt+Left glows where you clicked."""
+        page_no, to = self._link_destination(link)
+        if page_no < 0:
+            return False
+        r = link["from"]
+        self.follow_goto(page_no, to[1] if to is not None else None,
+                         origin=(self.current_page_idx,
+                                 (r.x0, r.y0, r.x1, r.y1)),
+                         target=self._landing_region(
+                             page_no, to, self._link_kind(link)))
+        return True
 
     def _open_link_at(self, sx, sy):
         if not self.page:
@@ -11977,14 +12094,8 @@ class PDFCanvas(Gtk.DrawingArea):
                             logger.debug("link: launch_default_for_uri failed",
                                          exc_info=True)
                 elif kind in (fitz.LINK_GOTO, fitz.LINK_NAMED):
-                    page_no, to = self._link_destination(link)
-                    to_y = to[1] if to is not None else None
-                    kname = "NAMED" if kind == fitz.LINK_NAMED else "GOTO"
-                    logger.debug(f"link: {kname} page={page_no} to_y={to_y}")
-                    if page_no >= 0:
-                        self.follow_goto(page_no, to_y)
-                    else:
-                        logger.debug(f"link: {kname} ignored (page < 0)")
+                    if not self.follow_link(link):
+                        logger.debug("link: GOTO/NAMED ignored (page < 0)")
                 else:
                     logger.debug(f"link: unhandled kind={kind}")
                 break
@@ -12009,13 +12120,19 @@ class PDFCanvas(Gtk.DrawingArea):
             logger.debug("resolve_names failed", exc_info=True)
         return -1, None
 
-    def follow_goto(self, page_no, to_y=None):
+    def follow_goto(self, page_no, to_y=None, origin=None, target=None):
         """Jump to an internal link destination (footnote, citation, TOC entry),
         scrolling to the target point — not just the page top — and remembering
-        the current reading location so going back returns to it."""
+        the current reading location so going back returns to it.
+
+        `origin` / `target` are (page, rect) to glow (row 220): `target` now,
+        on landing; `origin` when Alt+Left brings you back — and `target`
+        again on Alt+Right. With no target but a `to_y`, the line there."""
         page_no = max(0, min(self.n_pages - 1, page_no))
         logger.debug(
             f"follow_goto: page {self.current_page_idx} -> {page_no} to_y={to_y}")
+        if origin is not None:
+            self._remember_jump(self._view_state(), origin)
         self.history.jump()
         self._hide_link_preview()      # you went there; the peek is done
         if self.on_nav_history:
@@ -12030,7 +12147,19 @@ class PDFCanvas(Gtk.DrawingArea):
             f"follow_goto: now page={self.current_page_idx} "
             f"offset=({self.offset_x:.0f},{self.offset_y:.0f}) scale={self.scale:.3f}")
         self._is_fitted = False
+        if target is None and to_y is not None:
+            target = self.line_region(page_no, to_y)
+        if target is not None:
+            self._remember_jump(self._view_state(), target)
+            self.flash_region(*target)
         self.queue_draw()
+
+    JUMP_MARKS_MAX = 64
+
+    def _remember_jump(self, state, region):
+        self._jump_marks[state] = region
+        while len(self._jump_marks) > self.JUMP_MARKS_MAX:
+            self._jump_marks.pop(next(iter(self._jump_marks)))
 
     def _scroll_to_pdf_y(self, py, top_frac=0.18):
         """Position PDF y-coordinate ``py`` ``top_frac`` of the way down the
@@ -12085,10 +12214,21 @@ class PDFCanvas(Gtk.DrawingArea):
         return self.history.can_back()
 
     def go_back(self):
-        return self.history.go_back()
+        return self._step_and_glow(self.history.go_back)
 
     def go_forward(self):
-        return self.history.go_forward()
+        return self._step_and_glow(self.history.go_forward)
+
+    def _step_and_glow(self, step):
+        """Alt+Left / Alt+Right, and the place a jump left from or landed on
+        glows again (row 220) — back at the citation you clicked, you see
+        which one it was."""
+        moved = step()
+        if moved:
+            mark = self._jump_marks.get(self._view_state())
+            if mark is not None:
+                self.flash_region(*mark)
+        return moved
 
     def _erase_at(self, sx, sy):
         px, py = self._screen_to_pdf(sx, sy)

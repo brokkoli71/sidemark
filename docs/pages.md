@@ -39,6 +39,15 @@
     history, Ctrl gives the other; a text page has no pages, so there it is
     always history. `side_button_step(btn, pages)` alone decides the direction
     — the window and the projector both ask it.
+  - **Every jump GLOWS where it landed, and Alt+Left where it left (row
+    220).** `follow_goto(page, y, origin=, target=)` is the one way a jump
+    is made; it remembers both ends in `_jump_marks`, keyed by the view
+    state the history holds, and `go_back`/`go_forward` glow the mark of
+    the state they arrive at. The target is what the link MEANS
+    (`_landing_region`, the hover card's own `link_preview_clip` — a whole
+    citation entry, not its first lines), or the line at `y`. The look and
+    its timing are one table (`landing_alpha`, `LANDING_S`) and one painter
+    (`_draw_flash`) — the backlink rows use it too.
 
 - **Link preview on hover (row 197)** — resting on an internal link, where a
   click would follow it (`link_hover_active`), draws what it points at on the

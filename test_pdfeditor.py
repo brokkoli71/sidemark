@@ -393,6 +393,36 @@ class TestLinkPreview(unittest.TestCase):
         page = self.c.document[page_no]
         return page.get_textbox(sidemark.link_preview_clip(page, to))
 
+    def test_a_jump_glows_where_it_landed_and_back_where_it_left(self):
+        """Row 220: following a citation glows its whole entry; Alt+Left
+        glows the citation you clicked; Alt+Right the entry again."""
+        c = self.c
+        link = self._link("cite.b")
+        self.assertTrue(c.follow_link(link))
+        page, (x0, y0, x1, y1), _t = c._flash
+        self.assertEqual(page, c.current_page_idx)
+        entry = fitz.Rect(x0, y0, x1, y1)
+        bravo = c.document[page].search_for("bravoword")[0]
+        alpha = c.document[page].search_for("alphaword")[0]
+        self.assertTrue(entry.contains(fitz.Point((bravo.x0 + bravo.x1) / 2,
+                                                  (bravo.y0 + bravo.y1) / 2)))
+        self.assertFalse(entry.contains(fitz.Point((alpha.x0 + alpha.x1) / 2,
+                                                   (alpha.y0 + alpha.y1) / 2)))
+        c.go_back()
+        page, rect, _t = c._flash
+        self.assertEqual(page, 0)
+        self.assertEqual(fitz.Rect(rect), link["from"])   # the [2] you clicked
+        c.go_forward()
+        self.assertEqual(fitz.Rect(c._flash[1]), entry)
+
+    def test_a_jump_to_a_spot_glows_its_line(self):
+        c = self.c
+        bravo = c.document[1].search_for("bravoword")[0]
+        c.follow_goto(1, (bravo.y0 + bravo.y1) / 2)
+        _p, (x0, y0, x1, y1), _t = c._flash
+        self.assertTrue(y0 <= bravo.y0 + 1 and y1 >= bravo.y1 - 1)
+        self.assertLess(y1 - y0, 20)                       # one line, not more
+
     def test_a_citation_previews_its_own_entry_only(self):
         own = {"cite.a": "alphaword", "cite.b": "bravoword",
                "cite.c": "Charlieword"}
@@ -3165,6 +3195,32 @@ class TestMcpDrawing(unittest.TestCase):
             win._global_undo()
             self.assertEqual(tp.strokes, [])
         self._run(body)
+
+
+class TestLandingGlow(unittest.TestCase):
+    """Row 220: the glow's timing — bounds, not tuned values."""
+
+    def test_it_rises_holds_fades_and_ends(self):
+        a = sidemark.landing_alpha
+        total = sum(sidemark.LANDING_S)
+        self.assertEqual(a(0.0), (0.0, 0.0))
+        wash, bar = a(sidemark.LANDING_S[0] + 0.01)
+        self.assertGreater(min(wash, bar), 0.95)            # fully there
+        mid = total - sidemark.LANDING_S[3] / 2
+        self.assertEqual(a(mid)[0], 0.0)                    # wash gone first…
+        self.assertGreater(a(mid)[1], 0.0)                  # …the bar lingers
+        self.assertEqual(a(total + 0.01), (0.0, 0.0))
+        self.assertTrue(sidemark.landing_over(total + 0.01))
+        prev = 2.0
+        for i in range(60):                                 # never brightens again
+            t = sidemark.LANDING_S[0] + sidemark.LANDING_S[1] + i * total / 60
+            self.assertLessEqual(a(t)[0], prev + 1e-9)
+            prev = a(t)[0]
+
+    def test_without_animations_it_is_simply_shown_then_gone(self):
+        self.assertEqual(sidemark.landing_alpha(0.01, animate=False), (1.0, 1.0))
+        late = sidemark.LANDING_STATIC_S + 0.01
+        self.assertEqual(sidemark.landing_alpha(late, animate=False), (0.0, 0.0))
 
 
 class TestAskClaudePieces(unittest.TestCase):
