@@ -3203,24 +3203,20 @@ class TestLandingGlow(unittest.TestCase):
     def test_it_rises_holds_fades_and_ends(self):
         a = sidemark.landing_alpha
         total = sum(sidemark.LANDING_S)
-        self.assertEqual(a(0.0), (0.0, 0.0))
-        wash, bar = a(sidemark.LANDING_S[0] + 0.01)
-        self.assertGreater(min(wash, bar), 0.95)            # fully there
-        mid = total - sidemark.LANDING_S[3] / 2
-        self.assertEqual(a(mid)[0], 0.0)                    # wash gone first…
-        self.assertGreater(a(mid)[1], 0.0)                  # …the bar lingers
-        self.assertEqual(a(total + 0.01), (0.0, 0.0))
+        self.assertEqual(a(0.0), 0.0)
+        self.assertGreater(a(sidemark.LANDING_S[0] + 0.01), 0.95)  # fully there
+        self.assertEqual(a(total + 0.01), 0.0)
         self.assertTrue(sidemark.landing_over(total + 0.01))
         prev = 2.0
         for i in range(60):                                 # never brightens again
             t = sidemark.LANDING_S[0] + sidemark.LANDING_S[1] + i * total / 60
-            self.assertLessEqual(a(t)[0], prev + 1e-9)
-            prev = a(t)[0]
+            self.assertLessEqual(a(t), prev + 1e-9)
+            prev = a(t)
 
     def test_without_animations_it_is_simply_shown_then_gone(self):
-        self.assertEqual(sidemark.landing_alpha(0.01, animate=False), (1.0, 1.0))
+        self.assertEqual(sidemark.landing_alpha(0.01, animate=False), 1.0)
         late = sidemark.LANDING_STATIC_S + 0.01
-        self.assertEqual(sidemark.landing_alpha(late, animate=False), (0.0, 0.0))
+        self.assertEqual(sidemark.landing_alpha(late, animate=False), 0.0)
 
 
 class TestAskClaudePieces(unittest.TestCase):

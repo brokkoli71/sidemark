@@ -6394,30 +6394,26 @@ VIEW_HISTORY_MAX = 100
 # ── the landing glow (row 220) ───────────────────────────────────────────────
 # After a jump — a reference followed, Alt+Left back to where you clicked it —
 # the place it went to glows for a moment: an accent wash over exactly the
-# region the link means (the entry, the figure, the line) and a short bar in
-# the margin beside it, which lingers a little longer so the eye still finds
-# the place once the wash has gone. One look for every jump, both directions.
-LANDING_S = (0.1, 0.8, 1.0, 0.5)   # fade in, hold, fade out; the bar's extra
+# region the link means (the entry, the figure, the line). One look for
+# every jump, both directions. (A margin bar beside it was tried and taken
+# out: it read as a stray mark, not as part of the glow.)
+LANDING_S = (0.1, 0.8, 1.0)        # fade in, hold, fade out
 LANDING_STATIC_S = 1.5             # without animations: shown, then gone
 
 
 def landing_alpha(t, animate=True):
-    """(wash, bar) opacity factors in 0..1, `t` seconds after landing; both
-    0 once it is over."""
-    fade_in, hold, fade_out, bar_extra = LANDING_S
+    """The wash's opacity factor in 0..1, `t` seconds after landing; 0 once
+    it is over."""
+    fade_in, hold, fade_out = LANDING_S
     if t < 0:
-        return 0.0, 0.0
+        return 0.0
     if not animate:
-        on = 1.0 if t < LANDING_STATIC_S else 0.0
-        return on, on
-
-    def env(end_hold):
-        if t < fade_in:
-            return t / fade_in
-        if t < end_hold:
-            return 1.0
-        return max(0.0, 1.0 - (t - end_hold) / fade_out)
-    return env(fade_in + hold), env(fade_in + hold + bar_extra)
+        return 1.0 if t < LANDING_STATIC_S else 0.0
+    if t < fade_in:
+        return t / fade_in
+    if t < fade_in + hold:
+        return 1.0
+    return max(0.0, 1.0 - (t - fade_in - hold) / fade_out)
 
 
 def landing_over(t, animate=True):
@@ -11997,24 +11993,17 @@ class PDFCanvas(Gtk.DrawingArea):
         page_no, (x0, y0, x1, y1), _t0 = self._flash
         if page_no != self.current_page_idx:
             return
-        wash, bar = landing_alpha(self._flash_t(), self._animations_on())
-        if wash <= 0 and bar <= 0:
+        wash = landing_alpha(self._flash_t(), self._animations_on())
+        if wash <= 0:
             return
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
         ctx.scale(self.scale, self.scale)
         ar, ag, ab = self.zoom_accent
         pad = 2.0
-        if wash > 0:
-            ctx.set_source_rgba(ar, ag, ab, 0.22 * wash)
-            ctx.rectangle(x0 - pad, y0 - pad, x1 - x0 + 2 * pad,
-                          y1 - y0 + 2 * pad)
-            ctx.fill()
-        if bar > 0:
-            # in the margin, clear of the text, the full height of the place
-            ctx.set_source_rgba(ar, ag, ab, 0.9 * bar)
-            ctx.rectangle(x0 - pad - 7, y0 - pad, 3.0, y1 - y0 + 2 * pad)
-            ctx.fill()
+        ctx.set_source_rgba(ar, ag, ab, 0.22 * wash)
+        ctx.rectangle(x0 - pad, y0 - pad, x1 - x0 + 2 * pad, y1 - y0 + 2 * pad)
+        ctx.fill()
         ctx.restore()
 
     def _landing_region(self, page_no, to, kind):

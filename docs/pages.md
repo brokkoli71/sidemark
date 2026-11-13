@@ -45,7 +45,9 @@
     state the history holds, and `go_back`/`go_forward` glow the mark of
     the state they arrive at. The target is what the link MEANS
     (`_landing_region`, the hover card's own `link_preview_clip` — a whole
-    citation entry, not its first lines), or the line at `y`. The look and
+    citation entry, not its first lines), or the line at `y`: an accent
+    WASH over it, nothing else (a margin bar was tried and read as a stray
+    mark). The look and
     its timing are one table (`landing_alpha`, `LANDING_S`) and one painter
     (`_draw_flash`) — the backlink rows use it too.
 
