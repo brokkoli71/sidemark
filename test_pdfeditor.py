@@ -472,6 +472,29 @@ class TestLinkPreview(unittest.TestCase):
         self.assertIn("Silvi", page.get_textbox(clip))
         self.assertNotIn("Kourtis", page.get_textbox(clip))
 
+    def test_a_line_starting_with_a_year_is_not_the_next_entry(self):
+        """An F12 capture (LIPIcs): an entry's last line began "1997. doi:…",
+        which reads like a numbered label `1997.` — and the DOI was cut off.
+        The layout is the capture's: label alone at the left, entries
+        hanging, 3 pt between lines."""
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((92, 258), "12", fontsize=9)
+        page.insert_text((115, 258), "Chi-Chung Lam, P. Sadayappan, and "
+                         "Rephael Wenger.", fontsize=9)
+        page.insert_text((115, 270), "dimensional loops with reductions for "
+                         "parallel execution.", fontsize=9)
+        page.insert_text((115, 282), "1997. doi:10.1142/S0129626497000176.",
+                         fontsize=9)
+        page.insert_text((92, 295), "13", fontsize=9)
+        page.insert_text((115, 295), "Ling Liang, Jianyu Xu, Lei Deng.",
+                         fontsize=9)
+        clip = sidemark.link_preview_clip(page, (90.7, 245.9), "cite")
+        doi = page.search_for("S0129626497000176")[0]
+        self.assertGreaterEqual(clip.y1, doi.y1 - 1)     # the DOI line SHOWS
+        nxt = page.search_for("Liang")[0]
+        self.assertLess(clip.y1, (nxt.y0 + nxt.y1) / 2)  # the next entry not
+
     def test_an_equation_ends_where_the_body_text_resumes(self):
         doc, page = self._two_column_page()
         for y in range(60, 300, 12):

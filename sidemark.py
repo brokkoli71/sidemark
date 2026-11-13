@@ -4311,6 +4311,25 @@ TABLE_GAP = 8.0                 # PDF points: rows and rules of one table are cl
 _LINK_TARGET_KINDS = (("cite", "cite"), ("figure", "float"), ("table", "float"),
                       ("equation", "equation"), ("AMS", "equation"))
 _CITE_LABEL = re.compile(r"\s*(\[[^\]]{1,24}\]|\d{1,4}\.\s)")
+
+
+def _starts_entry(text, first=""):
+    """Does a row beginning `text` open a NEW bibliography entry? A bracket
+    label always does. A number with a period only when it can be a label:
+    the next one after `first`'s own numeric label, and never a year — an
+    entry's last line often begins "1997. doi:…" (LIPIcs puts the year
+    there), and stopping at it cut the DOI off the preview."""
+    m = _CITE_LABEL.match(text)
+    if not m:
+        return False
+    label = m.group(1).strip()
+    if label.startswith("["):
+        return True
+    n = int(label.rstrip("."))
+    own = _CITE_LABEL.match(first)
+    if own and not own.group(1).strip().startswith("["):
+        return n == int(own.group(1).strip().rstrip(".")) + 1
+    return n < 1000
 _CAPTION = re.compile(r"\s*(Fig(ure|\.)?|FIG\.?|Table|TABLE|Tab\.|Abbildung|Abb\.|"
                       r"Tabelle)\s*[\dIVXS]")
 
@@ -4492,9 +4511,11 @@ def link_preview_clip(page, to, kind=None, layout=None, max_h=None):
         if r[1] - prev[3] > 0.6 * (prev[3] - prev[1]):
             after = r
             break              # the space between entries / paragraphs
-        if kind == "cite" and _CITE_LABEL.match(r[4]):
+        if (kind == "cite" and _starts_entry(r[4], first[4])
+                and not (hanging and r[0] > first[0] + 3)):
             after = r
-            break              # the next entry's label
+            break              # the next entry's label (an indented line
+                               # of a hanging entry never is one)
         if hanging and r[0] <= first[0] + 1:
             after = r
             break              # the next entry starts here
