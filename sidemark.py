@@ -3,6 +3,7 @@ import sys
 import os
 import signal
 import math
+import random
 import re
 import subprocess
 import threading
@@ -472,6 +473,37 @@ MCP_TOOLS = [
                     "from).",
      "inputSchema": {"type": "object", "properties": {
          "page": _MCP_PAGE, "document": _MCP_DOC}, "required": ["page"]}},
+    {"name": "get_page_image", "write": False,
+     "description": "A picture of a page as it looks in Sidemark, ink "
+                    "included, with a faint ruler in points (lines every 50, "
+                    "numbered every 100) so you can name places on it. Pages "
+                    "are measured in points from the top left, y down; a "
+                    "text page counts in the A4 pages it exports as (595 × "
+                    "842). Ask for a region to see a part closely and "
+                    "cheaply. Use it to find space before drawing, and to "
+                    "check a drawing afterwards.",
+     "inputSchema": {"type": "object", "properties": {
+         "page": _MCP_PAGE,
+         "region": {"type": "array", "items": {"type": "number"},
+                    "minItems": 4, "maxItems": 4,
+                    "description": "[x0, y0, x1, y1] in points; default the "
+                                   "whole page."},
+         "grid": {"type": "boolean", "description": "Draw the ruler "
+                  "(default true)."},
+         "max_px": {"type": "integer", "minimum": 200, "maximum": 1600,
+                    "description": "Longest side of the picture, default "
+                                   "1000."},
+         "document": _MCP_DOC}, "required": ["page"]}},
+    {"name": "locate_text", "write": False,
+     "description": "Where a phrase is on the page: one [x0, y0, x1, y1] "
+                    "rectangle in points per occurrence (case-insensitive). "
+                    "The way to aim a drawing at text — circle it, underline "
+                    "it, point an arrow at it — without looking.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "minLength": 1},
+         "page": {**_MCP_PAGE, "description": "Only this page (default: "
+                  "every page)."},
+         "document": _MCP_DOC}, "required": ["text"]}},
     {"name": "add_page_note", "write": True,
      "description": "Append Markdown to the notes beside a page. Needs the "
                     "user to allow edits in Sidemark's Settings.",
@@ -485,6 +517,35 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "page": _MCP_PAGE, "text": {"type": "string", "minLength": 1},
          "document": _MCP_DOC}, "required": ["page", "text"]}},
+    {"name": "draw_svg", "write": True,
+     "description": "Draw on a page in the user's ink: give SVG (path, line, "
+                    "polyline, polygon, rect, circle, ellipse, g with "
+                    "transforms; stroke, stroke-width, opacity). It appears "
+                    "stroke by stroke as if drawn by hand and becomes "
+                    "ordinary ink the user can move, recolour, erase or undo "
+                    "(one Ctrl+Z). Ink is lines only: fills are drawn as "
+                    "outlines and text is skipped. Without box, SVG units "
+                    "are page points (origin top left, y down); with box, "
+                    "the SVG's viewBox is fitted into it. Colours and widths "
+                    "the SVG leaves out are the user's pen. Needs the user "
+                    "to allow edits in Sidemark's Settings.",
+     "inputSchema": {"type": "object", "properties": {
+         "page": _MCP_PAGE,
+         "svg": {"type": "string", "minLength": 1,
+                 "description": "An <svg> document, or just its shapes."},
+         "box": {"type": "array", "items": {"type": "number"},
+                 "minItems": 4, "maxItems": 4,
+                 "description": "[x, y, width, height] in points to fit the "
+                                "drawing into."},
+         "color": {"type": "string", "description": "Default colour (CSS "
+                   "name or #hex) for shapes that do not set one."},
+         "width": {"type": "number", "description": "Default line width in "
+                   "points."},
+         "style": {"type": "string", "enum": ["hand", "clean"],
+                   "description": "hand (default): tapered ends and a "
+                                  "slight drift, like a pen; clean: exact "
+                                  "geometry."},
+         "document": _MCP_DOC}, "required": ["page", "svg"]}},
 ]
 
 
@@ -527,7 +588,10 @@ def mcp_handle(msg, call):
                    "instructions":
                        "Sidemark is the user's PDF reader and note-taker. "
                        "These tools see the documents open in it right now. "
-                       "Pages count from 1."})
+                       "Pages count from 1. Places on a page are in points "
+                       "from its top left, y down. To draw: find the spot "
+                       "(locate_text, or get_page_image of a region), "
+                       "draw_svg, then look again to check it."})
     if method == "ping":
         return ok({})
     if method == "tools/list":
@@ -546,8 +610,15 @@ def mcp_handle(msg, call):
                                     "text": answer.get("error", "failed")}],
                        "isError": True})
         result = answer.get("result")
+        image = None
+        if isinstance(result, dict) and "_image" in result:
+            result = dict(result)
+            image = result.pop("_image")       # a picture is content, not data
         out = {"content": [{"type": "text", "text": json.dumps(
             result, indent=1, ensure_ascii=False)}]}
+        if image:
+            out["content"].insert(0, {"type": "image", "data": image,
+                                      "mimeType": "image/png"})
         if isinstance(result, dict):
             out["structuredContent"] = result
         return ok(out)
@@ -2143,6 +2214,542 @@ def draw_ink_stroke(ctx, pts, width, profile=None, grow=0.0):
 # erases and re-colours with no new object kind. The LINE is always the
 # fallback — an open or ambiguous stroke stays exactly the old dwell line, so
 # turning recognition off (which forces "line") can never regress.
+
+# ── SVG → ink (row 217): how an assistant draws ──────────────────────────────
+# `draw_svg` takes an SVG and turns its outlines into ordinary ink strokes in
+# PAGE POINTS, so what lands is ink like any other: lasso, recolour, erase and
+# undo all work on it. Ink is strokes only — a fill is drawn as its outline,
+# and <text> is skipped (both reported back to the assistant).
+
+SVG_MAX_BYTES = 200_000
+SVG_MAX_STROKES = 400
+SVG_MAX_POINTS = 60_000
+SVG_STEP = 0.8            # points between samples of the drawn line, in pt
+SVG_WIDTH_RANGE = (0.3, 24.0)
+
+_SVG_NAMED = {
+    "black": "#000000", "white": "#ffffff", "red": "#e01b24",
+    "green": "#26a269", "blue": "#1c71d8", "orange": "#ff7800",
+    "purple": "#9141ac", "yellow": "#f5c211", "gray": "#808080",
+    "grey": "#808080", "brown": "#865e3c", "pink": "#ff6eb4",
+    "teal": "#00a5a5", "navy": "#000080", "magenta": "#ff00ff",
+    "cyan": "#00b7eb", "darkred": "#8b0000", "darkgreen": "#006400",
+    "darkblue": "#00008b", "crimson": "#dc143c", "gold": "#ffd700",
+    "olive": "#808000", "maroon": "#800000", "indigo": "#4b0082",
+    "violet": "#ee82ee", "silver": "#c0c0c0", "lime": "#32cd32",
+}
+
+
+def svg_color(value, default):
+    """An SVG paint as (r, g, b) in 0..1; None for "none"; `default` for
+    currentColor or anything not understood."""
+    v = (value or "").strip().lower()
+    if not v:
+        return default
+    if v in ("none", "transparent"):
+        return None
+    v = _SVG_NAMED.get(v, v)
+    if v.startswith("#"):
+        h = v[1:]
+        if len(h) in (3, 4):
+            h = "".join(c * 2 for c in h[:3])
+        if len(h) in (6, 8):
+            try:
+                return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+            except ValueError:
+                return default
+        return default
+    m = re.match(r"rgba?\(([^)]*)\)", v)
+    if m:
+        parts = [p.strip() for p in re.split(r"[,\s/]+", m.group(1)) if p.strip()]
+        try:
+            rgb = [float(p[:-1]) / 100 if p.endswith("%") else float(p) / 255
+                   for p in parts[:3]]
+            return tuple(max(0.0, min(1.0, c)) for c in rgb)
+        except ValueError:
+            return default
+    return default
+
+
+def _svg_num(value, default=0.0):
+    m = re.match(r"\s*([-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?)", str(value or ""))
+    return float(m.group(1)) if m else default
+
+
+def _mat_mul(a, b):
+    """a∘b as SVG matrices (a, b, c, d, e, f): b applies first."""
+    return (a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+            a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+            a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5])
+
+
+_IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
+def svg_transform(text):
+    m = _IDENTITY
+    for name, args in re.findall(r"(\w+)\s*\(([^)]*)\)", text or ""):
+        a = [float(x) for x in re.findall(
+            r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?", args)]
+        t = None
+        if name == "matrix" and len(a) == 6:
+            t = tuple(a)
+        elif name == "translate" and a:
+            t = (1, 0, 0, 1, a[0], a[1] if len(a) > 1 else 0)
+        elif name == "scale" and a:
+            t = (a[0], 0, 0, a[1] if len(a) > 1 else a[0], 0, 0)
+        elif name == "rotate" and a:
+            r = math.radians(a[0])
+            c, s = math.cos(r), math.sin(r)
+            t = (c, s, -s, c, 0, 0)
+            if len(a) == 3:
+                t = _mat_mul(_mat_mul((1, 0, 0, 1, a[1], a[2]), t),
+                             (1, 0, 0, 1, -a[1], -a[2]))
+        elif name == "skewX" and a:
+            t = (1, 0, math.tan(math.radians(a[0])), 1, 0, 0)
+        elif name == "skewY" and a:
+            t = (1, math.tan(math.radians(a[0])), 0, 1, 0, 0)
+        if t is not None:
+            m = _mat_mul(m, t)
+    return m
+
+
+def _apply(m, p):
+    return (m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5])
+
+
+def _bezier_pts(p0, ctrl, p3, n):
+    """n+1 points of a quadratic (one control) or cubic (two) Bézier."""
+    out = []
+    for k in range(n + 1):
+        t = k / n
+        u = 1 - t
+        if len(ctrl) == 1:
+            c = ctrl[0]
+            out.append((u * u * p0[0] + 2 * u * t * c[0] + t * t * p3[0],
+                        u * u * p0[1] + 2 * u * t * c[1] + t * t * p3[1]))
+        else:
+            c1, c2 = ctrl
+            out.append((u ** 3 * p0[0] + 3 * u * u * t * c1[0]
+                        + 3 * u * t * t * c2[0] + t ** 3 * p3[0],
+                        u ** 3 * p0[1] + 3 * u * u * t * c1[1]
+                        + 3 * u * t * t * c2[1] + t ** 3 * p3[1]))
+    return out
+
+
+def _arc_pts(p0, rx, ry, phi, large, sweep, p1, steps_per_unit):
+    """An SVG elliptical arc as points (the endpoint → centre conversion of
+    SVG 1.1 F.6.5, radii scaled up when too small to reach)."""
+    if rx == 0 or ry == 0 or p0 == p1:
+        return [p0, p1]
+    rx, ry = abs(rx), abs(ry)
+    cp, sp = math.cos(phi), math.sin(phi)
+    dx, dy = (p0[0] - p1[0]) / 2, (p0[1] - p1[1]) / 2
+    x1 = cp * dx + sp * dy
+    y1 = -sp * dx + cp * dy
+    lam = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry)
+    if lam > 1:
+        rx, ry = rx * math.sqrt(lam), ry * math.sqrt(lam)
+    num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1
+    den = rx * rx * y1 * y1 + ry * ry * x1 * x1
+    co = math.sqrt(max(0.0, num / den)) if den else 0.0
+    if large == sweep:
+        co = -co
+    cx1, cy1 = co * rx * y1 / ry, -co * ry * x1 / rx
+    cx = cp * cx1 - sp * cy1 + (p0[0] + p1[0]) / 2
+    cy = sp * cx1 + cp * cy1 + (p0[1] + p1[1]) / 2
+
+    def ang(ux, uy, vx, vy):
+        a = math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)
+        return a
+
+    t1 = ang(1, 0, (x1 - cx1) / rx, (y1 - cy1) / ry)
+    dt = ang((x1 - cx1) / rx, (y1 - cy1) / ry,
+             (-x1 - cx1) / rx, (-y1 - cy1) / ry)
+    if not sweep and dt > 0:
+        dt -= 2 * math.pi
+    elif sweep and dt < 0:
+        dt += 2 * math.pi
+    n = max(4, min(720, int(abs(dt) * max(rx, ry) * steps_per_unit) + 1))
+    out = []
+    for k in range(n + 1):
+        t = t1 + dt * k / n
+        ex, ey = rx * math.cos(t), ry * math.sin(t)
+        out.append((cp * ex - sp * ey + cx, sp * ex + cp * ey + cy))
+    return out
+
+
+_PATH_TOKEN = re.compile(
+    r"\s*,?\s*([MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?)")
+_PATH_FLAG = re.compile(r"\s*,?\s*([01])")
+
+
+def svg_path_subpaths(d, steps_per_unit=1.0):
+    """An SVG path's `d` as [(points, closed)], curves flattened. Malformed
+    data ends the path where it breaks, as a browser does."""
+    pos, n = 0, len(d)
+    subpaths, cur, start = [], [], (0.0, 0.0)
+    x = y = 0.0
+    last_ctrl, last_cmd, cmd = None, None, None
+
+    def number():
+        nonlocal pos
+        m = _PATH_TOKEN.match(d, pos)
+        if not m or m.group(1)[0] in "MmLlHhVvCcSsQqTtAaZz":
+            raise ValueError
+        pos = m.end()
+        return float(m.group(1))
+
+    def flag():
+        nonlocal pos
+        m = _PATH_FLAG.match(d, pos)
+        if not m:
+            raise ValueError
+        pos = m.end()
+        return m.group(1) == "1"
+
+    def close_sub(closed):
+        nonlocal cur
+        if len(cur) >= 2:
+            subpaths.append((cur, closed))
+        cur = []
+
+    def seg_n(*pts):
+        L = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(pts, pts[1:]))
+        return max(4, min(400, int(L * steps_per_unit) + 1))
+
+    try:
+        while True:
+            m = _PATH_TOKEN.match(d, pos)
+            if not m:
+                break
+            tok = m.group(1)
+            if tok[0] in "MmLlHhVvCcSsQqTtAaZz":
+                cmd = tok
+                pos = m.end()
+            elif cmd is None:
+                break
+            elif cmd in "Mm":
+                cmd = "l" if cmd == "m" else "L"   # implicit lineto after moveto
+            rel = cmd.islower()
+            C = cmd.upper()
+            ox, oy = (x, y) if rel else (0.0, 0.0)
+            if C == "Z":
+                if cur:
+                    if cur[-1] != start:
+                        cur.append(start)
+                    close_sub(True)
+                x, y = start
+                last_ctrl, last_cmd = None, "Z"
+                cmd = None
+                continue
+            if C == "M":
+                close_sub(False)
+                x, y = ox + number(), oy + number()
+                start = (x, y)
+                cur = [(x, y)]
+                last_ctrl, last_cmd = None, "M"
+                cmd = "m" if rel else "M"
+                # the next bare pair is a lineto
+                m2 = _PATH_TOKEN.match(d, pos)
+                if m2 and m2.group(1)[0] not in "MmLlHhVvCcSsQqTtAaZz":
+                    cmd = "l" if rel else "L"
+                continue
+            if not cur:
+                cur = [(x, y)]
+                start = (x, y)
+            if C == "L":
+                x, y = ox + number(), oy + number()
+                cur.append((x, y))
+                last_ctrl = None
+            elif C == "H":
+                x = ox + number()
+                cur.append((x, y))
+                last_ctrl = None
+            elif C == "V":
+                y = oy + number()
+                cur.append((x, y))
+                last_ctrl = None
+            elif C in "CS":
+                if C == "C":
+                    c1 = (ox + number(), oy + number())
+                else:
+                    c1 = ((2 * x - last_ctrl[0], 2 * y - last_ctrl[1])
+                          if last_cmd in ("C", "S") and last_ctrl else (x, y))
+                c2 = (ox + number(), oy + number())
+                p3 = (ox + number(), oy + number())
+                cur.extend(_bezier_pts((x, y), (c1, c2), p3,
+                                       seg_n((x, y), c1, c2, p3))[1:])
+                last_ctrl = c2
+                x, y = p3
+            elif C in "QT":
+                if C == "Q":
+                    c = (ox + number(), oy + number())
+                else:
+                    c = ((2 * x - last_ctrl[0], 2 * y - last_ctrl[1])
+                         if last_cmd in ("Q", "T") and last_ctrl else (x, y))
+                p3 = (ox + number(), oy + number())
+                cur.extend(_bezier_pts((x, y), (c,), p3,
+                                       seg_n((x, y), c, p3))[1:])
+                last_ctrl = c
+                x, y = p3
+            elif C == "A":
+                rx, ry, rot = number(), number(), number()
+                large, sweep = flag(), flag()
+                p1 = (ox + number(), oy + number())
+                cur.extend(_arc_pts((x, y), rx, ry, math.radians(rot),
+                                    large, sweep, p1, steps_per_unit)[1:])
+                x, y = p1
+                last_ctrl = None
+            last_cmd = C
+    except (ValueError, ZeroDivisionError, TypeError):
+        pass
+    close_sub(False)
+    return subpaths
+
+
+def _shape_path(tag, a):
+    """The basic shapes as path data, so one flattener serves them all."""
+    g = lambda k: _svg_num(a.get(k))
+    if tag == "line":
+        return f"M{g('x1')},{g('y1')} L{g('x2')},{g('y2')}"
+    if tag in ("polyline", "polygon"):
+        nums = re.findall(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?",
+                          a.get("points", ""))
+        if len(nums) < 4:
+            return ""
+        pairs = [f"{nums[i]},{nums[i + 1]}" for i in range(0, len(nums) - 1, 2)]
+        return "M" + " L".join(pairs) + (" Z" if tag == "polygon" else "")
+    if tag == "rect":
+        x, y, w, h = g("x"), g("y"), g("width"), g("height")
+        if w <= 0 or h <= 0:
+            return ""
+        rx = _svg_num(a.get("rx"), -1)
+        ry = _svg_num(a.get("ry"), -1)
+        if rx < 0 and ry < 0:
+            return f"M{x},{y} H{x + w} V{y + h} H{x} Z"
+        rx = ry if rx < 0 else rx
+        ry = rx if ry < 0 else ry
+        rx, ry = min(rx, w / 2), min(ry, h / 2)
+        return (f"M{x + rx},{y} H{x + w - rx} A{rx},{ry} 0 0 1 {x + w},{y + ry} "
+                f"V{y + h - ry} A{rx},{ry} 0 0 1 {x + w - rx},{y + h} "
+                f"H{x + rx} A{rx},{ry} 0 0 1 {x},{y + h - ry} "
+                f"V{y + ry} A{rx},{ry} 0 0 1 {x + rx},{y} Z")
+    if tag in ("circle", "ellipse"):
+        cx, cy = g("cx"), g("cy")
+        rx = g("r") if tag == "circle" else g("rx")
+        ry = g("r") if tag == "circle" else g("ry")
+        if rx <= 0 or ry <= 0:
+            return ""
+        # start at the top, as a hand usually does
+        return (f"M{cx},{cy - ry} A{rx},{ry} 0 1 1 {cx},{cy + ry} "
+                f"A{rx},{ry} 0 1 1 {cx},{cy - ry} Z")
+    if tag == "path":
+        return a.get("d", "")
+    return ""
+
+
+def _svg_style(el):
+    """Presentation attributes with `style="…"` declarations over them."""
+    out = {k: el.get(k) for k in ("stroke", "stroke-width", "stroke-opacity",
+                                  "opacity", "fill", "fill-opacity")
+           if el.get(k) is not None}
+    for decl in (el.get("style") or "").split(";"):
+        if ":" in decl:
+            k, v = decl.split(":", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def even_polyline(pts, step):
+    """`pts` re-walked at a fixed arc length, every input vertex KEPT — a
+    rectangle's corners stay corners (the ink pipeline's Catmull-Rom would
+    round them; SVG geometry is exact and needs no interpolation)."""
+    if len(pts) < 2:
+        return list(pts)
+    out = [pts[0]]
+    for a, b in zip(pts, pts[1:]):
+        L = math.hypot(b[0] - a[0], b[1] - a[1])
+        n = int(L / step)
+        for k in range(1, n + 1):
+            t = k * step / L
+            if t < 1 - 1e-9:
+                out.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+        if L > 1e-9:
+            out.append(b)
+    return out
+
+
+def hand_wobble(pts, seed, amount=1.0):
+    """A hand's line: a slow sideways drift (two low-frequency waves with a
+    random phase) whose size grows with the stroke but stays under a point,
+    so a long straight edge stops looking plotted while a small circle keeps
+    its shape. Seeded, so the same SVG always draws the same way."""
+    if len(pts) < 3 or amount <= 0:
+        return list(pts)
+    rnd = random.Random(seed)
+    acc = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        acc.append(acc[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    L = acc[-1]
+    if L < 4:
+        return list(pts)
+    amp = amount * min(0.9, 0.006 * L + 0.15)
+    waves = [(rnd.uniform(0.6, 1.4) / max(L, 40) * 2 * math.pi,
+              rnd.uniform(0, 2 * math.pi), rnd.uniform(0.5, 1.0))
+             for _ in range(2)]
+    out = []
+    for i, p in enumerate(pts):
+        a = pts[max(0, i - 1)]
+        b = pts[min(len(pts) - 1, i + 1)]
+        tx, ty = b[0] - a[0], b[1] - a[1]
+        tl = math.hypot(tx, ty) or 1.0
+        nx, ny = -ty / tl, tx / tl
+        s = acc[i]
+        # pinned at both ends: a line that starts on its target stays on it
+        env = math.sin(math.pi * s / L) ** 0.5
+        off = amp * env * sum(w * math.sin(f * s + ph) for f, ph, w in waves) / 1.5
+        out.append((p[0] + nx * off, p[1] + ny * off))
+    return out
+
+
+def svg_to_strokes(svg, box=None, color=(0.0, 0.0, 0.0), width=1.5,
+                   style="hand"):
+    """An SVG document as ink strokes in PAGE POINTS.
+
+    Without `box` the SVG's user units ARE page points (y down, as on the
+    page). With `box` = (x, y, w, h), the SVG's viewBox — or its width ×
+    height, or failing both the bounds of what it draws — is fitted into the
+    box, centred, aspect kept. `color`/`width` stand in where the SVG says
+    nothing. `style` "hand" tapers the ends and lets the line drift a little,
+    as a pen does; "clean" draws the geometry exactly.
+
+    Returns (strokes, notes): each stroke {"pts", "color", "width",
+    "opacity", "press"?}, and a list of what was approximated or skipped."""
+    import xml.etree.ElementTree as ET
+    if len(svg.encode("utf-8")) > SVG_MAX_BYTES:
+        raise ValueError(f"the SVG is over {SVG_MAX_BYTES // 1000} kB")
+    if "<!ENTITY" in svg or "<!DOCTYPE" in svg:
+        raise ValueError("the SVG may not declare a DOCTYPE or entities")
+    if "<svg" not in svg:
+        svg = f'<svg xmlns="http://www.w3.org/2000/svg">{svg}</svg>'
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError as e:
+        raise ValueError(f"the SVG does not parse: {e}")
+    local = lambda t: t.rsplit("}", 1)[-1] if isinstance(t, str) else ""
+    notes, skipped, filled = [], Counter(), 0
+    raw = []      # (user-space subpath points, closed, ctm, style dict)
+
+    def walk(el, ctm, inherited):
+        nonlocal filled
+        tag = local(el.tag)
+        if tag in ("defs", "clipPath", "mask", "symbol", "marker", "title",
+                   "desc", "metadata", "style", "pattern", "linearGradient",
+                   "radialGradient", "filter"):
+            return
+        st = dict(inherited)
+        own = _svg_style(el)
+        if "opacity" in own:
+            st["opacity"] = st.get("opacity", 1.0) * _svg_num(own.pop("opacity"), 1.0)
+        st.update(own)
+        ctm = _mat_mul(ctm, svg_transform(el.get("transform")))
+        if tag in ("svg", "g", "a"):
+            for ch in el:
+                walk(ch, ctm, st)
+            return
+        if tag in ("text", "tspan", "image", "use", "foreignObject"):
+            skipped[tag] += 1
+            return
+        d = _shape_path(tag, el.attrib)
+        if not d:
+            if tag not in ("path",):
+                skipped[tag] += 1
+            return
+        sc = math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) or 1.0
+        for pts, closed in svg_path_subpaths(d, steps_per_unit=sc * box_scale / 1.5):
+            raw.append((pts, closed, ctm, st))
+
+    vb = [_svg_num(v) for v in re.split(r"[\s,]+", (root.get("viewBox") or "").strip())
+          if v] if local(root.tag) == "svg" else []
+    src = None
+    if len(vb) == 4 and vb[2] > 0 and vb[3] > 0:
+        src = tuple(vb)
+    elif local(root.tag) == "svg" and root.get("width") and root.get("height"):
+        w0, h0 = _svg_num(root.get("width")), _svg_num(root.get("height"))
+        if w0 > 0 and h0 > 0:
+            src = (0.0, 0.0, w0, h0)
+    box_scale = 1.0
+    if box is not None and src is not None:
+        box_scale = min(box[2] / src[2], box[3] / src[3])
+    walk(root, _IDENTITY, {})
+    if not raw:
+        return [], ["nothing to draw" + (
+            f" (skipped: {', '.join(sorted(skipped))})" if skipped else "")]
+
+    # user space → page: the box fit, once the source rectangle is known
+    fit = _IDENTITY
+    if box is not None:
+        if src is None:
+            xs = [_apply(c, p)[0] for pts, _cl, c, _s in raw for p in pts]
+            ys = [_apply(c, p)[1] for pts, _cl, c, _s in raw for p in pts]
+            src = (min(xs), min(ys), max(max(xs) - min(xs), 1e-6),
+                   max(max(ys) - min(ys), 1e-6))
+        k = min(box[2] / src[2], box[3] / src[3])
+        fit = (k, 0.0, 0.0, k,
+               box[0] + (box[2] - src[2] * k) / 2 - src[0] * k,
+               box[1] + (box[3] - src[3] * k) / 2 - src[1] * k)
+
+    strokes, total = [], 0
+    for idx, (pts, closed, ctm, st) in enumerate(raw):
+        m = _mat_mul(fit, ctm)
+        # SVG's own defaults are stroke none, fill black. Ink has no fill, so
+        # a filled shape is drawn as its outline in the fill's colour, and a
+        # shape that says nothing gets the pen's colour.
+        stroke_v, fill_v = st.get("stroke"), st.get("fill")
+        stroke_c = svg_color(stroke_v, color) if stroke_v is not None else None
+        if stroke_c is not None:
+            col, op = stroke_c, _svg_num(st.get("stroke-opacity"), 1.0)
+        else:
+            fill_c = svg_color(fill_v, color) if fill_v is not None else color
+            if fill_c is None:
+                if stroke_v is not None:
+                    continue           # stroke and fill both "none": invisible
+                col, op = color, 1.0   # fill="none" alone: a plain line
+            else:
+                col, op = fill_c, _svg_num(st.get("fill-opacity"), 1.0)
+                if fill_v is not None:
+                    filled += 1
+        op = max(0.05, min(1.0, op * st.get("opacity", 1.0)))
+        sc = math.sqrt(abs(m[0] * m[3] - m[1] * m[2])) or 1.0
+        w = (_svg_num(st["stroke-width"], width / sc) * sc
+             if "stroke-width" in st else width)
+        w = max(SVG_WIDTH_RANGE[0], min(SVG_WIDTH_RANGE[1], w))
+        page_pts = even_polyline([_apply(m, p) for p in pts], SVG_STEP)
+        if style == "hand":
+            page_pts = hand_wobble(page_pts, seed=idx * 7919 + len(pts))
+        total += len(page_pts)
+        if len(strokes) >= SVG_MAX_STROKES or total > SVG_MAX_POINTS:
+            notes.append(f"stopped at {len(strokes)} strokes — the drawing "
+                         "is too large; simplify it or split it up")
+            break
+        stroke = {"pts": [(round(x, 2), round(y, 2)) for x, y in page_pts],
+                  "color": tuple(round(c, 4) for c in col), "width": round(w, 2),
+                  "opacity": round(op, 3)}
+        if style == "hand" and len(page_pts) >= 2:
+            prof = width_profile(page_pts, None, taper=True, dot=True)
+            if prof and any(abs(v - 1.0) > 1e-6 for v in prof):
+                stroke["press"] = prof
+        strokes.append(stroke)
+    if filled:
+        notes.append(f"{filled} filled shape{'s' if filled != 1 else ''} "
+                     "drawn as outlines (ink has no fill)")
+    if skipped:
+        notes.append("skipped: " + ", ".join(
+            f"{n}× <{t}>" for t, n in sorted(skipped.items())))
+    return strokes, notes
+
 
 def polyline_is_closed(pts):
     """Is this freehand polyline a LOOP? Its ends meet, relative to its own
@@ -5706,6 +6313,10 @@ class PDFCanvas(Gtk.DrawingArea):
         self._redo_stack = []
         self._erase_group = 0
         self._draw_group = 0
+        # an assistant's drawing being played back (row 217): the stroke in
+        # flight as (page, stroke), painted like the pen's own live stroke
+        self._playback = None
+        self._playback_run = None
 
         # every value the pen popover offers is loaded from settings here, once
         # (see PEN_SETTINGS): the pen is a property of the app, not of this tab
@@ -6820,6 +7431,8 @@ class PDFCanvas(Gtk.DrawingArea):
                             "width": width,
                             "opacity": opacity,
                             "press": src_prof})
+        if self._playback and self._playback[0] == self.current_page_idx:
+            to_draw.append(self._playback[1])
 
         ctx.save()
         ctx.translate(self.offset_x, self.offset_y)
@@ -19555,6 +20168,8 @@ class TextPageView(Gtk.Overlay):
         self._zoom_cancelled = False  # right-click aborted the rect mid-drag
         self._undo_ops = []       # ("add", [stroke, ...]) | ("erase", [stroke, ...])
         self._redo_ops = []
+        self._playback = None     # an assistant's stroke in flight (row 217):
+        self._playback_run = None  # {"pts" (view coords), "width" (view px)…}
         self._erased_now = []     # strokes removed during the ongoing erase drag
         self.on_ink_action = None   # a draw/erase gesture finished (undo timeline)
         self.on_ink_changed = None  # any ink mutation (dirty tracking)
@@ -20793,6 +21408,58 @@ class TextPageView(Gtk.Overlay):
                     Gtk.TextWindowType.WIDGET,
                     int(r.x + dx * f), int(r.y + dy * f))
                 for dx, dy in st["pts"]]
+
+    EXPORT_PAGE_PT = (595.0, 842.0)    # A4: the pages the sheet exports as
+
+    def export_pages(self):
+        """(sheet px per pt, [y offsets]) of the A4 pages the sheet exports
+        as (`_write_text_pdf`) — so "page 2" of a text page means the same
+        thing to an assistant (row 217) as to the PDF you export."""
+        w = self.view.get_width()
+        if w < 1:
+            raise OSError("the page has no layout yet")
+        k = w / self.EXPORT_PAGE_PT[0]
+        return k, self.page_break_offsets(self.EXPORT_PAGE_PT[1] * k)
+
+    def render_export_page(self, n, region, px_per_pt):
+        """Export page `n`'s `region` (x0, y0, x1, y1 in pt) as a cairo
+        ImageSurface at `px_per_pt`: the text as the view paints it, the ink
+        on top — what the export would print there."""
+        k, offs = self.export_pages()
+        y_top = offs[n]
+        x0, y0, x1, y1 = region
+        vx0, vy0 = x0 * k, y_top + y0 * k
+        vw, vh = max(1.0, (x1 - x0) * k), max(1.0, (y1 - y0) * k)
+        f = px_per_pt / k                     # texture px per sheet px
+        w, h = self.view.get_width(), self.view.get_height()
+        paintable = Gtk.WidgetPaintable.new(self.view)
+        snap = Gtk.Snapshot()
+        paintable.snapshot(snap, w * f, h * f)
+        node = snap.to_node()
+        native = self.get_native()
+        if node is None or native is None:
+            raise OSError("the page is not on screen")
+        tex = native.get_renderer().render_texture(node, Graphene.Rect().init(
+            vx0 * f, vy0 * f, vw * f, vh * f))
+        png = tex.save_to_png_bytes()
+        img = cairo.ImageSurface.create_from_png(io.BytesIO(png.get_data()))
+        out = cairo.ImageSurface(cairo.FORMAT_RGB24, img.get_width(),
+                                 img.get_height())
+        ctx = cairo.Context(out)
+        ctx.set_source_rgb(1, 1, 1)
+        ctx.paint()
+        ctx.set_source_surface(img, 0, 0)
+        ctx.paint()
+        ctx.scale(f, f)
+        ctx.translate(-vx0, -vy0)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        for st in self.strokes:
+            sf = self.font_px / max(st["font_px"], 1)
+            ctx.set_source_rgba(*st["color"], st["opacity"])
+            draw_ink_stroke(ctx, self.stroke_view_pts(st), st["width"] * sf,
+                            st.get("press"))
+        return out
 
     def page_break_offsets(self, page_px):
         """Widget-y boundaries slicing the sheet into export pages of at most
@@ -22222,7 +22889,17 @@ class TextPageView(Gtk.Overlay):
         stroke stores for its geometry."""
         # float precision: these offsets are STORED, and truncating each point
         # to a whole pixel is what made a rotated stroke go lumpy
-        buf_pts = [self._overlay_to_buffer_f(px, py) for px, py in overlay_pts]
+        return self._anchor_buffer_pts(
+            [self._overlay_to_buffer_f(px, py) for px, py in overlay_pts])
+
+    def _view_to_buffer_f(self, pts):
+        """Sheet-widget coords (`stroke_view_pts`' space) → buffer coords,
+        keeping the fraction: a pure translation, taken once."""
+        ox, oy = self.view.window_to_buffer_coords(
+            Gtk.TextWindowType.WIDGET, 0, 0)
+        return [(ox + x, oy + y) for x, y in pts]
+
+    def _anchor_buffer_pts(self, buf_pts):
         buf = self.view.get_buffer()
         _over_text, it = self.view.iter_at_buffer_xy(*buf_pts[0])
         mark = buf.create_mark(None, it, True)
@@ -22749,6 +23426,12 @@ class TextPageView(Gtk.Overlay):
             # _commit_stroke will store, so nothing jumps on release
             live_pts, live_prof = self._live_stroke()
             draw_ink_stroke(ctx, live_pts, width * self.zoom, live_prof)
+        if self._playback:
+            st = self._playback
+            o = self.view.translate_coordinates(self.ink, 0.0, 0.0) or (0, 0)
+            ctx.set_source_rgba(*st["color"], st["opacity"])
+            draw_ink_stroke(ctx, [(x + o[0], y + o[1]) for x, y in st["pts"]],
+                            st["width"], st.get("press"))
         if self._snap_label:
             draw_snap_label(ctx, self._snap_at[0], self._snap_at[1],
                             self._snap_label, self.accent())
@@ -27445,6 +28128,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _global_undo(self):
         """Undo the most recent user action — a stroke, an erase gesture, or a
         typing burst — in chronological order across canvas and notes."""
+        finish_playbacks(self.canvas, self._text_page)   # whole, not half
         if not self._undo_timeline:
             return
         op = self._undo_timeline.pop()
@@ -27470,6 +28154,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
 
     def _global_redo(self):
         """Re-apply the most recently undone action (Ctrl+Y / Ctrl+Shift+Z)."""
+        finish_playbacks(self.canvas, self._text_page)
         if not self._redo_timeline:
             return
         op = self._redo_timeline.pop()
@@ -33712,6 +34397,120 @@ class PresenterWindow(Adw.Window):
             self._nav(-1)
 
 
+class InkPlayback:
+    """An assistant's drawing appearing as if drawn (row 217): each stroke
+    grows at a quick hand's pace, and is COMMITTED — into the model, undo
+    and autosave — the moment it is finished, so nothing about ink storage
+    or the cached ink layer knows about the animation. Only the stroke in
+    flight is shown through `show`, on the path the pen's own live stroke
+    takes. However big the drawing, it is over within MAX_S.
+
+    `finish()` lands the rest at once. Undo calls it first, so Ctrl+Z in
+    the middle takes back the whole drawing rather than half of it."""
+
+    SPEED = 380.0      # pt per second along the line: a brisk hand
+    MAX_S = 4.0        # the whole drawing, at most
+    GAP_S = 0.06       # pen lifted between strokes
+
+    def __init__(self, strokes, commit, show, done, unit=1.0):
+        self.strokes = strokes
+        self._commit, self._show, self._done = commit, show, done
+        lengths = [sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                       for a, b in zip(st["pts"], st["pts"][1:])) / unit
+                   for st in strokes]
+        n = max(1, len(strokes))
+        speed = max(self.SPEED, sum(lengths) / (0.75 * self.MAX_S))
+        gap = min(self.GAP_S, 0.15 * self.MAX_S / n)
+        shortest = min(0.05, 0.1 * self.MAX_S / n)
+        self._times, t = [], 0.0
+        for L in lengths:
+            d = max(shortest, L / speed)
+            self._times.append((t, t + d))
+            t += d + gap
+        self.duration = t
+        self._i = 0
+        self._over = False
+        self._t0 = GLib.get_monotonic_time()
+        self._src = GLib.timeout_add(16, self._tick)
+
+    def _tick(self):
+        t = (GLib.get_monotonic_time() - self._t0) / 1e6
+        while self._i < len(self.strokes) and t >= self._times[self._i][1]:
+            self._commit(self.strokes[self._i])
+            self._i += 1
+        if self._i >= len(self.strokes):
+            self._src = None
+            self.finish()
+            return False
+        a, b = self._times[self._i]
+        if t < a:
+            self._show(None)
+        else:
+            st = self.strokes[self._i]
+            m = max(2, int(len(st["pts"]) * (t - a) / max(b - a, 1e-6)))
+            part = dict(st, pts=st["pts"][:m])
+            if st.get("press"):
+                part["press"] = st["press"][:m]
+            self._show(part)
+        return True
+
+    def finish(self):
+        if self._over:
+            return
+        self._over = True
+        if self._src is not None:
+            GLib.source_remove(self._src)
+            self._src = None
+        while self._i < len(self.strokes):
+            self._commit(self.strokes[self._i])
+            self._i += 1
+        self._show(None)
+        self._done()
+
+
+def finish_playbacks(*surfaces):
+    """Land any drawing still being played back on these canvases/sheets."""
+    for x in surfaces:
+        run = getattr(x, "_playback_run", None) if x is not None else None
+        if run is not None:
+            run.finish()
+
+
+MCP_IMAGE_MAX_PX = (200, 1600)
+
+
+def draw_page_grid(surface, px_per_pt, origin):
+    """A faint ruler over a rendered page — lines every 50 pt, labelled every
+    100 — so an assistant reading the picture can name a place in points."""
+    ctx = cairo.Context(surface)
+    w, h = surface.get_width(), surface.get_height()
+    ox, oy = origin
+    ctx.set_line_width(1.0)
+    ctx.select_font_face("Sans")
+    ctx.set_font_size(10)
+    for axis in (0, 1):
+        lo = ox if axis == 0 else oy
+        span = (w if axis == 0 else h) / px_per_pt
+        v = math.ceil(lo / 50.0) * 50
+        while v <= lo + span:
+            p = (v - lo) * px_per_pt
+            major = v % 100 == 0
+            ctx.set_source_rgba(0.1, 0.4, 0.9, 0.35 if major else 0.15)
+            if axis == 0:
+                ctx.move_to(p + 0.5, 0)
+                ctx.line_to(p + 0.5, h)
+            else:
+                ctx.move_to(0, p + 0.5)
+                ctx.line_to(w, p + 0.5)
+            ctx.stroke()
+            if major:
+                ctx.set_source_rgba(0.1, 0.3, 0.8, 0.9)
+                ctx.move_to(p + 2, 11) if axis == 0 else ctx.move_to(2, p - 2)
+                ctx.show_text(f"{int(v)}")
+            v += 50
+    surface.flush()
+
+
 class McpBridge:
     """The running app's side of `sidemark --mcp` (row 216): each tool call
     arrives over D-Bus on the main loop, so it reads and changes the app's
@@ -33825,12 +34624,18 @@ class McpBridge:
         for n, (w, s) in enumerate(self._all_sessions(), start=1):
             text = s.doc_mode == "text"
             canvas = None if text else s.canvas
+            pages = canvas.n_pages if canvas and canvas.document else None
+            if text and s._text_page is not None:
+                try:
+                    pages = len(s._text_page.export_pages()[1]) - 1
+                except OSError:
+                    pages = None
             out.append({
                 "document": n,
                 "title": s._tab_page.get_title() if s._tab_page else "",
                 "path": self._path_of(s),
                 "kind": "text" if text else "pdf",
-                "pages": canvas.n_pages if canvas and canvas.document else None,
+                "pages": pages,
                 "current_page": (canvas.current_page_idx + 1
                                  if canvas and canvas.document else None),
                 "in_front": w._active_session is s,
@@ -33844,8 +34649,11 @@ class McpBridge:
         i = self._page_index(c, page)
         self._commit(w, s)
         model = s.notes_model
+        r = c.document[i].rect
         return {"document": self._path_of(s), "page": i + 1,
-                "pages": c.n_pages, "text": c.document[i].get_text(),
+                "pages": c.n_pages, "size_pt": [round(r.width, 1),
+                                                round(r.height, 1)],
+                "text": c.document[i].get_text(),
                 "notes": model.get(i),
                 "bookmark": (model.bookmark_name(i) or True)
                 if i in model._bookmarks else None,
@@ -33937,10 +34745,16 @@ class McpBridge:
         i = self._page_index(c, page)
         self._front(w, s)
         self._commit(w, s)
-        before = s.notes_model.get(i).rstrip()
+        old = s.notes_model.get(i)
+        before = old.rstrip()
         s.notes_model.set(i, (before + "\n\n" if before else "") + text.strip())
         if c.current_page_idx == i:
             w._restore_note()            # the editor shows the page: refresh it
+        # one step of the window's undo (Ctrl+Z), like a burst of typing
+        w._notes_burst_open = False
+        w._burst_base = w._notes_view.get_source_text()
+        w._undo_timeline.append(("notes", i, old))
+        w._redo_timeline.clear()
         w._mark_dirty(pdf=False)
         w._toast(f"An assistant added notes to page {i + 1}", timeout=4)
         return {"document": self._path_of(s), "page": i + 1,
@@ -33966,12 +34780,271 @@ class McpBridge:
         c._redo_stack.clear()
         if c.on_change:
             c.on_change()
+        if c.on_user_action:
+            c.on_user_action()           # Ctrl+Z takes it back, as one step
         c.queue_draw()
         w._toast(f"An assistant highlighted {len(rects)} place"
                  f"{'s' if len(rects) != 1 else ''} on page {i + 1}",
                  timeout=4)
         return {"document": self._path_of(s), "page": i + 1,
                 "highlighted": len(rects)}
+
+    # ── seeing and drawing (row 217) ────────────────────────────────────────
+    # One coordinate system for both modes: a page in POINTS, origin top left,
+    # y down. A PDF page is its own size; a text page is numbered by the A4
+    # pages it exports as (`TextPageView.export_pages`), 595 × 842 pt each.
+
+    def _surface_of(self, s):
+        """("pdf", canvas) or ("text", sheet) — what a document draws on."""
+        if s.doc_mode == "text":
+            if s._text_page is None:
+                raise McpError("That text page is not ready yet.")
+            return "text", s._text_page
+        if s.canvas is None or s.canvas.document is None:
+            raise McpError("That document has no pages.")
+        return "pdf", s.canvas
+
+    def _page_geometry(self, kind, x, page):
+        """(index, (width_pt, height_pt), extra) for a 1-based page; `extra`
+        is the sheet's (px per pt, page offsets) on a text page."""
+        try:
+            i = int(page) - 1
+        except (TypeError, ValueError):
+            raise McpError("page must be a number.")
+        if kind == "pdf":
+            if not 0 <= i < x.n_pages:
+                raise McpError(f"Page {page} is outside 1–{x.n_pages}.")
+            r = x.document[i].rect
+            return i, (r.width, r.height), None
+        try:
+            k, offs = x.export_pages()
+        except OSError:
+            raise McpError("The text page has no layout yet — bring it to "
+                           "the front and try again.")
+        n = len(offs) - 1
+        if not 0 <= i < n:
+            raise McpError(f"Page {page} is outside 1–{n}.")
+        return i, (x.EXPORT_PAGE_PT[0], (offs[i + 1] - offs[i]) / k), (k, offs)
+
+    @staticmethod
+    def _rect_arg(v, name):
+        if v is None:
+            return None
+        try:
+            r = [float(a) for a in v]
+        except (TypeError, ValueError):
+            raise McpError(f"{name} must be four numbers.")
+        if len(r) != 4:
+            raise McpError(f"{name} must be four numbers.")
+        return r
+
+    def _get_page_image(self, page, region=None, grid=True, max_px=1000,
+                        document=None):
+        _w, s = self._pick(document)
+        kind, x = self._surface_of(s)
+        finish_playbacks(x)
+        i, (pw, ph), _g = self._page_geometry(kind, x, page)
+        r = self._rect_arg(region, "region") or [0.0, 0.0, pw, ph]
+        x0, y0 = max(0.0, min(r[0], r[2])), max(0.0, min(r[1], r[3]))
+        x1, y1 = min(pw, max(r[0], r[2])), min(ph, max(r[1], r[3]))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            raise McpError(f"That region is not on the page "
+                           f"(0–{pw:.0f} × 0–{ph:.0f} pt).")
+        try:
+            max_px = int(max_px)
+        except (TypeError, ValueError):
+            max_px = 1000
+        max_px = max(MCP_IMAGE_MAX_PX[0], min(MCP_IMAGE_MAX_PX[1], max_px))
+        ppp = min(4.0, max_px / max(x1 - x0, y1 - y0))
+        if kind == "pdf":
+            x._write_ink_annotations()       # the ink as it is on screen
+            x._write_image_layer()
+            out = fitz.open()
+            try:
+                out.insert_pdf(x.document, from_page=i, to_page=i)
+                x._settle_ocg_refs(out)
+                pix = out[0].get_pixmap(matrix=fitz.Matrix(ppp, ppp),
+                                        clip=fitz.Rect(x0, y0, x1, y1),
+                                        alpha=False)
+                surf = cairo.ImageSurface.create_from_png(
+                    io.BytesIO(pix.tobytes("png")))
+            finally:
+                out.close()
+        else:
+            try:
+                surf = x.render_export_page(i, (x0, y0, x1, y1), ppp)
+            except (OSError, GLib.Error) as e:
+                raise McpError(f"Could not render the text page: {e}")
+        if grid:
+            draw_page_grid(surf, ppp, (x0, y0))
+        buf = io.BytesIO()
+        surf.write_to_png(buf)
+        return {"document": self._path_of(s), "page": i + 1,
+                "size_pt": [round(pw, 1), round(ph, 1)],
+                "region": [round(v, 1) for v in (x0, y0, x1, y1)],
+                "pixels_per_pt": round(ppp, 3),
+                "_image": base64.b64encode(buf.getvalue()).decode("ascii")}
+
+    def _locate_text(self, text, page=None, document=None):
+        _w, s = self._pick(document)
+        kind, x = self._surface_of(s)
+        hits = []
+        if kind == "pdf":
+            pages = ([self._page_geometry(kind, x, page)[0]]
+                     if page is not None else range(x.n_pages))
+            for i in pages:
+                for r in x.document[i].search_for(text):
+                    if len(hits) < self.SEARCH_HITS:
+                        hits.append({"page": i + 1, "rect": [
+                            round(v, 1) for v in (r.x0, r.y0, r.x1, r.y1)]})
+        else:
+            _i, _size, (k, offs) = self._page_geometry(kind, x, 1)
+            buf = x.view.get_buffer()
+            it = buf.get_start_iter()
+            ox, oy = x.view.window_to_buffer_coords(
+                Gtk.TextWindowType.WIDGET, 0, 0)
+            while len(hits) < self.SEARCH_HITS:
+                found = it.forward_search(
+                    text, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
+                if not found:
+                    break
+                a, b = found
+                ra = x.view.get_iter_location(a)
+                rb = x.view.get_iter_location(b)
+                vx0, vy0 = ra.x - ox, ra.y - oy
+                vx1, vy1 = rb.x - ox, rb.y + rb.height - oy
+                if rb.y > ra.y:            # it wraps: the first line's part
+                    vx1, vy1 = x.view.get_width(), ra.y + ra.height - oy
+                n = max(j for j in range(len(offs) - 1) if offs[j] <= vy0)
+                hits.append({"page": n + 1, "rect": [
+                    round(vx0 / k, 1), round((vy0 - offs[n]) / k, 1),
+                    round(vx1 / k, 1), round((vy1 - offs[n]) / k, 1)]})
+                it = b
+            if page is not None:
+                hits = [h for h in hits if h["page"] == int(page)]
+        return {"document": self._path_of(s), "text": text, "hits": hits}
+
+    def _draw_svg(self, page, svg, box=None, color=None, width=None,
+                  style="hand", document=None):
+        w, s = self._pick(document)
+        kind, x = self._surface_of(s)
+        finish_playbacks(x)
+        i, (pw, ph), geo = self._page_geometry(kind, x, page)
+        box = self._rect_arg(box, "box")
+        if box is not None and (box[2] <= 0 or box[3] <= 0):
+            raise McpError("box is [x, y, width, height], with a positive size.")
+        if kind == "pdf":
+            pen_c, pen_w = tuple(x.pen_color), float(x.pen_width)
+        else:
+            pen_c, pen_w, _o = x.pen_style(False)
+            pen_c = tuple(pen_c)
+        if color:
+            pen_c = svg_color(str(color), None)
+            if pen_c is None:
+                raise McpError(f"{color!r} is not a colour.")
+        if width is not None:
+            try:
+                pen_w = max(SVG_WIDTH_RANGE[0],
+                            min(SVG_WIDTH_RANGE[1], float(width)))
+            except (TypeError, ValueError):
+                raise McpError("width must be a number (points).")
+        if style not in ("hand", "clean"):
+            raise McpError('style is "hand" or "clean".')
+        try:
+            strokes, notes = svg_to_strokes(str(svg), box=box, color=pen_c,
+                                            width=pen_w, style=style)
+        except ValueError as e:
+            raise McpError(f"Cannot draw that: {e}.")
+        if not strokes:
+            raise McpError("Nothing to draw: " + "; ".join(notes))
+        xs = [p[0] for st in strokes for p in st["pts"]]
+        ys = [p[1] for st in strokes for p in st["pts"]]
+        bounds = [min(xs), min(ys), max(xs), max(ys)]
+        if bounds[2] < 0 or bounds[3] < 0 or bounds[0] > pw or bounds[1] > ph:
+            raise McpError(
+                f"The drawing ({', '.join(f'{v:.0f}' for v in bounds)}) is off "
+                f"the page (0–{pw:.0f} × 0–{ph:.0f} pt). Coordinates are page "
+                "points, origin top left, y down.")
+        if bounds[0] < 0 or bounds[1] < 0 or bounds[2] > pw or bounds[3] > ph:
+            notes.append("part of it runs off the page")
+        self._front(w, s)
+        if kind == "pdf":
+            run = self._play_on_canvas(w, x, i, strokes)
+        else:
+            run = self._play_on_sheet(x, i, strokes, geo)
+        w._toast(f"An assistant is drawing on page {i + 1}", timeout=4)
+        return {"document": self._path_of(s), "page": i + 1,
+                "strokes": len(strokes),
+                "bounds": [round(v, 1) for v in bounds],
+                "seconds": round(run.duration, 1), "notes": notes}
+
+    def _play_on_canvas(self, w, c, i, strokes):
+        if c.current_page_idx != i:
+            w._go_to_page(i)             # a step you can go back from
+        c._draw_group += 1
+        group = c._draw_group
+        if c.on_user_action:
+            c.on_user_action()           # its place in Ctrl+Z's order: now
+
+        def commit(st):
+            c.all_strokes.setdefault(i, []).append(st)
+            c._undo_stack.append(("draw", i, st, group))
+            c._redo_stack.clear()
+            if c.on_change:
+                c.on_change()
+            c.queue_draw()
+
+        def show(st):
+            c._playback = (i, st) if st else None
+            c.queue_draw()
+
+        def done():
+            c._playback = c._playback_run = None
+            c.queue_draw()
+
+        c._playback_run = InkPlayback(strokes, commit, show, done)
+        return c._playback_run
+
+    def _play_on_sheet(self, tp, i, strokes, geo):
+        k, offs = geo
+        view = [dict(st, pts=[(px * k, offs[i] + py * k)
+                              for px, py in st["pts"]],
+                     width=st["width"] * k) for st in strokes]
+        # bring the drawing into view: the buffer position at its top
+        top = min(p[1] for st in view for p in st["pts"])
+        bx, by = tp._view_to_buffer_f([(0.0, max(0.0, top))])[0]
+        _over, it = tp.view.get_iter_at_location(int(bx), int(by))
+        tp.scroll_to_offset(it.get_offset())
+        if tp.on_ink_action:
+            tp.on_ink_action()           # its place in Ctrl+Z's order: now
+        added = []
+
+        def commit(st):
+            mark, rel = tp._anchor_buffer_pts(tp._view_to_buffer_f(st["pts"]))
+            stroke = {"mark": mark, "pts": rel, "color": st["color"],
+                      "width": st["width"], "opacity": st["opacity"],
+                      "font_px": tp.font_px}
+            if st.get("press"):
+                stroke["press"] = st["press"]
+            tp.strokes.append(stroke)
+            added.append(stroke)
+            tp.ink.queue_draw()
+
+        def show(st):
+            tp._playback = st
+            tp.ink.queue_draw()
+
+        def done():
+            tp._playback = tp._playback_run = None
+            if added:
+                tp._undo_ops.append(("add", list(added)))
+                tp._redo_ops.clear()
+            if tp.on_ink_changed:
+                tp.on_ink_changed()
+            tp.ink.queue_draw()
+
+        tp._playback_run = InkPlayback(view, commit, show, done, unit=k)
+        return tp._playback_run
 
 
 class McpError(Exception):

@@ -75,7 +75,11 @@
   the well-known name: a Ctrl+R reload runs NON_UNIQUE and owns none. The
   newest process writes the file; a process removes it on exit only if the
   pid is its own. Edits are refused unless Settings → "Let assistants edit"
-  (`mcp_allow_edits`) is on, and each one fronts its tab and toasts. **Test
+  (`mcp_allow_edits`) is on, and each one fronts its tab, toasts, and is
+  ONE step on the window's undo timeline (`_undo_timeline`): an edit that
+  only reaches the canvas's own stack is one Ctrl+Z cannot find. Places on
+  a page are POINTS from its top left in both modes; a text page counts in
+  the A4 pages it exports as (`TextPageView.export_pages`). **Test
   it on a private `dbus-daemon`**, never `Gio.TestDBus`: GTK has already
   opened the session-bus singleton, so the app would sit on the user's real
   bus while the client looks on the test one.

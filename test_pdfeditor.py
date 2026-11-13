@@ -9,6 +9,7 @@ import random
 import math
 import re
 import base64
+import io
 import json
 import tempfile
 import shutil
@@ -2623,6 +2624,18 @@ class TestMcpProtocol(unittest.TestCase):
         self.assertEqual(res["result"]["structuredContent"]["text"], "hello")
         self.assertIn("hello", res["result"]["content"][0]["text"])
 
+    def test_a_picture_is_image_content_not_data(self):
+        (res,) = self._serve(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "get_page_image", "arguments": {"page": 1}}},
+            call=lambda t, a: {"ok": True, "result": {"page": 1,
+                                                      "_image": "iVBOR"}})
+        content = res["result"]["content"]
+        self.assertEqual(content[0], {"type": "image", "data": "iVBOR",
+                                      "mimeType": "image/png"})
+        self.assertNotIn("_image", res["result"]["structuredContent"])
+        self.assertNotIn("iVBOR", content[1]["text"])
+
     def test_failures_are_answers_not_crashes(self):
         bad, unknown, method, parse = self._serve(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -2711,6 +2724,229 @@ class TestMcpBridge(unittest.TestCase):
             self.assertEqual(win.canvas.all_strokes[1], [])
             miss = bridge.call("highlight_text", {"page": 2, "text": "zebra"})
             self.assertFalse(miss["ok"])
+        self._run(body)
+
+
+class TestSvgInk(unittest.TestCase):
+    """Row 217: an SVG becomes ordinary ink strokes in page points."""
+
+    def _one(self, svg, **kw):
+        strokes, notes = sidemark.svg_to_strokes(svg, **kw)
+        return strokes, notes
+
+    @staticmethod
+    def _bounds(strokes):
+        xs = [p[0] for st in strokes for p in st["pts"]]
+        ys = [p[1] for st in strokes for p in st["pts"]]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def test_without_a_box_svg_units_are_page_points(self):
+        strokes, _ = self._one('<line x1="100" y1="200" x2="300" y2="200"/>',
+                               style="clean")
+        (st,) = strokes
+        self.assertEqual(st["pts"][0], (100.0, 200.0))
+        self.assertEqual(st["pts"][-1], (300.0, 200.0))
+        gaps = [math.dist(a, b) for a, b in zip(st["pts"], st["pts"][1:])]
+        self.assertLessEqual(max(gaps), 1.5)      # dense enough to draw
+
+    def test_a_box_fits_the_viewbox_centred_and_keeps_its_aspect(self):
+        svg = ('<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="50"'
+               ' fill="none" stroke="red"/></svg>')
+        strokes, _ = self._one(svg, box=(100, 100, 400, 200), style="clean")
+        x0, y0, x1, y1 = self._bounds(strokes)
+        self.assertAlmostEqual(x1 - x0, y1 - y0, delta=1)   # still round
+        self.assertAlmostEqual((x0 + x1) / 2, 300, delta=1)  # centred
+        self.assertAlmostEqual(y0, 100, delta=1)
+        self.assertAlmostEqual(y1, 300, delta=1)
+
+    def test_every_path_command_draws(self):
+        d = ("M10 10 L20 10 H30 V20 l5 5 h5 v5 C 50 40 60 40 70 30 "
+             "S 90 20 90 30 Q 95 40 100 30 T 110 30 "
+             "A 5 5 0 1 0 120 30 a5,5 0 10-10 0 Z m 0 10 l 5 5")
+        strokes, _ = self._one(f'<path d="{d}"/>', style="clean")
+        self.assertEqual(len(strokes), 2)            # Z, then a new subpath
+        x0, y0, x1, y1 = self._bounds(strokes)
+        self.assertGreaterEqual(x1, 119)             # reached the arc's end
+        self.assertGreater(len(strokes[0]["pts"]), 50)
+
+    def test_clean_keeps_corners_hand_keeps_its_ends(self):
+        rect = '<rect x="10" y="10" width="100" height="50"/>'
+        (clean,), _ = self._one(rect, style="clean")
+        for corner in ((10, 10), (110, 10), (110, 60), (10, 60)):
+            self.assertIn(corner, clean["pts"])
+        line = '<line x1="0" y1="50" x2="300" y2="50"/>'
+        (hand,), _ = self._one(line)
+        self.assertEqual(hand["pts"][0], (0.0, 50.0))     # starts on target
+        self.assertEqual(hand["pts"][-1], (300.0, 50.0))  # ends on it
+        self.assertGreater(max(abs(y - 50) for _x, y in hand["pts"]), 0.05)
+        self.assertLess(max(abs(y - 50) for _x, y in hand["pts"]), 2.0)
+        self.assertIn("press", hand)                      # a nib's taper
+        self.assertEqual(self._one(line)[0][0]["pts"], hand["pts"])  # seeded
+
+    def test_colour_and_width_fall_back_to_the_pen(self):
+        pen = (0.1, 0.2, 0.3)
+        strokes, _ = self._one(
+            '<g stroke-width="3"><line x1="0" y1="0" x2="10" y2="0"/>'
+            '<line x1="0" y1="5" x2="10" y2="5" stroke="#ff0000"/></g>'
+            '<line x1="0" y1="9" x2="10" y2="9" style="stroke: blue"/>',
+            color=pen, width=1.25)
+        self.assertEqual(strokes[0]["color"], pen)
+        self.assertEqual(strokes[0]["width"], 3.0)
+        self.assertEqual(strokes[1]["color"], (1.0, 0.0, 0.0))
+        self.assertEqual(strokes[2]["width"], 1.25)
+        self.assertNotEqual(strokes[2]["color"], pen)
+
+    def test_what_ink_cannot_do_is_said(self):
+        strokes, notes = self._one(
+            '<rect x="0" y="0" width="10" height="10" fill="green"/>'
+            '<text x="0" y="0">hi</text>'
+            '<circle cx="5" cy="5" r="3" stroke="none" fill="none"/>')
+        self.assertEqual(len(strokes), 1)            # the rect, outlined
+        self.assertTrue(any("outline" in n for n in notes))
+        self.assertTrue(any("text" in n for n in notes))
+
+    def test_a_hostile_or_broken_svg_is_refused_not_crashed(self):
+        with self.assertRaises(ValueError):
+            sidemark.svg_to_strokes('<!DOCTYPE x [<!ENTITY a "a">]><svg/>')
+        with self.assertRaises(ValueError):
+            sidemark.svg_to_strokes('<svg><line')
+        strokes, _ = sidemark.svg_to_strokes('<path d="M0 0 L10 10 L oops"/>')
+        self.assertEqual(len(strokes), 1)            # drawn up to the break
+
+    def test_a_huge_drawing_is_capped(self):
+        many = "".join(f'<line x1="0" y1="{i}" x2="5" y2="{i}"/>'
+                       for i in range(sidemark.SVG_MAX_STROKES + 50))
+        strokes, notes = self._one(many)
+        self.assertLessEqual(len(strokes), sidemark.SVG_MAX_STROKES)
+        self.assertTrue(any("too large" in n for n in notes))
+
+
+class TestMcpDrawing(unittest.TestCase):
+    """Row 217: an assistant sees a page and draws on it, in both modes, and
+    the drawing is the user's ink — one Ctrl+Z, even mid-animation."""
+
+    _run = TestMcpBridge._run
+
+    @staticmethod
+    def _settle(ms=200):
+        ctx = GLib.MainContext.default()
+        deadline = time.time() + ms / 1000
+        while time.time() < deadline:
+            ctx.iteration(False)
+
+    def _until_drawn(self, x):
+        deadline = time.time() + sidemark.InkPlayback.MAX_S + 3
+        while x._playback_run is not None and time.time() < deadline:
+            GLib.MainContext.default().iteration(True)   # its timer wakes us
+        self.assertIsNone(x._playback_run)
+
+    @staticmethod
+    def _png(res):
+        raw = base64.b64decode(res["_image"])
+        return cairo.ImageSurface.create_from_png(io.BytesIO(raw))
+
+    def test_seeing_a_pdf_page(self):
+        def body(win, bridge):
+            res = bridge.call("get_page_image", {"page": 2, "max_px": 400})
+            self.assertTrue(res["ok"], res)
+            img = self._png(res["result"])
+            self.assertLessEqual(max(img.get_width(), img.get_height()), 401)
+            self.assertGreater(max(img.get_width(), img.get_height()), 300)
+            part = bridge.call("get_page_image", {
+                "page": 2, "region": [60, 280, 300, 360], "max_px": 400})
+            self.assertEqual(part["result"]["region"], [60, 280, 300, 360])
+            self.assertFalse(bridge.call("get_page_image", {
+                "page": 2, "region": [900, 900, 950, 950]})["ok"])
+            hits = bridge.call("locate_text", {"text": "Bravo Writer"})
+            (hit,) = hits["result"]["hits"]
+            r = win.canvas.document[1].search_for("Bravo Writer")[0]
+            self.assertEqual(hit["page"], 2)
+            self.assertAlmostEqual(hit["rect"][0], r.x0, delta=0.1)
+        self._run(body)
+
+    def test_drawing_on_a_pdf_page_plays_back_and_undoes_whole(self):
+        def body(win, bridge):
+            svg = "".join(f'<line x1="100" y1="{y}" x2="400" y2="{y}"/>'
+                          for y in range(400, 520, 20))
+            off = bridge.call("draw_svg", {"page": 2, "svg": svg})
+            self.assertIn("Let assistants edit", off["error"])
+            sidemark._save_setting("mcp_allow_edits", True)
+            res = bridge.call("draw_svg", {"page": 2, "svg": svg,
+                                           "color": "red", "width": 2})
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["result"]["strokes"], 6)
+            c = win.canvas
+            self.assertEqual(c.current_page_idx, 1)       # went to the page
+            self.assertLess(len(c.all_strokes.get(1, [])), 6)  # still drawing
+            self._settle(150)
+            # Ctrl+Z while it draws: the WHOLE drawing goes, not half of it
+            win._global_undo()
+            self.assertIsNone(c._playback_run)
+            self.assertEqual(c.all_strokes.get(1, []), [])
+            win._global_redo()
+            self.assertEqual(len(c.all_strokes[1]), 6)
+            win._global_undo()
+            res = bridge.call("draw_svg", {"page": 2, "svg": svg})
+            self._until_drawn(c)
+            self.assertEqual(len(c.all_strokes[1]), 6)
+            self.assertTrue(win._dirty)
+            for st in c.all_strokes[1]:                   # where it was asked
+                for x, y in st["pts"]:
+                    self.assertTrue(98 <= x <= 402 and 398 <= y <= 502)
+            # the assistant can see what it drew
+            img = self._png(bridge.call("get_page_image", {
+                "page": 2, "region": [90, 390, 410, 510], "grid": False,
+                "max_px": 320})["result"])
+            data = bytes(img.get_data())
+            self.assertTrue(any(data[i] < 128 for i in range(0, len(data), 4)))
+            far = bridge.call("draw_svg", {
+                "page": 2, "svg": '<line x1="2000" y1="0" x2="2100" y2="0"/>'})
+            self.assertIn("off the page", far["error"])
+        self._run(body)
+
+    def test_the_earlier_edits_are_one_ctrl_z_each(self):
+        def body(win, bridge):
+            sidemark._save_setting("mcp_allow_edits", True)
+            bridge.call("add_page_note", {"page": 1, "text": "from the AI"})
+            self.assertIn("from the AI", win.notes_model.get(0))
+            win._global_undo()
+            self.assertNotIn("from the AI", win.notes_model.get(0))
+            bridge.call("highlight_text", {"page": 2, "text": "Bravo Writer"})
+            self.assertEqual(len(win.canvas.all_strokes[1]), 1)
+            win._global_undo()
+            self.assertEqual(win.canvas.all_strokes[1], [])
+        self._run(body)
+
+    def test_a_text_page_counts_in_export_pages_and_takes_ink_too(self):
+        def body(win, bridge):
+            sidemark._save_setting("mcp_allow_edits", True)
+            win._on_new_text_page()
+            self._settle(400)
+            tp = win._text_page
+            tp.view.get_buffer().set_text("Intro line\n\nThe key idea here.\n")
+            self._settle(300)
+            docs = bridge.call("list_documents", {})["result"]["documents"]
+            self.assertEqual((docs[0]["kind"], docs[0]["pages"]), ("text", 1))
+            (hit,) = bridge.call("locate_text",
+                                 {"text": "key idea"})["result"]["hits"]
+            self.assertEqual(hit["page"], 1)
+            x0, y0, x1, y1 = hit["rect"]
+            self.assertTrue(0 <= x0 < x1 <= 595 and 0 <= y0 < y1 < 842)
+            img = bridge.call("get_page_image", {"page": 1, "max_px": 300})
+            self.assertTrue(img["ok"], img)
+            res = bridge.call("draw_svg", {"page": 1, "svg": (
+                f'<ellipse cx="{(x0 + x1) / 2}" cy="{(y0 + y1) / 2}" '
+                f'rx="{(x1 - x0) / 2 + 6}" ry="{(y1 - y0) / 2 + 4}"/>')})
+            self.assertTrue(res["ok"], res)
+            self._until_drawn(tp)
+            (st,) = tp.strokes
+            # it sits around the phrase, in the sheet's own coordinates
+            k, offs = tp.export_pages()
+            pts = tp.stroke_view_pts(st)
+            cx = sum(p[0] for p in pts) / len(pts) / k
+            self.assertAlmostEqual(cx, (x0 + x1) / 2, delta=3)
+            win._global_undo()
+            self.assertEqual(tp.strokes, [])
         self._run(body)
 
 

@@ -41,6 +41,19 @@
      long-wavelength shape, and preserving it is the same property that keeps a
      fast "o" round, so test denoising against a smooth arc plus per-sample
      noise, never a zigzag.
+  - **An assistant's drawing (`svg_to_strokes`, row 217) is the one ink that
+    skips this pipeline, on purpose**: SVG geometry is exact, so there is no
+    noise to denoise, and Catmull-Rom would round a rectangle's corners.
+    `even_polyline` re-walks it at `SVG_STEP` keeping every vertex, and
+    `width_profile` gives it the same taper the pen gets — the PRESS list
+    means the same thing either way. `hand_wobble` is pinned at both ends,
+    so a line aimed at a word still starts and ends on it.
+  - **`InkPlayback` commits each stroke the moment it is drawn.** Nothing in
+    storage or in the cached ink layer knows about the animation; only the
+    stroke in flight is painted, on the path the pen's live stroke takes
+    (`_playback` on both canvases). **Undo and redo call
+    `finish_playbacks` first**, so Ctrl+Z partway through takes the whole
+    drawing back, never the half already committed.
   - **The same three jobs run LIVE** (`live_ink_stroke`, row 143), so the line
     under the nib is the line you are left with. It skips exactly two steps of
     `finish_ink_stroke`, both because the stroke is not over: the raw capture
