@@ -504,48 +504,50 @@ MCP_TOOLS = [
          "page": {**_MCP_PAGE, "description": "Only this page (default: "
                   "every page)."},
          "document": _MCP_DOC}, "required": ["text"]}},
-    {"name": "add_page_note", "write": True,
-     "description": "Append Markdown to the notes beside a page. Needs the "
-                    "user to allow edits in Sidemark's Settings.",
-     "inputSchema": {"type": "object", "properties": {
-         "page": _MCP_PAGE, "text": {"type": "string", "minLength": 1},
-         "document": _MCP_DOC}, "required": ["page", "text"]}},
-    {"name": "highlight_text", "write": True,
-     "description": "Highlight every occurrence of a phrase on a page, as the "
-                    "highlighter would (undoable). Needs the user to allow "
-                    "edits in Sidemark's Settings.",
-     "inputSchema": {"type": "object", "properties": {
-         "page": _MCP_PAGE, "text": {"type": "string", "minLength": 1},
-         "document": _MCP_DOC}, "required": ["page", "text"]}},
-    {"name": "draw_svg", "write": True,
-     "description": "Draw on a page in the user's ink: give SVG (path, line, "
-                    "polyline, polygon, rect, circle, ellipse, g with "
-                    "transforms; stroke, stroke-width, opacity). It appears "
-                    "stroke by stroke as if drawn by hand and becomes "
-                    "ordinary ink the user can move, recolour, erase or undo "
-                    "(one Ctrl+Z). Ink is lines only: fills are drawn as "
-                    "outlines and text is skipped. Without box, SVG units "
-                    "are page points (origin top left, y down); with box, "
-                    "the SVG's viewBox is fitted into it. Colours and widths "
-                    "the SVG leaves out are the user's pen. Needs the user "
-                    "to allow edits in Sidemark's Settings.",
+    {"name": "annotate_page", "write": True,
+     "description": "Add to ONE page in a single call (one Ctrl+Z for the "
+                    "user): notes beside the page, callouts tied to a spot, "
+                    "highlights, drawings. All of it is marked as yours — "
+                    "tinted in the notes, removable as a set — and the user's "
+                    "view does not move. Give only the parts you need. Notes "
+                    "and callouts are Markdown, $…$ maths, PDF pages only. "
+                    "replace: true first removes what you added to this page "
+                    "before. Needs the user to allow edits in Settings.",
      "inputSchema": {"type": "object", "properties": {
          "page": _MCP_PAGE,
-         "svg": {"type": "string", "minLength": 1,
-                 "description": "An <svg> document, or just its shapes."},
-         "box": {"type": "array", "items": {"type": "number"},
-                 "minItems": 4, "maxItems": 4,
-                 "description": "[x, y, width, height] in points to fit the "
-                                "drawing into."},
-         "color": {"type": "string", "description": "Default colour (CSS "
-                   "name or #hex) for shapes that do not set one."},
-         "width": {"type": "number", "description": "Default line width in "
-                   "points."},
-         "style": {"type": "string", "enum": ["hand", "clean"],
-                   "description": "hand (default): tapered ends and a "
-                                  "slight drift, like a pen; clean: exact "
-                                  "geometry."},
-         "document": _MCP_DOC}, "required": ["page", "svg"]}},
+         "notes": {"type": "string", "description": "Appended to the page's "
+                   "notes."},
+         "callouts": {"type": "array", "items": {
+             "type": "object", "properties": {
+                 "at": {"description": "A phrase on the page (the first "
+                        "match), or [x, y] in points. A numbered marker goes "
+                        "in the margin beside it, linked to the text."},
+                 "text": {"type": "string"},
+                 "box": {"description": "Also show the text on the page: "
+                         "\"margin\" places a box beside it, or [x, y]."}},
+             "required": ["at", "text"]}},
+         "highlights": {"type": "array", "items": {
+             "type": "object", "properties": {
+                 "text": {"type": "string", "description": "Every match on "
+                          "the page is highlighted."},
+                 "color": {"type": "string", "description": "yellow, green, "
+                           "blue, pink, orange, purple or #hex; default the "
+                           "user's highlighter."}},
+             "required": ["text"]}},
+         "drawings": {"type": "array", "items": {
+             "type": "object", "properties": {
+                 "svg": {"type": "string", "description": "SVG shapes (path, "
+                         "line, polyline, polygon, rect, circle, ellipse, g); "
+                         "lines only — fills become outlines, text is "
+                         "skipped. Without box its units are page points."},
+                 "box": {"type": "array", "items": {"type": "number"},
+                         "minItems": 4, "maxItems": 4, "description":
+                         "[x, y, width, height] to fit the viewBox into."},
+                 "color": {"type": "string"}, "width": {"type": "number"},
+                 "style": {"type": "string", "enum": ["hand", "clean"]}},
+             "required": ["svg"]}},
+         "replace": {"type": "boolean"},
+         "document": _MCP_DOC}, "required": ["page"]}},
 ]
 
 
@@ -588,10 +590,14 @@ def mcp_handle(msg, call):
                    "instructions":
                        "Sidemark is the user's PDF reader and note-taker. "
                        "These tools see the documents open in it right now. "
-                       "Pages count from 1. Places on a page are in points "
-                       "from its top left, y down. To draw: find the spot "
-                       "(locate_text, or get_page_image of a region), "
-                       "draw_svg, then look again to check it."})
+                       "Pages count from 1; places on a page are points from "
+                       "its top left, y down. Working through a document: "
+                       "read each page with get_page (text is cheap), look "
+                       "with get_page_image only where text is not enough — "
+                       "a figure, an equation — and ask for just that "
+                       "region; then ONE annotate_page call per page. Aim "
+                       "callouts and highlights at phrases rather than "
+                       "coordinates."})
     if method == "ping":
         return ok({})
     if method == "tools/list":
@@ -6769,6 +6775,11 @@ class PDFCanvas(Gtk.DrawingArea):
                 # fitz reports -1.0 (or 1.0) when the PDF CA key is unset
                 opacity = annot.opacity if 0 < annot.opacity < 1 else 1.0
                 prof = _ink_profile_from_annot(annot)
+                try:
+                    by = (ASSISTANT_BY if (annot.info or {}).get("title")
+                          == ASSISTANT_INK_AUTHOR else None)
+                except Exception:
+                    by = None
                 for polyline in annot.vertices:
                     if polyline:
                         st = {
@@ -6782,6 +6793,8 @@ class PDFCanvas(Gtk.DrawingArea):
                         # belongs to this polyline
                         if prof and len(prof) == len(st["pts"]):
                             st["press"] = prof
+                        if by:
+                            st["by"] = by
                         self.all_strokes.setdefault(i, []).append(st)
                         total_annots += 1
         logger.info(f"load: {path} — {self.n_pages} pages, {total_annots} strokes loaded")
@@ -12866,6 +12879,10 @@ class PDFCanvas(Gtk.DrawingArea):
                     # lasso, the eraser and the control points along with it.
                     annot.set_info(content=INK_PROFILE_TAG
                                    + ",".join(f"{p:.2f}" for p in prof))
+                if stroke.get("by") == ASSISTANT_BY:
+                    # the annotation's AUTHOR (/T): every PDF reader shows it,
+                    # and it is how Sidemark knows the ink again (row 218)
+                    annot.set_info(title=ASSISTANT_INK_AUTHOR)
                 annot.update()
                 total_written += 1
             self._ink_on_page[xref] = sig
@@ -14551,6 +14568,40 @@ def _prune_autosaves(max_age_days=30):
 
 
 _ANCHOR_RE = re.compile(r'<!--\s*anchor:(\d+):(\d+)\s*-->')
+# What an assistant wrote (rows 216/218): its notes sit between these two
+# markers, hidden like every marker, so they can be tinted, redone and
+# removed as a set without a second file. A BLOCK, not a per-paragraph tag,
+# because one note may run to several paragraphs. Its ink says the same in
+# the stroke's "by" — the PDF annotation's author, the sheet's sidecar key.
+ASSISTANT_BY = "assistant"
+ASSISTANT_INK_AUTHOR = "Sidemark assistant"
+ASSISTANT_OPEN = "<!-- by:assistant -->"
+ASSISTANT_CLOSE = "<!-- /by:assistant -->"
+_ASSISTANT_MARK_RE = re.compile(r'<!--\s*/?by:assistant\s*-->')
+_ASSISTANT_BLOCK_RE = re.compile(
+    r'[ \t]*<!--\s*by:assistant\s*-->.*?<!--\s*/by:assistant\s*-->[ \t]*\n?',
+    re.S)
+
+
+def assistant_block(text, head=None):
+    """`text` as the assistant's: wrapped in its markers. `head` is a line
+    of marks that must open the paragraph (an anchor and its callout)."""
+    return "\n".join([ASSISTANT_OPEN] + ([head] if head else [])
+                     + [text.strip(), ASSISTANT_CLOSE])
+
+
+def strip_assistant_blocks(text):
+    """(text without the assistant's blocks, how many there were)."""
+    new, n = _ASSISTANT_BLOCK_RE.subn("", text)
+    if n:
+        new = re.sub(r"\n{3,}", "\n\n", new).strip("\n")
+    return new, n
+
+
+def assistant_spans(text):
+    """[(start, end)] character spans of the assistant's blocks in `text`."""
+    return [(m.start(), m.end()) for m in _ASSISTANT_BLOCK_RE.finditer(text)]
+
 _CALLOUT_RE = re.compile(r'<!--\s*callout:(\d+):(\d+)\s*-->')
 _TEXTBOX_RE = re.compile(r'<!--\s*textbox:(\d+):(\d+)\s*-->')
 _MD_STRIP = [
@@ -14562,6 +14613,7 @@ _MD_STRIP = [
 
 
 def _strip_markers(text):
+    text = _ASSISTANT_MARK_RE.sub('', text)
     text = _ANCHOR_RE.sub('', text)
     text = _CALLOUT_RE.sub('', text)
     text = _TEXTBOX_RE.sub('', text)
@@ -23572,6 +23624,8 @@ class TextPageView(Gtk.Overlay):
                 # the width profile is unitless, so unlike every other number
                 # here it needs no font_px rescale on the way back in
                 rec["press"] = [round(p, 2) for p in st["press"]]
+            if st.get("by"):
+                rec["by"] = st["by"]          # who drew it (row 218)
             out.append(rec)
         images = []
         for im in self.images:
@@ -23708,6 +23762,8 @@ class TextPageView(Gtk.Overlay):
                 # its points would shift every width along the stroke, so a
                 # hand-edited or truncated sidecar loses the taper, not the ink
                 st["press"] = [float(p) for p in press]
+            if rec.get("by") == ASSISTANT_BY:
+                st["by"] = ASSISTANT_BY
             self.strokes.append(st)
         for rec in data.get("images", []):
             try:
@@ -24349,6 +24405,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                    lambda: (menu_pop.popdown(), self._copy_link_to_here()),
                    "Put a [[link]] to this page on the clipboard, to paste "
                    "into another document's notes")
+        # only while there is something to remove (see _sync_assistant_item)
+        self._assistant_menu_item = _menu_item(
+            "Remove the assistant's marks",
+            lambda: (menu_pop.popdown(), self._remove_assistant_marks()),
+            "Take out every note, callout, highlight and drawing an AI "
+            "assistant added to this document — one Ctrl+Z puts them back")
+        self._assistant_menu_item.set_visible(False)
+        menu_pop.connect("show", lambda _p: self._sync_assistant_item())
         _menu_item("Keyboard shortcuts", lambda: self._show_menu_page("shortcuts"),
                    "Show the full list of keyboard shortcuts")
         # Preferences live in a DIALOG, not in this popover: a popover is
@@ -28132,6 +28196,17 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not self._undo_timeline:
             return
         op = self._undo_timeline.pop()
+        if op[0] == "group":
+            # several changes made as ONE (an assistant's page, row 218):
+            # undo each, newest first, and file their redos as one again
+            n = len(self._redo_timeline)
+            self._undo_timeline.extend(op[1])
+            for _ in op[1]:
+                self._global_undo()
+            subs = self._redo_timeline[n:]
+            del self._redo_timeline[n:]
+            self._redo_timeline.append(("group", subs))
+            return
         if op[0] == "canvas":
             self.canvas.undo_last()
             self._redo_timeline.append(("canvas",))
@@ -28158,6 +28233,15 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not self._redo_timeline:
             return
         op = self._redo_timeline.pop()
+        if op[0] == "group":
+            n = len(self._undo_timeline)
+            self._redo_timeline.extend(op[1])
+            for _ in op[1]:
+                self._global_redo()
+            subs = self._undo_timeline[n:]
+            del self._undo_timeline[n:]
+            self._undo_timeline.append(("group", subs))
+            return
         if op[0] == "canvas":
             self.canvas.redo_last()
             self._undo_timeline.append(("canvas",))
@@ -28175,10 +28259,72 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._set_notes_text(page, after)
         self._undo_timeline.append(("notes", page, before))
 
+    def _has_assistant_marks(self, s):
+        if s is None:
+            return False
+        if s.doc_mode == "text":
+            tp = s._text_page
+            return tp is not None and any(st.get("by") == ASSISTANT_BY
+                                          for st in tp.strokes)
+        if any(st.get("by") == ASSISTANT_BY
+               for strokes in s.canvas.all_strokes.values() for st in strokes):
+            return True
+        if s._notes_view is not None:
+            self._commit_note_for(s)
+        return any(ASSISTANT_OPEN in t for t in s.notes_model._notes.values())
+
+    def _sync_assistant_item(self):
+        self._assistant_menu_item.set_visible(
+            self._has_assistant_marks(self._active_session))
+
+    def _remove_assistant_marks(self):
+        """The ☰ verb (row 218): everything an assistant added to this
+        document, gone in one step — and back with one Ctrl+Z."""
+        s = self._active_session
+        if s is None:
+            return
+        if s.doc_mode != "text" and s._notes_view is not None:
+            self._commit_note_for(s)
+        removed, ops = remove_assistant_marks(s)
+        if not ops:
+            self._toast("Nothing here was added by an assistant")
+            return
+        McpBridge._record(s, ops)
+        if removed["notes"]:
+            self._restore_note()
+            self._burst_base = self._notes_view.get_source_text()
+            self._mark_dirty(pdf=False)
+        if removed["strokes"]:
+            self._mark_dirty()
+        bits = [f"{n} {what}{'s' if n != 1 else ''}" for what, n in
+                (("note", removed["notes"]), ("stroke", removed["strokes"])) if n]
+        toast = Adw.Toast.new("Removed the assistant's " + " and ".join(bits))
+        toast.set_button_label("Undo")
+        toast.connect("button-clicked", lambda _t: self._global_undo())
+        toast.set_timeout(6)
+        self.toast_overlay.add_toast(toast)
+
+    def _tint_assistant_notes(self, buf, text):
+        """The assistant's notes, told apart from yours at a glance: a faint
+        wash behind its blocks (row 218). The markers that bound them are
+        hidden, so without this they would read as your own words."""
+        tag = buf.get_tag_table().lookup("assistant-note")
+        if tag is None:
+            wash = Gdk.RGBA()
+            wash.parse("rgba(140, 107, 242, 0.10)")   # faint in either theme
+            tag = buf.create_tag("assistant-note",
+                                 paragraph_background_rgba=wash)
+        buf.remove_tag(tag, buf.get_start_iter(), buf.get_end_iter())
+        for a, b in assistant_spans(text):
+            buf.apply_tag(tag, buf.get_iter_at_offset(a),
+                          buf.get_iter_at_offset(b))
+
     def _update_canvas_anchors(self):
         page_idx = self.canvas.current_page_idx
         buf = self._notes_view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        if ASSISTANT_OPEN in text or buf.get_tag_table().lookup("assistant-note"):
+            self._tint_assistant_notes(buf, text)
         parsed = _parse_page_marks(text)
         changed = parsed != self.canvas._anchors.get(page_idx)
         self.canvas._anchors[page_idx] = parsed
@@ -31130,8 +31276,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             "MCP server. To connect Claude Code: "
             "claude mcp add sidemark -- sidemark --mcp")
         edits = Adw.SwitchRow(title="Let assistants edit")
-        edits.set_subtitle("Add notes and highlights. Each change is shown "
-                           "here as it happens and can be undone.")
+        edits.set_subtitle("Notes, callouts, highlights and drawings — marked "
+                           "as the assistant's, and each page's back out with "
+                           "one Ctrl+Z.")
         edits.set_active(_load_settings().get("mcp_allow_edits") is True)
         edits.connect("notify::active", lambda r, _p:
                       _save_setting("mcp_allow_edits", r.get_active()))
@@ -34412,7 +34559,7 @@ class InkPlayback:
     MAX_S = 4.0        # the whole drawing, at most
     GAP_S = 0.06       # pen lifted between strokes
 
-    def __init__(self, strokes, commit, show, done, unit=1.0):
+    def __init__(self, strokes, commit, show, done, unit=1.0, animate=True):
         self.strokes = strokes
         self._commit, self._show, self._done = commit, show, done
         lengths = [sum(math.hypot(b[0] - a[0], b[1] - a[1])
@@ -34429,9 +34576,13 @@ class InkPlayback:
             t += d + gap
         self.duration = t
         self._i = 0
-        self._over = False
+        self.over = False
+        self._src = None
         self._t0 = GLib.get_monotonic_time()
-        self._src = GLib.timeout_add(16, self._tick)
+        if animate:
+            self._src = GLib.timeout_add(16, self._tick)
+        else:
+            self.finish()        # nobody is looking: no show, just the ink
 
     def _tick(self):
         t = (GLib.get_monotonic_time() - self._t0) / 1e6
@@ -34455,9 +34606,9 @@ class InkPlayback:
         return True
 
     def finish(self):
-        if self._over:
+        if self.over:
             return
-        self._over = True
+        self.over = True
         if self._src is not None:
             GLib.source_remove(self._src)
             self._src = None
@@ -34474,6 +34625,67 @@ def finish_playbacks(*surfaces):
         run = getattr(x, "_playback_run", None) if x is not None else None
         if run is not None:
             run.finish()
+
+
+def remove_assistant_marks(s, pages=None):
+    """Take everything the assistant made off document session `s` — its
+    notes blocks and its ink — on `pages` (0-based; None: all). Returns
+    ({"notes": n, "strokes": n}, [undo timeline entries]); the caller files
+    the entries as ONE step, so a whole pass comes back with one Ctrl+Z."""
+    removed, ops = {"notes": 0, "strokes": 0}, []
+    if s.doc_mode == "text":
+        tp = s._text_page
+        if tp is None:
+            return removed, ops
+        finish_playbacks(tp)
+        gone = [st for st in tp.strokes if st.get("by") == ASSISTANT_BY]
+        if pages is not None and gone:
+            k, offs = tp.export_pages()
+            want = set(pages)
+
+            def page_of(st):
+                y = min(p[1] for p in tp.stroke_view_pts(st))
+                return max(j for j in range(len(offs) - 1) if offs[j] <= max(y, 0))
+            gone = [st for st in gone if page_of(st) in want]
+        if gone:
+            for st in gone:
+                tp.strokes.remove(st)
+            tp._undo_ops.append(("erase", gone))
+            tp._redo_ops.clear()
+            tp.ink.queue_draw()
+            ops.append(("ink",))
+            removed["strokes"] = len(gone)
+        return removed, ops
+    c, model = s.canvas, s.notes_model
+    finish_playbacks(c)
+    targets = range(c.n_pages) if pages is None else pages
+    snap = model.snapshot()
+    for p in targets:
+        new, n = strip_assistant_blocks(model.own_text(p))
+        if n:
+            model.set(p, new)
+            removed["notes"] += n
+    if removed["notes"]:
+        ops.append(("links", snap))    # the whole-model restore undo knows
+    c._erase_group += 1
+    for p in targets:
+        cur = c.all_strokes.get(p, [])
+        kept, k = [], 0
+        for idx, st in enumerate(cur):
+            if st.get("by") == ASSISTANT_BY:
+                # indices as the eraser records them, so undo re-inserts each
+                c._undo_stack.append(("erase", p, idx - k, st, c._erase_group))
+                k += 1
+            else:
+                kept.append(st)
+        if k:
+            c.all_strokes[p] = kept
+            removed["strokes"] += k
+    if removed["strokes"]:
+        c._redo_stack.clear()
+        c.queue_draw()
+        ops.append(("canvas",))
+    return removed, ops
 
 
 MCP_IMAGE_MAX_PX = (200, 1600)
@@ -34737,58 +34949,6 @@ class McpBridge:
         w._go_to_page(i)
         return {"document": self._path_of(s), "page": i + 1}
 
-    # ── changing (Settings → Let assistants edit) ───────────────────────────
-
-    def _add_page_note(self, page, text, document=None):
-        w, s = self._pick(document)
-        c = self._pdf(s)
-        i = self._page_index(c, page)
-        self._front(w, s)
-        self._commit(w, s)
-        old = s.notes_model.get(i)
-        before = old.rstrip()
-        s.notes_model.set(i, (before + "\n\n" if before else "") + text.strip())
-        if c.current_page_idx == i:
-            w._restore_note()            # the editor shows the page: refresh it
-        # one step of the window's undo (Ctrl+Z), like a burst of typing
-        w._notes_burst_open = False
-        w._burst_base = w._notes_view.get_source_text()
-        w._undo_timeline.append(("notes", i, old))
-        w._redo_timeline.clear()
-        w._mark_dirty(pdf=False)
-        w._toast(f"An assistant added notes to page {i + 1}", timeout=4)
-        return {"document": self._path_of(s), "page": i + 1,
-                "notes": s.notes_model.get(i)}
-
-    def _highlight_text(self, page, text, document=None):
-        w, s = self._pick(document)
-        c = self._pdf(s)
-        i = self._page_index(c, page)
-        rects = c.document[i].search_for(text)
-        if not rects:
-            raise McpError(f"{text!r} is not on page {i + 1}.")
-        self._front(w, s)
-        c._draw_group += 1
-        group = c._draw_group
-        strokes = c.all_strokes.setdefault(i, [])
-        for r in rects:
-            ymid = (r.y0 + r.y1) / 2
-            stroke = {"pts": [(r.x0, ymid), (r.x1, ymid)], "color": c.hl_color,
-                      "width": max(r.y1 - r.y0, 1.0), "opacity": c.hl_opacity}
-            strokes.append(stroke)
-            c._undo_stack.append(("draw", i, stroke, group))
-        c._redo_stack.clear()
-        if c.on_change:
-            c.on_change()
-        if c.on_user_action:
-            c.on_user_action()           # Ctrl+Z takes it back, as one step
-        c.queue_draw()
-        w._toast(f"An assistant highlighted {len(rects)} place"
-                 f"{'s' if len(rects) != 1 else ''} on page {i + 1}",
-                 timeout=4)
-        return {"document": self._path_of(s), "page": i + 1,
-                "highlighted": len(rects)}
-
     # ── seeing and drawing (row 217) ────────────────────────────────────────
     # One coordinate system for both modes: a page in POINTS, origin top left,
     # y down. A PDF page is its own size; a text page is numbered by the A4
@@ -34885,6 +35045,31 @@ class McpBridge:
                 "pixels_per_pt": round(ppp, 3),
                 "_image": base64.b64encode(buf.getvalue()).decode("ascii")}
 
+    def _sheet_hits(self, x, text):
+        """Every occurrence of `text` on a text page: [{page, rect}] in the
+        export pages' points (case-insensitive)."""
+        _i, _size, (k, offs) = self._page_geometry("text", x, 1)
+        hits = []
+        it = x.view.get_buffer().get_start_iter()
+        ox, oy = x.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, 0, 0)
+        while len(hits) < self.SEARCH_HITS:
+            found = it.forward_search(text, Gtk.TextSearchFlags.CASE_INSENSITIVE,
+                                      None)
+            if not found:
+                break
+            a, b = found
+            ra, rb = x.view.get_iter_location(a), x.view.get_iter_location(b)
+            vx0, vy0 = ra.x - ox, ra.y - oy
+            vx1, vy1 = rb.x - ox, rb.y + rb.height - oy
+            if rb.y > ra.y:               # it wraps: the first line's part
+                vx1, vy1 = x.view.get_width(), ra.y + ra.height - oy
+            n = max(j for j in range(len(offs) - 1) if offs[j] <= vy0)
+            hits.append({"page": n + 1, "rect": [
+                round(vx0 / k, 1), round((vy0 - offs[n]) / k, 1),
+                round(vx1 / k, 1), round((vy1 - offs[n]) / k, 1)]})
+            it = b
+        return hits
+
     def _locate_text(self, text, page=None, document=None):
         _w, s = self._pick(document)
         kind, x = self._surface_of(s)
@@ -34898,100 +35083,278 @@ class McpBridge:
                         hits.append({"page": i + 1, "rect": [
                             round(v, 1) for v in (r.x0, r.y0, r.x1, r.y1)]})
         else:
-            _i, _size, (k, offs) = self._page_geometry(kind, x, 1)
-            buf = x.view.get_buffer()
-            it = buf.get_start_iter()
-            ox, oy = x.view.window_to_buffer_coords(
-                Gtk.TextWindowType.WIDGET, 0, 0)
-            while len(hits) < self.SEARCH_HITS:
-                found = it.forward_search(
-                    text, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
-                if not found:
-                    break
-                a, b = found
-                ra = x.view.get_iter_location(a)
-                rb = x.view.get_iter_location(b)
-                vx0, vy0 = ra.x - ox, ra.y - oy
-                vx1, vy1 = rb.x - ox, rb.y + rb.height - oy
-                if rb.y > ra.y:            # it wraps: the first line's part
-                    vx1, vy1 = x.view.get_width(), ra.y + ra.height - oy
-                n = max(j for j in range(len(offs) - 1) if offs[j] <= vy0)
-                hits.append({"page": n + 1, "rect": [
-                    round(vx0 / k, 1), round((vy0 - offs[n]) / k, 1),
-                    round(vx1 / k, 1), round((vy1 - offs[n]) / k, 1)]})
-                it = b
+            hits = self._sheet_hits(x, text)
             if page is not None:
                 hits = [h for h in hits if h["page"] == int(page)]
         return {"document": self._path_of(s), "text": text, "hits": hits}
 
-    def _draw_svg(self, page, svg, box=None, color=None, width=None,
-                  style="hand", document=None):
+    # ── changing (Settings → Let assistants edit; rows 217/218) ─────────────
+    # ONE write tool: a page's notes, callouts, highlights and drawings in one
+    # call — one Ctrl+Z, and a reply that counts rather than echoes. An edit
+    # never moves the user's view (a pass over a whole paper must not drag
+    # the reader along): it animates only on the page already on screen,
+    # and the toasts merge into one running tally. Everything it makes is
+    # tagged as the assistant's, so it can be told apart, redone (`replace`)
+    # and removed as a set (`remove_assistant_marks`).
+    #
+    # Window state is proxied to the ACTIVE tab, so for a tab in the
+    # background nothing here may go through the window's own bookkeeping —
+    # undo entries and the dirty mark land on the session itself (`_touch`,
+    # `_record`).
+
+    HL_COLORS = {"yellow": (1.0, 0.85, 0.15), "green": (0.4, 0.85, 0.35),
+                 "blue": (0.4, 0.7, 1.0), "pink": (1.0, 0.45, 0.72),
+                 "orange": (1.0, 0.62, 0.2), "purple": (0.72, 0.5, 1.0)}
+    CALLOUT_W = 182.0     # pt a callout box takes: _note_box_layout's 170 + pad
+
+    @staticmethod
+    def _shown(w, s):
+        """Is this document on screen right now? Mapped, not FOCUSED: the
+        user is typing to the assistant in another window while they watch."""
+        return w._active_session is s and w.get_mapped()
+
+    @staticmethod
+    def _touch(w, s, pdf=True):
+        if w._active_session is s:
+            w._mark_dirty(pdf=pdf)
+        else:
+            s._dirty = True
+            if pdf:
+                s._pdf_dirty = True
+
+    @staticmethod
+    def _record(s, ops):
+        """One step of the document's own undo timeline (Ctrl+Z)."""
+        if not ops:
+            return
+        s._notes_burst_open = False
+        s._undo_timeline.append(ops[0] if len(ops) == 1 else ("group", ops))
+        s._redo_timeline.clear()
+
+    def _tally(self, w, page):
+        """One toast for a run of edits, kept up to date, not one per call."""
+        t = getattr(w, "_assistant_toast", None)
+        now = GLib.get_monotonic_time()
+        if t is None or t["gone"] or now - t["at"] > 20e6:
+            toast = Adw.Toast.new("")
+            toast.set_timeout(6)
+            t = {"toast": toast, "pages": set(), "gone": False}
+            toast.connect("dismissed", lambda _t, t=t: t.update(gone=True))
+            w._assistant_toast = t
+            w.toast_overlay.add_toast(toast)
+        t["at"] = now
+        t["pages"].add(page)
+        ps = sorted(t["pages"])
+        where = (f"page {ps[0]}" if len(ps) == 1
+                 else "pages " + (", ".join(map(str, ps)) if len(ps) <= 4
+                                  else f"{ps[0]}–{ps[-1]}"))
+        t["toast"].set_title(f"The assistant annotated {where}")
+
+    def _hits_on(self, kind, x, i, text, geo=None):
+        """[(x0, y0, x1, y1)] of `text` on page i, in page points."""
+        if kind == "pdf":
+            return [(r.x0, r.y0, r.x1, r.y1)
+                    for r in x.document[i].search_for(text)]
+        return [tuple(h["rect"]) for h in self._sheet_hits(x, text)
+                if h["page"] == i + 1]
+
+    def _annotate_page(self, page, notes=None, callouts=None, highlights=None,
+                       drawings=None, replace=False, document=None):
         w, s = self._pick(document)
         kind, x = self._surface_of(s)
         finish_playbacks(x)
         i, (pw, ph), geo = self._page_geometry(kind, x, page)
-        box = self._rect_arg(box, "box")
-        if box is not None and (box[2] <= 0 or box[3] <= 0):
-            raise McpError("box is [x, y, width, height], with a positive size.")
+        callouts, highlights, drawings = (list(callouts or []),
+                                          list(highlights or []),
+                                          list(drawings or []))
+        if not (notes or callouts or highlights or drawings or replace):
+            raise McpError("Nothing to add: give notes, callouts, highlights "
+                           "or drawings.")
+        if kind == "text" and (notes or callouts):
+            raise McpError("A text page has no separate notes, so notes and "
+                           "callouts are for PDF pages; highlights and "
+                           "drawings work here.")
+        problems = []
+
+        # build every stroke FIRST: a bad SVG must change nothing at all
+        strokes = []
         if kind == "pdf":
+            hl_c, hl_o = tuple(x.hl_color), x.hl_opacity
             pen_c, pen_w = tuple(x.pen_color), float(x.pen_width)
         else:
+            hl_c, _hw, hl_o = x.pen_style(True)
             pen_c, pen_w, _o = x.pen_style(False)
-            pen_c = tuple(pen_c)
-        if color:
-            pen_c = svg_color(str(color), None)
-            if pen_c is None:
-                raise McpError(f"{color!r} is not a colour.")
-        if width is not None:
+            hl_c, pen_c = tuple(hl_c), tuple(pen_c)
+        for h in highlights:
+            h = {"text": h} if isinstance(h, str) else dict(h or {})
+            phrase = str(h.get("text") or "").strip()
+            rects = self._hits_on(kind, x, i, phrase, geo) if phrase else []
+            if not rects:
+                problems.append(f"highlight {phrase!r}: not on this page")
+                continue
+            col = h.get("color")
+            col = (self.HL_COLORS.get(str(col).lower())
+                   or svg_color(str(col), None)) if col else hl_c
+            for x0, y0, x1, y1 in rects:
+                ym = (y0 + y1) / 2
+                strokes.append({"pts": [(x0, ym), (x1, ym)], "color": col or hl_c,
+                                "width": max(y1 - y0, 1.0), "opacity": hl_o})
+        for d in drawings:
+            d = {"svg": d} if isinstance(d, str) else dict(d or {})
+            box = self._rect_arg(d.get("box"), "box")
+            if box is not None and (box[2] <= 0 or box[3] <= 0):
+                raise McpError("box is [x, y, width, height], positive size.")
+            col = svg_color(str(d["color"]), None) if d.get("color") else pen_c
+            if col is None:
+                raise McpError(f"{d.get('color')!r} is not a colour.")
             try:
-                pen_w = max(SVG_WIDTH_RANGE[0],
-                            min(SVG_WIDTH_RANGE[1], float(width)))
-            except (TypeError, ValueError):
-                raise McpError("width must be a number (points).")
-        if style not in ("hand", "clean"):
-            raise McpError('style is "hand" or "clean".')
-        try:
-            strokes, notes = svg_to_strokes(str(svg), box=box, color=pen_c,
-                                            width=pen_w, style=style)
-        except ValueError as e:
-            raise McpError(f"Cannot draw that: {e}.")
-        if not strokes:
-            raise McpError("Nothing to draw: " + "; ".join(notes))
-        xs = [p[0] for st in strokes for p in st["pts"]]
-        ys = [p[1] for st in strokes for p in st["pts"]]
-        bounds = [min(xs), min(ys), max(xs), max(ys)]
-        if bounds[2] < 0 or bounds[3] < 0 or bounds[0] > pw or bounds[1] > ph:
-            raise McpError(
-                f"The drawing ({', '.join(f'{v:.0f}' for v in bounds)}) is off "
-                f"the page (0–{pw:.0f} × 0–{ph:.0f} pt). Coordinates are page "
-                "points, origin top left, y down.")
-        if bounds[0] < 0 or bounds[1] < 0 or bounds[2] > pw or bounds[3] > ph:
-            notes.append("part of it runs off the page")
-        self._front(w, s)
-        if kind == "pdf":
-            run = self._play_on_canvas(w, x, i, strokes)
-        else:
-            run = self._play_on_sheet(x, i, strokes, geo)
-        w._toast(f"An assistant is drawing on page {i + 1}", timeout=4)
-        return {"document": self._path_of(s), "page": i + 1,
-                "strokes": len(strokes),
-                "bounds": [round(v, 1) for v in bounds],
-                "seconds": round(run.duration, 1), "notes": notes}
+                wid = (max(SVG_WIDTH_RANGE[0], min(SVG_WIDTH_RANGE[1],
+                                                   float(d["width"])))
+                       if d.get("width") is not None else pen_w)
+                made, notes_ = svg_to_strokes(
+                    str(d.get("svg") or ""), box=box, color=col, width=wid,
+                    style="clean" if d.get("style") == "clean" else "hand")
+            except (TypeError, ValueError) as e:
+                raise McpError(f"Cannot draw that: {e}.")
+            problems += notes_
+            if not made:
+                continue
+            xs = [p[0] for st in made for p in st["pts"]]
+            ys = [p[1] for st in made for p in st["pts"]]
+            if max(xs) < 0 or max(ys) < 0 or min(xs) > pw or min(ys) > ph:
+                problems.append(f"a drawing at ({min(xs):.0f}, {min(ys):.0f}) "
+                                f"is off the page (0–{pw:.0f} × 0–{ph:.0f} pt)")
+                continue
+            strokes += made
+        for st in strokes:
+            st["by"] = ASSISTANT_BY
 
-    def _play_on_canvas(self, w, c, i, strokes):
-        if c.current_page_idx != i:
-            w._go_to_page(i)             # a step you can go back from
+        ops, removed = [], {}
+        if replace:
+            removed, ops = remove_assistant_marks(s, pages=[i])
+        if kind == "pdf" and (notes or callouts):
+            self._commit(w, s)
+            made_marks = self._add_notes(s, x, i, notes, callouts, problems)
+            if made_marks is not None:
+                ops.append(made_marks)
+        if strokes:
+            ops.append(("canvas",) if kind == "pdf" else ("ink",))
+        self._record(s, ops)
+        if kind == "pdf" and (notes or callouts or removed.get("notes")):
+            if self._shown(w, s) and x.current_page_idx == i:
+                w._restore_note()            # the editor shows this page
+                w._burst_base = w._notes_view.get_source_text()
+            self._touch(w, s, pdf=False)
+        if removed.get("strokes"):
+            self._touch(w, s)
+            x.queue_draw() if kind == "pdf" else x.ink.queue_draw()
+        seconds = 0.0
+        if strokes:
+            visible = self._shown(w, s) and (kind == "text"
+                                             or x.current_page_idx == i)
+            run = (self._play_on_canvas(w, s, x, i, strokes, visible)
+                   if kind == "pdf"
+                   else self._play_on_sheet(w, s, x, i, strokes, geo, visible))
+            seconds = run.duration if visible else 0.0
+        self._tally(w, i + 1)
+        out = {"page": i + 1}
+        added = {k: v for k, v in (("notes", int(bool(notes))),
+                                   ("callouts", len(callouts)),
+                                   ("strokes", len(strokes))) if v}
+        if added:
+            out["added"] = added
+        if any(removed.values()):
+            out["replaced"] = {k: v for k, v in removed.items() if v}
+        if problems:
+            out["problems"] = problems
+        if seconds:
+            out["drawing_for_s"] = round(seconds, 1)
+        return out
+
+    def _add_notes(self, s, c, i, notes, callouts, problems):
+        """The page's notes plus the callouts' paragraphs, each block wrapped
+        in the assistant's markers. Returns the undo entry, or None."""
+        model = s.notes_model
+        run = model.run_start(i)
+        blocks = []
+        if notes:
+            blocks.append(assistant_block(str(notes)))
+        if callouts and (run != i or model.run_start(i + 1) == i
+                         if i + 1 < c.n_pages else run != i):
+            problems.append("callouts skipped: this page shares its notes "
+                            "with the pages around it")
+            callouts = []
+        placed = []
+        lines = c._page_layout(i)[0]
+        body = [ln for ln in lines if ln[2] - ln[0] > 80] or lines
+        left = min((ln[0] for ln in body), default=60.0)
+        right = max((ln[2] for ln in body), default=c.document[i].rect.width - 60)
+        pw = c.document[i].rect.width
+        for co in callouts:
+            co = dict(co or {})
+            text = re.sub(r"\n\s*\n+", "\n", str(co.get("text") or "").strip())
+            at = co.get("at")
+            if not text or at is None:
+                problems.append("a callout needs at and text")
+                continue
+            if isinstance(at, str):
+                rects = c.document[i].search_for(at)
+                if not rects:
+                    problems.append(f"callout at {at!r}: not on this page")
+                    continue
+                r = rects[0]
+                ym = (r.y0 + r.y1) / 2
+                # the anchor sits in the margin beside the LINE, like a margin
+                # note, so its circle covers no words
+                row = [ln for ln in lines if ln[1] - 1 <= ym <= ln[3] + 1
+                       and ln[0] <= r.x0 + 1]
+                lx = min((ln[0] for ln in row), default=r.x0)
+                ax = lx - 9 if lx - 9 >= 6 else r.x0
+                ay = ym
+            else:
+                try:
+                    ax, ay = float(at[0]), float(at[1])
+                except (TypeError, ValueError, IndexError):
+                    problems.append("a callout's at is a phrase or [x, y]")
+                    continue
+            mark = f"<!-- anchor:{max(0, round(ax))}:{max(0, round(ay))} -->"
+            box = co.get("box")
+            if box:
+                est_h = (math.ceil(len(text) / 34) + text.count("\n")) * 10.5 + 10
+                if isinstance(box, (list, tuple)) and len(box) == 2:
+                    bx, by = float(box[0]), float(box[1])
+                else:
+                    room_r, room_l = pw - right, left
+                    bx = (right + 6) if room_r >= room_l else 4.0
+                    bx = max(4.0, min(bx, pw - self.CALLOUT_W - 4))
+                    if max(room_r, room_l) < self.CALLOUT_W:
+                        problems.append(f"a callout box overlaps the text (the "
+                                        f"margin is {max(room_r, room_l):.0f} pt)")
+                    by = ay - 6
+                    for py0, py1 in sorted(placed):
+                        if by < py1 + 4 and by + est_h > py0 - 4:
+                            by = py1 + 6
+                    placed.append((by, by + est_h))
+                mark += f" <!-- callout:{max(0, round(bx))}:{max(0, round(by))} -->"
+            blocks.append(assistant_block(text, head=mark))
+        if not blocks:
+            return None
+        old = model.get(i)
+        before = old.rstrip()
+        model.set(i, (before + "\n\n" if before else "") + "\n\n".join(blocks))
+        return ("notes", i, old)
+
+    def _play_on_canvas(self, w, s, c, i, strokes, visible):
+        """Into the canvas's own undo as ONE draw group; played back when the
+        page is on screen, landed at once when it is not."""
         c._draw_group += 1
         group = c._draw_group
-        if c.on_user_action:
-            c.on_user_action()           # its place in Ctrl+Z's order: now
 
         def commit(st):
             c.all_strokes.setdefault(i, []).append(st)
             c._undo_stack.append(("draw", i, st, group))
             c._redo_stack.clear()
-            if c.on_change:
-                c.on_change()
+            self._touch(w, s)
             c.queue_draw()
 
         def show(st):
@@ -35002,28 +35365,22 @@ class McpBridge:
             c._playback = c._playback_run = None
             c.queue_draw()
 
-        c._playback_run = InkPlayback(strokes, commit, show, done)
-        return c._playback_run
+        run = InkPlayback(strokes, commit, show, done, animate=visible)
+        c._playback_run = None if run.over else run
+        return run
 
-    def _play_on_sheet(self, tp, i, strokes, geo):
+    def _play_on_sheet(self, w, s, tp, i, strokes, geo, visible):
         k, offs = geo
         view = [dict(st, pts=[(px * k, offs[i] + py * k)
                               for px, py in st["pts"]],
                      width=st["width"] * k) for st in strokes]
-        # bring the drawing into view: the buffer position at its top
-        top = min(p[1] for st in view for p in st["pts"])
-        bx, by = tp._view_to_buffer_f([(0.0, max(0.0, top))])[0]
-        _over, it = tp.view.get_iter_at_location(int(bx), int(by))
-        tp.scroll_to_offset(it.get_offset())
-        if tp.on_ink_action:
-            tp.on_ink_action()           # its place in Ctrl+Z's order: now
         added = []
 
         def commit(st):
             mark, rel = tp._anchor_buffer_pts(tp._view_to_buffer_f(st["pts"]))
             stroke = {"mark": mark, "pts": rel, "color": st["color"],
                       "width": st["width"], "opacity": st["opacity"],
-                      "font_px": tp.font_px}
+                      "font_px": tp.font_px, "by": st["by"]}
             if st.get("press"):
                 stroke["press"] = st["press"]
             tp.strokes.append(stroke)
@@ -35039,12 +35396,12 @@ class McpBridge:
             if added:
                 tp._undo_ops.append(("add", list(added)))
                 tp._redo_ops.clear()
-            if tp.on_ink_changed:
-                tp.on_ink_changed()
+            self._touch(w, s)
             tp.ink.queue_draw()
 
-        tp._playback_run = InkPlayback(view, commit, show, done, unit=k)
-        return tp._playback_run
+        run = InkPlayback(view, commit, show, done, unit=k, animate=visible)
+        tp._playback_run = None if run.over else run
+        return run
 
 
 class McpError(Exception):

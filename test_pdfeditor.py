@@ -2600,7 +2600,7 @@ class TestMcpProtocol(unittest.TestCase):
         tools = {t["name"]: t for t in listing["result"]["tools"]}
         self.assertIn("get_page", tools)
         self.assertTrue(tools["get_page"]["annotations"]["readOnlyHint"])
-        self.assertFalse(tools["add_page_note"]["annotations"]["readOnlyHint"])
+        self.assertFalse(tools["annotate_page"]["annotations"]["readOnlyHint"])
         for t in tools.values():
             self.assertNotIn("write", t)        # our bookkeeping stays ours
             self.assertEqual(t["inputSchema"]["type"], "object")
@@ -2707,23 +2707,33 @@ class TestMcpBridge(unittest.TestCase):
             self.assertEqual(win.canvas.current_page_idx, 0)
         self._run(body)
 
-    def test_edits_need_the_users_switch_and_can_be_undone(self):
+    def test_edits_need_the_users_switch_and_are_one_ctrl_z(self):
         def body(win, bridge):
-            off = bridge.call("add_page_note", {"page": 2, "text": "x"})
+            off = bridge.call("annotate_page", {"page": 2, "notes": "x"})
             self.assertFalse(off["ok"])
             self.assertIn("Let assistants edit", off["error"])
             sidemark._save_setting("mcp_allow_edits", True)
-            res = bridge.call("add_page_note", {"page": 2, "text": "**key**"})
-            self.assertTrue(res["ok"])
+            res = bridge.call("annotate_page", {
+                "page": 2, "notes": "**key**",
+                "highlights": [{"text": "Bravo Writer", "color": "green"},
+                               {"text": "zebra"}]})
+            self.assertTrue(res["ok"], res)
+            r = res["result"]
+            self.assertEqual(r["added"], {"notes": 1, "strokes": 1})
+            self.assertIn("zebra", r["problems"][0])         # said, not fatal
+            self.assertNotIn("notes", json.dumps(r).replace('"notes": 1', ""))
             self.assertIn("**key**", win.notes_model.get(1))
+            self.assertIn(sidemark.ASSISTANT_OPEN, win.notes_model.get(1))
+            (st,) = win.canvas.all_strokes[1]
+            self.assertEqual(st["by"], sidemark.ASSISTANT_BY)
+            self.assertEqual(st["color"], sidemark.McpBridge.HL_COLORS["green"])
             self.assertTrue(win._dirty)
-            hl = bridge.call("highlight_text", {"page": 2, "text": "Bravo Writer"})
-            self.assertEqual(hl["result"]["highlighted"], 1)
-            self.assertEqual(len(win.canvas.all_strokes[1]), 1)
-            win.canvas.undo_last()
+            win._global_undo()                     # the whole page, at once
             self.assertEqual(win.canvas.all_strokes[1], [])
-            miss = bridge.call("highlight_text", {"page": 2, "text": "zebra"})
-            self.assertFalse(miss["ok"])
+            self.assertNotIn("**key**", win.notes_model.get(1))
+            win._global_redo()
+            self.assertIn("**key**", win.notes_model.get(1))
+            self.assertEqual(len(win.canvas.all_strokes[1]), 1)
         self._run(body)
 
 
@@ -2864,19 +2874,21 @@ class TestMcpDrawing(unittest.TestCase):
             self.assertAlmostEqual(hit["rect"][0], r.x0, delta=0.1)
         self._run(body)
 
-    def test_drawing_on_a_pdf_page_plays_back_and_undoes_whole(self):
+    def _on(self):
+        sidemark._save_setting("mcp_allow_edits", True)
+
+    def test_a_drawing_on_the_page_in_view_plays_back_and_undoes_whole(self):
         def body(win, bridge):
+            self._on()
+            bridge.call("go_to_page", {"page": 2})
             svg = "".join(f'<line x1="100" y1="{y}" x2="400" y2="{y}"/>'
                           for y in range(400, 520, 20))
-            off = bridge.call("draw_svg", {"page": 2, "svg": svg})
-            self.assertIn("Let assistants edit", off["error"])
-            sidemark._save_setting("mcp_allow_edits", True)
-            res = bridge.call("draw_svg", {"page": 2, "svg": svg,
-                                           "color": "red", "width": 2})
+            res = bridge.call("annotate_page", {"page": 2, "drawings": [
+                {"svg": svg, "color": "red", "width": 2}]})
             self.assertTrue(res["ok"], res)
-            self.assertEqual(res["result"]["strokes"], 6)
+            self.assertEqual(res["result"]["added"], {"strokes": 6})
+            self.assertGreater(res["result"]["drawing_for_s"], 0)
             c = win.canvas
-            self.assertEqual(c.current_page_idx, 1)       # went to the page
             self.assertLess(len(c.all_strokes.get(1, [])), 6)  # still drawing
             self._settle(150)
             # Ctrl+Z while it draws: the WHOLE drawing goes, not half of it
@@ -2885,11 +2897,6 @@ class TestMcpDrawing(unittest.TestCase):
             self.assertEqual(c.all_strokes.get(1, []), [])
             win._global_redo()
             self.assertEqual(len(c.all_strokes[1]), 6)
-            win._global_undo()
-            res = bridge.call("draw_svg", {"page": 2, "svg": svg})
-            self._until_drawn(c)
-            self.assertEqual(len(c.all_strokes[1]), 6)
-            self.assertTrue(win._dirty)
             for st in c.all_strokes[1]:                   # where it was asked
                 for x, y in st["pts"]:
                     self.assertTrue(98 <= x <= 402 and 398 <= y <= 502)
@@ -2899,27 +2906,135 @@ class TestMcpDrawing(unittest.TestCase):
                 "max_px": 320})["result"])
             data = bytes(img.get_data())
             self.assertTrue(any(data[i] < 128 for i in range(0, len(data), 4)))
-            far = bridge.call("draw_svg", {
-                "page": 2, "svg": '<line x1="2000" y1="0" x2="2100" y2="0"/>'})
-            self.assertIn("off the page", far["error"])
+            far = bridge.call("annotate_page", {"page": 2, "drawings": [
+                {"svg": '<line x1="2000" y1="0" x2="2100" y2="0"/>'}]})
+            self.assertIn("off the page", far["result"]["problems"][0])
         self._run(body)
 
-    def test_the_earlier_edits_are_one_ctrl_z_each(self):
+    def test_an_edit_never_moves_the_readers_view(self):
+        """A pass over a whole paper must not drag the reader along: a page
+        that is not on screen gets its ink at once, and the view stays."""
         def body(win, bridge):
-            sidemark._save_setting("mcp_allow_edits", True)
-            bridge.call("add_page_note", {"page": 1, "text": "from the AI"})
-            self.assertIn("from the AI", win.notes_model.get(0))
+            self._on()
+            c = win.canvas
+            self.assertEqual(c.current_page_idx, 0)
+            res = bridge.call("annotate_page", {
+                "page": 2, "notes": "later", "drawings": [
+                    {"svg": '<circle cx="200" cy="200" r="30"/>'}]})
+            self.assertNotIn("drawing_for_s", res["result"])
+            self.assertEqual(c.current_page_idx, 0)            # not moved
+            self.assertIsNone(c._playback_run)                 # landed
+            self.assertEqual(len(c.all_strokes[1]), 1)
+            bridge.call("annotate_page", {"page": 1, "notes": "here"})
+            title = win._assistant_toast["toast"].get_title()
+            self.assertIn("1", title)
+            self.assertIn("2", title)                          # ONE tally
+        self._run(body)
+
+    def test_callouts_sit_beside_their_phrase_and_explain_it(self):
+        def body(win, bridge):
+            self._on()
+            res = bridge.call("annotate_page", {"page": 2, "callouts": [
+                {"at": "Bravo Writer", "text": "The second\\n\\nreference.",
+                 "box": "margin"},
+                {"at": [300, 600], "text": "A spot."},
+                {"at": "zebra", "text": "missing"}]})
+            self.assertEqual(res["result"]["added"], {"callouts": 3})
+            self.assertTrue(any("zebra" in p for p in res["result"]["problems"]))
+            marks = sidemark._parse_anchors(win.notes_model.get(1))
+            self.assertEqual(len(marks), 2)
+            phrase = win.canvas.document[1].search_for("Bravo Writer")[0]
+            a, b = marks
+            self.assertLess(a["x"], phrase.x0)              # in the margin
+            self.assertTrue(phrase.y0 - 1 <= a["y"] <= phrase.y1 + 1)
+            self.assertIsNotNone(a["callout"])
+            self.assertNotIn("by:assistant", a["text"])     # markers hidden
+            self.assertIn("reference.", a["text"])
+            self.assertEqual((b["x"], b["y"], b["callout"]), (300, 600, None))
             win._global_undo()
-            self.assertNotIn("from the AI", win.notes_model.get(0))
-            bridge.call("highlight_text", {"page": 2, "text": "Bravo Writer"})
-            self.assertEqual(len(win.canvas.all_strokes[1]), 1)
-            win._global_undo()
+            self.assertEqual(sidemark._parse_anchors(win.notes_model.get(1)), [])
+        self._run(body)
+
+    def test_replace_redoes_a_page_and_keeps_the_users_own(self):
+        def body(win, bridge):
+            self._on()
+            win.notes_model.set(1, "my own words")
+            bridge.call("annotate_page", {"page": 2, "notes": "first try",
+                                          "highlights": [{"text": "Bravo Writer"}]})
+            res = bridge.call("annotate_page", {"page": 2, "notes": "better",
+                                                "replace": True})
+            self.assertEqual(res["result"]["replaced"],
+                             {"notes": 1, "strokes": 1})
+            text = win.notes_model.get(1)
+            self.assertIn("my own words", text)
+            self.assertIn("better", text)
+            self.assertNotIn("first try", text)
             self.assertEqual(win.canvas.all_strokes[1], [])
+            win._global_undo()                     # the replace, as one step
+            self.assertIn("first try", win.notes_model.get(1))
+            self.assertEqual(len(win.canvas.all_strokes[1]), 1)
+        self._run(body)
+
+    def test_everything_the_assistant_made_comes_out_as_one_step(self):
+        def body(win, bridge):
+            self._on()
+            win.canvas.all_strokes.setdefault(0, []).append(
+                {"pts": [(10, 10), (50, 50)], "color": (0, 0, 0),
+                 "width": 1.0, "opacity": 1.0})          # the user's own ink
+            win._notes_view.get_buffer().set_text("mine")   # typed, page 1
+            for p in (1, 2):
+                bridge.call("annotate_page", {
+                    "page": p, "notes": f"ai {p}", "callouts": [
+                        {"at": [100, 100], "text": "c"}], "drawings": [
+                        {"svg": '<line x1="60" y1="60" x2="90" y2="90"/>'}]})
+            self.assertTrue(win._has_assistant_marks(win._active_session))
+            win._remove_assistant_marks()
+            self.assertEqual(win.notes_model.get(0), "mine")
+            self.assertEqual(win.notes_model.get(1), "")
+            self.assertEqual(len(win.canvas.all_strokes[0]), 1)
+            self.assertEqual(win.canvas.all_strokes[1], [])
+            self.assertFalse(win._has_assistant_marks(win._active_session))
+            win._global_undo()
+            self.assertIn("ai 1", win.notes_model.get(0))
+            self.assertIn("ai 2", win.notes_model.get(1))
+            self.assertEqual(len(win.canvas.all_strokes[0]), 2)
+        self._run(body)
+
+    def test_the_assistants_notes_are_tinted_in_the_editor(self):
+        def body(win, bridge):
+            self._on()
+            win._notes_view.get_buffer().set_text("mine\n")
+            bridge.call("annotate_page", {"page": 1, "notes": "from the AI"})
+            buf = win._notes_view.get_buffer()
+            tag = buf.get_tag_table().lookup("assistant-note")
+            self.assertIsNotNone(tag)
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            at = lambda s: buf.get_iter_at_offset(text.index(s)).has_tag(tag)
+            self.assertTrue(at("from the AI"))
+            self.assertFalse(at("mine"))
+        self._run(body)
+
+    def test_the_assistants_ink_is_known_again_after_a_save(self):
+        def body(win, bridge):
+            self._on()
+            bridge.call("annotate_page", {"page": 2, "drawings": [
+                {"svg": '<line x1="60" y1="60" x2="90" y2="90"/>'}]})
+            c = win.canvas
+            c._write_ink_annotations()
+            out = os.path.join(os.path.dirname(c.document.name), "saved.pdf")
+            c.document.save(out)
+            again = PDFCanvas()
+            again.load(out)
+            (st,) = again.all_strokes[1]
+            self.assertEqual(st.get("by"), sidemark.ASSISTANT_BY)
+            saved = fitz.open(out)          # kept: an annot dies with its doc
+            annot = next(saved[1].annots(types=[fitz.PDF_ANNOT_INK]))
+            self.assertEqual(annot.info["title"], sidemark.ASSISTANT_INK_AUTHOR)
         self._run(body)
 
     def test_a_text_page_counts_in_export_pages_and_takes_ink_too(self):
         def body(win, bridge):
-            sidemark._save_setting("mcp_allow_edits", True)
+            self._on()
             win._on_new_text_page()
             self._settle(400)
             tp = win._text_page
@@ -2934,17 +3049,25 @@ class TestMcpDrawing(unittest.TestCase):
             self.assertTrue(0 <= x0 < x1 <= 595 and 0 <= y0 < y1 < 842)
             img = bridge.call("get_page_image", {"page": 1, "max_px": 300})
             self.assertTrue(img["ok"], img)
-            res = bridge.call("draw_svg", {"page": 1, "svg": (
-                f'<ellipse cx="{(x0 + x1) / 2}" cy="{(y0 + y1) / 2}" '
-                f'rx="{(x1 - x0) / 2 + 6}" ry="{(y1 - y0) / 2 + 4}"/>')})
+            no = bridge.call("annotate_page", {"page": 1, "notes": "x"})
+            self.assertIn("text page", no["error"])
+            res = bridge.call("annotate_page", {
+                "page": 1, "highlights": [{"text": "key idea"}],
+                "drawings": [{"svg": (
+                    f'<ellipse cx="{(x0 + x1) / 2}" cy="{(y0 + y1) / 2}" '
+                    f'rx="{(x1 - x0) / 2 + 6}" ry="{(y1 - y0) / 2 + 4}"/>')}]})
             self.assertTrue(res["ok"], res)
             self._until_drawn(tp)
-            (st,) = tp.strokes
+            self.assertEqual(len(tp.strokes), 2)
+            ring = tp.strokes[1]
             # it sits around the phrase, in the sheet's own coordinates
             k, offs = tp.export_pages()
-            pts = tp.stroke_view_pts(st)
+            pts = tp.stroke_view_pts(ring)
             cx = sum(p[0] for p in pts) / len(pts) / k
             self.assertAlmostEqual(cx, (x0 + x1) / 2, delta=3)
+            saved = tp.ink_to_json()
+            self.assertTrue(all(r.get("by") == sidemark.ASSISTANT_BY
+                                for r in saved["strokes"]))
             win._global_undo()
             self.assertEqual(tp.strokes, [])
         self._run(body)
