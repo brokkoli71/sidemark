@@ -13507,6 +13507,7 @@ class PDFCanvas(Gtk.DrawingArea):
             for ops in self._redo_stack
         ]
         self.n_pages = len(self.document)
+        self._document_repaged()
         self._load_page(idx)   # navigate to the new blank page
 
     def insert_pdf_pages(self, at_idx, src_path):
@@ -13547,8 +13548,32 @@ class PDFCanvas(Gtk.DrawingArea):
             for ops in self._redo_stack
         ]
         self.n_pages = len(self.document)
+        self._document_repaged()
         self._load_page(at_idx)
         return count
+
+    def _document_repaged(self):
+        """Pages were inserted, deleted or moved: everything keyed by a page
+        INDEX is wrong now. The caches here are keyed by the page COUNT, which
+        a move does not change and so never noticed; and PyMuPDF keeps its
+        own table of named destinations (`_resolved_names`) that nothing
+        refreshes — every LaTeX \\cite and \\ref kept pointing at the page its
+        target USED to be on until the file was reopened, so the badges, the
+        previews and the jumps all went to the wrong page."""
+        doc = self.document
+        if doc is not None and hasattr(doc, "_resolved_names"):
+            del doc._resolved_names
+        self._backlinks_key = None
+        self._layout_cache, self._layout_cache_key = {}, None
+        self._targets_cache, self._words_cache, self._gutters = {}, {}, {}
+        self._zotero_targets = {}
+        self._badge_worker, self._badge_job, self._badge_queue = None, None, []
+        self._pt_cache = {}
+        self._strip_cache, self._strip_cache_key = {}, None
+        self._dims, self._dims_key = {}, None
+        self._text_segments, self._other_segments = [], {}
+        self._sel_range = None
+        self._hide_link_preview()
 
     def delete_current_page(self):
         """Delete the current page. Refused if it's the last one."""
@@ -13589,6 +13614,7 @@ class PDFCanvas(Gtk.DrawingArea):
             ) if shifted
         ]
         self.n_pages = len(self.document)
+        self._document_repaged()
         new_idx = min(idx, self.n_pages - 1)
         self._load_page(new_idx)
         return True
@@ -13660,6 +13686,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # every page reorder has been leaving the outline out of order.
         self.resort_toc()
         self.n_pages = len(self.document)
+        self._document_repaged()
         self._load_page(old_to_new[self.current_page_idx])
         return old_to_new
 
@@ -28689,6 +28716,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if not self._text_mode and not self._notes_box.get_visible():
             self._set_notes_shown(True)
         panel.set_visible(True)
+        panel.set_collapsed(False)          # a new question opens it
         panel.show_passage(passage, page)
         panel.entry.grab_focus()
         self._ask_persist(s)
@@ -28696,13 +28724,14 @@ class PDFEditorWindow(Adw.ApplicationWindow):
     def _ask_panel(self, s):
         st = s._ask
         if st.get("panel") is None:
-            st["panel"] = AskPanel(
+            st["panel"] = panel = AskPanel(
                 on_send=lambda q, s=s: self._ask_send(s, q),
                 on_close=lambda s=s: self._ask_close(s),
                 on_add=lambda s=s: self._ask_add_to_notes(s),
                 on_link=lambda inner: self._follow_note_link(
                     _parse_note_link(inner)))
-            s._sheet_box.append(st["panel"])
+            panel.on_collapse = lambda _c, s=s: self._ask_persist(s)
+            s._sheet_box.append(panel)
         return st["panel"]
 
     def _ask_restore(self, s):
@@ -28728,6 +28757,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         if data.get("passage"):
             panel.show_passage(data["passage"], data.get("page"))
         panel.set_visible(bool(data.get("open")))
+        panel.set_collapsed(bool(data.get("collapsed")))
         if data.get("open") and not self._text_mode:
             self._set_notes_shown(True)
 
@@ -28740,6 +28770,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
                         "session": st.get("session"),
                         "passage": st.get("passage"), "page": st.get("page"),
                         "open": st["panel"].get_visible(),
+                        "collapsed": st["panel"].collapsed,
                         "entries": st["panel"].entries})
 
     def _ask_close(self, s):
@@ -35255,8 +35286,20 @@ class AskPanel(Gtk.Box):
         for side in ("start", "end", "top", "bottom"):
             getattr(self, f"set_margin_{side}")(6)
         head = Gtk.Box(spacing=6)
+        # the heading folds the panel down to this one line and back: the
+        # conversation must never cost the notes their room (asked: "the
+        # claude window covers the sidenotes")
+        self.chevron = Gtk.Image.new_from_icon_name("pan-down-symbolic")
+        head.append(self.chevron)
         title = Gtk.Label(label="Claude", xalign=0)
         title.add_css_class("heading")
+        head.set_tooltip_text("Fold or unfold the conversation")
+        fold = Gtk.GestureClick()
+        fold.connect("released", lambda *_a: self.set_collapsed(
+            not self.collapsed))
+        head.add_controller(fold)
+        self.collapsed = False
+        self.on_collapse = None
         self.passage = Gtk.Label(xalign=0, hexpand=True)
         self.passage.add_css_class("dim-label")
         self.passage.set_ellipsize(Pango.EllipsizeMode.END)
@@ -35264,6 +35307,11 @@ class AskPanel(Gtk.Box):
         close.add_css_class("flat")
         close.set_tooltip_text("Close (the conversation is kept for follow-ups)")
         close.connect("clicked", lambda _b: on_close())
+        guard = Gtk.GestureClick()      # a click on ✕ is not a fold
+        guard.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        guard.connect("pressed", lambda g, *_a: g.set_state(
+            Gtk.EventSequenceState.CLAIMED))
+        close.add_controller(guard)
         head.append(title)
         head.append(self.passage)
         head.append(close)
@@ -35303,7 +35351,17 @@ class AskPanel(Gtk.Box):
         row.append(self.add_btn)
         for w in (head, scroll, status_row, row):
             self.append(w)
+        self._body = (scroll, status_row, row)
         self._raw = ""
+
+    def set_collapsed(self, collapsed):
+        self.collapsed = bool(collapsed)
+        for w in self._body:
+            w.set_visible(not self.collapsed)
+        self.chevron.set_from_icon_name(
+            "pan-end-symbolic" if self.collapsed else "pan-down-symbolic")
+        if self.on_collapse:
+            self.on_collapse(self.collapsed)
 
     def show_passage(self, passage, page=None):
         one = " ".join(passage.split())

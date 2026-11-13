@@ -51,6 +51,14 @@
     its timing are one table (`landing_alpha`, `LANDING_S`) and one painter
     (`_draw_flash`) — the backlink rows use it too.
 
+- **Every re-paging calls `PDFCanvas._document_repaged()`** (insert, insert
+  a PDF, delete, move). The page caches are keyed by the page COUNT, which a
+  move does not change, and **PyMuPDF caches named destinations itself**
+  (`doc._resolved_names`, filled once and never refreshed): without the
+  reset every LaTeX `\cite`/`\ref` keeps its OLD target page until the file
+  is reopened — badges, previews and jumps on the wrong page. A new cache
+  keyed by page index belongs in that reset.
+
 - **Link preview on hover (row 197)** — resting on an internal link, where a
   click would follow it (`link_hover_active`), draws what it points at on the
   canvas after `LINK_PREVIEW_DELAY_MS`. Drawn by `_draw`, NOT a popover (rule

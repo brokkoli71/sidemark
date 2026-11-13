@@ -423,6 +423,31 @@ class TestLinkPreview(unittest.TestCase):
         self.assertTrue(y0 <= bravo.y0 + 1 and y1 >= bravo.y1 - 1)
         self.assertLess(y1 - y0, 20)                       # one line, not more
 
+    def test_citations_follow_their_entries_when_pages_move(self):
+        """An F12-shaped report: a page added in between, and the badges
+        (and previews, and jumps) still looked for the bibliography on the
+        page it USED to be on. PyMuPDF caches named destinations; inserting,
+        deleting and moving must all forget them — and a move keeps the page
+        COUNT, which the page caches were keyed by."""
+        c = self.c
+        self.assertTrue(c._targets_on_page(1))           # bibliography: p. 2
+        c.go_to_page(0)
+        c.add_blank_page()                                # now it is p. 3
+        dest = {v[0] for v in c._backlink_index()[1].values()}
+        self.assertEqual(dest, {2})
+        self.assertTrue(c._targets_on_page(2))
+        self.assertEqual(c._targets_on_page(1), [])      # the blank page
+        page_no, _to = c._link_destination(
+            next(l for l in c.document[0].get_links()
+                 if l.get("nameddest") == "cite.b"))
+        self.assertEqual(page_no, 2)
+        c.move_page(2, 1)                                 # same count, moved
+        self.assertEqual({v[0] for v in c._backlink_index()[1].values()}, {1})
+        self.assertTrue(c._targets_on_page(1))
+        c.go_to_page(2)                                   # the blank one
+        c.delete_current_page()
+        self.assertEqual({v[0] for v in c._backlink_index()[1].values()}, {1})
+
     def test_a_citation_previews_its_own_entry_only(self):
         own = {"cite.a": "alphaword", "cite.b": "bravoword",
                "cite.c": "Charlieword"}
@@ -3449,6 +3474,18 @@ say({"type": "result", "subtype": "success", "session_id": "sess-1"})
                         and st.get("run") is None)
             second = json.loads(open(log).readlines()[1])
             self.assertIn("--resume", second["argv"])     # the same conversation
+            # folded by its heading: only the heading line is left, and it
+            # stays folded across a reload; asking again unfolds it
+            panel.set_collapsed(True)
+            self.assertFalse(panel.scroll.get_visible())
+            self.assertFalse(panel.entry.get_parent().get_visible())
+            folded = PDFEditorWindow(win.get_application())
+            folded.present()
+            folded._do_open_file(s._path)
+            self.assertTrue(folded._active_session._ask["panel"].collapsed)
+            folded._ask_claude_about("another passage", 1)
+            self.assertFalse(folded._active_session._ask["panel"].collapsed)
+            folded.destroy()
             # closed stays closed
             again._ask_close(again._active_session)
             third = PDFEditorWindow(win.get_application())
