@@ -10603,8 +10603,36 @@ class PDFCanvas(Gtk.DrawingArea):
     def _page_f(self):
         """Card text and icons are sized with the PAGE (row 207): at the page's
         zoom, like the text they sit beside — within reason, so a card stays
-        legible zoomed far out and does not swallow the window zoomed in."""
-        return min(max(self.scale, 0.55), 2.5)
+        legible zoomed far out and does not swallow the window zoomed in.
+        And at the DOCUMENT's text size: CARD_TEXT_PX is a 12.5 pt body, and
+        a paper set in 9–10 pt got a card a third bigger than its own text,
+        too big to see whole when zoomed in. Never bigger than that, though."""
+        f = min(max(self.scale, 0.55), 2.5)
+        pt = self._doc_text_pt()
+        if pt:
+            f *= max(0.6, min(1.0, pt / self.CARD_TEXT_PX))
+        return f
+
+    def _doc_text_pt(self):
+        """The document's body text size in pt — the size most of the text on
+        its first pages is set in — or None. Measured once per document."""
+        doc = self.document
+        if doc is None:
+            return None
+        if getattr(self, "_text_pt_doc", None) is not doc:
+            sizes = Counter()
+            try:
+                for i in range(min(3, len(doc))):
+                    for b in doc[i].get_text("dict")["blocks"]:
+                        for ln in b.get("lines", []):
+                            for sp in ln["spans"]:
+                                sizes[round(sp["size"] * 2) / 2] += \
+                                    len(sp["text"].strip())
+            except Exception:
+                logger.warning("measuring the text size", exc_info=True)
+            self._text_pt = sizes.most_common(1)[0][0] if sizes else None
+            self._text_pt_doc = doc
+        return self._text_pt
 
     def _card_text(self, ctx, text, width_px, size=None, bold=False,
                    italic=False, lines=1):
@@ -10655,12 +10683,16 @@ class PDFCanvas(Gtk.DrawingArea):
         uri = ref.get("uri")
         open_paper = (("open-file", zot["pdf"]) if zot and zot.get("pdf")
                       else ("open", uri) if uri else None)
+        # a citation's card already SHOWS the entry: who, where and when are
+        # right there above, so the paper section says only what is new
+        entry_shown = p.get("type") == "link"
         out = [("title", self._card_text(ctx, info["title"], inner,
                                          size=self.CARD_TITLE_PX, bold=True,
-                                         lines=3), open_paper)]
-        meta = self._authors_line(info)
+                                         lines=2 if entry_shown else 3),
+                open_paper)]
+        meta = "" if entry_shown else self._authors_line(info)
         if info.get("citations"):
-            meta += f" · cited by {info['citations']}"
+            meta += (" · " if meta else "") + f"cited by {info['citations']}"
         if meta:
             out.append(("meta", self._card_text(ctx, meta, inner, lines=2),
                         None))

@@ -472,6 +472,35 @@ class TestLinkPreview(unittest.TestCase):
         self.assertIn("Silvi", page.get_textbox(clip))
         self.assertNotIn("Kourtis", page.get_textbox(clip))
 
+    def test_the_card_is_set_at_the_documents_text_size_never_bigger(self):
+        """An F12 capture: a 9 pt paper at 249% got a card a third bigger
+        than its own text, too big to see whole."""
+        self.c.scale = 2.0
+        small = self.c._page_f()                  # make_bib_pdf sets 10 pt
+        self.assertLess(small, 2.0)
+        doc = fitz.open()
+        doc.new_page().insert_text((72, 72), "Large print " * 8, fontsize=20)
+        path = os.path.join(self._tmp.name, "large.pdf")
+        doc.save(path)
+        self.c.load(path)
+        self.c.scale = 2.0
+        self.assertEqual(self.c._page_f(), 2.0)   # a big font never grows it
+        self.assertLess(small, self.c._page_f())
+
+    def test_a_citation_card_does_not_repeat_the_entry(self):
+        """The entry is on the card already: the paper section leaves out
+        its authors / venue / year line — but keeps it for a web link,
+        where nothing else says it."""
+        ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10))
+        info = {"title": "A paper", "authors": ["Ada Writer"],
+                "venue": "Some Journal", "year": "2020"}
+        for kind, expect_meta in (("link", False), ("ref", True)):
+            self.c._link_preview = {"type": kind, "ref": {
+                "state": "done", "info": info, "uri": None}}
+            rows = [k for k, _l, _a in self.c._ref_section(ctx, 300)]
+            self.assertIn("title", rows)
+            self.assertEqual("meta" in rows, expect_meta, kind)
+
     def test_a_line_starting_with_a_year_is_not_the_next_entry(self):
         """An F12 capture (LIPIcs): an entry's last line began "1997. doi:…",
         which reads like a numbered label `1997.` — and the DOI was cut off.
