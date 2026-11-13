@@ -207,6 +207,23 @@ def _remember_recent_page(path, page):
     _write_recent(items)
 
 
+BASE_APP_ID = "de.hspitz.sidemark"
+
+
+def _application_id():
+    """The GApplication id, scoped to this *copy* of the code so a launch only
+    ever joins another instance running the same one.
+
+    The installed copy uses the plain id `de.hspitz.sidemark`; any other gets
+    the `_copy_key` suffix, so a checkout never forwards into (and vanishes
+    behind) the instance you have installed and are using. Recent files stay
+    shared — a copy is a different app, not a different person. Defined up
+    here, before any GTK import, because `--mcp` (row 216) must find the app
+    it serves without starting one."""
+    key = _copy_key()
+    return f"{BASE_APP_ID}.{key}" if key else BASE_APP_ID
+
+
 def _settings_path():
     # resolved at call time so tests can redirect via XDG_CONFIG_HOME, and so a
     # copy of the app keeps its own settings (see _copy_key)
@@ -300,6 +317,9 @@ Options:
                         save (add --new-text for paper). For trying things out.
       --list-recent     Print recent files as "name<TAB>path" and exit
                         (for launcher integrations); no window is shown.
+      --mcp             Serve the running Sidemark to an AI assistant (MCP
+                        over stdio). Claude Code: claude mcp add sidemark --
+                        sidemark --mcp
 
 Examples:
   sidemark lecture.pdf
@@ -398,6 +418,215 @@ def _print_version():
         for i, f in enumerate(found):
             print(f"      {'→' if i == 0 else ' '} {f}")
         print("    Edits to the others will look as though they never landed.")
+
+
+# ── MCP: Sidemark as a tool server for AI assistants (row 216) ───────────────
+# `sidemark --mcp` speaks the Model Context Protocol on stdin/stdout (JSON-RPC
+# 2.0, one message per line) and answers from the RUNNING app over D-Bus, so
+# an assistant sees what you see: the open tabs, the page you are on, notes
+# you have not saved yet — and a change it makes goes through the app's own
+# model (undo, autosave) instead of rewriting files under it. Reading and
+# moving are always allowed; anything that changes a document needs Settings
+# → "Let assistants edit" and is announced in the window.
+# Defined before any GTK import: the server never starts a GUI.
+# Register with Claude Code:  claude mcp add sidemark -- sidemark --mcp
+
+MCP_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+MCP_DBUS_INTERFACE = "de.hspitz.sidemark.Mcp"
+
+_MCP_DOC = {"type": ["integer", "string"],
+            "description": "Which open document: its number from "
+                           "list_documents, or (part of) its file name. "
+                           "Defaults to the one in front."}
+_MCP_PAGE = {"type": "integer", "minimum": 1,
+             "description": "Page number, counting from 1."}
+
+MCP_TOOLS = [
+    {"name": "list_documents", "write": False,
+     "description": "The documents open in Sidemark: number, title, path, kind "
+                    "(pdf or text), page count, the page being read, and "
+                    "whether there are unsaved changes.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_page", "write": False,
+     "description": "A page of a PDF: its text, the notes written beside it "
+                    "in Sidemark, its bookmark and whether it is hidden.",
+     "inputSchema": {"type": "object", "properties": {
+         "page": _MCP_PAGE, "document": _MCP_DOC}, "required": ["page"]}},
+    {"name": "get_notes", "write": False,
+     "description": "All of a document's notes, page by page (Markdown). For "
+                    "a text page, its whole text.",
+     "inputSchema": {"type": "object", "properties": {"document": _MCP_DOC}}},
+    {"name": "search", "write": False,
+     "description": "Find text in a document's pages and notes; returns the "
+                    "page and a snippet for each hit.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "minLength": 1}, "document": _MCP_DOC},
+         "required": ["query"]}},
+    {"name": "list_references", "write": False,
+     "description": "A paper's bibliography as Sidemark reads it: each cited "
+                    "entry's text, the pages that cite it, and the matching "
+                    "paper when it is in the user's Zotero library.",
+     "inputSchema": {"type": "object", "properties": {"document": _MCP_DOC}}},
+    {"name": "go_to_page", "write": False,
+     "description": "Show a page in Sidemark (a step the user can go back "
+                    "from).",
+     "inputSchema": {"type": "object", "properties": {
+         "page": _MCP_PAGE, "document": _MCP_DOC}, "required": ["page"]}},
+    {"name": "add_page_note", "write": True,
+     "description": "Append Markdown to the notes beside a page. Needs the "
+                    "user to allow edits in Sidemark's Settings.",
+     "inputSchema": {"type": "object", "properties": {
+         "page": _MCP_PAGE, "text": {"type": "string", "minLength": 1},
+         "document": _MCP_DOC}, "required": ["page", "text"]}},
+    {"name": "highlight_text", "write": True,
+     "description": "Highlight every occurrence of a phrase on a page, as the "
+                    "highlighter would (undoable). Needs the user to allow "
+                    "edits in Sidemark's Settings.",
+     "inputSchema": {"type": "object", "properties": {
+         "page": _MCP_PAGE, "text": {"type": "string", "minLength": 1},
+         "document": _MCP_DOC}, "required": ["page", "text"]}},
+]
+
+
+def mcp_tool_listing():
+    """`tools/list`'s answer: the tools without our own bookkeeping, marked
+    read-only or not so a client can decide what to ask the user about."""
+    out = []
+    for t in MCP_TOOLS:
+        out.append({"name": t["name"], "description": t["description"],
+                    "inputSchema": t["inputSchema"],
+                    "annotations": {"readOnlyHint": not t["write"],
+                                    "destructiveHint": False,
+                                    "openWorldHint": False}})
+    return out
+
+
+def mcp_handle(msg, call):
+    """One JSON-RPC message in, its response out (None for a notification).
+    `call(tool, args)` reaches the running app and returns {"ok", "result"
+    | "error"}; injected, so the protocol is tested without one."""
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"}}
+    method, mid = msg.get("method"), msg.get("id")
+    if mid is None:
+        return None                     # a notification: nothing to answer
+    params = msg.get("params") or {}
+
+    def ok(result):
+        return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        version = asked if asked in MCP_PROTOCOL_VERSIONS \
+            else MCP_PROTOCOL_VERSIONS[0]
+        return ok({"protocolVersion": version,
+                   "capabilities": {"tools": {"listChanged": False}},
+                   "serverInfo": {"name": "sidemark",
+                                  "version": str(_build_info().get("version"))},
+                   "instructions":
+                       "Sidemark is the user's PDF reader and note-taker. "
+                       "These tools see the documents open in it right now. "
+                       "Pages count from 1."})
+    if method == "ping":
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": mcp_tool_listing()})
+    if method == "tools/call":
+        name = params.get("name")
+        if name not in {t["name"] for t in MCP_TOOLS}:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32602, "message": f"Unknown tool: {name}"}}
+        try:
+            answer = call(name, params.get("arguments") or {})
+        except Exception as e:          # the bridge must never kill the server
+            answer = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if not answer.get("ok"):
+            return ok({"content": [{"type": "text",
+                                    "text": answer.get("error", "failed")}],
+                       "isError": True})
+        result = answer.get("result")
+        out = {"content": [{"type": "text", "text": json.dumps(
+            result, indent=1, ensure_ascii=False)}]}
+        if isinstance(result, dict):
+            out["structuredContent"] = result
+        return ok(out)
+    return {"jsonrpc": "2.0", "id": mid,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}}
+
+
+def mcp_serve(stdin, stdout, call):
+    """The stdio transport: a JSON-RPC message per line in, one per line out.
+    Nothing but protocol may reach stdout — logging goes to stderr."""
+    for line in stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            reply = {"jsonrpc": "2.0", "id": None,
+                     "error": {"code": -32700, "message": "Parse error"}}
+        else:
+            reply = mcp_handle(msg, call)
+        if reply is not None:
+            stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            stdout.flush()
+
+
+def mcp_rendezvous_path(app_id):
+    """Where the running app says how to reach it: its UNIQUE bus name and
+    object path. A reload (Ctrl+R) runs NON_UNIQUE and owns no well-known
+    name, so the name alone could not find it; the newest process writes this
+    file and removes it on exit. SIDEMARK_MCP_RUNTIME overrides the folder
+    (tests)."""
+    base = (os.environ.get("SIDEMARK_MCP_RUNTIME")
+            or os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+    return os.path.join(base, f"sidemark-mcp-{app_id}.json")
+
+
+def mcp_object_path(app_id):
+    return "/" + app_id.replace(".", "/").replace("-", "_") + "/mcp"
+
+
+def _mcp_dbus_caller(app_id):
+    """`call(tool, args)` for mcp_serve, over the session bus to the app."""
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+
+    def target():
+        try:
+            with open(mcp_rendezvous_path(app_id), encoding="utf-8") as f:
+                rec = json.load(f)
+            os.kill(int(rec["pid"]), 0)      # still alive?
+            return rec["bus"], rec["path"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return app_id, mcp_object_path(app_id)
+
+    def call(tool, args):
+        bus, path = target()
+        try:
+            conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            res = conn.call_sync(
+                bus, path, MCP_DBUS_INTERFACE, "Call",
+                GLib.Variant("(ss)", (tool, json.dumps(args))),
+                GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE,
+                60000, None)
+        except GLib.Error as e:
+            if "ServiceUnknown" in str(e) or "UnknownObject" in str(e) \
+                    or "NameHasNoOwner" in str(e):
+                return {"ok": False, "error": "Sidemark isn't running — open "
+                        "it (with the document) and try again."}
+            return {"ok": False, "error": f"Sidemark did not answer: {e.message}"}
+        return json.loads(res.unpack()[0])
+
+    return call
+
+
+if __name__ == "__main__" and "--mcp" in sys.argv[1:]:
+    mcp_serve(sys.stdin, sys.stdout, _mcp_dbus_caller(_application_id()))
+    sys.exit(0)
 
 
 # Fast paths handled before any GTK import: print and exit straight away.
@@ -30157,6 +30386,20 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         reading.add(refs)
         page.add(reading)
 
+        assistants = Adw.PreferencesGroup(title="Assistants")
+        assistants.set_description(
+            "An AI assistant can read the open documents through Sidemark's "
+            "MCP server. To connect Claude Code: "
+            "claude mcp add sidemark -- sidemark --mcp")
+        edits = Adw.SwitchRow(title="Let assistants edit")
+        edits.set_subtitle("Add notes and highlights. Each change is shown "
+                           "here as it happens and can be undone.")
+        edits.set_active(_load_settings().get("mcp_allow_edits") is True)
+        edits.connect("notify::active", lambda r, _p:
+                      _save_setting("mcp_allow_edits", r.get_active()))
+        assistants.add(edits)
+        page.add(assistants)
+
         mouse = Adw.PreferencesGroup(title="Mouse")
         thumb = Adw.SwitchRow(title="Thumb button")
         thumb.set_subtitle("The side button some mice have. Off, Sidemark "
@@ -33416,20 +33659,329 @@ class PresenterWindow(Adw.Window):
             self._nav(-1)
 
 
-BASE_APP_ID = "de.hspitz.sidemark"
-# Where an installed copy lives (AUR package / install.sh). A copy running from
-# one of these paths keeps the canonical id so it matches the .desktop file for
-# its icon/name and every launch shares one instance (tabs drag between windows).
-def _application_id():
-    """The GApplication id, scoped to this *copy* of the code so a launch only
-    ever joins another instance running the same one.
+class McpBridge:
+    """The running app's side of `sidemark --mcp` (row 216): each tool call
+    arrives over D-Bus on the main loop, so it reads and changes the app's
+    own state — the open tabs, the notes as typed, the ink — exactly as the
+    window does. Pages are 1-based at this boundary, as a person counts them.
+    Changes need Settings → "Let assistants edit" (`mcp_allow_edits`), bring
+    their tab to the front, and say so in a toast: an edit nobody saw happen
+    is the one thing an assistant must not be able to do."""
 
-    The installed copy uses the plain id `de.hspitz.sidemark`; any other gets
-    the `_copy_key` suffix, so a checkout never forwards into (and vanishes
-    behind) the instance you have installed and are using. Recent files stay
-    shared — a copy is a different app, not a different person."""
-    key = _copy_key()
-    return f"{BASE_APP_ID}.{key}" if key else BASE_APP_ID
+    SEARCH_HITS = 60
+
+    def __init__(self, app):
+        self.app = app
+
+    # ── plumbing ─────────────────────────────────────────────────────────────
+
+    def call(self, name, args):
+        tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
+        if tool is None:
+            return {"ok": False, "error": f"Unknown tool: {name}"}
+        if tool["write"] and not _load_settings().get("mcp_allow_edits"):
+            return {"ok": False, "error":
+                    "Editing is off. The user can allow it in Sidemark: "
+                    "Settings → Assistants → Let assistants edit."}
+        try:
+            return {"ok": True,
+                    "result": getattr(self, "_" + name)(**(args or {}))}
+        except McpError as e:
+            return {"ok": False, "error": str(e)}
+        except TypeError as e:
+            return {"ok": False, "error": f"Bad arguments: {e}"}
+        except Exception:
+            logger.warning("mcp tool %s failed", name, exc_info=True)
+            return {"ok": False, "error": f"{name} failed inside Sidemark — "
+                    "see its log."}
+
+    def _windows(self):
+        wins = [w for w in self.app.get_windows()
+                if isinstance(w, PDFEditorWindow)]
+        front = self.app.get_active_window()
+        if front in wins:
+            wins.remove(front)
+            wins.insert(0, front)
+        return wins
+
+    def _all_sessions(self):
+        """[(window, session)] — the front window's tabs first, its active
+        tab first among them: list_documents' numbering."""
+        out = []
+        for w in self._windows():
+            tabs = list(w._sessions)
+            if w._active_session in tabs:
+                tabs.remove(w._active_session)
+                tabs.insert(0, w._active_session)
+            out += [(w, s) for s in tabs]
+        return out
+
+    @staticmethod
+    def _path_of(s):
+        return s._path or s._notes_path
+
+    def _pick(self, document=None):
+        docs = self._all_sessions()
+        if not docs:
+            raise McpError("No document is open in Sidemark.")
+        if document is None or document == "":
+            return docs[0]
+        if isinstance(document, int) or str(document).isdigit():
+            n = int(document)
+            if 1 <= n <= len(docs):
+                return docs[n - 1]
+            raise McpError(f"There is no document {n} (1–{len(docs)}).")
+        want = str(document).lower()
+        for w, s in docs:
+            path = self._path_of(s) or ""
+            if want in os.path.basename(path).lower() or want == path.lower():
+                return w, s
+        raise McpError(f"No open document matches {document!r}.")
+
+    def _pdf(self, s):
+        if s.doc_mode == "text" or s.canvas is None or s.canvas.document is None:
+            raise McpError("That document is a text page, not a PDF.")
+        return s.canvas
+
+    @staticmethod
+    def _page_index(canvas, page):
+        try:
+            i = int(page) - 1
+        except (TypeError, ValueError):
+            raise McpError("page must be a number.")
+        if not 0 <= i < canvas.n_pages:
+            raise McpError(f"Page {page} is outside 1–{canvas.n_pages}.")
+        return i
+
+    @staticmethod
+    def _commit(w, s):
+        """What is typed in the notes editor, into the model first — an
+        assistant reads the notes as they are on screen, unsaved included."""
+        if s._notes_view is not None:
+            w._commit_note_for(s)
+
+    def _front(self, w, s):
+        if w._active_session is not s:
+            w._activate_session_tab(s)
+        w.present()
+
+    # ── reading ──────────────────────────────────────────────────────────────
+
+    def _list_documents(self):
+        out = []
+        for n, (w, s) in enumerate(self._all_sessions(), start=1):
+            text = s.doc_mode == "text"
+            canvas = None if text else s.canvas
+            out.append({
+                "document": n,
+                "title": s._tab_page.get_title() if s._tab_page else "",
+                "path": self._path_of(s),
+                "kind": "text" if text else "pdf",
+                "pages": canvas.n_pages if canvas and canvas.document else None,
+                "current_page": (canvas.current_page_idx + 1
+                                 if canvas and canvas.document else None),
+                "in_front": w._active_session is s,
+                "unsaved": bool(s._dirty),
+            })
+        return {"documents": out}
+
+    def _get_page(self, page, document=None):
+        w, s = self._pick(document)
+        c = self._pdf(s)
+        i = self._page_index(c, page)
+        self._commit(w, s)
+        model = s.notes_model
+        return {"document": self._path_of(s), "page": i + 1,
+                "pages": c.n_pages, "text": c.document[i].get_text(),
+                "notes": model.get(i),
+                "bookmark": (model.bookmark_name(i) or True)
+                if i in model._bookmarks else None,
+                "hidden": i in model.hidden_pages()}
+
+    def _get_notes(self, document=None):
+        w, s = self._pick(document)
+        self._commit(w, s)
+        if s.doc_mode == "text":
+            return {"document": self._path_of(s),
+                    "text": s._notes_view.get_source_text()}
+        model = s.notes_model
+        notes = [{"page": i + 1, "notes": model.own_text(i)}
+                 for i in range(s.canvas.n_pages) if model.own_text(i).strip()]
+        return {"document": self._path_of(s), "notes": notes}
+
+    def _search(self, query, document=None):
+        w, s = self._pick(document)
+        self._commit(w, s)
+        q = query.lower()
+        hits = []
+
+        def add(page, where, text):
+            low = text.lower()
+            at = low.find(q)
+            while at >= 0 and len(hits) < self.SEARCH_HITS:
+                a, b = max(0, at - 60), min(len(text), at + len(q) + 60)
+                snippet = " ".join(text[a:b].split())
+                hits.append({"page": page, "in": where,
+                             "snippet": ("…" if a else "") + snippet
+                             + ("…" if b < len(text) else "")})
+                at = low.find(q, at + len(q))
+
+        if s.doc_mode == "text":
+            add(None, "text", s._notes_view.get_source_text())
+        else:
+            c = s.canvas
+            for i in range(c.n_pages):
+                add(i + 1, "page", c.document[i].get_text())
+                notes = s.notes_model.own_text(i)
+                if notes:
+                    add(i + 1, "notes", notes)
+                if len(hits) >= self.SEARCH_HITS:
+                    break
+        return {"query": query, "hits": hits,
+                "truncated": len(hits) >= self.SEARCH_HITS}
+
+    def _list_references(self, document=None):
+        _w, s = self._pick(document)
+        c = self._pdf(s)
+        sources, targets = c._backlink_index()
+        out = []
+        for key, (dest, to, kind) in targets.items():
+            if kind != "cite" or to is None:
+                continue
+            page = c.document[dest]
+            layout = c._page_layout(dest)
+            entry = link_preview_clip(page, to, kind, layout,
+                                      max_h=page.rect.height)
+            text = " ".join(region_text(layout[0], entry).split())
+            uris = [l.get("uri") for l in page.get_links()
+                    if l.get("kind") == fitz.LINK_URI
+                    and link_inside(l["from"], entry)]
+            item = c._zotero_match(text, uris)
+            out.append({
+                "entry": text, "on_page": dest + 1,
+                "cited_on": sorted({p + 1 for p, _r in sources.get(key, [])}),
+                "links": [u for u in uris if u],
+                "zotero": ({"title": item["title"], "has_pdf": bool(item["pdf"])}
+                           if item else None)})
+        out.sort(key=lambda e: (e["on_page"], e["entry"]))
+        return {"document": self._path_of(s), "references": out}
+
+    # ── moving ───────────────────────────────────────────────────────────────
+
+    def _go_to_page(self, page, document=None):
+        w, s = self._pick(document)
+        c = self._pdf(s)
+        i = self._page_index(c, page)
+        self._front(w, s)
+        w._go_to_page(i)
+        return {"document": self._path_of(s), "page": i + 1}
+
+    # ── changing (Settings → Let assistants edit) ───────────────────────────
+
+    def _add_page_note(self, page, text, document=None):
+        w, s = self._pick(document)
+        c = self._pdf(s)
+        i = self._page_index(c, page)
+        self._front(w, s)
+        self._commit(w, s)
+        before = s.notes_model.get(i).rstrip()
+        s.notes_model.set(i, (before + "\n\n" if before else "") + text.strip())
+        if c.current_page_idx == i:
+            w._restore_note()            # the editor shows the page: refresh it
+        w._mark_dirty(pdf=False)
+        w._toast(f"An assistant added notes to page {i + 1}", timeout=4)
+        return {"document": self._path_of(s), "page": i + 1,
+                "notes": s.notes_model.get(i)}
+
+    def _highlight_text(self, page, text, document=None):
+        w, s = self._pick(document)
+        c = self._pdf(s)
+        i = self._page_index(c, page)
+        rects = c.document[i].search_for(text)
+        if not rects:
+            raise McpError(f"{text!r} is not on page {i + 1}.")
+        self._front(w, s)
+        c._draw_group += 1
+        group = c._draw_group
+        strokes = c.all_strokes.setdefault(i, [])
+        for r in rects:
+            ymid = (r.y0 + r.y1) / 2
+            stroke = {"pts": [(r.x0, ymid), (r.x1, ymid)], "color": c.hl_color,
+                      "width": max(r.y1 - r.y0, 1.0), "opacity": c.hl_opacity}
+            strokes.append(stroke)
+            c._undo_stack.append(("draw", i, stroke, group))
+        c._redo_stack.clear()
+        if c.on_change:
+            c.on_change()
+        c.queue_draw()
+        w._toast(f"An assistant highlighted {len(rects)} place"
+                 f"{'s' if len(rects) != 1 else ''} on page {i + 1}",
+                 timeout=4)
+        return {"document": self._path_of(s), "page": i + 1,
+                "highlighted": len(rects)}
+
+
+class McpError(Exception):
+    """A tool's answer for the assistant ("no such page"), not a crash."""
+
+
+MCP_DBUS_XML = f"""<node>
+  <interface name="{MCP_DBUS_INTERFACE}">
+    <method name="Call">
+      <arg type="s" name="tool" direction="in"/>
+      <arg type="s" name="arguments" direction="in"/>
+      <arg type="s" name="answer" direction="out"/>
+    </method>
+  </interface>
+</node>"""
+
+
+def mcp_export(app, connection):
+    """Serve `McpBridge(app)` on `connection` and say where it is
+    (`mcp_rendezvous_path`): a reload runs NON_UNIQUE and owns no well-known
+    name, so `sidemark --mcp` finds it by that file. Returns the handle
+    `mcp_unexport` takes. Separate from `do_dbus_register` so a test can
+    serve it on a private bus — the app's own connection is the user's
+    session bus, which a test must never touch."""
+    app_id = app.get_application_id() or _application_id()
+    info = Gio.DBusNodeInfo.new_for_xml(MCP_DBUS_XML).interfaces[0]
+    bridge = McpBridge(app)
+    path = mcp_object_path(app_id)
+
+    def on_call(_conn, _sender, _path, _iface, method, params, invocation):
+        if method != "Call":
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod", method)
+            return
+        tool, raw = params.unpack()
+        try:
+            args = json.loads(raw) if raw else {}
+        except ValueError:
+            args = None
+        answer = (bridge.call(tool, args) if isinstance(args, dict)
+                  else {"ok": False, "error": "arguments are not JSON"})
+        invocation.return_value(GLib.Variant(
+            "(s)", (json.dumps(answer, ensure_ascii=False, default=str),)))
+
+    reg = connection.register_object(path, info, on_call, None, None)
+    rv = mcp_rendezvous_path(app_id)
+    os.makedirs(os.path.dirname(rv), exist_ok=True)
+    with open(rv, "w", encoding="utf-8") as f:
+        json.dump({"bus": connection.get_unique_name(), "path": path,
+                   "pid": os.getpid()}, f)
+    return reg, rv
+
+
+def mcp_unexport(connection, handle):
+    reg, rv = handle
+    connection.unregister_object(reg)
+    try:
+        # only OUR file: a newer process (a reload) may have written it
+        with open(rv, encoding="utf-8") as f:
+            if json.load(f).get("pid") == os.getpid():
+                os.remove(rv)
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 class PDFEditorApp(Adw.Application):
@@ -33544,6 +34096,24 @@ class PDFEditorApp(Adw.Application):
         if tmp and new is None:
             new = "pdf"
         return path, page, (None if path else new), restore, (tmp and not path)
+
+    # ── the MCP bridge on D-Bus (row 216) ───────────────────────────────────
+
+    def do_dbus_register(self, connection, object_path):
+        """Export `McpBridge` beside the app's own D-Bus objects (see
+        `mcp_export`)."""
+        Adw.Application.do_dbus_register(self, connection, object_path)
+        try:
+            self._mcp = mcp_export(self, connection)
+        except Exception:
+            logger.warning("MCP bridge not registered", exc_info=True)
+        return True
+
+    def do_dbus_unregister(self, connection, object_path):
+        if getattr(self, "_mcp", None):
+            mcp_unexport(connection, self._mcp)
+            self._mcp = None
+        Adw.Application.do_dbus_unregister(self, connection, object_path)
 
     def do_command_line(self, command_line):
         """Every launch (this process or a forwarded one from a second

@@ -7,7 +7,7 @@ _sidemark() {
     local cur prev opts
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="-h --help -v --verbose -V --version --page --new --new-text --tmp --list-recent"
+    opts="-h --help -v --verbose -V --version --page --new --new-text --tmp --list-recent --mcp"
 
     # --page takes a numeric argument we can't usefully complete
     if [[ "$prev" == "--page" ]]; then

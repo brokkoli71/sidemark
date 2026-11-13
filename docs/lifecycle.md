@@ -66,6 +66,20 @@
   dirtiness is still knowable. A **pre-GTK fast path** like `--help`, because
   the question matters most when the app will not start.
 
+- **`sidemark --mcp` is a client of the RUNNING app, never a second one**
+  (row 216). A pre-GTK fast path speaks MCP on stdio and forwards each tool
+  call over D-Bus to `McpBridge`, which `mcp_export` serves on the app's own
+  connection from `do_dbus_register`, so the tools see unsaved notes and an
+  edit goes through undo and autosave. It finds the app by a **rendezvous
+  file** (`mcp_rendezvous_path`: unique bus name, object path, pid), not by
+  the well-known name: a Ctrl+R reload runs NON_UNIQUE and owns none. The
+  newest process writes the file; a process removes it on exit only if the
+  pid is its own. Edits are refused unless Settings → "Let assistants edit"
+  (`mcp_allow_edits`) is on, and each one fronts its tab and toasts. **Test
+  it on a private `dbus-daemon`**, never `Gio.TestDBus`: GTK has already
+  opened the session-bus singleton, so the app would sit on the user's real
+  bus while the client looks on the test one.
+
 - **A COPY of the app is a different app.** `_copy_key()` is the one answer to
   "is this the installed script or a checkout?" — `""` for an installed path,
   else a hash of the source path (`SIDEMARK_INSTANCE=<name>` forces one). It

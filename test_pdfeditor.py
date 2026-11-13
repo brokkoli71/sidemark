@@ -2522,6 +2522,234 @@ class TestTouchpadCoast(unittest.TestCase):
         self.assertEqual(c.current_page_idx, 0)   # a coast never flips
 
 
+class TestMcpProtocol(unittest.TestCase):
+    """Row 216: `sidemark --mcp` speaks MCP over stdio — JSON-RPC 2.0, one
+    message a line — with the app behind an injected `call`."""
+
+    def _serve(self, *msgs, call=None):
+        import io
+        out = io.StringIO()
+        lines = "\n".join(m if isinstance(m, str) else json.dumps(m)
+                          for m in msgs) + "\n"
+        sidemark.mcp_serve(io.StringIO(lines), out,
+                           call or (lambda t, a: {"ok": True, "result": {}}))
+        return [json.loads(l) for l in out.getvalue().splitlines()]
+
+    def test_handshake_and_tool_list(self):
+        init, listing = self._serve(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": {"name": "t", "version": "0"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")
+        self.assertIn("tools", init["result"]["capabilities"])
+        tools = {t["name"]: t for t in listing["result"]["tools"]}
+        self.assertIn("get_page", tools)
+        self.assertTrue(tools["get_page"]["annotations"]["readOnlyHint"])
+        self.assertFalse(tools["add_page_note"]["annotations"]["readOnlyHint"])
+        for t in tools.values():
+            self.assertNotIn("write", t)        # our bookkeeping stays ours
+            self.assertEqual(t["inputSchema"]["type"], "object")
+
+    def test_an_unknown_version_gets_ours(self):
+        (init,) = self._serve({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                               "params": {"protocolVersion": "1999-01-01"}})
+        self.assertIn(init["result"]["protocolVersion"],
+                      sidemark.MCP_PROTOCOL_VERSIONS)
+
+    def test_a_tool_call_reaches_the_app_and_comes_back(self):
+        seen = []
+
+        def call(tool, args):
+            seen.append((tool, args))
+            return {"ok": True, "result": {"page": 3, "text": "hello"}}
+        (res,) = self._serve({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                              "params": {"name": "get_page",
+                                         "arguments": {"page": 3}}}, call=call)
+        self.assertEqual(seen, [("get_page", {"page": 3})])
+        self.assertEqual(res["result"]["structuredContent"]["text"], "hello")
+        self.assertIn("hello", res["result"]["content"][0]["text"])
+
+    def test_failures_are_answers_not_crashes(self):
+        bad, unknown, method, parse = self._serve(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "get_page", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "rm_rf"}},
+            {"jsonrpc": "2.0", "id": 3, "method": "resources/list"},
+            "{not json",
+            call=lambda t, a: {"ok": False, "error": "page must be a number."})
+        self.assertTrue(bad["result"]["isError"])
+        self.assertEqual(unknown["error"]["code"], -32602)
+        self.assertEqual(method["error"]["code"], -32601)
+        self.assertEqual(parse["error"]["code"], -32700)
+
+
+class TestMcpBridge(unittest.TestCase):
+    """Row 216: the running app answers the tools from its own state — the
+    notes as typed, unsaved included — and edits need the user's switch."""
+
+    def _run(self, body):
+        errors = []
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "paper.pdf")
+            self.centres = make_bib_pdf(pdf)
+            app = Adw.Application(application_id="test.sidemark.mcp")
+
+            def on_activate(a):
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    body(win, sidemark.McpBridge(a))
+                except Exception:
+                    import traceback
+                    errors.append(traceback.format_exc())
+                finally:
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+    def test_reading(self):
+        def body(win, bridge):
+            docs = bridge.call("list_documents", {})["result"]["documents"]
+            self.assertEqual(len(docs), 1)
+            self.assertEqual((docs[0]["kind"], docs[0]["pages"],
+                              docs[0]["current_page"]), ("pdf", 2, 1))
+            # typed but not saved: the assistant reads it as on screen
+            win._notes_view.get_buffer().set_text("my reading notes")
+            page = bridge.call("get_page", {"page": 1})["result"]
+            self.assertEqual(page["notes"], "my reading notes")
+            self.assertIn("[1]", page["text"])
+            hits = bridge.call("search", {"query": "bravoword"})["result"]["hits"]
+            self.assertEqual([h["page"] for h in hits], [2])
+            refs = bridge.call("list_references", {})["result"]["references"]
+            b = next(r for r in refs if "bravoword" in r["entry"])
+            self.assertEqual(b["cited_on"], [1, 2])
+            self.assertFalse(bridge.call("get_page", {"page": 9})["ok"])
+        self._run(body)
+
+    def test_moving(self):
+        def body(win, bridge):
+            res = bridge.call("go_to_page", {"page": 2})
+            self.assertTrue(res["ok"])
+            self.assertEqual(win.canvas.current_page_idx, 1)
+            win.canvas.go_back()                   # a step you can go back from
+            self.assertEqual(win.canvas.current_page_idx, 0)
+        self._run(body)
+
+    def test_edits_need_the_users_switch_and_can_be_undone(self):
+        def body(win, bridge):
+            off = bridge.call("add_page_note", {"page": 2, "text": "x"})
+            self.assertFalse(off["ok"])
+            self.assertIn("Let assistants edit", off["error"])
+            sidemark._save_setting("mcp_allow_edits", True)
+            res = bridge.call("add_page_note", {"page": 2, "text": "**key**"})
+            self.assertTrue(res["ok"])
+            self.assertIn("**key**", win.notes_model.get(1))
+            self.assertTrue(win._dirty)
+            hl = bridge.call("highlight_text", {"page": 2, "text": "Bravo Writer"})
+            self.assertEqual(hl["result"]["highlighted"], 1)
+            self.assertEqual(len(win.canvas.all_strokes[1]), 1)
+            win.canvas.undo_last()
+            self.assertEqual(win.canvas.all_strokes[1], [])
+            miss = bridge.call("highlight_text", {"page": 2, "text": "zebra"})
+            self.assertFalse(miss["ok"])
+        self._run(body)
+
+
+class TestMcpEndToEnd(unittest.TestCase):
+    """The real thing: `sidemark.py --mcp` as its own process, talking to the
+    app's bridge over D-Bus — on a PRIVATE dbus-daemon. Not Gio.TestDBus: GTK
+    has already opened the session-bus singleton by now, so the app would sit
+    on the user's real bus while the client looked on the test one."""
+
+    def test_a_client_reads_the_open_document_through_the_app(self):
+        import subprocess, threading, queue
+        from unittest import mock
+        if not shutil.which("dbus-daemon"):
+            self.skipTest("needs dbus-daemon")
+        daemon = subprocess.Popen(
+            ["dbus-daemon", "--session", "--nofork", "--print-address"],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (daemon.kill(), daemon.wait()))
+        address = daemon.stdout.readline().strip()
+        conn = Gio.DBusConnection.new_for_address_sync(
+            address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        self.addCleanup(lambda: conn.close_sync(None))
+        runtime = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, runtime, True)
+        scoped = {"SIDEMARK_MCP_RUNTIME": runtime,
+                  "SIDEMARK_INSTANCE": "mcptest"}
+        env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=address, **scoped)
+        replies = queue.Queue()
+        errors = []
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, scoped):
+            pdf = os.path.join(d, "paper.pdf")
+            make_bib_pdf(pdf)
+            app = Adw.Application(application_id=sidemark._application_id(),
+                                  flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+            def on_activate(a):
+                proc = None
+                try:
+                    win = PDFEditorWindow(a)
+                    win.present()
+                    win._do_open_file(pdf)
+                    handle = sidemark.mcp_export(a, conn)
+                    self.assertTrue(os.path.exists(handle[1]))
+                    proc = subprocess.Popen(
+                        [sys.executable, sidemark.__file__, "--mcp"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        text=True, env=env)
+                    threading.Thread(
+                        target=lambda: [replies.put(json.loads(l))
+                                        for l in proc.stdout],
+                        daemon=True).start()
+                    for m in ({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                               "params": {"protocolVersion": "2025-06-18"}},
+                              {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                               "params": {"name": "get_page",
+                                          "arguments": {"page": 2}}}):
+                        proc.stdin.write(json.dumps(m) + "\n")
+                    proc.stdin.flush()
+                    got = {}
+                    deadline = time.time() + 20
+                    while len(got) < 2 and time.time() < deadline:
+                        GLib.MainContext.default().iteration(False)
+                        try:
+                            r = replies.get_nowait()
+                            got[r["id"]] = r
+                        except queue.Empty:
+                            time.sleep(0.01)
+                    self.assertIn(2, got, got)
+                    self.assertNotIn("isError", got[2]["result"], got[2])
+                    page = got[2]["result"]["structuredContent"]
+                    self.assertEqual(page["page"], 2)
+                    self.assertIn("bravoword", page["text"])
+                    sidemark.mcp_unexport(conn, handle)
+                    self.assertFalse(os.path.exists(handle[1]))
+                except Exception:
+                    import traceback
+                    errors.append(traceback.format_exc())
+                finally:
+                    if proc is not None:
+                        proc.kill()             # never let a client hang the run
+                        proc.wait()
+                    GLib.timeout_add(50, lambda: a.quit() or False)
+
+            app.connect("activate", on_activate)
+            app.run([])
+        if errors:
+            raise AssertionError(errors[0])
+
+
 class TestCapture(unittest.TestCase):
     """F12 writes a capture for a bug report: a JSON file, the session log
     kept beside it, and one line naming both on the clipboard."""
