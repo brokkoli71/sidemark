@@ -27093,6 +27093,29 @@ class TestFormFields(unittest.TestCase):
         self.assertAlmostEqual((first - b.rect.height / 2) / got_size, k,
                                delta=0.01)
 
+    def test_a_field_drawn_apart_from_its_neighbours_keeps_its_place(self):
+        """A continuation box starts a line lower than the rest of its form;
+        re-confirming it unchanged must not pull it to the form's median."""
+        page = self.doc[0]
+        size = 9.0
+
+        def place(k, field):
+            h = field.rect.height
+            return lambda text: re.sub(
+                r"(-?[\d.]+) (-?[\d.]+) Td",
+                lambda m: f"{m.group(1)} {h / 2 + k * size:.3f} Td",
+                re.sub(r"[\d.]+ Tf", f"{size} Tf", text), count=1)
+        odd = _field(page, "auto_a")
+        for name, k in (("auto_a", -0.1), ("auto_b", -0.47),
+                        ("fixed", -0.47)):
+            f = _field(page, name)
+            self._restage(f, "Ada", place(k, f))
+        style = sidemark.form_house_style(self.doc)
+        sidemark.set_form_field(page, odd.n, "Ada", style)
+        got_size, first, _step = self._moves(odd)
+        self.assertAlmostEqual((first - odd.rect.height / 2) / got_size,
+                               -0.1, delta=0.01)
+
     def test_a_text_box_keeps_the_forms_line_spacing(self):
         page = self.doc[0]
         box = _field(page, "notes")

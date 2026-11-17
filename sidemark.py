@@ -6728,6 +6728,11 @@ class FormStyle(typing.NamedTuple):
     baseline: float = None    # single line: (baseline − h/2) / size
     step: float = None        # text box: baseline-to-baseline / size
     top: float = None         # text box: first baseline below top − size, pt
+    # {field xref: its OWN baseline (single line) or top (text box)}, in the
+    # units above. A field keeps where it was drawn: a continuation box
+    # (D&D Beyond's Actions2, FeaturesTraits2) starts a whole line lower
+    # than its neighbours, and the form-wide median moved it up a line.
+    own: dict = None
 
 
 def _form_text_moves(stream):
@@ -6771,7 +6776,7 @@ def form_house_style(doc):
     18pt ability score. A text box: PDFsharp starts size + 1pt below the top
     at 1.155·size per line, MuPDF lower at 1.116. The medians of what the
     filled fields show are what `set_form_field` redraws to."""
-    sizes, base, steps, tops = [], [], [], []
+    sizes, base, steps, tops, own = [], [], [], [], {}
     for page in doc:
         for f in form_fields(page):
             if f.kind != FORM_TEXT:
@@ -6793,10 +6798,12 @@ def form_house_style(doc):
             h = f.rect.height
             if f.multiline:
                 tops.append(h - first - size)
+                own[f.xref] = tops[-1]
                 if step:
                     steps.append(step / size)
                 continue
             base.append((first - h / 2) / size)
+            own[f.xref] = base[-1]
             font, da_size = _form_da(doc, f.xref)
             inner_h = h - 2 * FORM_TEXT_INSET
             if da_size or inner_h <= 0:
@@ -6809,7 +6816,7 @@ def form_house_style(doc):
 
     def median(xs):
         return sorted(xs)[len(xs) // 2] if xs else None
-    return FormStyle(sizes, median(base), median(steps), median(tops))
+    return FormStyle(sizes, median(base), median(steps), median(tops), own)
 
 
 def form_text_layout(field, size, style=None):
@@ -6821,11 +6828,14 @@ def form_text_layout(field, size, style=None):
     style = style or FormStyle([])
     h = field.rect.height
     step = (style.step or FORM_LINE_STEP) * size
+    own = (style.own or {}).get(field.xref)
     if field.multiline:
-        if style.top is not None:
-            return size + style.top, step
+        top = style.top if own is None else own
+        if top is not None:
+            return size + top, step
         return FORM_TEXT_INSET + FORM_LINE_STEP * size, step
-    k = FORM_MUPDF_BASELINE if style.baseline is None else style.baseline
+    k = style.baseline if own is None else own
+    k = FORM_MUPDF_BASELINE if k is None else k
     return h / 2 - k * size, step
 
 
