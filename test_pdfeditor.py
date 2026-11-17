@@ -27050,12 +27050,62 @@ class TestFormFields(unittest.TestCase):
         a, b = _field(page, "auto_a"), _field(page, "auto_b")
         size = 7.3       # nothing MuPDF would pick for a 20pt field by itself
         self._fill_as_another_producer(a, "Ada", size)
-        samples = sidemark.form_size_samples(self.doc)
-        sidemark.set_form_field(page, b.n, "Bea", samples)
+        style = sidemark.form_house_style(self.doc)
+        sidemark.set_form_field(page, b.n, "Bea", style)
         self.assertAlmostEqual(_ap_size(self.doc, b), size, delta=0.05)
         # and re-editing the filled one keeps its size
-        sidemark.set_form_field(page, a.n, "Ann", samples)
+        sidemark.set_form_field(page, a.n, "Ann", style)
         self.assertAlmostEqual(_ap_size(self.doc, a), size, delta=0.05)
+
+    def _moves(self, field):
+        ap = self.doc.xref_get_key(field.xref, "AP/N")
+        return sidemark._form_text_moves(
+            self.doc.xref_stream(int(ap[1].split()[0])))
+
+    def _restage(self, field, value, edit):
+        """Fill `field`, then rewrite its appearance's moves with `edit` —
+        another producer's placement of the same text."""
+        page = self.doc[0]
+        sidemark.set_form_field(page, field.n, value)
+        ap = self.doc.xref_get_key(field.xref, "AP/N")
+        xref = int(ap[1].split()[0])
+        text = self.doc.xref_stream(xref).decode("latin1")
+        self.doc.update_stream(xref, edit(text).encode("latin1"))
+
+    def test_a_fill_sits_where_the_forms_filled_fields_put_their_text(self):
+        """MuPDF puts a line higher than PDFsharp did; a field filled here
+        must sit like its neighbours, not jump up on confirm."""
+        page = self.doc[0]
+        a, b = _field(page, "auto_a"), _field(page, "auto_b")
+        h = a.rect.height
+        size = 9.0
+        k = -0.47             # nobody's real rule: only learning can find it
+
+        def place(text):
+            text = re.sub(r"[\d.]+ Tf", f"{size} Tf", text)
+            return re.sub(r"(-?[\d.]+) (-?[\d.]+) Td",
+                          lambda m: f"{m.group(1)} {h / 2 + k * size:.3f} Td",
+                          text, count=1)
+        self._restage(a, "Ada", place)
+        style = sidemark.form_house_style(self.doc)
+        sidemark.set_form_field(page, b.n, "Bea", style)
+        got_size, first, _step = self._moves(b)
+        self.assertAlmostEqual((first - b.rect.height / 2) / got_size, k,
+                               delta=0.01)
+
+    def test_a_text_box_keeps_the_forms_line_spacing(self):
+        page = self.doc[0]
+        box = _field(page, "notes")
+        spread = 1.4          # again nobody's rule
+
+        def space(text):
+            size = float(re.search(r"([\d.]+) Tf", text).group(1))
+            return re.sub(r"0 -[\d.]+ Td", f"0 -{spread * size:.3f} Td", text)
+        self._restage(box, "one\ntwo\nthree", space)
+        style = sidemark.form_house_style(self.doc)
+        sidemark.set_form_field(page, box.n, "four\nfive\nsix", style)
+        size, _first, step = self._moves(box)
+        self.assertAlmostEqual(step / size, spread, delta=0.01)
 
     def test_long_text_in_an_auto_field_shrinks_to_fit_its_width(self):
         page = self.doc[0]

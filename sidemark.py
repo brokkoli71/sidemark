@@ -6561,6 +6561,11 @@ FORM_TEXT_INSET = 2.0
 # read off the appearance streams it writes. Used to predict whether a wrapped
 # value fits, so it has to be MuPDF's number and not a typographer's.
 FORM_LINE_STEP = 1.116
+# ...and where it puts the text, read the same way: a single line's baseline
+# sits at h/2 + this × size above the box's bottom, a text box's first
+# baseline one inset plus one line step below its top. Used only for a form
+# with no filled field to learn its own placement from (FormStyle).
+FORM_MUPDF_BASELINE = -0.30
 FORM_AUTO_MAX = 12.0                # MuPDF's own auto size, as the ceiling
 FORM_AUTO_MIN = 3.0
 # base-14 resource names a /DA may use, as the names fitz measures text with
@@ -6713,47 +6718,160 @@ def _form_ap_size(doc, xref):
     return float(m.group(1)) if m else None
 
 
-def form_size_samples(doc):
-    """How this form's AUTO-SIZED single-line fields were sized by whatever
-    filled them: [(inner height, size ÷ inner height)] over the ones that are
-    filled and were not shrunk for width. Empty for an empty form, and then
-    MuPDF's own sizing is used instead.
+class FormStyle(typing.NamedTuple):
+    """How THIS form's filled fields were laid out by whatever filled them —
+    learned once per document (`form_house_style`) so a field filled here
+    looks like its neighbours, not like MuPDF's defaults. Every value is
+    per point of font size, so it carries across sizes; None where the form
+    has nothing to learn it from, and MuPDF's own placement stands."""
+    sizes: list               # [(inner height, size / inner height)]
+    baseline: float = None    # single line: (baseline − h/2) / size
+    step: float = None        # text box: baseline-to-baseline / size
+    top: float = None         # text box: first baseline below top − size, pt
 
-    This is what makes a field you fill here look like its neighbours. Each
-    producer has its own auto-size rule, and reverse-engineering each is a
-    losing game — PDFsharp's is ~0.866 of the inner height, except on its
-    smallest fields, where it pads by a point less for reasons the file does
-    not record. The filled fields already say what this document's rule was,
-    and a field is sized like the filled fields of ITS height."""
-    samples = []
+
+def _form_text_moves(stream):
+    """(size, first baseline above the box's bottom, smallest line step) read
+    off an appearance stream, or None. The baseline is every Td's y summed up
+    to the first shown text — MuPDF moves to the top and then down a line,
+    PDFsharp moves straight to the baseline, and both mean the same thing.
+    The step is the smallest DOWNWARD move between shown text (PDFsharp also
+    moves sideways word by word, and a blank line is two steps)."""
+    text = stream.decode("latin1")
+    m = re.search(r"([\d.]+)\s+Tf", text)
+    if m is None:
+        return None
+    size = float(m.group(1))
+    y, first, step = 0.0, None, None
+    for tok in re.finditer(r"(-?[\d.]+)\s+(-?[\d.]+)\s+Td|\)\s*Tj|>\s*Tj", text):
+        if tok.group(2) is not None:
+            dy = float(tok.group(2))
+            y += dy
+            if first is not None and dy < 0:
+                step = -dy if step is None else min(step, -dy)
+        elif first is None:
+            first = y
+    if first is None or size <= 0:
+        return None
+    return size, first, step
+
+
+def form_house_style(doc):
+    """Learn a FormStyle from the form's filled text fields.
+
+    Sizes: over AUTO-sized single-line fields that were not shrunk for width,
+    size ÷ inner height, kept with the height — a field is sized like the
+    filled fields of ITS height. Each producer has its own rule, and
+    reverse-engineering each is a losing game: PDFsharp's is ~0.866 of the
+    inner height except on its smallest fields, where it pads by a point
+    less for reasons the file does not record.
+
+    Placement: PDFsharp puts a line's baseline at h/2 − 0.385·size and MuPDF
+    at h/2 − 0.30·size, so a field MuPDF redraws jumps up — 1.6pt on an
+    18pt ability score. A text box: PDFsharp starts size + 1pt below the top
+    at 1.155·size per line, MuPDF lower at 1.116. The medians of what the
+    filled fields show are what `set_form_field` redraws to."""
+    sizes, base, steps, tops = [], [], [], []
     for page in doc:
         for f in form_fields(page):
-            if f.kind != FORM_TEXT or f.multiline:
+            if f.kind != FORM_TEXT:
                 continue
-            font, da_size = _form_da(doc, f.xref)
             value = _form_raw_value(doc, f.xref)
-            if da_size or not value:
+            if not value.strip() or value[0] in "\r\n":
                 continue
-            size = _form_ap_size(doc, f.xref)
-            inner_h = f.rect.height - 2 * FORM_TEXT_INSET
-            if not size or inner_h <= 0:
+            ap = doc.xref_get_key(f.xref, "AP/N")
+            if ap[0] != "xref":
+                continue
+            try:
+                moves = _form_text_moves(
+                    doc.xref_stream(int(ap[1].split()[0])) or b"")
+            except Exception:
+                moves = None
+            if moves is None:
+                continue
+            size, first, step = moves
+            h = f.rect.height
+            if f.multiline:
+                tops.append(h - first - size)
+                if step:
+                    steps.append(step / size)
+                continue
+            base.append((first - h / 2) / size)
+            font, da_size = _form_da(doc, f.xref)
+            inner_h = h - 2 * FORM_TEXT_INSET
+            if da_size or inner_h <= 0:
                 continue
             width = fitz.get_text_length(
                 value, _FORM_FONTS.get(font, "helv"), size)
             if width > f.rect.width - 2 * FORM_TEXT_INSET + 0.5:
                 continue                  # shrunk for width: says nothing
-            samples.append((inner_h, size / inner_h))
-    return samples
+            sizes.append((inner_h, size / inner_h))
+
+    def median(xs):
+        return sorted(xs)[len(xs) // 2] if xs else None
+    return FormStyle(sizes, median(base), median(steps), median(tops))
 
 
-def _form_ratio_for(samples, inner_h):
+def form_text_layout(field, size, style=None):
+    """Where a text field's lines go at `size`, in points from the box's TOP:
+    (first baseline, line step). The form's own placement where it has one
+    (FormStyle), MuPDF's otherwise. ONE table, read both by the appearance
+    `set_form_field` writes and by the editor that previews it — two
+    readings of where a line sits is how the text jumped on confirm."""
+    style = style or FormStyle([])
+    h = field.rect.height
+    step = (style.step or FORM_LINE_STEP) * size
+    if field.multiline:
+        if style.top is not None:
+            return size + style.top, step
+        return FORM_TEXT_INSET + FORM_LINE_STEP * size, step
+    k = FORM_MUPDF_BASELINE if style.baseline is None else style.baseline
+    return h / 2 - k * size, step
+
+
+def _form_place_text(doc, field, style):
+    """Move the lines of the appearance MuPDF just wrote to where
+    `form_text_layout` says — the size and the line breaks stay MuPDF's.
+    Its single-line stream is one absolute Td to the baseline; its text box
+    is an absolute Td to the top and then one relative Td per line."""
+    ap = doc.xref_get_key(field.xref, "AP/N")
+    if ap[0] != "xref":
+        return
+    xref = int(ap[1].split()[0])
+    text = (doc.xref_stream(xref) or b"").decode("latin1")
+    m = re.search(r"([\d.]+)\s+Tf", text)
+    if m is None:
+        return
+    first, step = form_text_layout(field, float(m.group(1)), style)
+    h = field.rect.height
+    tds = list(re.finditer(r"(-?[\d.]+)\s+(-?[\d.]+)\s+Td", text))
+    if not tds:
+        return
+    out, last, start_y, moved = [], 0, None, False
+    for i, td in enumerate(tds):
+        y = float(td.group(2))
+        if i == 0:
+            start_y = y
+            if not field.multiline:
+                y = h - first
+        elif y < 0:
+            # the first line's move lands on `first`, every later one is a step
+            y = -step if moved else (h - first) - start_y
+            moved = True
+        out.append(text[last:td.start(2)] + f"{y:.3f}")
+        last = td.end(2)
+    out.append(text[last:])
+    doc.update_stream(xref, "".join(out).encode("latin1"))
+
+
+def _form_ratio_for(sizes, inner_h):
     """The size ratio for a field of inner height `inner_h`: the median over
     filled fields of the same height (within half a point) if there are any,
     else over all of them; None with nothing to go on."""
-    if not samples:
+    if not sizes:
         return None
-    near = [r for h, r in samples if abs(h - inner_h) <= 0.5]
-    pool = sorted(near or [r for _h, r in samples])
+    near = [r for h, r in sizes if abs(h - inner_h) <= 0.5]
+    pool = sorted(near or [r for _h, r in sizes])
     return pool[len(pool) // 2]
 
 
@@ -6775,11 +6893,11 @@ def _form_wrapped_lines(text, font, size, width):
     return lines
 
 
-def form_auto_size(doc, field, value, samples):
+def form_auto_size(doc, field, value, style=None):
     """The size to draw an AUTO-SIZED text field's new `value` at, or None to
     leave it to MuPDF. Single line: the size this field was already drawn at
     if its old text was not shrunk for width (so re-editing looks unchanged),
-    else what `form_size_samples` says fields of its height were drawn at;
+    else what `form_house_style` says fields of its height were drawn at;
     then shrunk to fit the width. Multi-line: the largest size up to MuPDF's
     12pt whose wrapped lines fit the height — MuPDF itself always uses 12pt
     and lets them overflow the box."""
@@ -6789,12 +6907,28 @@ def form_auto_size(doc, field, value, samples):
     if inner_w <= 0 or inner_h <= 0:
         return None
     if field.multiline:
-        size = FORM_AUTO_MAX
-        while size > FORM_AUTO_MIN and (
-                _form_wrapped_lines(value, font, size, inner_w)
-                * FORM_LINE_STEP * size > inner_h):
-            size -= 0.25
-        return size
+        def fit(text):
+            size = FORM_AUTO_MAX
+            while size > FORM_AUTO_MIN:
+                first, step = form_text_layout(field, size, style)
+                lines = _form_wrapped_lines(text, font, size, inner_w)
+                if first + (lines - 1) * step + 0.25 * size \
+                        <= field.rect.height:
+                    break                 # the last descender is in the box
+                size -= 0.125
+            return size
+        size = fit(value)
+        # Whoever filled it fitted a little tighter or looser than this does
+        # (PDFsharp: 8.94pt where this says 9.25). The field's own old text
+        # and size say by how much — so an edit keeps its proportion, and a
+        # box you only touched up does not visibly change size.
+        old_value = _form_raw_value(doc, field.xref)
+        old_size = _form_ap_size(doc, field.xref) if old_value.strip() else None
+        if old_size:
+            ratio = old_size / fit(old_value)
+            if 0.5 <= ratio <= 1.0:
+                size *= ratio
+        return max(FORM_AUTO_MIN, size)
     natural = None
     old_value = _form_raw_value(doc, field.xref)
     old_size = _form_ap_size(doc, field.xref) if old_value else None
@@ -6802,7 +6936,7 @@ def form_auto_size(doc, field, value, samples):
                      <= inner_w + 0.5):
         natural = old_size
     else:
-        ratio = _form_ratio_for(samples, inner_h)
+        ratio = _form_ratio_for(style.sizes if style else (), inner_h)
         natural = ratio * inner_h if ratio else None
     if natural is None:
         return None
@@ -6824,7 +6958,7 @@ def form_radio_group(page, field, name=None):
             and form_widget(page, f).field_name == name]
 
 
-def set_form_field(page, n, value, samples=()):
+def set_form_field(page, n, value, style=None):
     """Fill field `n` of `page` with `value` (str, or bool for a checkbox or
     radio button) and regenerate its appearance. Returns the value it had, or
     None if `n` is not a fillable field.
@@ -6858,7 +6992,7 @@ def set_form_field(page, n, value, samples=()):
     own_da = doc.xref_get_key(field.xref, "DA")
     size = None
     if field.kind == FORM_TEXT and not _form_da(doc, field.xref)[1]:
-        size = form_auto_size(doc, field, value, samples)
+        size = form_auto_size(doc, field, value, style)
     if size is not None:
         # PyMuPDF draws at the size in /DA as MuPDF READS it, inherited from
         # the parent when the widget has none — setting text_fontsize alone is
@@ -6874,6 +7008,8 @@ def set_form_field(page, n, value, samples=()):
     if value:
         w.field_value = value
     w.update()
+    if field.kind == FORM_TEXT and value:
+        _form_place_text(doc, field, style)
     doc.xref_set_key(field.xref, "DA", fitz.get_pdf_str(own_da[1])
                      if own_da[0] == "string" else "null")
     return old
@@ -7270,7 +7406,7 @@ class FormFieldEditor:
             # an auto-sized field previews at the size it will be drawn at,
             # so it shrinks as you type exactly as the result will
             size = form_auto_size(doc, field, self._read() or "",
-                                  self.canvas.form_samples()) or FORM_AUTO_MAX
+                                  self.canvas.form_style()) or FORM_AUTO_MAX
         size = size or FORM_AUTO_MAX
         family = _FORM_PREVIEW_FAMILY.get(
             _FORM_FONTS.get(font, "helv")[:2], _FORM_PREVIEW_FAMILY["he"])
@@ -7280,16 +7416,36 @@ class FormFieldEditor:
                       da[1] if da[0] == "string" else "")
         if m:
             rgb = tuple(float(v) for v in m.groups())
+        # the field's own ground (/MK /BG), so the editor reads as the field
+        # with a caret in it rather than a white box laid over the form
+        ground = "white"
+        bg = doc.xref_get_key(field.xref, "MK/BG")
+        if bg[0] == "array":
+            vals = [float(v) for v in bg[1].strip("[]").split()]
+            if len(vals) == 3:
+                ground = "rgb({},{},{})".format(
+                    *(round(v * 255) for v in vals))
+            elif len(vals) == 1:
+                ground = "rgb({0},{0},{0})".format(round(vals[0] * 255))
+        for _pass in range(2 if isinstance(self.widget, Gtk.Entry) else 1):
+            # an entry's line is measured with the font IN FORCE, so the
+            # second pass places it with what the first one applied
+            self._load_css(field, family, size, scale, rgb, ground)
+
+    def _load_css(self, field, family, size, scale, rgb, ground):
         ar, ag, ab = (round(c * 255) for c in self.canvas.zoom_accent)
         r, g, b = (round(c * 255) for c in rgb)
         pad = self.PAD_PT * scale
         k = self._klass
+        place = ""
+        if field.kind == FORM_TEXT:
+            place = self._placement(field, family, size, scale)
         self._css.load_from_data(f"""
             .{k} {{
                 font-family: {family};
                 font-size: {size * scale:.2f}px;
                 color: rgb({r},{g},{b});
-                background: white;
+                background: {ground};
                 padding: 0 {pad:.1f}px;
                 margin: 0; min-height: 0; min-width: 0;
                 border: none; border-radius: 0; outline: none;
@@ -7297,12 +7453,51 @@ class FormFieldEditor:
             }}
             .{k} text {{ background: transparent; color: rgb({r},{g},{b});
                          padding: 0; min-height: 0; }}
-            textview.{k} {{ padding: {pad:.1f}px; }}
+            {place}
             .{k}.ring {{
                 background: rgba({ar},{ag},{ab},0.12); padding: 0;
                 box-shadow: inset 0 0 0 2px rgba({ar},{ag},{ab},0.9);
             }}
         """.encode())
+
+    def _placement(self, field, family, size, scale):
+        """CSS that puts the editor's lines where the appearance will draw
+        them (`form_text_layout`): the first baseline at the same depth, and
+        in a text box the same line step. GTK's own placement — centred in
+        an entry, its font's line height in a text view — was a little off
+        everywhere and overflowed a full box, which then scrolled."""
+        first, step = form_text_layout(field, size, self.canvas.form_style())
+        # the EDITOR's own context: its font options (hinting, metric
+        # rounding) decide the line height GTK gives it, not the canvas's
+        layout = (self.widget or self.canvas).create_pango_layout("Hg")
+        fd = Pango.FontDescription.from_string(family.replace(", ", ","))
+        fd.set_absolute_size(size * scale * Pango.SCALE)
+        layout.set_font_description(fd)
+        line_h = layout.get_extents()[1].height / Pango.SCALE
+        ascent = layout.get_baseline() / Pango.SCALE
+        side = self.PAD_PT * scale
+        k = self._klass
+        if field.multiline:
+            step_px = step * scale
+            # Pango spreads a line-height's extra room half above, half below
+            top = first * scale - ((step_px - line_h) / 2 + ascent)
+            return (f"textview.{k} {{ padding: {max(0.0, top):.2f}px "
+                    f"{side:.1f}px 0 {side:.1f}px; "
+                    f"line-height: {step_px:.2f}px; }}")
+        # The bottom padding leaves the entry's text line EXACTLY its own
+        # height, so wherever GtkText puts its line inside the content box —
+        # at the top, which is why the text rode up against the field's edge,
+        # or centred — the baseline is the top padding plus the ascent. The
+        # line's height is GtkText's, measured, not Pango's logical one: it
+        # is a pixel or two taller, and the entry then overran its field.
+        top = max(0.0, first * scale - ascent)
+        line = line_h
+        if isinstance(self.widget, Gtk.Entry):
+            line = max(line, self.widget.get_delegate().measure(
+                Gtk.Orientation.VERTICAL, -1)[1])
+        bottom = max(0.0, field.rect.height * scale - top - line)
+        return (f"entry.{k} {{ padding: {top:.2f}px {side:.1f}px "
+                f"{bottom:.2f}px {side:.1f}px; }}")
 
 
 class PDFCanvas(Gtk.DrawingArea):
@@ -7487,7 +7682,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self.field_editor = None
         self._form_cache = {}          # page xref -> [FormField], this document
         self._form_cache_doc = None
-        self._form_samples = (None, ())
+        self._form_samples = (None, None)
         self._hovered_field = None     # FormField under the pointer, caret live
         self._fields_lit = False       # the page's fields are tinted right now
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
@@ -10215,12 +10410,12 @@ class PDFCanvas(Gtk.DrawingArea):
     def form_field_by_n(self, idx, n):
         return next((f for f in self.page_form_fields(idx) if f.n == n), None)
 
-    def form_samples(self):
-        """form_size_samples for this document, read once (~50 ms on a
+    def form_style(self):
+        """form_house_style for this document, read once (~50 ms on a
         775-field form) and only when a field is first filled."""
         if self._form_samples[0] is not self.document:
             self._form_samples = (self.document,
-                                  form_size_samples(self.document))
+                                  form_house_style(self.document))
         return self._form_samples[1]
 
     def field_at_screen(self, sx, sy):
@@ -10254,7 +10449,7 @@ class PDFCanvas(Gtk.DrawingArea):
         if field.kind == FORM_RADIO and value:
             was_on = [f.n for f in form_radio_group(page, field)
                       if form_field_value(form_widget(page, f))]
-        set_form_field(page, n, value, self.form_samples())
+        set_form_field(page, n, value, self.form_style())
         self._undo_stack.append(("field", idx, n, old, value, was_on))
         self._redo_stack.clear()
         self._field_changed(idx)
@@ -10268,7 +10463,7 @@ class PDFCanvas(Gtk.DrawingArea):
         """Undo/redo's half of set_field_value: no history of its own."""
         if self.form_field_by_n(idx, n) is None:
             return
-        set_form_field(self.document[idx], n, value, self.form_samples())
+        set_form_field(self.document[idx], n, value, self.form_style())
         self._field_changed(idx)
 
     def _field_changed(self, idx):
