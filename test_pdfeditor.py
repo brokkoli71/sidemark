@@ -7789,6 +7789,32 @@ class TestRendering(unittest.TestCase):
         canvas._rerender_now()
         self.assertIsNotNone(canvas._page_surface)
 
+    def test_form_fields_show_and_stale_ink_does_not(self):
+        """A filled-in form's values are widget annotations; the canvas skips
+        ink annotations (it draws its own strokes), and must not skip these
+        with them."""
+        def alpha(pix, x, y):       # coverage under PDF point (x, y) at 1:1
+            return pix.samples[(int(y) * pix.width + int(x)) * pix.n + 3]
+        doc = fitz.open()
+        page = doc.new_page()       # blank, so only annotations paint
+        w = fitz.Widget()
+        w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        w.field_name = "name"
+        w.field_value = "MMMMMMMMMM"
+        w.text_fontsize = 30
+        w.rect = fitz.Rect(50, 50, 400, 100)
+        page.add_widget(w)
+        ink = page.add_ink_annot([[(100, 300), (400, 300)]])
+        ink.set_border(width=20)
+        ink.update()
+        pix = sidemark._page_pixmap(page, fitz.Matrix(1, 1))
+        self.assertTrue(any(alpha(pix, x, y) for x in range(50, 400)
+                            for y in range(50, 100)),
+                        "the field's value is not painted")
+        self.assertEqual(alpha(pix, 250, 300), 0,
+                         "a saved ink annotation was painted under the live ink")
+        doc.close()
+
     def test_surface_scale_stored(self):
         canvas = self._canvas_with_pdf()
         canvas.scale = 1.5
@@ -26892,6 +26918,473 @@ class TestCaretAsATool(unittest.TestCase):
         self.assertEqual(len(drags), 1,
                          "a second GestureDrag on the sheet cannot fire — the "
                          "router claims every press before it")
+
+
+# ── PDF form fields (row 222) ─────────────────────────────────────────────────
+
+def make_form_pdf(path):
+    """A two-page form with one of each kind of field, named so tests can find
+    them: auto-sized single-line text (two of the same height), fixed-size
+    text, an auto multi-line box, a checkbox, a two-button radio group, a
+    read-only field, and a field on page 2."""
+    doc = fitz.open()
+    doc.new_page()
+    doc.new_page()
+    p, p2 = doc[0], doc[1]       # pages after new_page: it orphans earlier ones
+
+    def add(page, kind, name, rect, value=None, size=0, flags=0):
+        w = fitz.Widget()
+        w.field_type, w.field_name = kind, name
+        w.rect, w.text_fontsize, w.field_flags = fitz.Rect(rect), size, flags
+        if value is not None:
+            w.field_value = value
+        page.add_widget(w)
+
+    T = fitz.PDF_WIDGET_TYPE_TEXT
+    add(p, T, "auto_a", (50, 50, 250, 70))
+    add(p, T, "auto_b", (50, 80, 250, 100))
+    add(p, T, "fixed", (50, 110, 250, 130), size=9)
+    add(p, T, "notes", (50, 140, 250, 180), flags=4096)
+    add(p, fitz.PDF_WIDGET_TYPE_CHECKBOX, "tick", (50, 190, 62, 202))
+    add(p, fitz.PDF_WIDGET_TYPE_RADIOBUTTON, "pick", (50, 210, 62, 222), True)
+    add(p, fitz.PDF_WIDGET_TYPE_RADIOBUTTON, "pick", (70, 210, 82, 222), False)
+    add(p, T, "locked", (50, 230, 250, 250), "x", flags=1)
+    add(p2, T, "next_page", (50, 50, 250, 70))
+    doc.save(path)
+    doc.close()
+
+
+def _field(page, name, nth=0):
+    """The FormField called `name` on `page` (the nth, for a radio group)."""
+    hits = [f for f in sidemark.form_fields(page)
+            if sidemark.form_widget(page, f).field_name == name]
+    return hits[nth]
+
+
+def _ap_size(doc, field):
+    return sidemark._form_ap_size(doc, field.xref)
+
+
+class TestFormFields(unittest.TestCase):
+    """The form model: finding fields, filling them, and drawing what was
+    filled the way the rest of the form looks."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._dir.name, "form.pdf")
+        make_form_pdf(self.path)
+        self.doc = fitz.open(self.path)
+
+    def tearDown(self):
+        self.doc.close()
+        self._dir.cleanup()
+
+    def test_fields_are_the_fillable_widgets_named_by_position(self):
+        page = self.doc[0]
+        widgets = list(page.widgets())
+        fields = sidemark.form_fields(page)
+        names = [widgets[f.n].field_name for f in fields]
+        self.assertNotIn("locked", names, "a read-only field is not offered")
+        self.assertEqual(len(fields), len(widgets) - 1)
+        for f in fields:
+            self.assertEqual(f.xref, widgets[f.n].xref,
+                             "n is the position among ALL the page's widgets")
+            self.assertEqual(f.rect, widgets[f.n].rect)
+            self.assertEqual(f.kind, widgets[f.n].field_type)
+
+    def test_tab_order_walks_every_page(self):
+        order = sidemark.form_tab_order(self.doc)
+        self.assertEqual(order[-1][0], 1, "the page-2 field comes last")
+        self.assertEqual(order, sorted(order))
+
+    def test_hit_test_finds_the_field_under_a_point(self):
+        page = self.doc[0]
+        tick = _field(page, "tick")
+        c = tick.rect
+        self.assertEqual(sidemark.form_field_at(
+            page, (c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2), tick)
+        self.assertIsNone(sidemark.form_field_at(page, 400, 400))
+
+    def test_a_filled_value_survives_save_and_reopen(self):
+        page = self.doc[0]
+        sidemark.set_form_field(page, _field(page, "auto_a").n, "Grüße €")
+        sidemark.set_form_field(page, _field(page, "tick").n, True)
+        out = os.path.join(self._dir.name, "out.pdf")
+        self.doc.save(out)
+        doc = fitz.open(out)
+        try:
+            p = doc[0]
+            got = {w.field_name: sidemark.form_field_value(w)
+                   for w in p.widgets()}
+            self.assertEqual(got["auto_a"], "Grüße €")
+            self.assertIs(got["tick"], True)
+        finally:
+            doc.close()
+
+    def test_da_is_left_exactly_as_it_was(self):
+        """A fill changes the value and its appearance, nothing else — an
+        auto-sized field must stay auto-sized for the next viewer."""
+        page = self.doc[0]
+        for name in ("auto_a", "fixed"):
+            f = _field(page, name)
+            before = self.doc.xref_get_key(f.xref, "DA")
+            sidemark.set_form_field(page, f.n, "something")
+            self.assertEqual(self.doc.xref_get_key(f.xref, "DA"), before)
+
+    def _fill_as_another_producer(self, field, value, size):
+        """Fill `field` the way some other program would: an appearance at
+        `size`, the field itself still auto-sized."""
+        page = self.doc[0]
+        da = self.doc.xref_get_key(field.xref, "DA")
+        # MuPDF draws at the size /DA says, so say it on the widget itself
+        self.doc.xref_set_key(field.xref, "DA",
+                              fitz.get_pdf_str(f"/Helv {size} Tf 0 g"))
+        w = sidemark.form_widget(page, field)
+        w.field_value = value
+        w.update()
+        self.doc.xref_set_key(field.xref, "DA", fitz.get_pdf_str(da[1])
+                              if da[0] == "string" else "null")
+
+    def test_an_empty_field_is_sized_like_its_filled_neighbours(self):
+        page = self.doc[0]
+        a, b = _field(page, "auto_a"), _field(page, "auto_b")
+        size = 7.3       # nothing MuPDF would pick for a 20pt field by itself
+        self._fill_as_another_producer(a, "Ada", size)
+        samples = sidemark.form_size_samples(self.doc)
+        sidemark.set_form_field(page, b.n, "Bea", samples)
+        self.assertAlmostEqual(_ap_size(self.doc, b), size, delta=0.05)
+        # and re-editing the filled one keeps its size
+        sidemark.set_form_field(page, a.n, "Ann", samples)
+        self.assertAlmostEqual(_ap_size(self.doc, a), size, delta=0.05)
+
+    def test_long_text_in_an_auto_field_shrinks_to_fit_its_width(self):
+        page = self.doc[0]
+        a = _field(page, "auto_a")
+        text = "a sentence far too long to fit across this field at all"
+        sidemark.set_form_field(page, a.n, text)
+        size = _ap_size(self.doc, a)
+        width = fitz.get_text_length(text, "helv", size)
+        self.assertLessEqual(width, a.rect.width)
+
+    def test_an_auto_text_box_keeps_its_lines_inside_the_box(self):
+        """MuPDF draws a multi-line auto field at 12pt whatever the text and
+        lets it run out of the bottom; read the baselines it actually drew."""
+        page = self.doc[0]
+        box = _field(page, "notes")
+        sidemark.set_form_field(page, box.n, " ".join(["word"] * 40))
+        ap = self.doc.xref_get_key(box.xref, "AP/N")
+        stream = self.doc.xref_stream(int(ap[1].split()[0])).decode("latin1")
+        moves = [float(m) for m in re.findall(r"0 (-[\d.]+) Td", stream)]
+        top = float(re.search(r"\n[\d.]+ ([\d.]+) Td", stream).group(1))
+        self.assertGreater(len(moves), 1, "the text wrapped")
+        self.assertGreaterEqual(top + sum(moves), 0.0,
+                                "the last line's baseline is inside the box")
+
+    def test_a_radio_button_turns_its_group_off(self):
+        page = self.doc[0]
+        first, second = _field(page, "pick", 0), _field(page, "pick", 1)
+
+        def on(f):
+            return sidemark.form_field_value(sidemark.form_widget(page, f))
+
+        self.assertTrue(on(first))
+        sidemark.set_form_field(page, second.n, True)
+        self.assertEqual((on(first), on(second)), (False, True))
+
+    def test_a_field_shows_on_the_canvas_render(self):
+        page = self.doc[0]
+        a = _field(page, "auto_a")
+        sidemark.set_form_field(page, a.n, "MMMMMMMM")
+        pix = sidemark._page_pixmap(page, fitz.Matrix(1, 1), clip=a.rect)
+        alpha = pix.samples[3::pix.n]
+        self.assertTrue(any(alpha), "the filled value is painted")
+
+
+class TestFormFieldsOnCanvas(unittest.TestCase):
+    """Filling through the canvas: one undo step, and only the caret fills."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._dir.name, "form.pdf")
+        make_form_pdf(self.path)
+        self.canvas = PDFCanvas()
+        self.canvas.load(self.path)
+        self.canvas.scale, self.canvas.offset_x, self.canvas.offset_y = 1.0, 0, 0
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _n(self, name, nth=0, idx=0):
+        return _field(self.canvas.document[idx], name, nth).n
+
+    def test_a_fill_is_one_undo_step_and_redo_puts_it_back(self):
+        c, n = self.canvas, self._n("auto_a")
+        self.assertTrue(c.set_field_value(0, n, "first"))
+        self.assertTrue(c.set_field_value(0, n, "second"))
+        c.undo_last()
+        self.assertEqual(c.field_value(0, n), "first")
+        c.undo_last()
+        self.assertEqual(c.field_value(0, n), "")
+        c.redo_last()
+        self.assertEqual(c.field_value(0, n), "first")
+
+    def test_the_same_value_again_is_not_a_change(self):
+        c, n = self.canvas, self._n("auto_a")
+        changes = []
+        c.on_change = lambda: changes.append(1)
+        c.set_field_value(0, n, "x")
+        depth = len(c._undo_stack)
+        self.assertFalse(c.set_field_value(0, n, "x"))
+        self.assertEqual(len(c._undo_stack), depth)
+        self.assertEqual(len(changes), 1)
+
+    def test_undoing_a_radio_pick_turns_the_old_one_back_on(self):
+        c = self.canvas
+        first, second = self._n("pick", 0), self._n("pick", 1)
+        c.set_field_value(0, second, True)
+        self.assertFalse(c.field_value(0, first))
+        c.undo_last()
+        self.assertEqual((c.field_value(0, first), c.field_value(0, second)),
+                         (True, False))
+
+    def _centre(self, name):
+        r = _field(self.canvas.document[0], name).rect
+        return self.canvas._pdf_to_screen((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+
+    def test_the_caret_ticks_a_box_and_the_pen_writes_over_it(self):
+        c, n = self.canvas, self._n("tick")
+        c._begin_tool("pen", *self._centre("tick"), chorded=False)
+        c.current_stroke = []
+        self.assertFalse(c.field_value(0, n), "the pen does not fill forms")
+        c._begin_tool("text", *self._centre("tick"), chorded=True)
+        self.assertTrue(c.field_value(0, n))
+        self.assertTrue(c._ignoring, "the press is spent on the field")
+
+    def test_hover_lights_a_field_only_while_the_caret_is_live(self):
+        c = self.canvas
+        c._hover_x, c._hover_y = self._centre("auto_a")
+        c.link_hover_active = lambda: False
+        c._update_link_hover()
+        self.assertIsNone(c._hovered_field)
+        c.link_hover_active = lambda: True
+        c._update_link_hover()
+        self.assertEqual(c._hovered_field.n, self._n("auto_a"))
+
+    def test_page_edits_carry_a_fill_with_its_page(self):
+        """The undo entry names a PAGE, so inserting a page before it must
+        move the entry with it, or undo would empty a field on the wrong
+        page."""
+        c, n = self.canvas, self._n("next_page", idx=1)
+        c.set_field_value(1, n, "kept")
+        c.add_blank_page()               # after page 0: the form page moves to 2
+        self.assertEqual(c.field_value(2, n), "kept")
+        c.undo_last()
+        self.assertEqual(c.field_value(2, n), "")
+
+
+class TestFormFieldEditorInWindow(unittest.TestCase):
+    """The editor that floats over a field: what it writes, when, and where
+    Tab goes. NOT presented — a choice field's list is a popover — so these
+    assert on the model and the editor's state, never on its geometry."""
+
+    def _run_in_window(self, body):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.forms")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "form.pdf")
+                    make_form_pdf(pdf)
+                    win = PDFEditorWindow(a)
+                    win._do_open_file(pdf)
+                    body(win, pdf)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _open(win, name, idx=0, nth=0):
+        c = win.canvas
+        f = _field(c.document[idx], name, nth)
+        c.activate_field(idx, f)
+        return c.field_editor, f
+
+    def test_tab_writes_the_field_and_opens_the_next(self):
+        def body(win, _pdf):
+            c = win.canvas
+            ed, a = self._open(win, "auto_a")
+            self.assertIsInstance(ed.widget, Gtk.Entry)
+            ed.widget.set_text("Ada")
+            self.assertEqual(c.field_value(0, a.n), "",
+                             "nothing is written while you type")
+            ed.move(1)
+            self.assertEqual(c.field_value(0, a.n), "Ada")
+            self.assertEqual(ed.target[1].n,
+                             _field(c.document[0], "auto_b").n)
+            ed.move(-1)
+            self.assertEqual(ed.target[1].n, a.n, "Shift+Tab goes back")
+            self.assertEqual(ed.widget.get_text(), "Ada")
+            ed.close()
+            win._global_undo()
+            self.assertEqual(c.field_value(0, a.n), "",
+                             "the fill is one step on the window's timeline")
+        self._run_in_window(body)
+
+    def test_escape_leaves_the_field_as_it_was(self):
+        def body(win, _pdf):
+            ed, a = self._open(win, "auto_a")
+            ed.widget.set_text("typo")
+            ed._on_key(None, Gdk.KEY_Escape, 0, Gdk.ModifierType(0))
+            self.assertFalse(ed.is_open())
+            self.assertEqual(win.canvas.field_value(0, a.n), "")
+        self._run_in_window(body)
+
+    def test_tab_off_a_pages_last_field_turns_the_page(self):
+        def body(win, _pdf):
+            c = win.canvas
+            ed, _f = self._open(win, "pick", nth=1)   # last fillable on page 1
+            ed.move(1)
+            self.assertEqual(c.current_page_idx, 1)
+            self.assertEqual(ed.target[0], 1)
+        self._run_in_window(body)
+
+    def test_a_box_ticks_on_the_click_and_again_from_its_ring(self):
+        def body(win, _pdf):
+            c = win.canvas
+            ed, tick = self._open(win, "tick")
+            self.assertTrue(c.field_value(0, tick.n))
+            self.assertIsInstance(ed.widget, Gtk.Button,
+                                  "a box gets a focus ring, not a text box")
+            ed._press_ring()                 # Space, Enter or a second click
+            self.assertFalse(c.field_value(0, tick.n))
+        self._run_in_window(body)
+
+    def test_saving_mid_field_saves_what_is_typed(self):
+        def body(win, pdf):
+            ed, a = self._open(win, "auto_a")
+            ed.widget.set_text("Saved")
+            win.canvas.save(pdf)
+            doc = fitz.open(pdf)
+            try:
+                got = {w.field_name: w.field_value for w in doc[0].widgets()}
+            finally:
+                doc.close()
+            self.assertEqual(got["auto_a"], "Saved")
+        self._run_in_window(body)
+
+    def test_ctrl_v_pastes_into_the_open_field(self):
+        def body(win, _pdf):
+            self.assertIsNotNone(win._paste_surface())
+            self._open(win, "auto_a")
+            self.assertIsNone(win._paste_surface(),
+                              "the page must not take a paste from the field")
+        self._run_in_window(body)
+
+
+# ── re-paging keeps page-keyed state on its page ─────────────────────────────
+
+class TestPageLinksFollowTheirPages(unittest.TestCase):
+    """`[[#page=N]]` in the notes is re-pointed when pages move."""
+
+    def test_same_document_page_links_shift_and_nothing_else_does(self):
+        after_insert = lambda k: k + 1 if k >= 1 else k   # a page at index 1
+        text = ("[[#page=3]] [[#3|see]] [[#page=3,y=120]] [[#page=1]] "
+                "[[other.pdf#page=3]] [[#Eigen]] ![[deck.pdf]]")
+        got = sidemark.shift_page_links(text, after_insert)
+        self.assertEqual(got, (
+            "[[#page=4]] [[#4|see]] [[#page=4,y=120]] [[#page=1]] "
+            "[[other.pdf#page=3]] [[#Eigen]] ![[deck.pdf]]"))
+
+    def test_a_link_to_a_deleted_page_is_left_as_written(self):
+        gone = lambda k: None if k == 2 else (k - 1 if k > 2 else k)
+        self.assertEqual(
+            sidemark.shift_page_links("[[#page=3]] [[#page=5]]", gone),
+            "[[#page=3]] [[#page=4]]")
+
+    def test_the_notes_model_shifts_them_on_every_re_page(self):
+        m = NotesModel()
+        m.set(0, "see [[#page=3]]")
+        m.shift_for_insert(1)
+        self.assertEqual(m.get(0), "see [[#page=4]]")
+        m.reorder({0: 0, 1: 1, 2: 3, 3: 2})
+        self.assertEqual(m.get(0), "see [[#page=3]]")
+        m.shift_for_delete(1)
+        self.assertEqual(m.get(0), "see [[#page=2]]")
+
+
+class TestViewHistoryFollowsThePages(unittest.TestCase):
+    """Alt+Left goes to the PAGE you were on, not to its old index."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._dir.name, "deck.pdf")
+        make_pdf(self.path, n_pages=4)
+        self.c = PDFCanvas()
+        self.c.load(self.path)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_an_inserted_page_moves_the_history_and_the_glow(self):
+        c = self.c
+        c.history.back = [(2, 0.0, 0.0, 1.0)]
+        c._jump_marks = {(2, 0.0, 0.0, 1.0): (2, (0, 0, 10, 10))}
+        c.add_blank_page()                     # after page 0
+        self.assertEqual(c.history.back, [(3, 0.0, 0.0, 1.0)])
+        self.assertEqual(c._jump_marks, {(3, 0.0, 0.0, 1.0): (3, (0, 0, 10, 10))})
+
+    def test_the_view_of_a_deleted_page_is_forgotten(self):
+        c = self.c
+        c.go_to_page(1)
+        c.history.back = [(0, 0.0, 0.0, 1.0), (1, 5.0, 5.0, 1.0),
+                          (2, 0.0, 0.0, 1.0)]
+        c.delete_current_page()
+        self.assertEqual(c.history.back, [(0, 0.0, 0.0, 1.0),
+                                          (1, 0.0, 0.0, 1.0)])
+
+
+class TestRepagingTimelinesInWindow(unittest.TestCase):
+    """An assistant's page is ONE group on the timeline; re-paging must
+    re-key the notes inside it like any other."""
+
+    def test_undoing_an_assistant_page_after_an_insert_hits_its_page(self):
+        errors = []
+        app = Adw.Application(application_id="test.sidemark.repage")
+
+        def on_activate(a):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    pdf = os.path.join(d, "deck.pdf")
+                    make_pdf(pdf, n_pages=4)
+                    win = PDFEditorWindow(a)
+                    win._do_open_file(pdf)
+                    win.notes_model.set(2, "the assistant's [[#page=2]]")
+                    win._undo_timeline.append(
+                        ("group", [("notes", 2, "mine, see [[#page=2]]")]))
+                    win._go_to_page(0)
+                    win._add_blank_page()       # after page 0
+                    self.assertEqual(win.notes_model.get(3),
+                                     "the assistant's [[#page=3]]")
+                    win._global_undo()
+                    self.assertEqual(win.notes_model.get(3),
+                                     "mine, see [[#page=3]]")
+                    self.assertEqual(win.notes_model.get(2), "")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                GLib.timeout_add(50, lambda: a.quit() or False)
+
+        app.connect("activate", on_activate)
+        app.run([])
+        if errors:
+            raise errors[0]
 
 
 if __name__ == "__main__":

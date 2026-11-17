@@ -16,6 +16,7 @@ import ctypes
 import traceback
 import hashlib
 import difflib
+import typing
 import io
 import json
 import shutil
@@ -6470,6 +6471,21 @@ class ViewHistory:
         if self.on_change:
             self.on_change()
 
+    def repage(self, page_map):
+        """The document's pages moved: re-key every stored view whose FIRST
+        element is a page index by `page_map` (old → new, None = deleted),
+        and drop the views of a deleted page."""
+        def fix(stack):
+            out = []
+            for state in stack:
+                new = page_map(state[0])
+                if new is not None:
+                    out.append((new,) + tuple(state[1:]))
+            return out
+        self.back, self.fwd = fix(self.back), fix(self.fwd)
+        if self.on_change:
+            self.on_change()
+
     def can_back(self):
         return bool(self.back)
 
@@ -6508,6 +6524,772 @@ class ViewHistory:
         self.back.clear()
         self.fwd.clear()
         self._last = None
+
+
+# ── PDF form fields (row 222) ─────────────────────────────────────────────────
+# A fillable form's fields are WIDGET annotations: each has a value and an
+# appearance stream (/AP) that is what every viewer actually paints. Filling one
+# here sets the value and regenerates that appearance, so the PDF on disk is
+# the whole truth — there is no sidecar, and Acrobat, a browser and the phone
+# all see what was typed. A field is named by (page index, `n` = its position
+# among the page's widgets): xrefs are renumbered by every compacting save, the
+# widget order on a page is not.
+#
+# Fields are FOUND by reading /Annots raw (`form_fields`), never with
+# page.widgets(): that builds a full Widget per field and costs ~0.5 ms each —
+# 236 ms for a 504-field page, on every hover. A real Widget is loaded only
+# for the one field being filled.
+
+FORM_TEXT = fitz.PDF_WIDGET_TYPE_TEXT
+FORM_CHECK = fitz.PDF_WIDGET_TYPE_CHECKBOX
+FORM_RADIO = fitz.PDF_WIDGET_TYPE_RADIOBUTTON
+FORM_CHOICE = (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX)
+# push buttons run scripts and signatures need a certificate: neither is a
+# value you type, so neither is offered
+FORM_FILLABLE = (FORM_TEXT, FORM_CHECK, FORM_RADIO) + FORM_CHOICE
+_FIELD_READONLY = 1                 # /Ff bit 1
+_FIELD_MULTILINE = 1 << 12          # /Ff bit 13 (text)
+_FIELD_RADIO = 1 << 15              # /Ff bit 16 (button)
+_FIELD_PUSH = 1 << 16               # /Ff bit 17 (button)
+_FIELD_COMBO = 1 << 17              # /Ff bit 18 (choice)
+_ANNOT_HIDDEN = 2 | 32              # /F Hidden | NoView
+# The inset MuPDF lays text out in, both ways round: 1pt of border and 1pt of
+# padding. What a size has to fit inside, and what a learned ratio is taken
+# against, so the two agree with what is then drawn.
+FORM_TEXT_INSET = 2.0
+# MuPDF's baseline-to-baseline step for a multi-line field, per point of size —
+# read off the appearance streams it writes. Used to predict whether a wrapped
+# value fits, so it has to be MuPDF's number and not a typographer's.
+FORM_LINE_STEP = 1.116
+FORM_AUTO_MAX = 12.0                # MuPDF's own auto size, as the ceiling
+FORM_AUTO_MIN = 3.0
+# base-14 resource names a /DA may use, as the names fitz measures text with
+_FORM_FONTS = {"Helv": "helv", "HeBo": "hebo", "HeIt": "heit", "HeBI": "hebi",
+               "TiRo": "tiro", "TiBo": "tibo", "TiIt": "tiit", "TiBI": "tibi",
+               "Cour": "cour", "CoBo": "cobo", "CoIt": "coit", "CoBI": "cobi"}
+
+
+class FormField(typing.NamedTuple):
+    n: int              # position among the page's widgets — the field's name
+    xref: int
+    kind: int           # a FORM_* widget type
+    flags: int          # /Ff, inherited
+    rect: "fitz.Rect"   # page space, like everything else on the canvas
+
+    @property
+    def multiline(self):
+        return self.kind == FORM_TEXT and bool(self.flags & _FIELD_MULTILINE)
+
+
+def _form_inherited(doc, xref, key):
+    """`key` of a field, walking up /Parent the way field attributes inherit
+    (/FT, /Ff, /V and /DA usually live on the parent of a radio group or a
+    field shown in several places)."""
+    for _ in range(32):                   # a cycle in /Parent is not our loop
+        v = doc.xref_get_key(xref, key)
+        if v[0] != "null":
+            return v
+        parent = doc.xref_get_key(xref, "Parent")
+        if parent[0] != "xref":
+            return v
+        xref = int(parent[1].split()[0])
+    return ("null", "null")
+
+
+def _form_kind(ft, flags):
+    if ft == "/Tx":
+        return FORM_TEXT
+    if ft == "/Btn":
+        if flags & _FIELD_PUSH:
+            return fitz.PDF_WIDGET_TYPE_BUTTON
+        return FORM_RADIO if flags & _FIELD_RADIO else FORM_CHECK
+    if ft == "/Ch":
+        return FORM_CHOICE[0] if flags & _FIELD_COMBO else FORM_CHOICE[1]
+    return fitz.PDF_WIDGET_TYPE_SIGNATURE if ft == "/Sig" else None
+
+
+def form_fields(page):
+    """[FormField] for the fields on `page` a person can fill, in /Annots
+    order. Read-only, hidden and push-button fields are left out — they are
+    part of the page, not part of the form you fill — but still COUNT for `n`,
+    which is the position among all the page's widgets."""
+    doc = page.parent
+    if not doc.is_pdf or page.first_widget is None:
+        return []
+    to_page = page.transformation_matrix
+    out = []
+    n = -1
+    for xref, atype, _id in page.annot_xrefs():
+        if atype != fitz.PDF_ANNOT_WIDGET:
+            continue
+        n += 1
+        ff = _form_inherited(doc, xref, "Ff")
+        flags = int(ff[1]) if ff[0] == "int" else 0
+        kind = _form_kind(_form_inherited(doc, xref, "FT")[1], flags)
+        if kind not in FORM_FILLABLE or flags & _FIELD_READONLY:
+            continue
+        f = doc.xref_get_key(xref, "F")
+        if f[0] == "int" and int(f[1]) & _ANNOT_HIDDEN:
+            continue
+        try:
+            nums = [float(v) for v in
+                    doc.xref_get_key(xref, "Rect")[1].strip("[]").split()]
+            rect = fitz.Rect(*nums[:4]) * to_page
+        except (TypeError, ValueError):
+            continue
+        rect.normalize()
+        out.append(FormField(n, xref, kind, flags, rect))
+    return out
+
+
+def form_field(page, n):
+    """Field `n` of `page` as a FormField, or None if it is not fillable."""
+    for f in form_fields(page):
+        if f.n == n:
+            return f
+    return None
+
+
+def form_field_at(page, px, py, fields=None):
+    """The fillable field under PDF point (px, py), or None. The LAST match
+    wins: widgets later in /Annots are painted later, so they are on top."""
+    hit = None
+    for f in (form_fields(page) if fields is None else fields):
+        r = f.rect
+        if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
+            hit = f
+    return hit
+
+
+def form_tab_order(doc):
+    """[(page, n)] — every fillable field in the order Tab walks them: page by
+    page, and within a page in /Annots order, which is the order the form's
+    author placed them and what browsers and Acrobat follow by default.
+    ceiling: a page's /Tabs /R or /C (row or column order) is not honoured;
+    if a form ever tabs wrongly, sort by rect here when /Tabs says so."""
+    return [(i, f.n) for i in range(len(doc)) for f in form_fields(doc[i])]
+
+
+def form_widget(page, field):
+    """The real fitz Widget for `field`. The PAGE must outlive it: a widget
+    whose page object was collected raises "Annot is not bound to a page" on
+    update(), so callers keep the page they passed in."""
+    return page.load_widget(field.xref)
+
+
+def form_field_value(w):
+    """A Widget's value the way the editors hold it: str for text and choice
+    fields, bool for a checkbox or radio button (is THIS one on)."""
+    v = w.field_value
+    if w.field_type in (FORM_CHECK, FORM_RADIO):
+        return v not in (None, False, "", "Off")
+    return "" if v in (None, False) else str(v)
+
+
+def _form_raw_value(doc, xref):
+    v = _form_inherited(doc, xref, "V")
+    return v[1] if v[0] == "string" else ""
+
+
+def _form_da(doc, xref):
+    """(font resource name, size) from a field's /DA; size 0 is AUTO, and so
+    is a field with no /DA at all (there is nothing else it could mean)."""
+    da = _form_inherited(doc, xref, "DA")
+    m = re.search(r"/([^\s/]+)\s+([\d.]+)\s+Tf",
+                  da[1] if da[0] == "string" else "")
+    return (m.group(1), float(m.group(2))) if m else ("Helv", 0.0)
+
+
+def _form_ap_size(doc, xref):
+    """The font size the field's CURRENT appearance was drawn at, or None."""
+    ap = doc.xref_get_key(xref, "AP/N")
+    if ap[0] != "xref":
+        return None
+    try:
+        stream = doc.xref_stream(int(ap[1].split()[0])) or b""
+    except Exception:
+        return None
+    m = re.search(rb"([\d.]+)\s+Tf", stream)
+    return float(m.group(1)) if m else None
+
+
+def form_size_samples(doc):
+    """How this form's AUTO-SIZED single-line fields were sized by whatever
+    filled them: [(inner height, size ÷ inner height)] over the ones that are
+    filled and were not shrunk for width. Empty for an empty form, and then
+    MuPDF's own sizing is used instead.
+
+    This is what makes a field you fill here look like its neighbours. Each
+    producer has its own auto-size rule, and reverse-engineering each is a
+    losing game — PDFsharp's is ~0.866 of the inner height, except on its
+    smallest fields, where it pads by a point less for reasons the file does
+    not record. The filled fields already say what this document's rule was,
+    and a field is sized like the filled fields of ITS height."""
+    samples = []
+    for page in doc:
+        for f in form_fields(page):
+            if f.kind != FORM_TEXT or f.multiline:
+                continue
+            font, da_size = _form_da(doc, f.xref)
+            value = _form_raw_value(doc, f.xref)
+            if da_size or not value:
+                continue
+            size = _form_ap_size(doc, f.xref)
+            inner_h = f.rect.height - 2 * FORM_TEXT_INSET
+            if not size or inner_h <= 0:
+                continue
+            width = fitz.get_text_length(
+                value, _FORM_FONTS.get(font, "helv"), size)
+            if width > f.rect.width - 2 * FORM_TEXT_INSET + 0.5:
+                continue                  # shrunk for width: says nothing
+            samples.append((inner_h, size / inner_h))
+    return samples
+
+
+def _form_ratio_for(samples, inner_h):
+    """The size ratio for a field of inner height `inner_h`: the median over
+    filled fields of the same height (within half a point) if there are any,
+    else over all of them; None with nothing to go on."""
+    if not samples:
+        return None
+    near = [r for h, r in samples if abs(h - inner_h) <= 0.5]
+    pool = sorted(near or [r for _h, r in samples])
+    return pool[len(pool) // 2]
+
+
+def _form_wrapped_lines(text, font, size, width):
+    """How many lines `text` wraps to at `size` in `width` — word wrap, the
+    way MuPDF lays out a multi-line field."""
+    lines = 0
+    space = fitz.get_text_length(" ", font, size)
+    for para in text.split("\n"):
+        lines += 1
+        cur = 0.0
+        for word in para.split(" "):
+            ww = fitz.get_text_length(word, font, size)
+            if cur and cur + space + ww > width:
+                lines += 1
+                cur = ww
+            else:
+                cur += (space if cur else 0.0) + ww
+    return lines
+
+
+def form_auto_size(doc, field, value, samples):
+    """The size to draw an AUTO-SIZED text field's new `value` at, or None to
+    leave it to MuPDF. Single line: the size this field was already drawn at
+    if its old text was not shrunk for width (so re-editing looks unchanged),
+    else what `form_size_samples` says fields of its height were drawn at;
+    then shrunk to fit the width. Multi-line: the largest size up to MuPDF's
+    12pt whose wrapped lines fit the height — MuPDF itself always uses 12pt
+    and lets them overflow the box."""
+    font = _FORM_FONTS.get(_form_da(doc, field.xref)[0], "helv")
+    inner_w = field.rect.width - 2 * FORM_TEXT_INSET
+    inner_h = field.rect.height - 2 * FORM_TEXT_INSET
+    if inner_w <= 0 or inner_h <= 0:
+        return None
+    if field.multiline:
+        size = FORM_AUTO_MAX
+        while size > FORM_AUTO_MIN and (
+                _form_wrapped_lines(value, font, size, inner_w)
+                * FORM_LINE_STEP * size > inner_h):
+            size -= 0.25
+        return size
+    natural = None
+    old_value = _form_raw_value(doc, field.xref)
+    old_size = _form_ap_size(doc, field.xref) if old_value else None
+    if old_size and (fitz.get_text_length(old_value, font, old_size)
+                     <= inner_w + 0.5):
+        natural = old_size
+    else:
+        ratio = _form_ratio_for(samples, inner_h)
+        natural = ratio * inner_h if ratio else None
+    if natural is None:
+        return None
+    width = fitz.get_text_length(value, font, 1.0)
+    if width > 0:
+        natural = min(natural, inner_w / width)
+    return max(FORM_AUTO_MIN, natural)
+
+
+def form_radio_group(page, field, name=None):
+    """The OTHER buttons of `field`'s radio group on its page.
+    ceiling: a group is looked for on one page only. One spread over several
+    pages would keep a second button on; walk the document here if a form
+    ever does that."""
+    if name is None:
+        name = form_widget(page, field).field_name
+    return [f for f in form_fields(page)
+            if f.kind == FORM_RADIO and f.xref != field.xref
+            and form_widget(page, f).field_name == name]
+
+
+def set_form_field(page, n, value, samples=()):
+    """Fill field `n` of `page` with `value` (str, or bool for a checkbox or
+    radio button) and regenerate its appearance. Returns the value it had, or
+    None if `n` is not a fillable field.
+
+    A radio button switched ON switches its group's other buttons OFF — the
+    group is one field with one value. An auto-sized field (/DA size 0) is
+    drawn at `form_auto_size`. /DA is then put back exactly as it was on
+    every field: update() rewrites it (and adds one to a widget that
+    inherited or lacked it), and a fill changes the value and its appearance
+    and nothing else — in particular an auto-sized field stays one for the
+    next viewer, rather than carrying the size we happened to draw at."""
+    doc = page.parent
+    field = form_field(page, n)
+    if field is None:
+        return None
+    w = form_widget(page, field)
+    old = form_field_value(w)
+    if field.kind in (FORM_CHECK, FORM_RADIO):
+        if field.kind == FORM_RADIO and value:
+            for f in form_radio_group(page, field, w.field_name):
+                other = form_widget(page, f)
+                other.field_value = "Off"
+                other.update()
+            w = form_widget(page, field)
+        w.field_value = w.on_state() if value else "Off"
+        w.update()
+        return old
+    value = "" if value is None else str(value)
+    if field.kind == FORM_TEXT and not field.multiline:
+        value = value.replace("\r", " ").replace("\n", " ")
+    own_da = doc.xref_get_key(field.xref, "DA")
+    size = None
+    if field.kind == FORM_TEXT and not _form_da(doc, field.xref)[1]:
+        size = form_auto_size(doc, field, value, samples)
+    if size is not None:
+        # PyMuPDF draws at the size in /DA as MuPDF READS it, inherited from
+        # the parent when the widget has none — setting text_fontsize alone is
+        # silently ignored then. So the size goes into the widget's own /DA
+        # for the duration of the update.
+        doc.xref_set_key(field.xref, "DA", fitz.get_pdf_str(
+            _form_da_at(doc, field.xref, size)))
+    if not value:
+        # PyMuPDF skips an EMPTY value rather than writing it, so a field
+        # could be filled but never emptied: clear /V where it lives
+        _form_clear_value(doc, field.xref)
+    w = form_widget(page, field)
+    if value:
+        w.field_value = value
+    w.update()
+    doc.xref_set_key(field.xref, "DA", fitz.get_pdf_str(own_da[1])
+                     if own_da[0] == "string" else "null")
+    return old
+
+
+def _form_da_at(doc, xref, size):
+    """The field's /DA (inherited if need be) with its size set to `size`."""
+    da = _form_inherited(doc, xref, "DA")
+    da = da[1] if da[0] == "string" else ""
+    tf = re.compile(r"([^\s/]+)\s+[\d.]+\s+Tf")
+    if tf.search(da):
+        return tf.sub(lambda m: f"{m.group(1)} {size:.3f} Tf", da, count=1)
+    return f"/Helv {size:.3f} Tf {da or '0 g'}"
+
+
+def _form_clear_value(doc, xref):
+    """Empty a text field's /V on whichever object in its /Parent chain
+    holds it."""
+    for _ in range(32):
+        if doc.xref_get_key(xref, "V")[0] != "null":
+            doc.xref_set_key(xref, "V", "()")
+            return
+        parent = doc.xref_get_key(xref, "Parent")
+        if parent[0] != "xref":
+            return
+        xref = int(parent[1].split()[0])
+
+
+def _page_pixmap(page, matrix, clip=None):
+    """The page as the canvas shows it: its content and every annotation
+    EXCEPT ink. Ink is drawn live from the canvas's own strokes, and the
+    page's ink annotations are only as fresh as the last save, so painting
+    them too would show erased strokes and double the rest. Everything else
+    that rides as an annotation — filled-in form fields above all, then
+    highlights, stamps or notes another viewer left — is part of what the page
+    says and is painted as the PDF has it.
+
+    MuPDF has no "all annotations but one type" switch, so a page that has any
+    is run through a display list piece by piece; a page with none (the usual
+    case) takes the plain render."""
+    has_other = page.first_widget is not None or any(
+        a.type[0] != fitz.PDF_ANNOT_INK for a in page.annots())
+    if not has_other:
+        return page.get_pixmap(matrix=matrix, alpha=True, annots=False,
+                               clip=clip)
+    m = fitz.mupdf
+    fz_page = page.this
+    dl = m.fz_new_display_list(m.fz_bound_page(fz_page))
+    dev = m.fz_new_list_device(dl)
+    ctm, cookie = m.FzMatrix(), m.FzCookie()
+    try:
+        m.fz_run_page_contents(fz_page, dev, ctm, cookie)
+        for annot in page.annots():
+            if annot.type[0] != fitz.PDF_ANNOT_INK:
+                m.pdf_run_annot(annot.this, dev, ctm, cookie)
+        m.fz_run_page_widgets(fz_page, dev, ctm, cookie)
+        m.fz_close_device(dev)
+    finally:
+        dev = None
+    return fitz.DisplayList(dl).get_pixmap(matrix=matrix, alpha=True,
+                                           clip=clip)
+
+
+# the faces a field's /DA font is previewed in while you type: metric twins
+# of the base-14 fonts MuPDF then draws the appearance with, so the text does
+# not visibly reflow when the editor closes
+_FORM_PREVIEW_FAMILY = {"he": "Liberation Sans, Arimo, Arial, Helvetica, sans-serif",
+                        "ti": "Liberation Serif, Tinos, Times New Roman, serif",
+                        "co": "Liberation Mono, Cousine, Courier New, monospace"}
+
+
+class FormFieldEditor:
+    """The one form field being filled (row 222), as a real GTK editor
+    floating over it in the session's overlay — so typing, input methods,
+    selection, the clipboard and the entry's own undo all come from GTK rather
+    than from a hand-rolled editor on the canvas.
+
+    It FOLLOWS the page (`follow`, from every canvas draw) at the field's
+    font and size scaled by the zoom, so what you type sits where the
+    appearance will draw it. Nothing is written until the field is confirmed
+    — Enter, Tab, a click elsewhere, focus leaving, a save — and then it is
+    ONE undoable step on the canvas. Esc leaves the field as it was.
+
+    A checkbox, radio button or list field gets a focus ring instead of a text
+    box, so Tab walks a form the way a browser does and Space ticks a box.
+
+    The widget is removed in an idle, never from the handler acting on it: a
+    focus-leave that unparents its own entry is the gtk-traps loop."""
+
+    PAD_PT = FORM_TEXT_INSET
+
+    def __init__(self, canvas, overlay):
+        self.canvas = canvas
+        self.overlay = overlay
+        self.target = None          # (page idx, FormField) being filled
+        self.widget = None
+        self._original = None       # what it held when opened
+        self._rect = None           # where follow() last put it
+        self._scale = None
+        self._place_id = None
+        self._choices = None        # the open list of a choice field
+        self._klass = f"sm-field-{id(self):x}"
+        self._css = Gtk.CssProvider()
+        _display_provider_while_realized(
+            overlay, self._css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+        overlay.connect("get-child-position", self._position)
+        canvas.field_editor = self
+
+    # ── opening and closing ────────────────────────────────────────────────
+
+    def is_open(self):
+        return self.target is not None
+
+    def open(self, idx, field, select_all=False):
+        if self.target is not None and self.target[0] == idx \
+                and self.target[1].n == field.n:
+            return
+        self.commit()
+        page = self.canvas.document[idx]
+        w = form_widget(page, field)
+        value = form_field_value(w)
+        self.target = (idx, field)
+        self._original = value
+        self._rect = None
+        if field.kind == FORM_TEXT and field.multiline:
+            view = Gtk.TextView()
+            view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            view.set_justification(
+                (Gtk.Justification.LEFT, Gtk.Justification.CENTER,
+                 Gtk.Justification.RIGHT)[self._quadding(field)])
+            view.get_buffer().set_text(value)
+            view.get_buffer().connect("changed", lambda *_a: self._restyle())
+            self.widget = view
+        elif field.kind == FORM_TEXT:
+            entry = Gtk.Entry()
+            entry.set_has_frame(False)
+            entry.set_text(value)
+            entry.set_alignment((0.0, 0.5, 1.0)[self._quadding(field)])
+            if w.text_maxlen:
+                entry.set_max_length(w.text_maxlen)
+            entry.connect("activate", lambda _e: self.close(commit=True))
+            entry.connect("changed", lambda _e: self._restyle())
+            self.widget = entry
+        else:
+            # a focus ring that takes Space, Enter and a click
+            ring = Gtk.Button()
+            ring.add_css_class("ring")
+            ring.connect("clicked", lambda _b: self._press_ring())
+            self.widget = ring
+        self.widget.add_css_class(self._klass)
+        self.widget.set_overflow(Gtk.Overflow.HIDDEN)
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key)
+        self.widget.add_controller(keys)
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda _c, w=self.widget: self._focus_left(w))
+        self.widget.add_controller(focus)
+        self._restyle()
+        self.overlay.add_overlay(self.widget)
+        self.overlay.set_clip_overlay(self.widget, True)
+        self.widget.grab_focus()
+        if isinstance(self.widget, Gtk.Entry):
+            # Tab into a field selects it, the way a browser does; a click
+            # puts the caret at the end of what is there
+            if select_all:
+                self.widget.select_region(0, -1)
+            else:
+                self.widget.set_position(-1)
+        if field.kind in FORM_CHOICE and not select_all:
+            self._show_choices()     # a click on a list field opens the list
+
+    def commit(self):
+        """Write what the editor holds and close it. Safe to call when
+        nothing is open, and from any handler: the widget goes in an idle."""
+        self.close(commit=True)
+
+    def close(self, commit=False):
+        if self.target is None:
+            return
+        if commit:
+            self._write()
+        self.target = None
+        widget, self.widget = self.widget, None
+        if self._choices is not None:
+            self._choices.popdown()
+        if widget is not None:
+            had_focus = widget.has_focus() or (
+                widget.get_focus_child() is not None)
+            if had_focus:
+                # leave the keyboard on the page, not on whatever GTK picks
+                self.canvas.grab_focus()
+            GLib.idle_add(self._remove, widget)
+
+    def _remove(self, widget):
+        if widget.get_parent() is self.overlay:
+            self.overlay.remove_overlay(widget)
+        return False
+
+    def write_now(self):
+        """Confirm what is typed WITHOUT closing — a save in the middle of
+        filling a field saves what you see."""
+        if self.target is not None:
+            self._write()
+            if self.target is not None:
+                self._original = self._read()
+
+    def _write(self):
+        idx, field = self.target
+        if field.kind not in (FORM_TEXT,) + FORM_CHOICE:
+            return            # boxes and radios are written as they are clicked
+        value = self._read()
+        if value is not None and value != self._original:
+            self.canvas.set_field_value(idx, field.n, value)
+
+    def _read(self):
+        if isinstance(self.widget, Gtk.Entry):
+            return self.widget.get_text()
+        if isinstance(self.widget, Gtk.TextView):
+            buf = self.widget.get_buffer()
+            return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        return None
+
+    def _focus_left(self, widget):
+        # Only the CURRENT editor's leaving confirms anything: the one before
+        # it is still parented until its idle removal, and it loses focus to
+        # its successor — which would otherwise confirm the field just opened.
+        if widget is not self.widget:
+            return
+        # focus moving to the choice list is still filling this field
+        if self._choices is not None and self._choices.get_visible():
+            return
+        self.commit()
+
+    # ── keys ──────────────────────────────────────────────────────────────
+
+    def _on_key(self, _ctrl, keyval, _code, state):
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab, Gdk.KEY_KP_Tab):
+            back = (keyval == Gdk.KEY_ISO_Left_Tab
+                    or bool(state & Gdk.ModifierType.SHIFT_MASK))
+            self.move(-1 if back else 1)
+            return True
+        if keyval == Gdk.KEY_Escape:
+            self.close(commit=False)
+            return True
+        if (keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                and isinstance(self.widget, Gtk.TextView)
+                and state & Gdk.ModifierType.CONTROL_MASK):
+            self.close(commit=True)    # Enter is a new line in a text box
+            return True
+        return False
+
+    def move(self, step):
+        """Tab / Shift+Tab: confirm this field and open the next one in the
+        form's order, turning the page if it is on another."""
+        if self.target is None:
+            return
+        idx, field = self.target
+        order = [(i, f.n) for i in range(self.canvas.n_pages)
+                 for f in self.canvas.page_form_fields(i)]
+        here = (idx, field.n)
+        if here not in order:
+            return
+        self.close(commit=True)
+        nxt_idx, nxt_n = order[(order.index(here) + step) % len(order)]
+        nxt = self.canvas.form_field_by_n(nxt_idx, nxt_n)
+        self.canvas.reveal_field(nxt_idx, nxt)
+        self.open(nxt_idx, nxt, select_all=True)
+
+    # ── boxes and lists ────────────────────────────────────────────────────
+
+    def _press_ring(self):
+        idx, field = self.target
+        if field.kind in FORM_CHOICE:
+            self._show_choices()
+        elif field.kind == FORM_RADIO:
+            self.canvas.set_field_value(idx, field.n, True)
+        else:
+            self.canvas.set_field_value(
+                idx, field.n, not self.canvas.field_value(idx, field.n))
+
+    def _show_choices(self):
+        """The list of a choice field, under it. Picking one writes it."""
+        idx, field = self.target
+        w = form_widget(self.canvas.document[idx], field)
+        options = []
+        for opt in w.choice_values or []:
+            if isinstance(opt, (list, tuple)):
+                options.append((str(opt[0]), str(opt[-1])))    # export, shown
+            else:
+                options.append((str(opt), str(opt)))
+        if not options:
+            return
+        pop = Gtk.Popover()
+        pop.set_parent(self.widget)
+        pop.set_position(Gtk.PositionType.BOTTOM)
+        listing = Gtk.ListBox()
+        listing.set_selection_mode(Gtk.SelectionMode.NONE)
+        current = form_field_value(w)
+        for export, shown in options:
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=shown, xalign=0)
+            if export == current:
+                label.add_css_class("heading")
+            row.set_child(label)
+            row.export = export
+            listing.append(row)
+
+        def picked(_l, row):
+            self._original = None            # anything picked is a change
+            self.canvas.set_field_value(idx, field.n, row.export)
+            pop.popdown()
+
+        listing.connect("row-activated", picked)
+        pop.set_child(listing)
+
+        def closed(p):
+            if self._choices is p:
+                self._choices = None
+            GLib.idle_add(_drop_popover, p)
+        pop.connect("closed", closed)
+        self._choices = pop
+        pop.popup()
+
+    # ── placement ──────────────────────────────────────────────────────────
+
+    def follow(self):
+        """Called from every canvas draw: keep the editor over its field as
+        the page pans and zooms, and confirm it once its page is gone."""
+        if self.target is None:
+            return
+        idx, field = self.target
+        rect = self.canvas.field_rect_on_screen(idx, field)
+        if rect is None:
+            GLib.idle_add(self.commit)   # not from inside a draw
+            return
+        if rect != self._rect:
+            self._rect = rect
+            if self.canvas.scale != self._scale:
+                self._restyle()
+            if self._place_id is None:
+                # queue_allocate from inside the draw is a frame late at
+                # best and a warning at worst
+                self._place_id = GLib.idle_add(self._place)
+
+    def _place(self):
+        self._place_id = None
+        self.overlay.queue_allocate()
+        return False
+
+    def _position(self, _overlay, child, allocation):
+        if child is not self.widget or self._rect is None:
+            return False
+        x, y, w, h = self._rect
+        allocation.x, allocation.y = round(x), round(y)
+        allocation.width = max(1, round(w))
+        allocation.height = max(1, round(h))
+        return True
+
+    def refresh(self):
+        """The field's value changed under the editor (a click, undo)."""
+        if self.widget is not None:
+            self._restyle()
+
+    def _quadding(self, field):
+        q = _form_inherited(self.canvas.document, field.xref, "Q")
+        return min(max(int(q[1]), 0), 2) if q[0] == "int" else 0
+
+    def _restyle(self):
+        """The CSS that makes the editor look like the field at this zoom:
+        the face and size the appearance will be drawn in, over an opaque
+        ground that hides the old appearance underneath."""
+        if self.target is None:
+            return
+        idx, field = self.target
+        doc = self.canvas.document
+        scale = self.canvas.scale
+        self._scale = scale
+        font, size = _form_da(doc, field.xref)
+        if not size and field.kind == FORM_TEXT:
+            # an auto-sized field previews at the size it will be drawn at,
+            # so it shrinks as you type exactly as the result will
+            size = form_auto_size(doc, field, self._read() or "",
+                                  self.canvas.form_samples()) or FORM_AUTO_MAX
+        size = size or FORM_AUTO_MAX
+        family = _FORM_PREVIEW_FAMILY.get(
+            _FORM_FONTS.get(font, "helv")[:2], _FORM_PREVIEW_FAMILY["he"])
+        da = _form_inherited(doc, field.xref, "DA")
+        rgb = (0.0, 0.0, 0.0)
+        m = re.search(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg",
+                      da[1] if da[0] == "string" else "")
+        if m:
+            rgb = tuple(float(v) for v in m.groups())
+        ar, ag, ab = (round(c * 255) for c in self.canvas.zoom_accent)
+        r, g, b = (round(c * 255) for c in rgb)
+        pad = self.PAD_PT * scale
+        k = self._klass
+        self._css.load_from_data(f"""
+            .{k} {{
+                font-family: {family};
+                font-size: {size * scale:.2f}px;
+                color: rgb({r},{g},{b});
+                background: white;
+                padding: 0 {pad:.1f}px;
+                margin: 0; min-height: 0; min-width: 0;
+                border: none; border-radius: 0; outline: none;
+                box-shadow: inset 0 0 0 1px rgba({ar},{ag},{ab},0.9);
+            }}
+            .{k} text {{ background: transparent; color: rgb({r},{g},{b});
+                         padding: 0; min-height: 0; }}
+            textview.{k} {{ padding: {pad:.1f}px; }}
+            .{k}.ring {{
+                background: rgba({ar},{ag},{ab},0.12); padding: 0;
+                box-shadow: inset 0 0 0 2px rgba({ar},{ag},{ab},0.9);
+            }}
+        """.encode())
 
 
 class PDFCanvas(Gtk.DrawingArea):
@@ -6686,6 +7468,15 @@ class PDFCanvas(Gtk.DrawingArea):
         self.on_callout_placed = None  # callback(pdf_x, pdf_y) — for the last placed anchor
         self.on_callout_moved = None   # callback(anchor_index, pdf_x, pdf_y)
         self.on_user_action = None     # callback() once per completed draw/erase gesture
+        # form fields (row 222): the editor floats over the canvas in the
+        # session's overlay, so a bare canvas (tests, the presenter) has none
+        # and fills fields only through set_field_value
+        self.field_editor = None
+        self._form_cache = {}          # page xref -> [FormField], this document
+        self._form_cache_doc = None
+        self._form_samples = (None, ())
+        self._hovered_field = None     # FormField under the pointer, caret live
+        self._fields_lit = False       # the page's fields are tinted right now
         self.on_canvas_press = None    # callback() on any press in the canvas (clears thumb selection)
         self.on_lasso_selection = None # callback(has_selection: bool) when the lasso set changes
         self.on_nav_history = None     # callback(True) when a followed link records a step
@@ -7025,6 +7816,9 @@ class PDFCanvas(Gtk.DrawingArea):
     # ── page management ──────────────────────────────────────────────────────
 
     def load(self, path):
+        if self.field_editor is not None:
+            self.field_editor.close()    # it belonged to the old document
+        self._hovered_field = None
         self.document = fitz.open(path)
         self.n_pages = len(self.document)
         self.current_stroke = []
@@ -7077,6 +7871,7 @@ class PDFCanvas(Gtk.DrawingArea):
         self._hide_link_preview()      # it belonged to a link on the old page
         self.current_page_idx = idx
         self.page = self.document[idx]
+        self._hovered_field = None     # it was on the page we left
         self.page_width  = self.page.rect.width
         self.page_height = self.page.rect.height
         self._page_surface = None
@@ -7416,8 +8211,8 @@ class PDFCanvas(Gtk.DrawingArea):
         exact device pixels per logical one, fractional scaling included)."""
         sf = device or self.get_scale_factor()
         device_scale = logical_scale * sf
-        pix = page.get_pixmap(matrix=fitz.Matrix(device_scale, device_scale),
-                              alpha=True, annots=False, clip=clip)
+        pix = _page_pixmap(page, fitz.Matrix(device_scale, device_scale),
+                           clip=clip)
         w, h = pix.width, pix.height
         # fitz RGBA → cairo ARGB32 (BGRA in memory on little-endian): swap R and B channels
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 4).copy()
@@ -7782,6 +8577,9 @@ class PDFCanvas(Gtk.DrawingArea):
             ctx.stroke()
             ctx.restore()
 
+        self._draw_form_fields(ctx)
+        if self.field_editor is not None:
+            self.field_editor.follow()     # the editor rides the page
         if self._flash is not None:
             self._draw_flash(ctx)
         self._draw_backlink_icons(ctx)
@@ -9095,6 +9893,9 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def _on_motion_leave(self, _ctrl):
         self._pointer_in = False
+        if self._hovered_field is not None:
+            self._hovered_field = None
+            self.queue_draw()
         if not (self._link_preview or {}).get("pinned"):
             self._hide_link_preview()
         if self._hovered_link_rect is not None:
@@ -9150,6 +9951,11 @@ class PDFCanvas(Gtk.DrawingArea):
         """Cursor that matches the active tool while idle (no drag in flight)."""
         if self._hide_pointer():
             return Gdk.Cursor.new_from_name("none", None)
+        if self._hovered_field is not None:
+            # an I-beam over what you type into, a hand over what you click
+            return Gdk.Cursor.new_from_name(
+                "text" if self._hovered_field.kind == FORM_TEXT
+                else "pointer", None)
         name = {"text": "text", "pan": "grab", "lasso": "crosshair",
                 "zoom": "crosshair", "anchor": "crosshair"}.get(self.tool)
         return Gdk.Cursor.new_from_name(name, None) if name else None
@@ -9187,6 +9993,24 @@ class PDFCanvas(Gtk.DrawingArea):
             BTN_LEFT, self._ctrl_held, self._shift_held, self._alt_held,
             mode=self.doc_mode) == "text"
 
+    def _update_field_hover(self, off_link):
+        """The form field under the pointer while the caret is live (row 222):
+        its glow and its cursor. Only off a link — the link is what the click
+        follows. Also repaints when the caret comes and goes under a held
+        modifier, since that is what lights the page's fields at all."""
+        live = self.link_hover_active() and self.page is not None
+        field = (self.field_at_screen(self._hover_x, self._hover_y)
+                 if live and off_link else None)
+        lit = live and bool(self.page_form_fields())
+        if field == self._hovered_field and lit == self._fields_lit:
+            return
+        self._fields_lit = lit
+        if field != self._hovered_field:
+            self._hovered_field = field
+            if off_link:
+                self.set_cursor(self._default_cursor())
+        self.queue_draw()
+
     def _update_link_hover(self):
         """Which link the pointer is on, while links are live — the glow, the
         pointer cursor, and the hover card's timer. On the card itself
@@ -9206,6 +10030,7 @@ class PDFCanvas(Gtk.DrawingArea):
                 if r.x0 <= px <= r.x1 and r.y0 <= py <= r.y1:
                     new_rect, new_link = r, link
                     break
+        self._update_field_hover(new_rect is None)
         if p is not None and not p.get("pinned"):
             if new_rect is not None and new_rect == p.get("anchor"):
                 if self._card_hide_id is not None:      # back on its link
@@ -9269,6 +10094,10 @@ class PDFCanvas(Gtk.DrawingArea):
             self._post_pinch = False
         self._dismissed_selection = False
         self._text_highlighting = False
+        if self.field_editor is not None:
+            # a press beside the field being filled is the click-away that
+            # confirms it, as in a browser (the editor covers the field itself)
+            self.field_editor.commit()
         self._glide.stop()               # a press catches a coasting page
         self._pressing = True
         if self._continuous():
@@ -9351,6 +10180,186 @@ class PDFCanvas(Gtk.DrawingArea):
         self._begin_tool(tool, start_x, start_y, chorded=(tool != plain),
                          additive=additive)
 
+    # ── form fields (row 222) ───────────────────────────────────────────────
+
+    def page_form_fields(self, idx=None):
+        """The fillable fields of page `idx` (default: the current one),
+        cached per page — hover asks on every motion, and a 500-field page
+        takes ~12 ms to read."""
+        doc = self.document
+        idx = self.current_page_idx if idx is None else idx
+        if doc is None or not 0 <= idx < self.n_pages:
+            return []
+        if self._form_cache_doc is not doc:
+            # a save reopens the document: xrefs moved, so start over
+            self._form_cache, self._form_cache_doc = {}, doc
+        key = doc.page_xref(idx)
+        got = self._form_cache.get(key)
+        if got is None:
+            got = self._form_cache[key] = form_fields(doc[idx])
+        return got
+
+    def form_field_by_n(self, idx, n):
+        return next((f for f in self.page_form_fields(idx) if f.n == n), None)
+
+    def form_samples(self):
+        """form_size_samples for this document, read once (~50 ms on a
+        775-field form) and only when a field is first filled."""
+        if self._form_samples[0] is not self.document:
+            self._form_samples = (self.document,
+                                  form_size_samples(self.document))
+        return self._form_samples[1]
+
+    def field_at_screen(self, sx, sy):
+        """The fillable field of the current page under a screen point."""
+        if self.page is None:
+            return None
+        px, py = self._screen_to_pdf(sx, sy)
+        return form_field_at(self.page, px, py, self.page_form_fields())
+
+    def field_value(self, idx, n):
+        field = self.form_field_by_n(idx, n)
+        if field is None:
+            return None
+        page = self.document[idx]      # held: the widget needs it alive
+        return form_field_value(form_widget(page, field))
+
+    def set_field_value(self, idx, n, value):
+        """Fill field `n` of page `idx` as ONE undoable step. Returns whether
+        anything changed — the same value again writes nothing, so neither
+        the appearance nor the dirty flag moves for a field you only visited."""
+        field = self.form_field_by_n(idx, n)
+        if field is None:
+            return False
+        if field.kind == FORM_TEXT and not field.multiline:
+            value = value.replace("\r", " ").replace("\n", " ")
+        old = self.field_value(idx, n)
+        if old == value:
+            return False
+        page = self.document[idx]
+        was_on = []
+        if field.kind == FORM_RADIO and value:
+            was_on = [f.n for f in form_radio_group(page, field)
+                      if form_field_value(form_widget(page, f))]
+        set_form_field(page, n, value, self.form_samples())
+        self._undo_stack.append(("field", idx, n, old, value, was_on))
+        self._redo_stack.clear()
+        self._field_changed(idx)
+        if self.on_change:
+            self.on_change()
+        if self.on_user_action:
+            self.on_user_action()
+        return True
+
+    def _put_field(self, idx, n, value):
+        """Undo/redo's half of set_field_value: no history of its own."""
+        if self.form_field_by_n(idx, n) is None:
+            return
+        set_form_field(self.document[idx], n, value, self.form_samples())
+        self._field_changed(idx)
+
+    def _field_changed(self, idx):
+        """A field's appearance changed: every bitmap of that page is stale."""
+        self._strip_cache.pop(idx, None)
+        if idx == self.current_page_idx + 1:
+            self._stack_surface = None
+        if idx == self.current_page_idx and self.page is not None:
+            self._rerender_now()       # now, not in 120 ms: you just typed it
+        if self.field_editor is not None:
+            self.field_editor.refresh()
+        self.queue_draw()
+
+    def activate_field(self, idx, field):
+        """The caret's click on a field: a checkbox toggles, a radio button
+        turns on, anything you type into opens the editor over it."""
+        if field.kind == FORM_CHECK:
+            self.set_field_value(idx, field.n,
+                                 not self.field_value(idx, field.n))
+        elif field.kind == FORM_RADIO:
+            self.set_field_value(idx, field.n, True)
+        if self.field_editor is not None:
+            # a checkbox gets the editor too — as a focus ring, so Space
+            # toggles it and Tab carries on, the way a browser form does
+            self.field_editor.open(idx, field)
+
+    def field_rect_on_screen(self, idx, field):
+        """(x, y, w, h) of a field in canvas pixels, or None off the strip."""
+        if idx == self.current_page_idx:
+            ox, oy = self.offset_x, self.offset_y
+        elif self._continuous():
+            hit = next(((x0, y0) for i, x0, y0, _w, _h in self._strip_layout()
+                        if i == idx), None)
+            if hit is None:
+                return None
+            ox, oy = hit
+        else:
+            return None
+        r = field.rect
+        return (ox + r.x0 * self.scale, oy + r.y0 * self.scale,
+                r.width * self.scale, r.height * self.scale)
+
+    def reveal_field(self, idx, field):
+        """Make page `idx` current and pan, at the current zoom, until the
+        field is on screen with a margin — Tab onto a field you cannot see."""
+        if idx != self.current_page_idx:
+            if self._continuous():
+                self.choose_strip_page(idx)
+            else:
+                self.go_to_page(idx, keep_view=True)
+        rect = self.field_rect_on_screen(idx, field)
+        if rect is None:
+            return
+        x, y, w, h = rect
+        vw, vh = self.get_width() or 800, self.get_height() or 600
+        m = 32.0
+        dx = dy = 0.0
+        if x < m or w > vw - 2 * m:
+            dx = m - x
+        elif x + w > vw - m:
+            dx = vw - m - (x + w)
+        if y < m or h > vh - 2 * m:
+            dy = m - y
+        elif y + h > vh - m:
+            dy = vh - m - (y + h)
+        if dx or dy:
+            self.offset_x += dx
+            self.offset_y += dy
+            self._is_fitted = False
+            if self._continuous():
+                self._clamp_strip()
+        self.queue_draw()
+
+    def _draw_form_fields(self, ctx):
+        """While the caret is what the left button would do, the page's
+        fields wear a faint tint, so a form says where it can be filled — and
+        the one under the pointer a stronger one, like a link. Nothing at all
+        otherwise: with the pen in hand a form is just a page to write on."""
+        if not self.link_hover_active() or self.page is None:
+            return
+        fields = self.page_form_fields()
+        if not fields:
+            return
+        ar, ag, ab = self.zoom_accent
+        ctx.save()
+        ctx.translate(self.offset_x, self.offset_y)
+        ctx.scale(self.scale, self.scale)
+        ctx.set_source_rgba(ar, ag, ab, 0.08)
+        for f in fields:
+            r = f.rect
+            ctx.rectangle(r.x0, r.y0, r.width, r.height)
+        ctx.fill()
+        hov = self._hovered_field
+        if hov is not None:
+            r = hov.rect
+            ctx.set_source_rgba(ar, ag, ab, 0.15)
+            ctx.rectangle(r.x0, r.y0, r.width, r.height)
+            ctx.fill()
+            ctx.set_source_rgba(ar, ag, ab, 0.7)
+            ctx.set_line_width(1.0 / self.scale)
+            ctx.rectangle(r.x0, r.y0, r.width, r.height)
+            ctx.stroke()
+        ctx.restore()
+
     def _page_mark_at(self, x, y):
         """`("anchor", i)` or `("callout", i)` under a screen point, or None.
         An anchor circle beats a box: it is the smaller target."""
@@ -9394,6 +10403,14 @@ class PDFCanvas(Gtk.DrawingArea):
         if not chorded and tool != "lasso" and self.selection_grab_at(start_x, start_y):
             self._lasso_press(start_x, start_y)
             return
+        if tool == "text":
+            # the caret's click on a form field FILLS it — the same click
+            # that follows a link, and the hover says which one you will get
+            field = self.field_at_screen(start_x, start_y)
+            if field is not None:
+                self._ignoring = True
+                self.activate_field(self.current_page_idx, field)
+                return
         if tool == "pan":
             self.history.moving()
             self._panning = True
@@ -13093,6 +14110,11 @@ class PDFCanvas(Gtk.DrawingArea):
                 strokes.remove(new_stroke)
             for s, old_pts, _new in entries:
                 s["pts"] = list(old_pts)
+        elif op[0] == "field":
+            _, _, n, old, _new, was_on = op
+            self._put_field(page, n, old)
+            for other in was_on:          # the radio button it switched off
+                self._put_field(page, other, True)
         else:
             self._undo_erase_op(page, op)
             # one erase GESTURE — which in the continuous strip may have
@@ -13159,6 +14181,8 @@ class PDFCanvas(Gtk.DrawingArea):
             self.all_strokes.setdefault(page, []).append(new_stroke)
             for s, _old, new_pts in entries:
                 s["pts"] = list(new_pts)
+        elif ops[0][0] == "field":
+            self._put_field(page, ops[0][2], ops[0][4])
         else:
             # re-remove in the gesture's chronological order (reverse of pop
             # order), each on its own page (row 214)
@@ -13391,6 +14415,8 @@ class PDFCanvas(Gtk.DrawingArea):
 
     def save(self, path):
         """Save via self.document so structural changes (inserted pages) are preserved."""
+        if self.field_editor is not None:
+            self.field_editor.write_now()   # what you see in a field is saved
         tmp = path + ".tmp"
         total_written = self._write_ink_annotations()
         placed = self._write_image_layer()
@@ -13507,7 +14533,7 @@ class PDFCanvas(Gtk.DrawingArea):
             for ops in self._redo_stack
         ]
         self.n_pages = len(self.document)
-        self._document_repaged()
+        self._document_repaged(lambda k: k + 1 if k >= idx else k)
         self._load_page(idx)   # navigate to the new blank page
 
     def insert_pdf_pages(self, at_idx, src_path):
@@ -13548,13 +14574,14 @@ class PDFCanvas(Gtk.DrawingArea):
             for ops in self._redo_stack
         ]
         self.n_pages = len(self.document)
-        self._document_repaged()
+        self._document_repaged(lambda k: k + count if k >= at_idx else k)
         self._load_page(at_idx)
         return count
 
-    def _document_repaged(self):
+    def _document_repaged(self, page_map):
         """Pages were inserted, deleted or moved: everything keyed by a page
-        INDEX is wrong now. The caches here are keyed by the page COUNT, which
+        INDEX is wrong now. `page_map(old)` is a page's new index, or None for
+        the page that was deleted. The caches here are keyed by the page COUNT, which
         a move does not change and so never noticed; and PyMuPDF keeps its
         own table of named destinations (`_resolved_names`) that nothing
         refreshes — every LaTeX \\cite and \\ref kept pointing at the page its
@@ -13574,6 +14601,17 @@ class PDFCanvas(Gtk.DrawingArea):
         self._text_segments, self._other_segments = [], {}
         self._sel_range = None
         self._hide_link_preview()
+        # where you were (Alt+Left/Right) and the glows that mark where a jump
+        # left and landed are views OF A PAGE: they follow it, and a view of
+        # a deleted page is forgotten rather than shown on its neighbour
+        self.history.repage(page_map)
+        marks = {}
+        for state, (page, rect) in self._jump_marks.items():
+            new_state, new_page = page_map(state[0]), page_map(page)
+            if new_state is not None and new_page is not None:
+                marks[(new_state,) + tuple(state[1:])] = (new_page, rect)
+        self._jump_marks = marks
+        self._flash = None
 
     def delete_current_page(self):
         """Delete the current page. Refused if it's the last one."""
@@ -13614,7 +14652,7 @@ class PDFCanvas(Gtk.DrawingArea):
             ) if shifted
         ]
         self.n_pages = len(self.document)
-        self._document_repaged()
+        self._document_repaged(lambda k: None if k == idx else (k - 1 if k > idx else k))
         new_idx = min(idx, self.n_pages - 1)
         self._load_page(new_idx)
         return True
@@ -13686,7 +14724,7 @@ class PDFCanvas(Gtk.DrawingArea):
         # every page reorder has been leaving the outline out of order.
         self.resort_toc()
         self.n_pages = len(self.document)
-        self._document_repaged()
+        self._document_repaged(old_to_new.get)
         self._load_page(old_to_new[self.current_page_idx])
         return old_to_new
 
@@ -15358,6 +16396,35 @@ def _split_markup(text):
     if i < len(text) or not out:
         out.append((text[i:], 'text'))
     return out
+
+
+_PAGE_LINK_TARGET_RE = re.compile(r"(\s*#\s*(?:page=)?)(\d+)(?=\s*(?:,|$))")
+
+
+def shift_page_links(text, page_map):
+    """Re-point this document's page-number links (`[[#page=N]]`, `[[#N]]`,
+    with or without `,y=` and an alias) after its pages moved. `page_map`
+    takes a 0-based old index to the new one, or None for a deleted page —
+    whose links are left as written: there is no right page to send them to,
+    and the number at least still reads as what you wrote.
+
+    Only SAME-document links: `other.pdf#page=3` is another file's page 3,
+    which nothing here moved. Named links (`#Bookmark`) need nothing — they
+    follow their page by construction, which is why they are the form to
+    write (row 165)."""
+    def fix(m):
+        inner = m.group(1)
+        target, bar, alias = inner.partition("|")
+        mm = _PAGE_LINK_TARGET_RE.match(target)
+        if mm is None:
+            return m.group(0)
+        old = int(mm.group(2)) - 1
+        new = page_map(old)
+        if new is None or new == old:
+            return m.group(0)
+        return ("[[" + mm.group(1) + str(new + 1) + target[mm.end():]
+                + bar + alias + "]]")
+    return _MD_LINK_RE.sub(fix, text)
 
 
 def _parse_note_link(inner):
@@ -18562,6 +19629,7 @@ class NotesModel:
         self._hidden = {(k + count if k >= idx else k) for k in self._hidden}
         if in_run:
             self._links.update(range(idx, idx + count))
+        self._shift_page_links(lambda k: k + count if k >= idx else k)
 
     def shift_for_delete(self, idx):
         """Drop the note of deleted page idx; re-key later pages.
@@ -18586,6 +19654,8 @@ class NotesModel:
                            for k, v in self._bookmarks.items() if k != idx}
         self._hidden = {(k - 1 if k > idx else k)
                         for k in self._hidden if k != idx}
+        self._shift_page_links(
+            lambda k: None if k == idx else (k - 1 if k > idx else k))
 
     def reorder(self, old_to_new):
         """Re-key notes after pages were reordered. old_to_new maps each old
@@ -18605,6 +19675,13 @@ class NotesModel:
                            for k, v in self._bookmarks.items()}
         self._hidden = {old_to_new.get(k, k) for k in self._hidden}
         self._normalize()   # a torn-off page may now own text behind a link
+        self._shift_page_links(lambda k: old_to_new.get(k, k))
+
+    def _shift_page_links(self, page_map):
+        """The notes' `[[#page=N]]` links follow the pages they point at —
+        the same re-keying the notes themselves just had."""
+        self._notes = {k: shift_page_links(v, page_map)
+                       for k, v in self._notes.items()}
 
     def to_text(self):
         """The sidecar's whole text — the sectioned form `save` writes.
@@ -25912,7 +26989,13 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         s._search_revealer.set_reveal_child(False)
 
         canvas_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        canvas_box.append(s.canvas)
+        # the canvas sits in an overlay so a form field's editor can float
+        # over the field it fills (row 222)
+        s._canvas_overlay = Gtk.Overlay()
+        s._canvas_overlay.set_child(s.canvas)
+        s._canvas_overlay.set_vexpand(True)
+        FormFieldEditor(s.canvas, s._canvas_overlay)
+        canvas_box.append(s._canvas_overlay)
 
         # ── split pane ────────────────────────────────────────────────────────
         s._saved_pane_pos = 800
@@ -27283,15 +28366,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # so _restore_note already sees the re-keyed model.
         idx = self.canvas.current_page_idx + 1
         self.notes_model.shift_for_insert(idx)
-        self._undo_timeline = [
-            ("notes", op[1] + 1, op[2]) if op[0] == "notes" and op[1] >= idx else op
-            for op in self._undo_timeline
-        ]
-        self._redo_timeline = [
-            ("notes", op[1] + 1) + op[2:] if op[0] == "notes" and op[1] >= idx else op
-            for op in self._redo_timeline
-        ]
-        self._drop_link_timeline_ops()
+        self._repage_timelines(lambda k: k + 1 if k >= idx else k)
         self.canvas.add_blank_page()
         self._populate_toc()
         self._mark_dirty()
@@ -27306,17 +28381,8 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return
         idx = self.canvas.current_page_idx
         self.notes_model.shift_for_delete(idx)
-        self._undo_timeline = [
-            ("notes", op[1] - 1, op[2]) if op[0] == "notes" and op[1] > idx else op
-            for op in self._undo_timeline
-            if not (op[0] == "notes" and op[1] == idx)
-        ]
-        self._redo_timeline = [
-            ("notes", op[1] - 1) + op[2:] if op[0] == "notes" and op[1] > idx else op
-            for op in self._redo_timeline
-            if not (op[0] == "notes" and op[1] == idx)
-        ]
-        self._drop_link_timeline_ops()
+        self._repage_timelines(
+            lambda k: None if k == idx else (k - 1 if k > idx else k))
         self.canvas.delete_current_page()
         self._populate_toc()
         self._mark_dirty()
@@ -27352,15 +28418,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         old_to_new = {old: new for new, old in enumerate(order)}
         self._commit_note()
         self.notes_model.reorder(old_to_new)
-        self._undo_timeline = [
-            ("notes", old_to_new[op[1]], op[2]) if op[0] == "notes" else op
-            for op in self._undo_timeline
-        ]
-        self._redo_timeline = [
-            ("notes", old_to_new[op[1]]) + op[2:] if op[0] == "notes" else op
-            for op in self._redo_timeline
-        ]
-        self._drop_link_timeline_ops()
+        self._repage_timelines(lambda k: old_to_new.get(k, k))
         apply_to_canvas()
         self._populate_toc()
         self._mark_dirty()
@@ -28429,18 +29487,39 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         self._populate_toc()
         self._mark_dirty()
 
-    def _drop_link_timeline_ops(self):
-        """Forget recorded link changes when the document is RE-PAGED.
+    def _repage_timelines(self, page_map):
+        """Re-key the window's undo and redo timelines for re-paged pages:
+        `page_map(old)` is the new index, None for a deleted page.
 
-        A link op carries a snapshot of the whole model, keyed by page index;
-        after an insert, a delete or a reorder those keys describe pages that
-        have moved, so replaying one would put notes back on the wrong slides.
-        Dropping it costs one undo step and is the same "degrade to unlinked
-        rather than guess" rule the model's re-keying follows (row 129)."""
-        self._undo_timeline = [op for op in self._undo_timeline
-                               if op[0] != "links"]
-        self._redo_timeline = [op for op in self._redo_timeline
-                               if op[0] != "links"]
+        Recurses into GROUPS — an assistant's page is one group of notes and
+        canvas entries (row 218), and re-keying only the top level left its
+        notes entries pointing at the old pages, so its Ctrl+Z restored text
+        onto the wrong slide. The texts an entry carries get their
+        `[[#page=N]]` links re-pointed like the model's, or an undo would put
+        the old numbers back.
+
+        A LINK op is dropped instead: it carries a snapshot of the whole
+        model keyed by page index, and replaying one after a re-page would
+        put notes back on the wrong slides. Losing that one undo step is the
+        same "degrade to unlinked rather than guess" rule the model's
+        re-keying follows (row 129)."""
+        def fix(op):
+            if op[0] == "group":
+                subs = [x for x in map(fix, op[1]) if x is not None]
+                return ("group", subs) if subs else None
+            if op[0] == "links":
+                return None
+            if op[0] != "notes":
+                return op
+            new = page_map(op[1])
+            if new is None:
+                return None
+            return (("notes", new)
+                    + tuple(shift_page_links(t, page_map) for t in op[2:]))
+        self._undo_timeline = [x for x in map(fix, self._undo_timeline)
+                               if x is not None]
+        self._redo_timeline = [x for x in map(fix, self._redo_timeline)
+                               if x is not None]
 
     def _push_links_undo(self, before):
         """Record a link change on the shared timeline, so Ctrl+Z reaches it in
@@ -28628,6 +29707,9 @@ class PDFEditorWindow(Adw.ApplicationWindow):
             return self._active_session._text_page
         if self._notes_view.has_focus():
             return None
+        editor = self.canvas.field_editor
+        if editor is not None and editor.is_open():
+            return None                  # Ctrl+V types into the form field
         return self.canvas
 
     def _global_undo(self):
@@ -30328,17 +31410,7 @@ class PDFEditorWindow(Adw.ApplicationWindow):
         # page restore already sees the shifted model (mirrors _add_blank_page)
         self._commit_note()
         self.notes_model.shift_for_insert(at, count)
-        self._undo_timeline = [
-            ("notes", op[1] + count, op[2])
-            if op[0] == "notes" and op[1] >= at else op
-            for op in self._undo_timeline
-        ]
-        self._redo_timeline = [
-            ("notes", op[1] + count) + op[2:]
-            if op[0] == "notes" and op[1] >= at else op
-            for op in self._redo_timeline
-        ]
-        self._drop_link_timeline_ops()
+        self._repage_timelines(lambda k: k + count if k >= at else k)
         return self.canvas.insert_pdf_pages(at, path)
 
     # ── merge import: several documents → one, a chapter each (row 123) ───────

@@ -38,7 +38,10 @@
   `gtk_widget_get_parent` assertion **per iteration, for ever**: 3.5M lines and
   a killed process in one measurement, not the handful you see scroll past.
   Defer the teardown to a `GLib.idle_add`; the signal itself must only note
-  what to do. The same shape hides in "closed" handlers (see the popover note
+  what to do. **And a deferred widget is still live until then**: when its
+  successor takes focus it emits `focus-leave`, so a leave handler must check
+  it belongs to the CURRENT widget (`FormFieldEditor._focus_left`) or it acts
+  on the new one. The same shape hides in "closed" handlers (see the popover note
   below) and in any `clicked` that repopulates the list its button sits in.
 
 - **Event reachability — a correct handler can still never run.** When a

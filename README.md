@@ -60,6 +60,7 @@ Sidemark was built for taking lecture notes. It works with two plain files and n
 
 ### Files & integration
 
+- **Fill in PDF forms** — click a field with the text cursor and type, `Tab` to the next one, click to tick a box; what you type matches the form's own lettering and saves into the PDF
 - **Formats** — opens `.pdf`, `.pptx` (auto-converted via LibreOffice) and `.md` files (a `<name>-notes.md` sidecar reopens its PDF; other text files open as a text-first page); drag files from your file manager onto the window
 - **Merge a semester into one document** — drop several files at once and choose **Merge**: each becomes a chapter in the outline, in filename order that counts numbers as numbers (`1`, `2`, `10`, `101`), and their notes and pasted images come along with the page numbers adjusted
 - **OCR for scans** — a scanned PDF with no text layer triggers an offer to **make it searchable** in the background (also on demand from the ☰ menu). Needs the optional [`ocrmypdf`](https://ocrmypdf.readthedocs.io) tool — `./install.sh --with-ocr` installs it

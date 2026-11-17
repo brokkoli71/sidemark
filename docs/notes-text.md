@@ -142,11 +142,14 @@
   - **A LINK POINTS AT A NAME (row 165)** — a bookmark (row 134) or an outline
     heading, the two things here that have both a name and a page:
     `[[#Eigenvalues]]`, `[[l2.pdf#Chapter Two]]`. That is not a syntax
-    preference, it is the fix for the defect: nothing re-keys a `#page=N` when
-    a slide is inserted, a chapter is dragged (row 123) or two decks are
-    merged, while a bookmark follows its page. **The page forms stay readable
-    for ever** — written notes are full of them — they are just never what the
-    picker offers.
+    preference: a bookmark follows its page everywhere, while a `#page=N` is
+    only re-pointed where we can see the move — a SAME-document link, in this
+    document's notes, by the model's re-keying (`shift_page_links`, called
+    from `shift_for_insert`/`shift_for_delete`/`reorder`, and on the texts in
+    the undo timelines). Another file's `#page=N`, or one written into a deck
+    before it was merged, still points at the old number. **The page forms
+    stay readable for ever** — written notes are full of them — they are just
+    never what the picker offers.
   - **`document_anchors()` indexes a document that is not open** (headings from
     the PDF, bookmarks parsed straight out of the sidecar's markers), cached on
     BOTH files' mtimes because what changes anchors is often not ours. The OPEN
@@ -256,7 +259,10 @@
   `_undo_timeline` — a whole-model `snapshot()`/`restore()`, because linking
   MERGES two bodies and no page/text pair describes that. A snapshot is keyed
   by page index, so any re-paging (insert/delete/reorder) DROPS the link ops
-  (`_drop_link_timeline_ops`) rather than replaying them onto moved slides.
+  (`_repage_timelines`) rather than replaying them onto moved slides. Every
+  re-paging path re-keys the timelines through that ONE function, which
+  recurses into an assistant's `("group", …)` — a fourth inline copy of the
+  re-key is how the groups were missed.
 
 - **A viewport SCROLLS TO ITS FOCUS WIDGET, and the sheet's is the whole
   paper.** `TextPageView`'s Box wrapper makes the text view a non-scrollable

@@ -257,7 +257,13 @@ export class Doc {
     const ctx = canvas.getContext("2d", { alpha: false });
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await p.render({ canvasContext: ctx, viewport: vp }).promise;
+    // ENABLE, not pdf.js's default ENABLE_FORMS: that one leaves form fields
+    // to an HTML layer we do not build, so a filled-in form's values vanished.
+    // ENABLE paints them from their appearance streams like any annotation.
+    // Our own ink is stripped out of the bytes at open (`_adopt`), so this
+    // cannot paint it a second time.
+    await p.render({ canvasContext: ctx, viewport: vp,
+                     annotationMode: pdfjs.AnnotationMode.ENABLE }).promise;
     return canvas;
   }
 

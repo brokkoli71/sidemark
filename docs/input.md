@@ -89,6 +89,13 @@
     the web port's `_onDown` is the same rule). Left only, so a finger bound
     to pan still pans across a callout. The `GestureClick` beside the drag
     decides nothing: it fires for a finger too and cannot tell it from left.
+  - **The caret FILLS a form field (row 222)** instead of selecting under it
+    — checked in `_begin_tool` for `tool == "text"`, the same click that
+    follows a link, so the hover glow and the press can never disagree.
+    No other tool touches a field: the pen writes over a form. A press
+    anywhere on the canvas confirms the open field first (`_on_drag_begin`);
+    the editor itself sits OVER its field, so presses on it never reach the
+    canvas.
   - **PDF text selection is ONE model, `PageText` (row 196)**: the page's
     characters in MuPDF reading order. Hit-testing (`caret_at` — the LINE
     first, then the character), the painted bands, the copied text and the

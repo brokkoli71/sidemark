@@ -51,13 +51,18 @@
     its timing are one table (`landing_alpha`, `LANDING_S`) and one painter
     (`_draw_flash`) — the backlink rows use it too.
 
-- **Every re-paging calls `PDFCanvas._document_repaged()`** (insert, insert
-  a PDF, delete, move). The page caches are keyed by the page COUNT, which a
-  move does not change, and **PyMuPDF caches named destinations itself**
-  (`doc._resolved_names`, filled once and never refreshed): without the
-  reset every LaTeX `\cite`/`\ref` keeps its OLD target page until the file
-  is reopened — badges, previews and jumps on the wrong page. A new cache
-  keyed by page index belongs in that reset.
+- **Every re-paging calls `PDFCanvas._document_repaged(page_map)`**
+  (insert, insert a PDF, delete, move), `page_map(old)` being the new index
+  or None for a deleted page. The page caches are keyed by the page COUNT,
+  which a move does not change, and **PyMuPDF caches named destinations
+  itself** (`doc._resolved_names`, filled once and never refreshed): without
+  the reset every LaTeX `\cite`/`\ref` keeps its OLD target page until the
+  file is reopened — badges, previews and jumps on the wrong page. A new
+  cache keyed by page index belongs in that reset; STATE keyed by page index
+  is re-keyed there instead — the view history (`ViewHistory.repage`, a view
+  of a deleted page is dropped) and `_jump_marks`, or Alt+Left lands and
+  glows a page off. The window's timelines and the notes are the other half
+  (`_repage_timelines`, the notes model's re-keying).
 
 - **Link preview on hover (row 197)** — resting on an internal link, where a
   click would follow it (`link_hover_active`), draws what it points at on the
