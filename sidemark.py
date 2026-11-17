@@ -6937,12 +6937,15 @@ def _page_pixmap(page, matrix, clip=None):
                                            clip=clip)
 
 
-# the faces a field's /DA font is previewed in while you type: metric twins
-# of the base-14 fonts MuPDF then draws the appearance with, so the text does
-# not visibly reflow when the editor closes
-_FORM_PREVIEW_FAMILY = {"he": "Liberation Sans, Arimo, Arial, Helvetica, sans-serif",
-                        "ti": "Liberation Serif, Tinos, Times New Roman, serif",
-                        "co": "Liberation Mono, Cousine, Courier New, monospace"}
+# the faces a field's /DA font is previewed in while you type. FIRST the URW
+# fonts MuPDF itself draws the base-14 fonts with — the same glyphs the
+# appearance will have, so nothing changes shape when the editor closes.
+# Liberation comes after as a metric twin only: it is Arial's design, not
+# Helvetica's, and was visibly a different font while typing.
+_FORM_PREVIEW_FAMILY = {
+    "he": "Nimbus Sans, Helvetica, Liberation Sans, Arimo, sans-serif",
+    "ti": "Nimbus Roman, Times, Liberation Serif, Tinos, serif",
+    "co": "Nimbus Mono PS, Courier, Liberation Mono, Cousine, monospace"}
 
 
 class FormFieldEditor:
@@ -7025,6 +7028,10 @@ class FormFieldEditor:
             self.widget = ring
         self.widget.add_css_class(self._klass)
         self.widget.set_overflow(Gtk.Overflow.HIDDEN)
+        # placed BEFORE it is shown: without a position the overlay gives a
+        # child the whole canvas, and for one frame the white editor covered
+        # the document — a blink on every field you entered
+        self._rect = self.canvas.field_rect_on_screen(idx, field)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         keys.connect("key-pressed", self._on_key)
@@ -7225,8 +7232,14 @@ class FormFieldEditor:
         return False
 
     def _position(self, _overlay, child, allocation):
-        if child is not self.widget or self._rect is None:
+        if child is not self.widget:
             return False
+        if self._rect is None:
+            # nowhere yet: nothing, rather than the overlay's default of
+            # the whole canvas
+            allocation.x = allocation.y = 0
+            allocation.width = allocation.height = 0
+            return True
         x, y, w, h = self._rect
         allocation.x, allocation.y = round(x), round(y)
         allocation.width = max(1, round(w))

@@ -27237,6 +27237,16 @@ class TestFormFieldEditorInWindow(unittest.TestCase):
                              "the fill is one step on the window's timeline")
         self._run_in_window(body)
 
+    def test_the_editor_is_placed_before_it_is_shown(self):
+        """An overlay child with no position gets the WHOLE canvas, so an
+        editor placed only by the next draw covered the document for a
+        frame — the blink on entering a field."""
+        def body(win, _pdf):
+            ed, a = self._open(win, "auto_a")
+            self.assertEqual(ed._rect,
+                             win.canvas.field_rect_on_screen(0, a))
+        self._run_in_window(body)
+
     def test_escape_leaves_the_field_as_it_was(self):
         def body(win, _pdf):
             ed, a = self._open(win, "auto_a")
