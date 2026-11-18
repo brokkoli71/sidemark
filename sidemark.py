@@ -16462,6 +16462,11 @@ def _pdf_needs_ocr(path, sample=10):
         if n == 0:
             return False
         pages = min(sample, n)
+        # A page that names a font has a text layer — a scan does not, and an
+        # OCRed scan does — and asking is a resource lookup, where get_text
+        # lays out every glyph (~4x the cost, on the main thread at open).
+        if any(doc.load_page(i).get_fonts() for i in range(pages)):
+            return False
         text_chars = 0
         has_image = False
         for i in range(pages):
